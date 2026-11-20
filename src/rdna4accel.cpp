@@ -74,6 +74,7 @@ RDNA4_ACCEL_BASE(IOAccelMemoryMap)
 RDNA4_ACCEL_BASE(IOAccelEventMachine2)
 RDNA4_ACCEL_BASE(IOAccelEventMachineFast2)
 RDNA4_ACCEL_BASE(IOAccelDisplayMachine)
+RDNA4_ACCEL_BASE(IOAccelResource2)
 
 // The family objects the family's start asks for. The event machine's four (its stamps and barriers in command buffers) and the
 // memory map's three (the GPU page table) are for submissions through the family, which nothing makes yet: they do nothing.
@@ -109,6 +110,28 @@ public:
 };
 RDNA4_ACCEL_STRUCTORS(RDNA4MemoryMap, IOAccelMemoryMap)
 
+// A resource: the family's header for a surface or buffer (a display pipe asks for one for its framebuffer). Its memory, apertures and
+// paging buffer are not ours yet: nothing.
+class RDNA4Resource : public IOAccelResource2 {
+	OSDeclareDefaultStructors(RDNA4Resource)
+public:
+	uintptr_t rebuildPagingBuffer() APPLE_KEXT_OVERRIDE { return 0; }
+	uintptr_t getLevelOffset(unsigned char, unsigned char, int *offset) APPLE_KEXT_OVERRIDE { if (offset) *offset = 0; return 0; }
+	uintptr_t getBackingLevelOffset(unsigned char, unsigned char, int *offset) APPLE_KEXT_OVERRIDE { if (offset) *offset = 0; return 0; }
+	uintptr_t calculateIOSurfaceDeviceCacheVRAMBytes(unsigned long long *a, unsigned long long *b) APPLE_KEXT_OVERRIDE
+	{
+		if (a)
+			*a = 0;
+		if (b)
+			*b = 0;
+		return 0;
+	}
+	uintptr_t addToAperture() APPLE_KEXT_OVERRIDE { return 0; }
+	uintptr_t removeFromAperture() APPLE_KEXT_OVERRIDE { return 0; }
+	uintptr_t getApertureMemoryDescriptor(unsigned long long *) APPLE_KEXT_OVERRIDE { return 0; }
+};
+RDNA4_ACCEL_STRUCTORS(RDNA4Resource, IOAccelResource2)
+
 class RDNA4Accelerator : public IOGraphicsAccelerator2 {
 	OSDeclareDefaultStructors(RDNA4Accelerator)
 	using super = IOGraphicsAccelerator2;
@@ -124,11 +147,19 @@ public:
 	void *getStampMemory(unsigned int *) APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelEventMachine2 *newEventMachine() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4EventMachine); }
 	IOAccelTask *createUserGPUTask() APPLE_KEXT_OVERRIDE { return nullptr; }
-	void populateAccelConfig(IOAccelConfig *) APPLE_KEXT_OVERRIDE {}
+	// the family's defaults (initializeConfigStructure) but the number of framebuffers the display machine takes (+0x28, as AMD's:
+	// its display count; the default took one, "trying to init too many framebuffers" for the others)
+	void populateAccelConfig(IOAccelConfig *config) APPLE_KEXT_OVERRIDE
+	{
+		if (config)
+			*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(config) + 0x28) = kMaxFramebuffers;
+	}
+	static constexpr uint32_t kMaxFramebuffers = 8;
 	bool configureDevice(IOPCIDevice *) APPLE_KEXT_OVERRIDE { return true; }
 	void teardownDevice(IOPCIDevice *) APPLE_KEXT_OVERRIDE {}
 	IOAccelTask *createKernelGPUTask() APPLE_KEXT_OVERRIDE;
-	IOAccelDisplayMachine *newDisplayMachine() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4DisplayMachine); }
+	IOAccelDisplayMachine *newDisplayMachine() APPLE_KEXT_OVERRIDE { return displayMachine = OSTypeAlloc(RDNA4DisplayMachine); }
+	RDNA4DisplayMachine *displayMachine = nullptr;   // the family keeps it (+0x378) and releases it
 	IOAccelContext2 *newGLContext() APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelContext2 *newCLContext() APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelSurface *newSurface() APPLE_KEXT_OVERRIDE { return nullptr; }
@@ -136,7 +167,7 @@ public:
 	IOAccelContext2 *newVideoContext() APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelSysMemory *newSysMemory() APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelVidMemory *newVidMemory() APPLE_KEXT_OVERRIDE { return nullptr; }
-	IOAccelResource2 *newResource() APPLE_KEXT_OVERRIDE { return nullptr; }
+	IOAccelResource2 *newResource() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4Resource); }
 	IOAccelMemoryMap *newMemoryMap() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4MemoryMap); }
 };
 
@@ -192,6 +223,7 @@ const Derived kDerived[] = {
 	RDNA4_DERIVED(RDNA4DisplayMachine, IOAccelDisplayMachine, 21),
 	RDNA4_DERIVED(RDNA4Task, IOAccelTask, 11),
 	RDNA4_DERIVED(RDNA4MemoryMap, IOAccelMemoryMap, 16),
+	RDNA4_DERIVED(RDNA4Resource, IOAccelResource2, 16),
 };
 constexpr size_t kDerivedCount = sizeof(kDerived) / sizeof(kDerived[0]);
 
@@ -237,20 +269,22 @@ void familyLoaded(KernelPatcher &patcher, size_t index, mach_vm_address_t addres
 	}
 	rdna4Log("AMDRadeonRDNA4: accel: IOAcceleratorFamily2: %zu thunks, %u not found, %u slots not the KDK's, %u of %zu classes not as "
 	         "expected: %s\n", kThunks, missing, wrongSlots, bad, kDerivedCount,
-	         gReady ? "ready (debug.rdna4_accel=1 makes one, 2 starts it)" : "NOT usable");
+	         gReady ? "ready (debug.rdna4_accel=1 makes one, 2 starts it, 3 its displays)" : "NOT usable");
 }
 
 RDNA4Accelerator *gAccel;   // made and attached (debug.rdna4_accel=1)
-bool gStarted;              // started and published (debug.rdna4_accel=2)
+bool gStarted;              // the family's start ran (debug.rdna4_accel=2)
+bool gDisplays;             // the display machine started (debug.rdna4_accel=3)
 
-// In steps, each logged: 1 makes one (the family's own constructor runs) and attaches it under the GPU; 2 starts and publishes it.
+// In steps, each logged: 1 makes one (the family's own constructor runs) and attaches it under the GPU; 2 runs the family's start;
+// 3 initialises and starts the display machine on the GPU (the family's: a display pipe for each framebuffer it finds).
 int accelSysctl SYSCTL_HANDLER_ARGS
 {
-	int value = gStarted ? 2 : gAccel ? 1 : 0;
+	int value = gDisplays ? 3 : gStarted ? 2 : gAccel ? 1 : 0;
 	const int err = sysctl_handle_int(oidp, &value, 0, req);
 	if (err || !req->newptr)
 		return err;
-	if (value != 1 && value != 2)
+	if (value < 1 || value > 3)
 		return EINVAL;
 	// (accelcensus.cpp's: an extern of its variable, which is in an anonymous namespace, linked as an unresolved lookup that OpenCore
 	// bound to junk: reading it panicked the rig, 2026-11-20)
@@ -282,17 +316,30 @@ int accelSysctl SYSCTL_HANDLER_ARGS
 		rdna4Log("AMDRadeonRDNA4: accel: attached under %s (not started): a kind of IOGraphicsAccelerator2: %s\n", gpu->getName(),
 		         a->metaCast("IOGraphicsAccelerator2") ? "yes" : "NO");
 	}
-	if (value == 2 && !gStarted) {
+	if (value >= 2 && !gStarted) {
 		rdna4Log("AMDRadeonRDNA4: accel: starting\n");
 		if (!gAccel->start(gpu))
 			return EIO;
 		gStarted = true;
 	}
+	if (value == 3 && !gDisplays) {
+		RDNA4DisplayMachine *dm = gAccel->displayMachine;
+		if (!dm)
+			return ENODEV;
+		rdna4Log("AMDRadeonRDNA4: accel: display machine init\n");
+		const bool inited = dm->init(gAccel);
+		rdna4Log("AMDRadeonRDNA4: accel: display machine init %s; start on the GPU\n", inited ? "done" : "FAILED");
+		if (!inited)
+			return EIO;
+		const uintptr_t started = dm->start(reinterpret_cast<IOPCIDevice *>(gpu));   // (gpu is the GPU's IOPCIDevice)
+		rdna4Log("AMDRadeonRDNA4: accel: display machine start returned 0x%lx\n", static_cast<unsigned long>(started));
+		gDisplays = true;
+	}
 	return 0;
 }
 
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_accel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, accelSysctl, "I",
-            "AMDRadeonRDNA4: our own IOGraphicsAccelerator2 (skeleton): 1 makes and attaches one, 2 starts and publishes it (docs/native-driver-plan.md)");
+            "AMDRadeonRDNA4: our own IOGraphicsAccelerator2: 1 makes and attaches one, 2 runs the family's start, 3 starts the display machine (docs/native-driver-plan.md)");
 }   // namespace
 
 void RDNA4Accel::start()

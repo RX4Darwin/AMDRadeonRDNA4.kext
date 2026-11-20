@@ -13,7 +13,9 @@ class IOAccelMemoryMap;
 class IOAccelEventMachine2;
 class IOAccelEventMachineFast2;
 class IOAccelDisplayMachine;
+class IOAccelResource2;
 class IOAccelAllocationInfo;
+class IOAccelChannel2;
 class IOAccelClientSharedRO;
 class IOAccelClientSharedRW;
 class IOAccelCommandDescriptor;
@@ -21,8 +23,10 @@ class IOAccelConfig;
 class IOAccelContext2;
 class IOAccelEvent;
 class IOAccelEventQueue;
+class IOAccelGetResourceInfoReturnData;
 class IOAccelMemory;
-class IOAccelResource2;
+class IOAccelNewResourceArgs;
+class IOAccelResourcePrivate;
 class IOAccelShared2;
 class IOAccelSurface;
 class IOAccelSysMemory;
@@ -389,3 +393,68 @@ private:
 };
 static_assert(sizeof(IOAccelDisplayMachine) == 0x178, "the KDK's size");
 enum : size_t { kIOAccelDisplayMachineSize = 0x178 };
+
+class IOAccelResource2 : public OSObject {
+public:
+	virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;   // the key function (see accelgen.py)
+	class MetaClass : public OSMetaClass { public: OSObject *alloc() const APPLE_KEXT_OVERRIDE; };
+	static MetaClass gMetaClass;   // a placeholder in our kext (ioaccel_thunks.S): our subclasses' superclass link is patched
+protected:
+	IOAccelResource2(const OSMetaClass *meta);
+	virtual ~IOAccelResource2() APPLE_KEXT_OVERRIDE;
+public:
+	// slots 35-78 its own (the KDK's order), the rest overrides; pure ones named after __ZTV31AMDRadeonX6000_AMDAccelResource's
+	virtual int getRetainCount() const APPLE_KEXT_OVERRIDE; // 3
+	virtual void retain() const APPLE_KEXT_OVERRIDE; // 4
+	virtual void release() const APPLE_KEXT_OVERRIDE; // 5
+	virtual void free() APPLE_KEXT_OVERRIDE; // 18
+	virtual uintptr_t initSurfaceBuffer(IOAccelSurface*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int); // 35
+	virtual uintptr_t allocMemory(IOAccelShared2*); // 36
+	virtual uintptr_t allocDataBufferMemory(IOAccelShared2*, bool, unsigned int); // 37
+	virtual uintptr_t allocFallbackMemory(); // 38
+	virtual bool init(IOGraphicsAccelerator2*, IOAccelShared2*, unsigned int); // 39
+	virtual uintptr_t initialize(IOAccelNewResourceArgs*, unsigned long long); // 40
+	virtual uintptr_t initClientShared(IOAccelClientSharedRO*, IOAccelClientSharedRW*); // 41
+	virtual uintptr_t termClientShared(IOAccelClientSharedRO*, IOAccelClientSharedRW*); // 42
+	virtual uintptr_t copyResourcePrivate(IOAccelResourcePrivate*); // 43
+	virtual uintptr_t sharedRelease(IOAccelShared2*); // 44
+	virtual uintptr_t dirtyLevel(unsigned int, unsigned int); // 45
+	virtual uintptr_t prepare(); // 46
+	virtual uintptr_t complete(); // 47
+	virtual uintptr_t load(); // 48
+	virtual uintptr_t unload(); // 49
+	virtual uintptr_t addToChannel(IOAccelChannel2*, unsigned int); // 50
+	virtual uintptr_t removeFromChannel(IOAccelChannel2*); // 51
+	virtual uintptr_t fallback(); // 52
+	virtual uintptr_t getResourceInfo(IOAccelGetResourceInfoReturnData*, unsigned int*); // 53
+	virtual uintptr_t pageon(IOAccelEvent*, bool); // 54
+	virtual uintptr_t pageon(IOAccelEvent*, bool, unsigned long long); // 55
+	virtual uintptr_t pageoff(IOAccelEvent*, bool, bool*); // 56
+	virtual uintptr_t pageoff(IOAccelEvent*, bool, bool*, unsigned long long); // 57
+	virtual uintptr_t rebuildPagingBuffer() = 0; // 58
+	virtual uintptr_t getMemoryAllocParameter(); // 59
+	virtual uintptr_t getLevelOffset(unsigned char, unsigned char, int*) = 0; // 60
+	virtual uintptr_t getBackingLevelOffset(unsigned char, unsigned char, int*) = 0; // 61
+	virtual uintptr_t calculateIOSurfaceDeviceCacheVRAMBytes(unsigned long long*, unsigned long long*) = 0; // 62
+	virtual uintptr_t addToAperture() = 0; // 63
+	virtual uintptr_t removeFromAperture() = 0; // 64
+	virtual uintptr_t getApertureMemoryDescriptor(unsigned long long*) = 0; // 65
+	virtual uintptr_t dirtyFaceLevels(unsigned int, unsigned int); // 66
+	virtual uintptr_t dirtyBufferRange(unsigned int, unsigned int); // 67
+	virtual uintptr_t zeroVidMemory(IOAccelEvent*, unsigned long long); // 68
+	virtual uintptr_t scrubEvents(); // 69
+	virtual uintptr_t dirtyBufferRange(unsigned long long, unsigned long long); // 70
+	virtual uintptr_t dirtyVendorCommand(unsigned int, unsigned long long); // 71
+	virtual uintptr_t _RESERVEDIOAccelResource2(); // 72
+	virtual uintptr_t _RESERVEDIOAccelResource3(); // 73
+	virtual uintptr_t _RESERVEDIOAccelResource4(); // 74
+	virtual uintptr_t _RESERVEDIOAccelResource5(); // 75
+	virtual uintptr_t pageoffIfNeeded(unsigned int, unsigned int); // 76
+	virtual uintptr_t pageonIfNeeded(); // 77
+	virtual uintptr_t gartEvent(); // 78
+
+private:
+	uint8_t opaque_[0x180 - sizeof(OSObject)];
+};
+static_assert(sizeof(IOAccelResource2) == 0x180, "the KDK's size");
+enum : size_t { kIOAccelResource2Size = 0x180 };

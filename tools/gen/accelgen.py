@@ -23,6 +23,8 @@ OVERRIDES = {
     'getMetaClass() const': 'virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;',
     'free()': 'virtual void free() APPLE_KEXT_OVERRIDE;',
     'release() const': 'virtual void release() const APPLE_KEXT_OVERRIDE;',
+    'retain() const': 'virtual void retain() const APPLE_KEXT_OVERRIDE;',
+    'getRetainCount() const': 'virtual int getRetainCount() const APPLE_KEXT_OVERRIDE;',
     'setProperties(OSObject*)': 'virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;',
     'requestTerminate(IOService*, unsigned int)': 'virtual bool requestTerminate(IOService *provider, IOOptionBits options) APPLE_KEXT_OVERRIDE;',
     'didTerminate(IOService*, unsigned int, bool*)': 'virtual bool didTerminate(IOService *provider, IOOptionBits options, bool *defer) '
@@ -68,6 +70,7 @@ CLASSES = [
     ('IOAccelEventMachine2', 'OSObject', (AMD, '__ZTV35AMDRadeonX6000_AMDAccelEventMachine')),
     ('IOAccelEventMachineFast2', 'IOAccelEventMachine2', (AMD, '__ZTV35AMDRadeonX6000_AMDAccelEventMachine')),
     ('IOAccelDisplayMachine', 'IOService', (AMD, '__ZTV37AMDRadeonX6000_AMDAccelDisplayMachine')),
+    ('IOAccelResource2', 'OSObject', (AMD, '__ZTV31AMDRadeonX6000_AMDAccelResource')),
 ]
 
 

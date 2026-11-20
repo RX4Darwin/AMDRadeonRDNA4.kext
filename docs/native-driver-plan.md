@@ -83,6 +83,16 @@ is prelinked against the system collection's copies.
   (AMD's driver does that after it). System stable. On the way: in `-fapple-kext` code `Base::f()` is a call through the base's vtable
   symbol, so every family class's vtable must be emitted in our kext (key function `getMetaClass`, `RDNA4_ACCEL_BASE`): undefined, it
   was bound to junk and panicked; the build now fails on any undefined IOAcceleratorFamily2 symbol.
+- **The display machine runs on the card (2026-11-20, kext cce7c390):** `debug.rdna4_accel=3`: `IOAccelDisplayMachine::init` and
+  `start(IOPCIDevice*)` walk the GPU's framebuffers and `found_framebuffer` makes a family `IOAccelDisplayPipe` for one: the pipe's
+  init asks the accelerator for a resource (`newResource`: an `IOAccelResource2` subclass, its seven functions stubs; nil would have
+  panicked: no check), registers a framebuffer notification and sets `IOAccelTypes` (our accelerator's path), `IOAccelIndex` 0 and
+  `IOAccelRevision` on that IONDRVFramebuffer: how WindowServer ties a display to its accelerator. The other five: "trying to init too
+  many framebuffers": the config's display count (accelerator +0xc88 config, +0x28; AMD sets its display count) defaulted to 1; now 8.
+  The "IOAccelResource2::map(): resource already has a map" faults in the log are the paravirtual path's (thousands a boot without ours).
+- Next: WindowServer on these framebuffers through our pipes: today the kext hides the IONDRV framebuffers from it (the paravirtual
+  displays are its displays) and our accelerator refuses user clients (`IOAccelDisplayPipeUserClient2` and the rest); the family's
+  IOAccelLegacyDisplayMachine / IOAccelLegacyDisplayPipe implement flips through a plain framebuffer and may be the shortest way.
 - Was planned as milestone 2: the family's own `start` (from `RDNA4Accelerator::start`), with what it calls implemented: configureDevice (312),
   populateAccelConfig (310), createEventMachine/newEventMachine (272/273), newDisplayMachine (320), createKernelGPUTask (314),
   calcMaxGPUPhysicalMemoryBytes (311), newStatistics (336) and the memory/command-descriptor factories. Each object it asks for is a
