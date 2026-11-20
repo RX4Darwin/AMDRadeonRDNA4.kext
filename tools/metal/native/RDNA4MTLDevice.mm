@@ -2894,17 +2894,20 @@ RDNA4_ANSWER_MISSING
 		statAdd(kStatWaitUs, started - self->_committedUs);
 		dispatch_queue_t handlers = self->_queue.handlers;
 		NSError *why = nil;
+		uint64_t slowest = 0, slowestAt = 0;   // its longest step (a command buffer of 200 ms or more is logged: the pointer stood at times)
 		for (NSUInteger i = 0; i < self->_ops.count && !why; i++) {
 			const BOOL draw = [self->_draws containsIndex:i];
+			const uint64_t t0 = nowUs();
 			if (!draw)
 				why = [device drainGfx] ?: heldWriteBackAll(device);   // (a CPU step may read a held surface's memory)
-			const uint64_t t0 = draw ? 0 : nowUs();
+			const uint64_t t1 = nowUs();
 			if (!why)
 				why = self->_ops[i]();
-			if (!draw) {
-				const uint64_t us = nowUs() - t0;
-				statAdd(kStatSteps, 1), statAdd(kStatStepUs, us), statMax(gStepMaxUs, us);
-			}
+			const uint64_t t2 = nowUs();
+			if (t2 - t0 > slowest)
+				slowest = t2 - t0, slowestAt = i;
+			if (!draw)
+				statAdd(kStatSteps, 1), statAdd(kStatStepUs, t2 - t1), statMax(gStepMaxUs, t2 - t1);
 		}
 		NSError *drained = [device drainGfx];
 		self->_error = why ?: drained;
@@ -2916,6 +2919,10 @@ RDNA4_ANSWER_MISSING
 		// between its old and new places (2026-11-20).
 		const uint64_t done = nowUs();
 		statAdd(kStatRunUs, done - started);
+		if (done - started >= 200000)
+			RLOG(@"RDNA4MTL: a command buffer (%@) ran %.0f ms: %lu steps, %lu draws, the longest step %lu (%s) %.0f ms", self.label ?: @"-",
+			     (done - started) / 1e3, (unsigned long)self->_ops.count, (unsigned long)self->_draws.count, (unsigned long)slowestAt,
+			     [self->_draws containsIndex:slowestAt] ? "a draw" : "not a draw", slowest / 1e3);
 		statMax(gLatencyMaxUs, done - self->_committedUs);
 		self->_status = MTLCommandBufferStatusScheduled;
 		dispatch_group_leave(self->_scheduledGroup);

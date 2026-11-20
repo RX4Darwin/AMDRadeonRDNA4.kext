@@ -90,10 +90,24 @@ uint32_t nextFence(uint32_t previous) {
 constexpr uint64_t kCopyChunk = 4ull << 20;   // wired at a time
 constexpr uint32_t kCodePad = 0x100;          // zeroed past the image: instruction prefetch
 
+// The runtime's lock, held for a scope. Held or waited for 50 ms or more: logged with the line that took it (the pointer stood for a second
+// at times, 2026-11-20: who holds the lock that long).
 struct Locked {
 	IOLock *l;
-	explicit Locked(IOLock *lock) : l(lock) { IOLockLock(l); }
-	~Locked() { IOLockUnlock(l); }
+	int line;
+	uint64_t asked, got;
+	explicit Locked(IOLock *lock, int at = __builtin_LINE()) : l(lock), line(at), asked(mach_absolute_time()) {
+		IOLockLock(l);
+		got = mach_absolute_time();
+	}
+	~Locked() {
+		IOLockUnlock(l);
+		uint64_t held = 0, waited = 0;
+		absolutetime_to_nanoseconds(mach_absolute_time() - got, &held);
+		absolutetime_to_nanoseconds(got - asked, &waited);
+		if (held >= 50000000 || waited >= 50000000)
+			RLOG("lock: line %d waited %llu ms for it and held it %llu ms", line, waited / 1000000, held / 1000000);
+	}
 };
 
 // Copy between a user range and kernel memory, `length` bytes.

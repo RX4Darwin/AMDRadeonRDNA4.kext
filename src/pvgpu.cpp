@@ -636,6 +636,8 @@ private:
 	uint32_t mIrqBits { 0 };           // INTR_STATUS_GPU bits we raised and have not cleared yet
 	uint32_t mReplies { 0 };           // GetDeviceInfo replies sent
 	uint64_t mTicks { 0 };
+	uint64_t mTickAt { 0 };   // when the last tick ran
+	uint32_t mCmdsAtTick { 0 };
 	uint32_t mCmds { 0 };               // FIFO commands decoded so far
 	uint32_t mBadHeaders { 0 };
 	uint32_t mBarrierLines { 0 };
@@ -875,6 +877,7 @@ private:
 		uint32_t cursorPos { 0xffffffff };
 		uint8_t cursorVisible { 0 };
 		uint32_t cursorLines { 0 };
+		uint64_t cursorAt { 0 }, cursorGap { 0 };   // when it last moved, and the time between its two moves before that
 	};
 	Pipe mPipe[pvstream::disp::kMaxPorts];
 	uint64_t mDrawStatSince { 0 }, mDrawStatNs { 0 }, mDrawStatMaxNs { 0 };   // noteDraw: the draws of the last 5 s
@@ -1426,6 +1429,11 @@ void RDNA4PvHost::tick() {
 	// timed wait (most raises of a session: animations stood still, frames came late).
 	dropIrqBits();
 	const uint32_t cmds = mCmds;
+	const uint64_t tickAt = nowNs();   // a tick that came 100 ms or more late: logged (the pointer stood at times, 2026-11-20)
+	if (mTickAt && tickAt - mTickAt >= 100000000)
+		pvstat("host: tick %llu ms after the one before (%u commands since)", (tickAt - mTickAt) / 1000000, cmds - mCmdsAtTick);
+	mTickAt = tickAt;
+	mCmdsAtTick = cmds;
 
 	// The runtime opened here, on the tick's own shallow stack, once the guest is talking (then once a second until it opens): opened first from
 	// runDraw, 10 KB down the command walk, IOLog's os_log path ran the timer thread's 16 KB kernel stack out (double fault panic, 2026-11-20).
@@ -9094,6 +9102,15 @@ void RDNA4PvHost::pollDisplay() {
 		// onto the head's cursor plane (the page holds the hot spot's position)
 		if ((pos != p.cursorPos || visible != p.cursorVisible) && pos != 0xffffffff && PvScanout::cursorReady(port))
 			PvScanout::cursorMove(port, static_cast<int32_t>(pos & 0xffff), static_cast<int32_t>(pos >> 16), visible);
+		// moving, then standing 250 ms or more, then moving again: logged (or the mouse was held still that long)
+		if (pos != p.cursorPos && pos != 0xffffffff) {
+			const uint64_t gap = p.cursorAt ? now - p.cursorAt : 0;
+			if (gap >= 250000000 && p.cursorGap && p.cursorGap < 50000000)
+				pvstat("host: display pipe %u cursor: stood %llu ms after moving (the last tick %llu ms before this one)", port, gap / 1000000,
+				       mTickAt && now > mTickAt ? (now - mTickAt) / 1000000 : 0);
+			p.cursorGap = gap;
+			p.cursorAt = now;
+		}
 		p.cursorPos = pos;
 		p.cursorVisible = visible;
 	}
