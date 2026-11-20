@@ -114,6 +114,22 @@ is prelinked against the system collection's copies.
     0x921 (a 0xb0-byte capability record), 0x980, 0x2001, the rest the base's); AMD's have `AtiDeviceControl` (AMDSupport) and
     `AmdAgdcServices`. Next: our `AppleGraphicsDeviceControl` subclass on the GPU (the family in AppleGraphicsControl.kext/PlugIns/
     AppleGraphicsDeviceControl.kext: accelgen.py needs a second kext's thunks), answering as the paravirtual one; then the transactions.
+- **The AGDC service (2026-11-20, later):** `RDNA4DeviceControl : AppleGraphicsDeviceControl` (accelgen.py now derives from two kexts;
+  `ioaccel_kexts.inc`), started on the GPU by `rdna4-accel=4`. IOPresentment's association map then works. Learned on the way:
+  - AGDC attribute 0x980 lists the GPU's framebuffers as **kernel objects**: `AppleGraphicsDeviceControl::filtered_doDeviceAttribute`
+    turns them into registry IDs for user space (registry IDs there were taken for objects: two panics, in
+    AppleGraphicsDevicePolicy's start and in UserKernelTransfer);
+  - AppleGraphicsDevicePolicy attaches to every AGDC service: fine once 0x980 is right;
+  - the family's `newUserClient` refuses display pipe clients (type 4) unless the accel config's byte +0x47 is set (AMD's first
+    store in populateAccelConfig): it was the "Unable to create IOAccelDisplayPipe".
+  - **Now:** WindowServer opens our display pipes, then CoreDisplay asserts in `CoreDisplay_CreateDisplayForCGXDisplayDevice` after
+    "Attempting to get capabilities from capabilities with no devices" (LoadCapabilities) and restarts every 10 s: the boot has no
+    desktop. The accelerator's `IOAccelDisplayPipeCapabilities` (all the family's `copyCapabilities` returns) is the same two keys
+    on the paravirtual GPU, so the devices come from elsewhere: IOPresentment asks AGDC attributes 1, 0x980, 0x921, 3 (answered) and
+    **0x711 (0x196c bytes), 0x925 (12)**, 0x923, 0x941, 0x2, 0x2001 (refused). The paravirtual GPU's framebuffers answer 0x704, 0x711
+    (checks size 0x196c), 0x924, 0x925, 0x986 (`AppleParavirtFramebuffer::doDeviceAttribute`): 0x711 is the next thing to decode.
+  - The test config is kept in the EFI's `rdna4-backups/20261120-214231/config.plist` (no `rdna4-pvgpu=1`, `rdna4-accel=4`); the
+    rig is back on its paravirtual config (`~/rdna4/config.plist.before-accelws`).
 - Next: WindowServer on these framebuffers through our pipes: today the kext hides the IONDRV framebuffers from it (the paravirtual
   displays are its displays) and our accelerator refuses user clients (`IOAccelDisplayPipeUserClient2` and the rest); the family's
   IOAccelLegacyDisplayMachine / IOAccelLegacyDisplayPipe implement flips through a plain framebuffer and may be the shortest way.
