@@ -257,13 +257,17 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface
                          plane:(NSUInteger)plane;
 - (void)clearTo:(MTLClearColor)colour;
-- (NSError *)clearDepthTo:(double)depth;   // a Depth32Float texture: every pixel (the tiling does not matter for one value)
+- (NSError *)clearDepthTo:(double)depth;
+// A view (newTextureViewWithPixelFormat:...): the same memory from level `levels.location` on, read as `format` (of the same size a pixel).
+- (instancetype)initViewOf:(RDNA4MTLTexture *)texture format:(MTLPixelFormat)format type:(MTLTextureType)type levels:(NSRange)levels
+                    slices:(NSRange)slices;   // a Depth32Float texture: every pixel (the tiling does not matter for one value)
 - (void)descriptor:(uint32_t[8])t;          // its T# for shaders (level 0)
 - (void)descriptor:(uint32_t[8])t level:(NSUInteger)level;   // level `level` as an image of its own (explicit-LOD sampling)
 - (void)refresh;                            // an IOSurface's copy for the GPU made current (rows not 128-byte multiples)
 - (void)generateMipmaps;                    // levels 1 .. from level 0 (the CPU, 2x2 boxes)
 - (RDNA4MTLTexture *)copyForReading;        // its pixels now, in a texture of its own (kept for the next time); drained first by the caller
 - (uint32_t)sampleOr;                       // the OR of some of its pixels' first 4 bytes (the trace)
+- (RDNA4MTLTexture *)level:(NSUInteger)level;   // level `level` as a texture of its own (kept): a render pass's attachment level
 @property (readonly) BOOL shadowed;         // the GPU reads a copy of an IOSurface's pixels (refresh)
 // A view of a buffer's memory (newLinearTextureWithDescriptor:): rows `bpr` apart from `offset`.
 - (instancetype)initWithBuffer:(RDNA4MTLBuffer *)buffer descriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset
@@ -290,6 +294,7 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 	NSUInteger _levels, _levelOffset[16], _levelRow[16];   // a mipmapped 2D texture's levels: each an image of its own in _memory
 	const uint8_t *_surfaceRows;   // shadowed: the IOSurface's own pixels, _surfaceRowBytes apart; _memory is the GPU's copy
 	NSUInteger _surfaceRowBytes;
+	RDNA4MTLTexture *_parent;   // a view's
 	rdna4_buffer_t _vram;   // a depth texture's
 }
 @synthesize label;
@@ -438,6 +443,73 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 	_format = d.pixelFormat;
 	_usage = d.usage;
 	return self;
+}
+
+- (instancetype)initViewOf:(RDNA4MTLTexture *)t format:(MTLPixelFormat)format type:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices
+{
+	if (!(self = [super init]))
+		return nil;
+	const NSUInteger l = levels.location, have = MAX(t->_levels, (NSUInteger)1);
+	_fm = textureFormat((uint32_t)format);
+	if (t->_isDepth || !t->_fm || !_fm || _fm->bpp != t->_fm->bpp || l >= have || slices.location || t->_type == MTLTextureType3D) {
+		rdna4Error([NSString stringWithFormat:@"a view of format %lu, type %lu, levels %lu+%lu, slices %lu+%lu of a texture of format %lu: only colour "
+		                                      @"textures, the same size a pixel, from slice 0, not 3D, so far", (unsigned long)format,
+		                                      (unsigned long)type, (unsigned long)l, (unsigned long)levels.length,
+		                                      (unsigned long)slices.location, (unsigned long)slices.length, (unsigned long)t->_format], 0);
+		return nil;
+	}
+	_device = t->_device;
+	_memory = t->_memory;
+	_surface = t->_surface;
+	_plane = t->_plane;
+	_surfaceRows = l ? NULL : t->_surfaceRows;   // a level of a shadowed texture: ponytail, level 0 only is kept current
+	_surfaceRowBytes = t->_surfaceRowBytes;
+	_offset = t->_offset + t->_levelOffset[l];
+	_rowBytes = l ? t->_levelRow[l] : t->_rowBytes;
+	_width = MAX(t->_width >> l, (NSUInteger)1);
+	_height = MAX(t->_height >> l, (NSUInteger)1);
+	_format = format;
+	_usage = t->_usage;
+	_type = type == MTLTextureType1DArray || type == MTLTextureType1D ? type : MTLTextureType2D;
+	_layers = t->_layers;
+	_depth = 1;
+	_levels = MIN(levels.length ?: 1, have - l);
+	for (NSUInteger k = 0; k < _levels; k++) {
+		_levelOffset[k] = t->_levelOffset[l + k] - t->_levelOffset[l];
+		_levelRow[k] = t->_levelRow[l + k] ?: t->_rowBytes;
+	}
+	_parent = t;
+	return self;
+}
+
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices
+{
+	return [[RDNA4MTLTexture alloc] initViewOf:self format:format type:type levels:levels slices:slices];
+}
+
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format
+{
+	return [self newTextureViewWithPixelFormat:format textureType:self.textureType levels:NSMakeRange(0, self.mipmapLevelCount)
+	                                    slices:NSMakeRange(0, self.arrayLength)];
+}
+
+- (id<MTLTexture>)parentTexture { return _parent; }
+
+- (RDNA4MTLTexture *)level:(NSUInteger)level
+{
+	if (!level)
+		return self;
+	static char key;
+	@synchronized(self) {
+		NSMutableDictionary *views = objc_getAssociatedObject(self, &key);
+		if (!views)
+			objc_setAssociatedObject(self, &key, views = [NSMutableDictionary dictionary], OBJC_ASSOCIATION_RETAIN);
+		RDNA4MTLTexture *v = views[@(level)];
+		if (!v && (v = [[RDNA4MTLTexture alloc] initViewOf:self format:_format type:MTLTextureType2D levels:NSMakeRange(level, 1)
+		                                            slices:NSMakeRange(0, 1)]))
+			views[@(level)] = v;
+		return v;
+	}
 }
 
 - (IOSurfaceRef)iosurface { return _surface; }
@@ -1036,6 +1108,7 @@ typedef struct {
 - (NSError *)drainGfx;
 - (dispatch_queue_t)work;
 - (void)spareImage:(uint32_t[8])t;   // the T# of an unbound texture slot: one texel of the zeroed spare buffer
+- (uint64_t)spareBuffer;             // what an unbound buffer slot points at: the zeroed spare buffer
 - (BOOL)drawnInFlight:(RDNA4MTLTexture *)t;   // a draw not yet waited for draws into it
 @end
 
@@ -1348,6 +1421,12 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 	NSMutableData *args = [NSMutableData dataWithLength:8 * n + 24 + 8];
 	uint8_t *p = (uint8_t *)args.mutableBytes;
 	memcpy(p, _addresses, 8 * MIN(n, (uint32_t)kMaxBufferIndex));
+	// unbound buffer slots: the zeroed spare buffer, as a draw's (a kernel's read through address 0 faulted: Core Animation's
+	// calculate_average_luma, 2026-11-20)
+	const uint64_t spare = [(RDNA4MTLDevice *)self.device spareBuffer];
+	for (uint32_t i = 0; i < n; i++)
+		if (!((uint64_t *)p)[i])
+			((uint64_t *)p)[i] = spare;
 	const uint32_t sizes[6] = { (uint32_t)groupSize.width, (uint32_t)groupSize.height, (uint32_t)groupSize.depth,
 		                        (uint32_t)grid.width,      (uint32_t)grid.height,      (uint32_t)grid.depth };
 	memcpy(p + 8 * n, sizes, sizeof sizes);
@@ -1375,7 +1454,8 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 			anyTexture = YES;
 		}
 	}
-	if (anyTexture) {
+	{   // always: a kernel's texture read through a table at 0 faulted
+		(void)anyTexture;
 		uint32_t spare[8];
 		[(RDNA4MTLDevice *)self.device spareImage:spare];
 		for (int i = 0; i < 16; i++)   // unbound slots: the spare texel (an all-zero T# can stall the texture unit)
@@ -1454,7 +1534,10 @@ RDNA4_ANSWER_MISSING
 			      (unsigned long)i);
 			continue;
 		}
-		RDNA4MTLTexture *t = _targets[i] = (RDNA4MTLTexture *)a.texture;
+		// a level of it (Core Animation's blurs draw each mip level from the one before): that level as a texture of its own
+		RDNA4MTLTexture *t = _targets[i] = [(RDNA4MTLTexture *)a.texture level:a.level];
+		if (!t)
+			continue;
 		first = first ?: t;
 		const MTLClearColor c = a.clearColor;
 		if (a.loadAction == MTLLoadActionClear)
@@ -1674,6 +1757,20 @@ RDNA4_ANSWER_MISSING
 			return rdna4Error(@"a draw without a render pipeline or a colour attachment of this device", 0);
 
 		why = [device draw:&dd pipeline:pipeline target:target];
+		// debug (2026-11-20): what the glass's draws read and write, sampled after they ran
+		static int looked;
+		if (!why && ([pipeline.names containsString:@"glass"] || [pipeline.names containsString:@"blur"]) &&
+		    __atomic_fetch_add(&looked, 1, __ATOMIC_RELAXED) < 40 && !(why = [device drainGfx])) {
+			NSMutableString *seen = [NSMutableString stringWithFormat:@"%@ %u vertices into %lux%lu fmt %lu lv %lu: target %08x, scissor %u %u %u %u",
+			                                                         pipeline.names, d.count, (unsigned long)target.width, (unsigned long)target.height,
+			                                                         (unsigned long)target.pixelFormat, (unsigned long)target.mipmapLevelCount,
+			                                                         [target sampleOr], d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]];
+			for (NSArray *r in reads)
+				[seen appendFormat:@"; %@ tex %@: %lux%lu fmt %lu lv %lu%@%@ %08x", [r[0] intValue] ? @"fs" : @"vs", r[1], (unsigned long)[r[2] width],
+				                   (unsigned long)[r[2] height], (unsigned long)[r[2] pixelFormat], (unsigned long)[r[2] mipmapLevelCount],
+				                   [r[2] parentTexture] ? @" view" : @"", [r[2] shadowed] ? @" shadowed" : @"", [(RDNA4MTLTexture *)r[2] sampleOr]];
+			RLOG(@"RDNA4MTL trace: looked at %@", seen);
+		}
 		return why;
 	}];
 }
@@ -1828,7 +1925,7 @@ static NSError *colourOnly(id<MTLTexture> t)
 		NSError *why = colourOnly(from) ?: colourOnly(to);
 		if (why)
 			return why;
-		RDNA4MTLTexture *f = (RDNA4MTLTexture *)from;
+		RDNA4MTLTexture *f = [(RDNA4MTLTexture *)from level:fromLevel];
 		[to replaceRegion:MTLRegionMake2D(toOrigin.x, toOrigin.y, size.width, size.height) mipmapLevel:toLevel
 		        withBytes:f.bytes + fromOrigin.y * f.rowBytes + f.bpp * fromOrigin.x bytesPerRow:f.rowBytes];
 		return nil;
@@ -2185,6 +2282,13 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 		}
 	}
 	linearImage(t, _spare.gpu, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 1, 1, 64);
+}
+
+- (uint64_t)spareBuffer
+{
+	uint32_t t[8];
+	[self spareImage:t];   // makes it
+	return _spare.gpu;
 }
 - (dispatch_queue_t)work { return _work; }
 
@@ -2655,6 +2759,22 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 		return nil;
 	}
 	return [[RDNA4MTLComputePipeline alloc] initWithDevice:self function:function error:error];
+}
+
+// Core Animation's compute pipelines (calculate_average_luma, which picks the menu bar's text colour) come with a descriptor; _MTLDevice's own
+// answer failed and Core Animation aborted, logging the user out (2026-11-20).
+- (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor error:(NSError **)error
+{
+	return [self newComputePipelineStateWithFunction:descriptor.computeFunction error:error];
+}
+
+- (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor options:(MTLPipelineOption)options
+                                                         reflection:(MTLAutoreleasedComputePipelineReflection *)reflection
+                                                              error:(NSError **)error
+{
+	if (reflection)
+		*reflection = nil;
+	return [self newComputePipelineStateWithFunction:descriptor.computeFunction error:error];
 }
 
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function
