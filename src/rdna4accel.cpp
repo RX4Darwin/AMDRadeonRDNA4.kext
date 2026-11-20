@@ -445,6 +445,15 @@ int accelTo(int value)
 	if (value == 4 && !gFamilyClients) {
 		gAccel->setProperty("MetalPluginName", "AMDRadeonRDNA4Metal");   // as the native spike's service (accelcensus.cpp, level 3)
 		gAccel->setProperty("MetalPluginClassName", "RDNA4MTLDevice");
+		// as Apple's paravirtual accelerator (its AcceleratorProperties): CoreDisplay presents through display pipe transactions when
+		// these say so; without them it took the older surface path
+		gAccel->setProperty("IOMatchCategory", "IOAccelerator");
+		if (OSDictionary *caps = OSDictionary::withCapacity(2)) {
+			caps->setObject("DisplayPipeSupported", kOSBooleanTrue);
+			caps->setObject("TransactionsSupported", kOSBooleanTrue);
+			gAccel->setProperty("IOAccelDisplayPipeCapabilities", caps);
+			caps->release();
+		}
 		gFamilyClients = true;
 		gAccel->registerService();
 		rdna4Log("AMDRadeonRDNA4: accel: registered for WindowServer: our Metal bundle, the family's user clients\n");
