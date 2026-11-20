@@ -37,9 +37,9 @@ static uint64_t vramLeaf(const Policy &pol, uint64_t va, uint64_t end, uint64_t 
 	return GpuVm::encodePte(phys, flags, fragment64k);
 }
 
-static uint64_t hostLeaf(const Policy &pol, uint64_t bus, bool executable) {
+static uint64_t hostLeaf(const Policy &pol, uint64_t bus, bool executable, bool readOnly) {
 	uint64_t flags = GpuVm::kSystem | GpuVm::kSnooped | GpuVm::kValid |
-	                 GpuVm::kReadable | GpuVm::kWritable | (pol.isPteOff ? 0 : GpuVm::kIsPte);
+	                 GpuVm::kReadable | (readOnly ? 0 : GpuVm::kWritable) | (pol.isPteOff ? 0 : GpuVm::kIsPte);
 	if (executable || !pol.execOff)
 		flags |= GpuVm::kExecutable;
 	/* Cached GTT on gfx12.0 uses MTYPE_NC, encoded as zero. */
@@ -85,7 +85,7 @@ bool mapVram(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 	return true;
 }
 
-bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable, Span &out) {
+bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable, Span &out, bool readOnly) {
 	out = Span {};
 	if (end > GpuVm::kVaStart + denseVa(tableBytes))
 		return false;
@@ -112,7 +112,7 @@ bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 		if (out.firstPt == ~0ull)
 			out.firstPt = ptOff;
 		out.lastPt = ptOff;
-		*pte = hostLeaf(pol, pageBuses[page], executable);
+		*pte = hostLeaf(pol, pageBuses[page], executable, readOnly);
 	}
 	return true;
 }
@@ -176,7 +176,7 @@ bool treeMapVram(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, ui
 	return true;
 }
 
-bool treeMapHost(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable) {
+bool treeMapHost(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable, bool readOnly) {
 	uint64_t *pt = nullptr;
 	uint32_t ptId = 0;
 	uint64_t ptKey = ~0ull;
@@ -191,7 +191,7 @@ bool treeMapHost(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, co
 				return false;
 			ptKey = at >> 21;
 		}
-		pt[GpuVm::index(at, 3)] = hostLeaf(pol, pageBuses[page], executable);
+		pt[GpuVm::index(at, 3)] = hostLeaf(pol, pageBuses[page], executable, readOnly);
 		t.dirty(t.context, ptId);
 	}
 	return true;

@@ -685,7 +685,7 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 }
 
 bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses,
-                             uint64_t bytes, bool executable) {
+                             uint64_t bytes, bool executable, bool readOnly) {
 	if (!poolCpu || !hasTables(c) || !pageBuses || !bytes ||
 	    (va & (GpuVm::kPageBytes - 1)))
 		return false;
@@ -696,12 +696,12 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 	if (c.sp) {
 		TreeCtx tc { this, &c };
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
-		return GpuVmTable::treeMapHost(tree, vmPolicy(), va, end, pageBuses, executable) && sparseSync(c);
+		return GpuVmTable::treeMapHost(tree, vmPolicy(), va, end, pageBuses, executable, readOnly) && sparseSync(c);
 	}
 	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
-	if (!GpuVmTable::mapHost(access, vmPolicy(), kVmTableBytes, va, end, pageBuses, executable, span))
+	if (!GpuVmTable::mapHost(access, vmPolicy(), kVmTableBytes, va, end, pageBuses, executable, span, readOnly))
 		return false;
 	/* The root and directory pages when a PDE was written (the first mapping in a 2 MiB range: once written, a PDE stays), then the leaf
 	 * pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its size, is what a mapping costs. */
@@ -2596,7 +2596,9 @@ IOReturn RDNA4Compute::rtImportHost(const void *owner, task_t task, uint64_t add
 	if (r != kIOReturnSuccess)
 		return r;
 	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
-	IOMemoryDescriptor *memory = IOMemoryDescriptor::withAddressRange(address, rounded, kIODirectionInOut, task);
+	// read-only memory (RDNA4_HOST_READ_ONLY): wired for the device to read (kIODirectionOut), mapped without WRITEABLE (mapHostLocked)
+	IOMemoryDescriptor *memory = IOMemoryDescriptor::withAddressRange(address, rounded, (flags & RDNA4_HOST_READ_ONLY) ? kIODirectionOut
+	                                                                                                                  : kIODirectionInOut, task);
 	if (!memory)
 		return kIOReturnNoMemory;
 	if ((r = memory->prepare()) != kIOReturnSuccess) {
@@ -2617,7 +2619,7 @@ IOReturn RDNA4Compute::hostChecks(const void *owner, uint64_t bytes, uint64_t fl
 	RtClient *c = vmClientFor(owner);
 	if (!c || !dmaReady || !busMasterSet)
 		return kIOReturnUnsupported;
-	if (!bytes || bytes > kHostMaxBuffer || (flags & ~static_cast<uint64_t>(RDNA4_HOST_EXECUTABLE)))
+	if (!bytes || bytes > kHostMaxBuffer || (flags & ~static_cast<uint64_t>(RDNA4_HOST_EXECUTABLE | RDNA4_HOST_READ_ONLY)))
 		return bytes > kHostMaxBuffer ? kIOReturnNoResources : kIOReturnBadArgument;
 	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
 	if (rounded < bytes || rounded > kHostMaxBuffer || rounded > kHostMaxClient - c->hostBytes || rounded > kHostMaxTotal - hostBytesTotal)
@@ -2706,7 +2708,7 @@ IOReturn RDNA4Compute::mapHostLocked(const void *owner, IOMemoryDescriptor *memo
 	if (!b.hostUser || !b.va ||
 	    b.va + rounded < b.va || b.va + rounded > GpuVm::kVaEnd ||
 	    !vmMapHost(*c, b.va, pageBuses, rounded,
-                (flags & RDNA4_HOST_EXECUTABLE) != 0)) {
+                (flags & RDNA4_HOST_EXECUTABLE) != 0, (flags & RDNA4_HOST_READ_ONLY) != 0)) {
 		if (pageBuses)
 			IOFree(pageBuses, pageCount * sizeof(uint64_t));
 		if (b.va) {

@@ -1104,7 +1104,7 @@ private:
 	bool vmMap(RtClient &client, uint64_t va, uint64_t mc, uint64_t bytes, bool executable);
 	bool vmSyncCpu(RtClient &client, uint64_t va, uint64_t end);
 	bool vmMapHost(RtClient &client, uint64_t va, const uint64_t *pageBuses,
-	               uint64_t bytes, bool executable);
+	               uint64_t bytes, bool executable, bool readOnly = false);   // readOnly: RDNA4_HOST_READ_ONLY, no WRITEABLE
 	void vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
 	bool vmContextInit(RtClient &client);
 	bool vmInvalidate(uint32_t vmid, const char *tag);

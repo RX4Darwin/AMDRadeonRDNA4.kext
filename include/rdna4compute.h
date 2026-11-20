@@ -105,6 +105,9 @@ enum {
 
 /* AllocHost flags.  Host memory is non-executable unless this bit is set. */
 #define RDNA4_HOST_EXECUTABLE (1u << 0)
+/* ImportHost: memory the caller may only read (another process's, shared read-only: Core Animation's in WindowServer), mapped for the GPU
+ * to read only (no PTE WRITEABLE): its updates seen, never written through. */
+#define RDNA4_HOST_READ_ONLY  (1u << 1)
 
 #define RDNA4_FLAG_READY   (1u << 0)   /* bring-up reached a dispatching stage */
 #define RDNA4_FLAG_WEDGED  (1u << 1)   /* a dispatch timed out: no more work */

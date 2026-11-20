@@ -182,7 +182,11 @@ static NSError *rdna4Error(NSString *what, kern_return_t kr)
 	if (!(self = [super init]) || !device.gpu)
 		return nil;
 	const uint64_t bytes = ((length ?: 1) + 4095) & ~4095ull;
-	const kern_return_t kr = ((uintptr_t)pointer & 4095) ? kIOReturnBadArgument : rdna4_import_host(device.gpu, pointer, bytes, 0, &_buf);
+	kern_return_t kr = ((uintptr_t)pointer & 4095) ? kIOReturnBadArgument : rdna4_import_host(device.gpu, pointer, bytes, 0, &_buf);
+	// memory this process may only read (Core Animation's shared with WindowServer): for the GPU to read, so its updates are seen (copied,
+	// the menu bar's app menus never changed after the first)
+	if (kr == KERN_PROTECTION_FAILURE)
+		kr = rdna4_import_host(device.gpu, pointer, bytes, RDNA4_HOST_READ_ONLY, &_buf);
 	if (kr) {
 		rdna4Error([NSString stringWithFormat:@"%lu bytes at %p into the GPU", (unsigned long)length, pointer], kr);
 		return nil;
@@ -1757,20 +1761,6 @@ RDNA4_ANSWER_MISSING
 			return rdna4Error(@"a draw without a render pipeline or a colour attachment of this device", 0);
 
 		why = [device draw:&dd pipeline:pipeline target:target];
-		// debug (2026-11-20): what the glass's draws read and write, sampled after they ran
-		static int looked;
-		if (!why && ([pipeline.names containsString:@"glass"] || [pipeline.names containsString:@"blur"]) &&
-		    __atomic_fetch_add(&looked, 1, __ATOMIC_RELAXED) < 40 && !(why = [device drainGfx])) {
-			NSMutableString *seen = [NSMutableString stringWithFormat:@"%@ %u vertices into %lux%lu fmt %lu lv %lu: target %08x, scissor %u %u %u %u",
-			                                                         pipeline.names, d.count, (unsigned long)target.width, (unsigned long)target.height,
-			                                                         (unsigned long)target.pixelFormat, (unsigned long)target.mipmapLevelCount,
-			                                                         [target sampleOr], d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]];
-			for (NSArray *r in reads)
-				[seen appendFormat:@"; %@ tex %@: %lux%lu fmt %lu lv %lu%@%@ %08x", [r[0] intValue] ? @"fs" : @"vs", r[1], (unsigned long)[r[2] width],
-				                   (unsigned long)[r[2] height], (unsigned long)[r[2] pixelFormat], (unsigned long)[r[2] mipmapLevelCount],
-				                   [r[2] parentTexture] ? @" view" : @"", [r[2] shadowed] ? @" shadowed" : @"", [(RDNA4MTLTexture *)r[2] sampleOr]];
-			RLOG(@"RDNA4MTL trace: looked at %@", seen);
-		}
 		return why;
 	}];
 }

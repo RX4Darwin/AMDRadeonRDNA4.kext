@@ -2366,6 +2366,20 @@ static CALayer *caScene(void)
 		video.contents = (__bridge id)yuv;
 		[root addSublayer:video];
 	}
+	if (getenv("NATIVECA_VIBRANT")) {   // the menu bar's titles: text composited with Core Animation's vibrancy filters (private CAFilter)
+		NSArray *types = [@(getenv("NATIVECA_VIBRANT")) componentsSeparatedByString:@","];
+		for (NSUInteger k = 0; k < types.count; k++) {
+			CATextLayer *t = [CATextLayer layer];
+			t.frame = CGRectMake(250, 300 + 40 * k, 250, 36);
+			t.string = types[k];
+			t.fontSize = 28;
+			t.foregroundColor = CGColorCreateGenericRGB(1, 1, 1, 1);
+			t.contentsScale = 1;
+			Class filter = NSClassFromString(@"CAFilter");
+			t.compositingFilter = [filter performSelector:@selector(filterWithType:) withObject:types[k]];
+			[root addSublayer:t];
+		}
+	}
 	CALayer *glass = [CALayer layer];
 	glass.frame = CGRectMake(150, 250, 300, 200);
 	glass.backgroundColor = CGColorCreateGenericRGB(0.1, 0.7, 0.3, 0.5);

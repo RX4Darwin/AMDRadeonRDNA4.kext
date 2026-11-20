@@ -77,7 +77,7 @@ struct Tree {
 
 // Same contract as mapVram / mapHost / unmap, for a Tree. The pages that changed are reported through Tree::dirty; the caller syncs them.
 bool treeMapVram(const Tree &t, const Policy &p, uint64_t va, uint64_t end, uint64_t physical, bool executable);
-bool treeMapHost(const Tree &t, const Policy &p, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable);
+bool treeMapHost(const Tree &t, const Policy &p, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable, bool readOnly = false);
 void treeUnmap(const Tree &t, uint64_t va, uint64_t end);
 
 // Map [va, end) to `physical` upward (VRAM, no SNOOPED). The caller validated the alignment, `end` and the VA range. False on a failure that the old code
@@ -85,7 +85,8 @@ void treeUnmap(const Tree &t, uint64_t va, uint64_t end);
 bool mapVram(const Access &a, const Policy &p, uint64_t tableBytes, uint64_t va, uint64_t end, uint64_t physical, bool executable, Span &out);
 
 // Map [va, va + pages) to the bus addresses `pageBuses` (system memory, SNOOPED).
-bool mapHost(const Access &a, const Policy &p, uint64_t tableBytes, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable, Span &out);
+bool mapHost(const Access &a, const Policy &p, uint64_t tableBytes, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable, Span &out,
+             bool readOnly = false);   // readOnly: no WRITEABLE (RDNA4_HOST_READ_ONLY)
 
 // Clear the leaf PTEs of [va, end). Stops at the first address outside the image, as before.
 void unmap(const Access &a, uint64_t tableBytes, uint64_t va, uint64_t end, Span &out);
