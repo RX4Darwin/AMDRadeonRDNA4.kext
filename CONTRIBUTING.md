@@ -43,6 +43,10 @@ commands and where the results go. Two rules keep it working for both makes and 
 - A new source file of the kext is one more name in `USER_OBJS` in `src/kext.mk`. The Xcode project lists
   directories, not files, and needs no change.
 
+- CI (`.github/workflows/ci.yml`) builds the kext three ways, the tools and the Metal bundle, and runs `make test`
+  with LLVM 19, on every push and pull request; a second job does the same with the linux-firmware blobs. It has no
+  card: a change that touches the GPU still needs a run on one.
+
 ## Releasing
 
 On `next`, with `VERSION` and `CHANGELOG.md` saying what is being released:
