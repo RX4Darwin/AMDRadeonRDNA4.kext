@@ -97,6 +97,23 @@ is prelinked against the system collection's copies.
   (The 20:30 one looked like a freeze on reboot.)
 - A test boot's `rdna4-accel` must be read late: at the plugin's start NVRAM is not there yet (the trial read as none, then another
   reader marked it used); the boot thread now waits for the GPU first.
+- **WindowServer on our accelerator (2026-11-20 evening, test boots: config.plist without `rdna4-pvgpu=1`, with `rdna4-accel=4`):**
+  - without the paravirtual GPU nothing loads IOAcceleratorFamily2: the boot thread loads it (`OSKextLoadKextWithIdentifier`);
+  - the family's GPU progress check panicked on the event machine's missing stamps: `setStampBaseAddress` with our memory, as AMD;
+  - WindowServer's GPU wrangler lists a GPU's accelerator when WindowServer first opens it: held there until ours is registered
+    (pvhooks.cpp wrapServiceOpen, `RDNA4Accel::waitForWindowServer`); holding IOKit busy did not work (the GPU's own attach waits for
+    quiet too). Then its wrangler shows `accel /RDNA4Accelerator`, the framebuffers our pipes' indices, and WindowServer opens our
+    2D contexts (type 2), surfaces (type 0) and display pipe clients (type 4); the desktop runs (software path; screenshots over ssh
+    impossible);
+  - an `rdna4-accel` boot-arg is guarded: NVRAM `rdna4-accel-guard` "pending" while an attempt runs, "survived" after 120 s; a boot that
+    finds "pending" skips (it caught a hung boot); `debug.rdna4_accel=0` clears it.
+  - **No display pipe transactions yet: IOPresentment cannot map the GPU.** `ioPresentmentCreateAssociationMap` asks every
+    `AppleGraphicsDeviceControl` service (the GPU wrangler is one) for `kAGDCVendorInfo` / `kAGDCGPUCapability` per GPU: "Unable to get
+    AGDC information (0x10000003)", "Unable to locate service dependencies", "Unable to acquire map" (the same without our accelerator).
+    The paravirtual GPU's driver has `AppleParavirtGPUControl : AppleGraphicsDeviceControl` (`vendor_doDeviceAttribute` answers 1, 3,
+    0x921 (a 0xb0-byte capability record), 0x980, 0x2001, the rest the base's); AMD's have `AtiDeviceControl` (AMDSupport) and
+    `AmdAgdcServices`. Next: our `AppleGraphicsDeviceControl` subclass on the GPU (the family in AppleGraphicsControl.kext/PlugIns/
+    AppleGraphicsDeviceControl.kext: accelgen.py needs a second kext's thunks), answering as the paravirtual one; then the transactions.
 - Next: WindowServer on these framebuffers through our pipes: today the kext hides the IONDRV framebuffers from it (the paravirtual
   displays are its displays) and our accelerator refuses user clients (`IOAccelDisplayPipeUserClient2` and the rest); the family's
   IOAccelLegacyDisplayMachine / IOAccelLegacyDisplayPipe implement flips through a plain framebuffer and may be the shortest way.
