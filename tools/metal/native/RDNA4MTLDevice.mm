@@ -1530,6 +1530,7 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 - (uint64_t)gfxRings;
 - (NSError *)draw:(const RDNA4Draw *)draw pipeline:(RDNA4MTLRenderPipeline *)pipeline target:(RDNA4MTLTexture *)target;
 - (NSError *)drainGfx;
+- (NSError *)flushBatch;   // the draws and barriers written so far onto the gfx ring (one submit)
 - (dispatch_queue_t)work;
 - (void)spareImage:(uint32_t[8])t;   // the T# of an unbound texture slot: one texel of the zeroed spare buffer
 - (uint64_t)spareBuffer;             // what an unbound buffer slot points at: the zeroed spare buffer
@@ -2918,6 +2919,8 @@ RDNA4_ANSWER_MISSING
 		// (commitAndWaitUntilSubmitted), and the kext's present copies it behind them on the same ring, after an idle barrier. Scheduled
 		// when the command buffer only started, the display showed frames half drawn (a moving window torn between two places); scheduled
 		// once its draws were done, WindowServer's main thread waited for the card in 23 % of a window drag (spindump, 2026-11-20).
+		NSError *flushed = [device flushBatch];   // (the last batch of draws onto the ring first)
+		why = why ?: flushed;
 		self->_status = MTLCommandBufferStatusScheduled;
 		dispatch_group_leave(self->_scheduledGroup);
 		NSArray<MTLCommandBufferHandler> *scheduled = [self->_scheduled copy];
@@ -3055,7 +3058,7 @@ static uint32_t floatBits(float f)
 enum { kMiscBytes = 0x5000, kMiscTables = 0x1000 };
 // draws in flight: each has its own IB page and state page until its fence has come. 16 kept the submit loop waiting for the card for
 // most of a frame of 80 draws, and WindowServer's main thread with it (commitAndWaitUntilSubmitted: 25 % of a window drag, 2026-11-20)
-enum { kSlots = 64 };
+enum { kSlots = 128, kBatchSlots = 32 };   // a batch is submitted at kBatchSlots: up to 96 slots in flight while the next is written
 
 @implementation RDNA4MTLDevice {
 	io_service_t _service;
@@ -3076,6 +3079,7 @@ enum { kSlots = 64 };
 	NSHashTable *_drawnInFlight;               // the targets of the draws since the last drainGfx (work queue only)
 	BOOL _drawsInFlight;                       // a draw since the last drainGfx: drainGfx checks _lastSlot's stream fence word
 	uint32_t _slot, _lastSlot;
+	uint32_t _batchFirst, _batchCount;   // the slots written and not yet submitted (queueSlot, flushBatch): consecutive, from _batchFirst
 }
 
 + (void)load
@@ -3161,6 +3165,58 @@ enum { kSlots = 64 };
 
 // A slot's IB onto the gfx ring; again while the ring is full (kIOReturnBusy: every client's submissions in it at once, at most 128;
 // kIOReturnNoResources: no room for the packets), for up to 2 s.
+// The next slot for a draw or a barrier, its earlier use waited for. Its IB page goes onto the ring with the pages written before it in
+// one submit (queueSlot, flushBatch): a batch is submitted before the slots wrap (its pages must be one range) and at 32 slots (a slot is
+// never waited for while its own batch is unsubmitted: 128 slots).
+- (NSError *)takeSlot:(uint32_t *)slot
+{
+	*slot = _slot++ % kSlots;
+	NSError *why = _batchCount && (!*slot || _batchCount >= kBatchSlots) ? [self flushBatch] : nil;
+	if (why)
+		return why;
+	const uint64_t t0 = nowUs();
+	const kern_return_t kr = _slotFence[*slot] ? rdna4_wait_gfx_fence(&_gpu, _slotFence[*slot], 2000, NULL) : KERN_SUCCESS;
+	statAdd(kStatSlotUs, nowUs() - t0);
+	if (kr)
+		return rdna4Error([NSString stringWithFormat:@"waiting for slot %u's earlier draw", *slot], kr);
+	_slotFence[*slot] = 0;
+	return nil;
+}
+
+// Slot `slot`'s IB (n dwords in its page) padded to the page's end with a NOP and added to the batch: the pages of consecutive slots are
+// then one IB. One submit (a kext call, 8 us) a draw was a third of WindowServer's wait for its frames' submits (2026-11-20).
+- (void)queueSlot:(uint32_t)slot dwords:(uint32_t)n
+{
+	uint32_t *page = (uint32_t *)(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE);
+	const uint32_t room = RDNA4_TRIRUN_PAGE / 4 - n;
+	if (room == 1)
+		page[n] = 0xffff1000u;   // the one-dword NOP (PACKET3(NOP, 0x3FFF))
+	else if (room)
+		page[n] = 0xc0001000u | (room - 2) << 16;   // NOP: a header and room - 1 dwords skipped
+	if (!_batchCount)
+		_batchFirst = slot;
+	_batchCount++;
+}
+
+- (NSError *)flushBatch
+{
+	if (!_batchCount)
+		return nil;
+	__sync_synchronize();   // the pages in memory before the card reads them
+	const uint64_t t0 = nowUs();
+	uint64_t fence = 0;
+	const uint32_t first = _batchFirst, count = _batchCount;
+	_batchCount = 0;
+	const kern_return_t kr = [self submitIb:(uint64_t)first * RDNA4_TRIRUN_PAGE dwords:count * (RDNA4_TRIRUN_PAGE / 4) fence:&fence];
+	statAdd(kStatSubmitUs, nowUs() - t0);
+	if (kr)
+		return rdna4Error([NSString stringWithFormat:@"%u draws and barriers onto the gfx ring", count], kr);
+	for (uint32_t i = 0; i < count; i++)
+		_slotFence[first + i] = fence;
+	_lastFence = fence;
+	return nil;
+}
+
 - (kern_return_t)submitIb:(uint64_t)offset dwords:(uint32_t)n fence:(uint64_t *)fence
 {
 	kern_return_t kr;
@@ -3179,7 +3235,7 @@ enum { kSlots = 64 };
 {
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];
 	uint32_t n = 0;
-	if (_lastFence) {
+	if (_lastFence || _batchCount) {
 		const uint64_t word = _idle.gpu;
 		const uint32_t seq = ++_idleSeq ?: ++_idleSeq;
 		const uint32_t barrier[15] = {
@@ -3192,7 +3248,7 @@ enum { kSlots = 64 };
 	uint64_t total = 0;
 	for (uint32_t c = 0; c < count; c++)
 	for (uint64_t at = 0, bytes = copies[c].bytes; at < bytes;) {
-		if (n + 7 > sizeof ib / 4)
+		if (n + 7 > sizeof ib / 4 - 1)   // (a dword left for the page's NOP)
 			return rdna4Error([NSString stringWithFormat:@"%u copies on the card: more than their IB holds", count], 0);
 		const uint32_t len = (uint32_t)MIN(bytes - at, (uint64_t)1 << 20);
 		const uint64_t from = copies[c].src + at, to = copies[c].dst + at;
@@ -3207,17 +3263,12 @@ enum { kSlots = 64 };
 	}
 	if (!n)
 		return nil;   // nothing in flight to wait for, nothing to copy
-	const uint32_t slot = _slot++ % kSlots;
-	kern_return_t kr = _slotFence[slot] ? rdna4_wait_gfx_fence(&_gpu, _slotFence[slot], 2000, NULL) : KERN_SUCCESS;
-	if (kr)
-		return rdna4Error([NSString stringWithFormat:@"waiting for slot %u's earlier draw", slot], kr);
-	const uint64_t ibOffset = (uint64_t)slot * RDNA4_TRIRUN_PAGE;
-	memcpy(_ibCpu + ibOffset, ib, n * 4);
-	__sync_synchronize();
-	uint64_t fence = 0;
-	if ((kr = [self submitIb:ibOffset dwords:n fence:&fence]))
-		return rdna4Error([NSString stringWithFormat:@"a barrier and copy of %llu bytes on the card", total], kr);
-	_slotFence[slot] = _lastFence = fence;   // (_lastSlot stays the last draw's: its stream fence is what drainGfx checks)
+	uint32_t slot = 0;
+	NSError *why = [self takeSlot:&slot];
+	if (why)
+		return why;
+	memcpy(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE, ib, n * 4);
+	[self queueSlot:slot dwords:n];   // (_lastSlot stays the last draw's: its stream fence is what drainGfx checks)
 	_slotPipe[slot] = nil;
 	[_drawnInFlight removeAllObjects];
 	statAdd(kStatSelfReads, total ? 1 : 0);
@@ -3252,6 +3303,9 @@ enum { kSlots = 64 };
 // a command buffer). The gfx fences are ordered, so the last one is enough; its stream's own fence word says the stream ran to its end.
 - (NSError *)drainGfx
 {
+	NSError *flushed = [self flushBatch];
+	if (flushed)
+		return flushed;
 	if (!_lastFence)
 		return nil;
 	[_drawnInFlight removeAllObjects];
@@ -3292,14 +3346,12 @@ enum { kSlots = 64 };
 		                                             (unsigned long)[p formatOf:d->attachment], (unsigned long)t.pixelFormat], 0);
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];   // built here and copied into the slot's pages: draws are made on the work queue only
 	static uint64_t misc[kMiscBytes / 8];
-	const uint32_t slot = _slot++ % kSlots;
+	uint32_t slot = 0;
+	NSError *taken = [self takeSlot:&slot];
+	if (taken)
+		return taken;
 	uint64_t t0 = nowUs();
-	kern_return_t kr = _slotFence[slot] ? rdna4_wait_gfx_fence(&_gpu, _slotFence[slot], 2000, NULL) : KERN_SUCCESS;
-	statAdd(kStatSlotUs, nowUs() - t0);
-	t0 = nowUs();
-	if (kr)
-		return rdna4Error([NSString stringWithFormat:@"waiting for slot %u's earlier draw", slot], kr);
-	_slotFence[slot] = 0;
+	kern_return_t kr = KERN_SUCCESS;
 	const uint64_t miscGpu = _misc.gpu + (uint64_t)slot * kMiscBytes, ibOffset = (uint64_t)slot * RDNA4_TRIRUN_PAGE;
 	const uint32_t *vs = p.vs, *ps = p.ps, outs = p.outs, ins = p.ins;
 	const BOOL noColour = (ps[7] >> 31) || p.exportsNothing;
@@ -3450,7 +3502,6 @@ enum { kSlots = 64 };
 			return rdna4Error(@"the stream lacks a shader's RSRC2", 0);
 		*at = (*at & ~0x3003eu) | rsrc2[i][1] << 1 | rsrc2[i][2];
 	}
-	uint64_t fence = 0;
 	for (unsigned st = 0; levels && st < 2; st++)   // each level's own image (a texture of fewer levels: its last), unbound ones the spare texel
 		for (uint32_t level = 1; level < RDNA4_MTLC_LEVELS; level++) {
 			uint8_t *at = (uint8_t *)misc + kMiscTables + RDNA4_MTLC_LEVEL_STRIDE * (level - 1) + 0x400 * st;
@@ -3465,13 +3516,9 @@ enum { kSlots = 64 };
 	memcpy(_ibCpu + ibOffset, ib, total * 4);
 	__sync_synchronize();   // in memory before the card reads them
 	statAdd(kStatWriteUs, nowUs() - t0);
-	t0 = nowUs();
-	if (!kr)
-		kr = [self submitIb:ibOffset dwords:total fence:&fence];
-	statAdd(kStatSubmitUs, nowUs() - t0);
 	if (kr)
 		return rdna4Error([NSString stringWithFormat:@"a draw of %u vertices (%u dwords)", d->count, total], kr);
-	_slotFence[slot] = _lastFence = fence;
+	[self queueSlot:slot dwords:total];
 	_lastSlot = slot;
 	_drawsInFlight = YES;
 	const uint32_t cx = d->covered[0], cy = d->covered[1], cx2 = MIN(cx + d->covered[2], (uint32_t)t.width), cy2 = MIN(cy + d->covered[3], (uint32_t)t.height);

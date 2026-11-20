@@ -446,3 +446,10 @@ retried while the ring is full, the work queue at user-interactive QoS (it ran a
 samples of 1000, waiting for the device 230 -> 152, idle 590 -> 708. What is left of the wait is the device's own submit loop (about
 1.4 ms a command buffer: a draw built, 9 us, and submitted with a kext call, 8 us).
 
+Draw submits batched (2026-11-20, evening): each draw (and barrier) still writes its IB into its slot's 4 KB page, the rest of the page a
+NOP (`0xc0001000 | (room - 2) << 16`, or the one-dword `0xffff1000`), so the pages of consecutive slots are one IB, submitted with one
+kext call: at 32 slots (`kBatchSlots`), before the slots wrap (128 now), before every wait (`drainGfx`) and before a command buffer is
+scheduled (its draws must be on the ring before WindowServer presents). Card: kext submit time 294 -> 53 ms and slot waits 340 -> 36 ms
+per 5 s while a window moves; WindowServer's main thread waiting for the device 152 -> 89 samples of 1000 (230 before a0b36cc);
+frames 328 of 329 at the next vblank, no torn frames, no hangs, Mission Control right.
+

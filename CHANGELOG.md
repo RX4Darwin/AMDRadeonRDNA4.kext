@@ -35,7 +35,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - Smoother cursor and frame pacing: a client's wait for its gfx fence no longer holds the runtime's lock while it polls, and the
   paravirtual host keeps moving the cursor and raising VBL events while it waits for the card (VBLs 2 ms or more late 15 -> 1 in 5 s).
 - Native WindowServer: its main thread no longer waits for the card to finish each frame (a command buffer is scheduled once its draws
-  are on the ring; 64 draw slots; the runtime takes 128 gfx submissions in flight).
+  are on the ring; 128 draw slots; the runtime takes 128 gfx submissions in flight), and its draws go onto the ring 32 at a time in one
+  submit, not one kext call each.
 - The paravirtual host opens the runtime from its tick (from a draw, IOLog ran the timer thread's stack out: a double fault).
 
 ## 0.3.3 (2026-11-19)
