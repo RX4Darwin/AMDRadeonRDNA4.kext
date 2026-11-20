@@ -2914,14 +2914,23 @@ RDNA4_ANSWER_MISSING
 			if (!draw)
 				statAdd(kStatSteps, 1), statAdd(kStatStepUs, t2 - t1), statMax(gStepMaxUs, t2 - t1);
 		}
+		// Scheduled once every draw is on the gfx ring, before they are waited for: WindowServer hands its frame to the display then
+		// (commitAndWaitUntilSubmitted), and the kext's present copies it behind them on the same ring, after an idle barrier. Scheduled
+		// when the command buffer only started, the display showed frames half drawn (a moving window torn between two places); scheduled
+		// once its draws were done, WindowServer's main thread waited for the card in 23 % of a window drag (spindump, 2026-11-20).
+		self->_status = MTLCommandBufferStatusScheduled;
+		dispatch_group_leave(self->_scheduledGroup);
+		NSArray<MTLCommandBufferHandler> *scheduled = [self->_scheduled copy];
+		if (scheduled.count)
+			dispatch_async(handlers, ^{
+				for (MTLCommandBufferHandler h in scheduled)
+					h(self);
+			});
 		NSError *drained = [device drainGfx];
 		self->_error = why ?: drained;
 		for (RDNA4MTLTexture *t in self->_drawnShadows)   // the draws done: their pixels into the surfaces
 			[t writeBack];
 		[self->_drawnShadows removeAllObjects];
-		// Scheduled once its draws are done, not when they start: WindowServer hands its frame to the display when its command buffer is
-		// scheduled (Apple's GPUs: the display waits for the GPU's writes), and the display showed frames half drawn, a moving window torn
-		// between its old and new places (2026-11-20).
 		const uint64_t done = nowUs();
 		statAdd(kStatRunUs, done - started);
 		uint64_t vblNs = 0;   // the kext's last VBL event on display 0 (the same clock): where in the frame this one was made, committed, done
@@ -2941,14 +2950,6 @@ RDNA4_ANSWER_MISSING
 			     (done - started) / 1e3, (unsigned long)self->_ops.count, (unsigned long)self->_draws.count, (unsigned long)slowestAt,
 			     [self->_draws containsIndex:slowestAt] ? "a draw" : "not a draw", slowest / 1e3);
 		statMax(gLatencyMaxUs, done - self->_committedUs);
-		self->_status = MTLCommandBufferStatusScheduled;
-		dispatch_group_leave(self->_scheduledGroup);
-		NSArray<MTLCommandBufferHandler> *scheduled = [self->_scheduled copy];
-		if (scheduled.count)
-			dispatch_async(handlers, ^{
-				for (MTLCommandBufferHandler h in scheduled)
-					h(self);
-			});
 		RTRACE(60, @"command buffer %@: %lu steps, %lu draws, %lu drawables%@%@", self.label ?: @"-", (unsigned long)self->_ops.count,
 		       (unsigned long)self->_draws.count, (unsigned long)self->_drawables.count, self->_error ? @": " : @"",
 		       self->_error.localizedDescription ?: @"");
@@ -3052,7 +3053,9 @@ static uint32_t floatBits(float f)
 // the state page: the stream's fence at +0, the vertex stage's table at +0x400, the fragment stage's at +0x800, the levels' T#s from +0x1000
 // (RDNA4_MTLC_LEVEL_FIRST, written only for a stage that samples at explicit LODs)
 enum { kMiscBytes = 0x5000, kMiscTables = 0x1000 };
-enum { kSlots = 16 };           // draws in flight: each has its own IB page and state page until its fence has come
+// draws in flight: each has its own IB page and state page until its fence has come. 16 kept the submit loop waiting for the card for
+// most of a frame of 80 draws, and WindowServer's main thread with it (commitAndWaitUntilSubmitted: 25 % of a window drag, 2026-11-20)
+enum { kSlots = 64 };
 
 @implementation RDNA4MTLDevice {
 	io_service_t _service;
@@ -3101,7 +3104,8 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 	IORegistryEntryGetRegistryEntryID(service, &_registryID);
 	const kern_return_t kr = rdna4_open(&_gpu);
 	_open = kr == KERN_SUCCESS;
-	_work = dispatch_queue_create("RDNA4MTL work", DISPATCH_QUEUE_SERIAL);
+	// user-interactive: WindowServer's main thread waits for its submits (commitAndWaitUntilSubmitted); at the default QoS it ran at 31
+	_work = dispatch_queue_create("RDNA4MTL work", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
 	RLOG(@"RDNA4MTLDevice: for service 0x%x (registry ID 0x%llx): the kext's runtime client: %s", service, _registryID,
 	      _open ? "open" : rdna4_error(kr));
 	return _open ? self : nil;   // no device without the GPU (the router then makes Apple's)
@@ -3155,6 +3159,17 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 
 - (BOOL)drawnInFlight:(RDNA4MTLTexture *)t { return [_drawnInFlight containsObject:t]; }
 
+// A slot's IB onto the gfx ring; again while the ring is full (kIOReturnBusy: every client's submissions in it at once, at most 128;
+// kIOReturnNoResources: no room for the packets), for up to 2 s.
+- (kern_return_t)submitIb:(uint64_t)offset dwords:(uint32_t)n fence:(uint64_t *)fence
+{
+	kern_return_t kr;
+	for (int tries = 0; ((kr = rdna4_submit_gfx_ib(&_gpu, &_ib, offset, n, fence)) == kIOReturnBusy || kr == kIOReturnNoResources) && tries < 20000;
+	     tries++)
+		usleep(100);
+	return kr;
+}
+
 // An IB of its own in the next slot, as the PV host's rowsOnCard: its idle barrier (RELEASE_MEM of a new sequence number with the colour
 // caches flushed and the L2 written back, end of pipe: after every draw before; WAIT_REG_MEM for it), then DMA_DATA through the L2 (CP_SYNC
 // on the last: the CP goes on once it is copied); the next draw's ACQUIRE_MEM invalidates the shader caches. Waiting instead for the last
@@ -3200,7 +3215,7 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 	memcpy(_ibCpu + ibOffset, ib, n * 4);
 	__sync_synchronize();
 	uint64_t fence = 0;
-	if ((kr = rdna4_submit_gfx_ib(&_gpu, &_ib, ibOffset, n, &fence)))
+	if ((kr = [self submitIb:ibOffset dwords:n fence:&fence]))
 		return rdna4Error([NSString stringWithFormat:@"a barrier and copy of %llu bytes on the card", total], kr);
 	_slotFence[slot] = _lastFence = fence;   // (_lastSlot stays the last draw's: its stream fence is what drainGfx checks)
 	_slotPipe[slot] = nil;
@@ -3452,7 +3467,7 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 	statAdd(kStatWriteUs, nowUs() - t0);
 	t0 = nowUs();
 	if (!kr)
-		kr = rdna4_submit_gfx_ib(&_gpu, &_ib, ibOffset, total, &fence);
+		kr = [self submitIb:ibOffset dwords:total fence:&fence];
 	statAdd(kStatSubmitUs, nowUs() - t0);
 	if (kr)
 		return rdna4Error([NSString stringWithFormat:@"a draw of %u vertices (%u dwords)", d->count, total], kr);

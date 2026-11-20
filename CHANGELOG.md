@@ -34,6 +34,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
   call `PresentSource`, WindowServer only); with many apps open a moving window's display 74 % -> 98 % of frames on time.
 - Smoother cursor and frame pacing: a client's wait for its gfx fence no longer holds the runtime's lock while it polls, and the
   paravirtual host keeps moving the cursor and raising VBL events while it waits for the card (VBLs 2 ms or more late 15 -> 1 in 5 s).
+- Native WindowServer: its main thread no longer waits for the card to finish each frame (a command buffer is scheduled once its draws
+  are on the ring; 64 draw slots; the runtime takes 128 gfx submissions in flight).
 - The paravirtual host opens the runtime from its tick (from a draw, IOLog ran the timer thread's stack out: a double fault).
 
 ## 0.3.3 (2026-11-19)

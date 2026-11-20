@@ -845,7 +845,8 @@ private:
 	static constexpr uint64_t kHostMaxClient = 1ull << 30;
 	static constexpr uint64_t kHostMaxTotal = 4ull << 30;
 	static constexpr uint32_t kMaxIbOutstanding = 16;
-	static constexpr uint32_t kMaxGfxIbOutstanding = 64;   // a client's gfx IBs in flight: the paravirtual host submits draws without waiting
+	static constexpr uint32_t kMaxGfxIbOutstanding = 128;  // a client's gfx IBs in flight: the paravirtual host submits draws without waiting,
+	                                                       // the native device up to 64 (its draws' slots)
 	struct RtBuffer  {
 		const void *owner { nullptr };
 		uint64_t    offset { 0 }, bytes { 0 }; // heap offset (pool or VRAM), size
@@ -1126,7 +1127,7 @@ private:
 	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the
 	// bring-up thread with bringupRunning set and do NOT take rtLock; client submissions take rtLock and refuse while bringupRunning,
 	// so the two never use the ring at the same time. Everything below runs under rtLock.
-	static constexpr uint32_t kMaxGfxOutstanding = 64;     // submissions in the ring across all clients (15 dwords each, 22 with the pool's ring fence: 1408 of 4096)
+	static constexpr uint32_t kMaxGfxOutstanding = 128;    // submissions in the ring across all clients (15 dwords each, 22 with the pool's ring fence: 2816 of 4096)
 	static constexpr uint32_t kGfxFenceSlot = 0x40;        // bytes into the client's fence page
 	bool     gfxWedged { false };                          // a client gfx IB timed out: the gfx ring is given up until the next bring-up
 	bool     gfxParked { false };                          // gfxPark halted PFP/ME (probe boots)

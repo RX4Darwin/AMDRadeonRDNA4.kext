@@ -436,3 +436,13 @@ VBL to present 28 % under 4 ms, 30 % 4-8, 27 % 8-12, 13 % 12-16, 1 % later. `deb
 the VBL event, 0 by default) moves WindowServer's frame later in the period, so the frame waits less for the vblank: tried at 3 ms, about
 a fifth of the frames then miss the earlier vblank (a frame later), worse than 0. The device's own share is about 2 ms of a frame.
 
+**WindowServer's main thread waited for the card (spindump, 2026-11-20):** with `sudo -n /usr/local/libexec/rdna4-spindump.sh WindowServer 10`
+(installed by `~/rdna4/add-spindump-sudoers.sh`) during a window drag: the main thread spent 23-25 % of the time in
+`commitAndWaitUntilSubmitted` -> `waitUntilScheduled`, because a command buffer counted as scheduled only once its draws were done (the
+tearing fix). Scheduled now means every draw is on the gfx ring (the kext's present copies behind them on the same ring, after an idle
+barrier: no torn frame in the grabs); 64 draw slots instead of 16 (the submit loop waited for the card to free slots: slot waits 340 ->
+45 ms per 5 s), the runtime's gfx submission limits 64 -> 128 (per client and across clients, 2816 of the ring's 4096 dwords), a submit
+retried while the ring is full, the work queue at user-interactive QoS (it ran at 31). Main thread during the drag: composing 401 -> 277
+samples of 1000, waiting for the device 230 -> 152, idle 590 -> 708. What is left of the wait is the device's own submit loop (about
+1.4 ms a command buffer: a draw built, 9 us, and submitted with a kext call, 8 us).
+
