@@ -4271,10 +4271,19 @@ void RDNA4PvHost::keepOnCard(void *surface)
 {
 	CardSurface *slot = nullptr;
 	IOMemoryDescriptor *md = surface ? gSurfaceFns.memory(surface) : nullptr;
-	const uint64_t bpr = md ? gSurfaceFns.bytesPerRow(surface) : 0, bytes = bpr * (md ? gSurfaceFns.height(surface) : 0);
+	const uint64_t bpr = md ? gSurfaceFns.bytesPerRow(surface) : 0;
+	const uint64_t height = md ? gSurfaceFns.height(surface) : 0;
+	const uint64_t base = md ? gSurfaceFns.baseOffset(surface) : 0;
 
-	if ((gInPlace & 32) || !md || cardSurface(surface) || gSurfaceFns.planeCount(surface) > 1 || (bpr % 128) || (gSurfaceFns.baseOffset(surface) & 0xff) || !bytes ||
-	    gSurfaceFns.baseOffset(surface) + bytes > md->getLength())
+	// Surface dimensions and offsets ultimately describe guest-backed memory: validate multiplication and
+	// the resulting range before retaining it for a GPU-resident copy.
+	if (!md || !height || bpr > ~0ull / height)
+		return;
+	const uint64_t bytes = bpr * height;
+	const uint64_t length = md->getLength();
+
+	if ((gInPlace & 32) || cardSurface(surface) || gSurfaceFns.planeCount(surface) > 1 || (bpr % 128) || (base & 0xff) || !bytes ||
+	    base > length || bytes > length - base)
 		return;
 
 	dropReleasedSurfaces();
@@ -5639,9 +5648,15 @@ bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t 
 	// each of kitty's draws an index buffer of its own, 4 KiB at a new address, and those were 91000 new mappings in 5 s of scrolling,
 	// the cache (256) finding none of them again.
 	static constexpr uint64_t kWindow = 2ull << 20;
+	if (!bytes || va > ~0ull - (bytes - 1))
+		return false;
+	const uint64_t last = va + bytes - 1;
+	const uint64_t first = va & ~0xfffull;
+	const uint64_t pageCount = ((last >> 12) - (first >> 12)) + 1;
 	const uint64_t window = va & ~(kWindow - 1);
+	const uint64_t inWindow = va - window;
 
-	if (bytes && bytes <= kWindow / 4 && va + bytes <= window + kWindow) {
+	if (bytes <= kWindow / 4 && inWindow <= kWindow && bytes <= kWindow - inWindow) {
 		Mapping *m = keyedMapping(nullptr, task, window, kWindow >> 12);
 
 		if (!m)
@@ -5649,7 +5664,7 @@ bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t 
 
 		bool covered = m != nullptr;
 
-		for (uint64_t p = (va - window) >> 12; covered && p <= (va + bytes - 1 - window) >> 12; p++)
+		for (uint64_t p = inWindow >> 12; covered && p <= (last - window) >> 12; p++)
 			covered = m->window ? (m->present[p / 64] >> (p % 64) & 1) && (!write || (m->writes[p / 64] >> (p % 64) & 1))
 			                    : !write || m->writable;
 
@@ -5660,9 +5675,7 @@ bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t 
 		}
 	}
 
-	const uint64_t first = va & ~0xfffull;
-
-	if (!mapGuestPages(task, first, (va + bytes + 0xfff - first) >> 12, write, handle, gpu))
+	if (!mapGuestPages(task, first, pageCount, write, handle, gpu))
 		return false;
 
 	gpu += va & 0xfff;
@@ -5748,7 +5761,20 @@ bool RDNA4PvHost::mapGuestPages(uint32_t task, uint64_t first, uint64_t count, b
 
 // The same for `bytes` of a prepared memory descriptor (an IOSurface's) from `offset`, which must be 256-byte aligned (an image's base).
 bool RDNA4PvHost::mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
-	const uint64_t first = offset & ~0xfffull, count = (offset + bytes + 0xfff - first) >> 12;
+	if (!memory || !bytes)
+		return false;
+
+	const uint64_t length = memory->getLength();
+	if (offset > length || bytes > length - offset)
+		return false;
+
+	const uint64_t first = offset & ~0xfffull;
+	const uint64_t span = offset - first;
+	const uint64_t count = ((span + bytes - 1) >> 12) + 1;
+	// Keep the same upper bound as the page-array allocation below, including cache lookups.
+
+	if (count > (256u << 8))
+		return false;
 
 	if (const Mapping *m = !(offset & 0xff) ? keyedMapping(memory, 0, first, count) : nullptr) {
 		handle = 0;
@@ -5769,7 +5795,7 @@ bool RDNA4PvHost::mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_
 		ok = phys && !(phys & 0xfff) && length;
 
 		// physical memory breaks only at page boundaries: a segment ending inside a page ends where the descriptor does
-		for (uint64_t p = 0; ok && p < (length + 0xfff) >> 12 && i < count; p++, i++)
+		for (uint64_t p = 0; ok && p < length / 4096 + (length % 4096 != 0) && i < count; p++, i++)
 			pages[i] = phys + (p << 12);
 	}
 
