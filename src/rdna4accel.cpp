@@ -9,7 +9,7 @@
 //  - the running class has the KDK's size;
 //  - our metaclass's superclass link and size are where OSMetaClass keeps them (+16, +32), then the link is set to the real class.
 //
-//  debug.rdna4_accel=1 makes one, attached to the GPU (RDNA4AccelCensus::gpu) and published. Milestone 1: IOService::start only (not the family's
+//  debug.rdna4_accel=1 makes one and attaches it to the GPU (RDNA4AccelCensus::gpu); 2 starts and publishes it. Milestone 1: IOService::start only (not the family's
 //  start), no user clients; the 17 functions every accelerator must have return nothing.
 //
 #include <Headers/kern_api.hpp>
@@ -147,53 +147,60 @@ void familyLoaded(KernelPatcher &patcher, size_t index, mach_vm_address_t addres
 	}
 	rdna4Log("AMDRadeonRDNA4: accel: IOAcceleratorFamily2: %zu thunks, %u not found, %u slots not the KDK's; the class %s, "
 	         "our metaclass %s: %s\n", kThunks, missing, wrongSlots, real ? "found" : "NOT found", layout ? "as expected" : "NOT as expected",
-	         gReady ? "ready (debug.rdna4_accel=1 publishes one)" : "NOT usable");
+	         gReady ? "ready (debug.rdna4_accel=1 makes one, 2 publishes it)" : "NOT usable");
 }
 
-RDNA4Accelerator *gAccel;
+RDNA4Accelerator *gAccel;   // made and attached (debug.rdna4_accel=1)
+bool gStarted;              // started and published (debug.rdna4_accel=2)
 
+// In steps, each logged: 1 makes one (the family's own constructor runs) and attaches it under the GPU; 2 starts and publishes it.
 int accelSysctl SYSCTL_HANDLER_ARGS
 {
-	int value = gAccel ? 1 : 0;
+	int value = gStarted ? 2 : gAccel ? 1 : 0;
 	const int err = sysctl_handle_int(oidp, &value, 0, req);
 	if (err || !req->newptr)
 		return err;
-	if (value != 1)
+	if (value != 1 && value != 2)
 		return EINVAL;
-	if (gAccel)
-		return 0;
 	// (accelcensus.cpp's: an extern of its variable, which is in an anonymous namespace, linked as an unresolved lookup that OpenCore
 	// bound to junk: reading it panicked the rig, 2026-11-20)
 	IOService *gpu = RDNA4AccelCensus::gpu();
 	if (!gReady || !gpu)
 		return ENODEV;
-	const OSMetaClass *base = RDNA4Accelerator::gMetaClass.getSuperClass();
-	if (base->getClassSize() != kIOGraphicsAccelerator2Size) {
-		rdna4Log("AMDRadeonRDNA4: accel: IOGraphicsAccelerator2 is 0x%x bytes here, the KDK's 0x%zx: not made\n", base->getClassSize(),
-		         static_cast<size_t>(kIOGraphicsAccelerator2Size));
-		return ENODEV;
+	if (!gAccel) {
+		const OSMetaClass *base = RDNA4Accelerator::gMetaClass.getSuperClass();
+		if (base->getClassSize() != kIOGraphicsAccelerator2Size) {
+			rdna4Log("AMDRadeonRDNA4: accel: IOGraphicsAccelerator2 is 0x%x bytes here, the KDK's 0x%zx: not made\n", base->getClassSize(),
+			         static_cast<size_t>(kIOGraphicsAccelerator2Size));
+			return ENODEV;
+		}
+		rdna4Log("AMDRadeonRDNA4: accel: making one (the family's constructor)\n");
+		auto *a = OSTypeAlloc(RDNA4Accelerator);
+		rdna4Log("AMDRadeonRDNA4: accel: made %p; init\n", a);
+		if (!a || !a->init()) {
+			OSSafeReleaseNULL(a);
+			return ENOMEM;
+		}
+		a->setName("RDNA4Accelerator");
+		if (!a->attach(gpu)) {
+			a->release();
+			return EBUSY;
+		}
+		gAccel = a;
+		rdna4Log("AMDRadeonRDNA4: accel: attached under %s (not started): a kind of IOGraphicsAccelerator2: %s\n", gpu->getName(),
+		         a->metaCast("IOGraphicsAccelerator2") ? "yes" : "NO");
 	}
-	auto *a = OSTypeAlloc(RDNA4Accelerator);
-	if (!a || !a->init()) {
-		OSSafeReleaseNULL(a);
-		return ENOMEM;
+	if (value == 2 && !gStarted) {
+		rdna4Log("AMDRadeonRDNA4: accel: starting\n");
+		if (!gAccel->start(gpu))
+			return EIO;
+		gStarted = true;
 	}
-	a->setName("RDNA4Accelerator");
-	if (!a->attach(gpu)) {
-		a->release();
-		return EBUSY;
-	}
-	if (!a->start(gpu)) {
-		a->detach(gpu);
-		a->release();
-		return EIO;
-	}
-	gAccel = a;
 	return 0;
 }
 
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_accel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, accelSysctl, "I",
-            "AMDRadeonRDNA4: 1 publishes our own IOGraphicsAccelerator2 (skeleton; HUNG the rig on 2026-11-20, docs/native-driver-plan.md)");
+            "AMDRadeonRDNA4: our own IOGraphicsAccelerator2 (skeleton): 1 makes and attaches one, 2 starts and publishes it (docs/native-driver-plan.md)");
 }   // namespace
 
 void RDNA4Accel::start()

@@ -71,6 +71,16 @@ is prelinked against the system collection's copies.
   bound to junk. Fixed (`RDNA4AccelCensus::gpu()`), and the kext build now fails if any of our own globals is left undefined. The
   skeleton itself has not run yet. The boots after it: two warm restarts failed the compute bring-up at SDMA's test write (as once
   before after a warm restart), the cold boot hit the SimpleHDA race (IONDRVSupport loaded unseen, the GPU never attached).
+- **MILESTONE 1 MET ON THE CARD (2026-11-20, kext cf910523):** `debug.rdna4_accel=1` makes one (the family's real constructor runs
+  through the thunk) and attaches it under the GPU (`VGA`): `metaCast("IOGraphicsAccelerator2")` yes; `=2` starts and publishes it:
+  `ioreg -c IOAccelerator` and `-c IOGraphicsAccelerator2` list `RDNA4Accelerator` beside AppleParavirtAccelerator; the desktop kept
+  running, nobody asked it for a user client. (A boot with the UR22 plugged in never got a desktop: XH00 re-enumerated it in a loop and
+  WindowServer waited in IOKitWaitQuiet: USB, not graphics.)
+- Next (milestone 2): the family's own `start` (from `RDNA4Accelerator::start`), with what it calls implemented: configureDevice (312),
+  populateAccelConfig (310), createEventMachine/newEventMachine (272/273), newDisplayMachine (320), createKernelGPUTask (314),
+  calcMaxGPUPhysicalMemoryBytes (311), newStatistics (336) and the memory/command-descriptor factories. Each object it asks for is a
+  family class to derive the same way (IOAccelEventMachine2, IOAccelDisplayMachine2, IOAccelTask, ...): `tools/gen/accelgen.py`'s
+  CLASSES list.
 
 ## Milestones
 
