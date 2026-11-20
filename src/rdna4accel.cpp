@@ -98,8 +98,10 @@ RDNA4_ACCEL_STRUCTORS(RDNA4EventMachine, IOAccelEventMachineFast2)
 class RDNA4DisplayMachine : public IOAccelDisplayMachine {
 	OSDeclareDefaultStructors(RDNA4DisplayMachine)
 public:
-	uintptr_t displayModeWillChange() APPLE_KEXT_OVERRIDE { return 0; }
-	uintptr_t displayModeDidChange() APPLE_KEXT_OVERRIDE { return 0; }
+	// true: false makes the family panic ("display_mode_did_change: driver returns false", WindowServer setting a mode on an IONDRV
+	// framebuffer with our pipe, twice on 2026-11-20)
+	uintptr_t displayModeWillChange() APPLE_KEXT_OVERRIDE { return true; }
+	uintptr_t displayModeDidChange() APPLE_KEXT_OVERRIDE { return true; }
 };
 RDNA4_ACCEL_STRUCTORS(RDNA4DisplayMachine, IOAccelDisplayMachine)
 
@@ -441,10 +443,14 @@ int accelSysctl SYSCTL_HANDLER_ARGS
 // once the family is solved, the GPU known and its first framebuffer up (the rest of the boot heads a moment later).
 void accelAtBoot(void *, wait_result_t)
 {
-	uint32_t want = 0;
-	(void)Trial::option("rdna4-accel", want);
 	for (int ms = 0; ms < 60000 && !(gReady && RDNA4AccelCensus::gpu()); ms += 100)
 		IOSleep(100);
+	// asked only now: at the plugin's start NVRAM is not there yet and a test boot's options read as none (2026-11-20)
+	uint32_t want = 0;
+	if (!Trial::option("rdna4-accel", want) || want < 1 || want > 4) {
+		thread_terminate(current_thread());
+		return;
+	}
 	OSDictionary *match = IOService::serviceMatching("IONDRVFramebuffer");
 	IOService *fb = match ? IOService::waitForMatchingService(match, 60ull * NSEC_PER_SEC) : nullptr;
 	OSSafeReleaseNULL(match);
@@ -466,8 +472,7 @@ void RDNA4Accel::start()
 			familyLoaded(patcher, index, address, size);
 	}, nullptr);
 	sysctl_register_oid(&sysctl__debug_rdna4_accel);
-	uint32_t want = 0;
-	thread_t th;
-	if (Trial::option("rdna4-accel", want) && want >= 1 && want <= 4 && kernel_thread_start(accelAtBoot, nullptr, &th) == KERN_SUCCESS)
+	thread_t th;   // (it waits for the GPU, then reads rdna4-accel)
+	if (kernel_thread_start(accelAtBoot, nullptr, &th) == KERN_SUCCESS)
 		thread_deallocate(th);
 }

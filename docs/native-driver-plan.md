@@ -92,6 +92,11 @@ is prelinked against the system collection's copies.
   With 8 (kext 8dc2bab3): all six IONDRV framebuffers get a pipe (IOAccelIndex 0-5), desktop unaffected. `IOAccelDisplayMachine::init`
   and `start` return nothing (rax holds the lock's address): judge them by the framebuffers' properties, not their "result".
   The "IOAccelResource2::map(): resource already has a map" faults in the log are the paravirtual path's (thousands a boot without ours).
+- **Two panics after step 3 (19:08 and 20:30, 2026-11-20):** WindowServer set a mode on an IONDRV framebuffer with our pipe; the
+  family asks the display machine's `displayModeDidChange` and panics on false ("driver returns false"); our stub returned 0. Now true.
+  (The 20:30 one looked like a freeze on reboot.)
+- A test boot's `rdna4-accel` must be read late: at the plugin's start NVRAM is not there yet (the trial read as none, then another
+  reader marked it used); the boot thread now waits for the GPU first.
 - Next: WindowServer on these framebuffers through our pipes: today the kext hides the IONDRV framebuffers from it (the paravirtual
   displays are its displays) and our accelerator refuses user clients (`IOAccelDisplayPipeUserClient2` and the rest); the family's
   IOAccelLegacyDisplayMachine / IOAccelLegacyDisplayPipe implement flips through a plain framebuffer and may be the shortest way.
