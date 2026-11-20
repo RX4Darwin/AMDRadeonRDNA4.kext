@@ -303,10 +303,19 @@ What it took to get WindowServer composing on `RDNA4MTLDevice` (each found on th
 - A safety net: the router counts WindowServer's starts on the native device (a file in its temporary directory); the third start within
   two minutes gets Apple's device, so a crash loop ends with the desktop back.
 
-**Open (2026-11-20):** the compositor runs and draws (Core Animation's pipelines, CoreDisplay's), but one Core Animation shader,
-`VfxU10Xh / TkfhBvcmA2Xh_IsrcM1` (a fragment function with no values from the vertex stage, drawing into a 3840x192 or 896x448
-BGRA8 surface), hangs the gfx ring on every boot (fence after it never reached; draws before it finish); after that nothing draws until a
-reboot. Not yet known why: the same register sequence as the PV host's; reading its own target from a copy and a barrier before it did
-not change it. Next: log its RGFX registers (SPI_PS_INPUT_ENA/ADDR: a pixel shader enabling no barycentric input hangs AMD hardware)
-and compare with the PV host's run of it. `rdna4-nativews` is off in the rig's config.plist again; the kext and the bundle on the rig
-are this state (Apple's device for everything without the boot-arg).
+**A native desktop (2026-11-20, 1c4c73e):** with `rdna4-nativews=3`, WindowServer composes both displays on `RDNA4MTLDevice`: the
+wallpaper (a 10-bit YCbCr image), desktop icons and labels, menu bars, notifications, the Dock, matching a boot on Apple's device by eye
+but for a translucent notification banner (opaque here). What the last steps were:
+
+- A fragment shader without an export (Core Animation's `TkfhBvcmA2Xh_IsrcM1`, `s_endpgm` alone, its header saying it has a colour)
+  hung the gfx ring: drawn as one without a colour now (an export is a dword with bits 31-26 `111110`).
+- Our device answers the feature queries and GPU families as Apple's paravirtual device does (`mtlprobe features` lists both):
+  `_MTLDevice`'s defaults describe an Apple GPU, and Core Animation chose techniques for it that the paravirtual device never sees.
+- Textures over buffers and IOSurfaces typed 2D (0 is `MTLTextureType1D`: their T#s read row 0 only; the wallpaper was flat).
+- Tiled textures as linear ones; CPU-refreshed copies where offsets or rows do not suit the hardware; `set*Bytes` in 256 KiB chunks;
+  the kext's runtime holds 4096 buffers (WindowServer ran it out at 1024).
+- The kext keeps nothing of the paravirtual host's on the card while WindowServer is native (`debug.rdna4_pvinplace` bits 32 and 16
+  from the boot): the display frames and the other processes' targets (they still draw through Apple's device) are read from memory.
+
+Open: the Dock flashes at intervals (Sunneva, watching the rig; 24 frame grabs over 33 s did not catch it); every draw is still its
+own IB (about 64 us each); colour matching of DeviceRGB images (`nativeca`); MSAA, stencil, heaps not yet.
