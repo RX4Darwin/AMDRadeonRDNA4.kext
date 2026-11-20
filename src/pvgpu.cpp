@@ -59,6 +59,13 @@ SYSCTL_INT(_debug, OID_AUTO, rdna4_pvpresent, CTLFLAG_RW | CTLFLAG_LOCKED, &gPre
 	   "AMDRadeonRDNA4: a presented frame copied on the card and flipped to at vblank (1), copied into the display's scanout on the card "
 	   "(2: it tears), or with the CPU (0)");
 // debug.rdna4_pvdrawsync=1: each draw in an IB of its own with its own fence, not batched: a hang names the draw that did not finish.
+// debug.rdna4_pvvblat: when port 0's last VBL event was raised (ns of uptime, mach_absolute_time): the native device times its frames from it
+static uint64_t gVblAtNs;
+SYSCTL_QUAD(_debug, OID_AUTO, rdna4_pvvblat, CTLFLAG_RD | CTLFLAG_LOCKED, &gVblAtNs, "AMDRadeonRDNA4: when display 0's last VBL event was raised (ns)");
+// debug.rdna4_pvvbldelay: a flipping port's VBL event this many microseconds after its vblank (0: at it; at most half a period).
+static int gVblDelayUs;
+SYSCTL_INT(_debug, OID_AUTO, rdna4_pvvbldelay, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblDelayUs, 0,
+	   "AMDRadeonRDNA4: a flipping display's VBL event this many microseconds after its vblank (WindowServer composes later)");
 static int gDrawSync;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvdrawsync, CTLFLAG_RW | CTLFLAG_LOCKED, &gDrawSync, 0,
 	   "AMDRadeonRDNA4: submit each paravirtual draw on its own (1), so that a hang names the draw");
@@ -892,7 +899,7 @@ private:
 	// present (sum and most); and how long the stamps queued behind draws in flight waited (sum, most, count).
 	// gaps: frames 1, 2, 3 and 4 to 8 VBLs after the one before; underflows: frames before which the head's HUBP had run out of data;
 	// shown: vblanks after which the head showed another buffer (a port flipping its frames: each frame shown, none dropped, if as many)
-	struct PortTiming { uint64_t last, vblNs, vblMaxNs; uint32_t frames, missed, gaps[4], underflows, shown; uint64_t vblAt, inUse; };
+	struct PortTiming { uint64_t last, vblNs, vblMaxNs; uint32_t frames, missed, gaps[4], underflows, shown; uint64_t vblAt, inUse; uint32_t vblHist[5]; };
 	PortTiming mPortTiming[8] {};
 	void timePresent(PortTiming &t);
 	uint64_t mLateNs { 0 }, mLateMaxNs { 0 };
@@ -8147,6 +8154,7 @@ void RDNA4PvHost::timePresent(PortTiming &t)
 	t.frames++;
 
 	if (t.vblAt && sinceVbl < 4 * kVblPeriodNs) {
+		t.vblHist[sinceVbl / 4000000 < 4 ? sinceVbl / 4000000 : 4]++;   // in 4 ms steps
 		t.vblNs += sinceVbl;
 		t.vblMaxNs = sinceVbl > t.vblMaxNs ? sinceVbl : t.vblMaxNs;
 	}
@@ -8949,6 +8957,12 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 		       mLateDone ? mLateNs / mLateDone / 1000 : 0, mLateMaxNs / 1000);
 	if (gaps[0])
 		pvstat("host: render:   frames after 1, 2, 3 and 4 to 8 VBLs:%s", gaps);
+	for (uint32_t p = 0; p < 8; p++)
+		if (mPortTiming[p].frames) {
+			const uint32_t *v = mPortTiming[p].vblHist;
+			pvstat("host: render:   port %u: VBL to present under 4, 8, 12, 16 ms and more: %u/%u/%u/%u/%u (the VBL %u us after the vblank)", p, v[0], v[1],
+			       v[2], v[3], v[4], gVblDelayUs);
+		}
 	if (mVbls)
 		pvstat("host: render:   VBL events: %u, %llu us late on average, %u by 2 ms or more, the latest %llu us", mVbls,
 		       mVblLateNs / mVbls / 1000, mVblsLate, mVblLateMaxNs / 1000);
@@ -9150,9 +9164,10 @@ bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
 
 		uint64_t requested = 0, inUse = 0;
 
-		// an early wake-up (the tick runs every 250 us to 1 ms): the vblank is still to come
+		// an early wake-up (the tick runs every 250 us to 1 ms): the vblank is still to come. The event debug.rdna4_pvvbldelay us after the
+		// vblank (at most half a period): WindowServer composes later, its frame waits less for the vblank after (but misses it when late).
 		fire = *due && toBlank > kVblPeriodNs / 8;
-		*due = now + toBlank;
+		*due = now + toBlank + MIN(static_cast<uint64_t>(gVblDelayUs) * 1000, kVblPeriodNs / 2);
 
 		if (fire && gCompute->rtScanoutShown(sm->hubp, requested, inUse) && inUse != mPortTiming[port].inUse) {
 			mPortTiming[port].shown++;
@@ -9162,6 +9177,8 @@ bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
 
 	if (fire)
 		mPortTiming[port].vblAt = now;
+	if (fire && !port)
+		gVblAtNs = now;
 
 	return fire;
 }
@@ -9871,6 +9888,8 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtalk);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvinplace);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvpresent);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvvbldelay);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvvblat);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvdrawsync);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvprofile);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtexid);

@@ -73,7 +73,7 @@ extern "C" {
 }
 // Where WindowServer's time goes (window drags were slow, 2026-11-20): totals, logged every 5 s while there is work ("RDNA4MTL stats: ...").
 enum RDNA4Stat { kStatBuffers, kStatDraws, kStatDrawUs, kStatDrainUs, kStatShadowBytes, kStatShadowUs, kStatSelfReads, kStatSelfReadBytes,
-	             kStatDispatches, kStatDispatchUs, kStatSlotUs, kStatBuildUs, kStatWriteUs, kStatSubmitUs, kStatBarriers, kStatWaitUs, kStatRunUs, kStatEncodeUs, kStatRecordUs, kStatAllocs, kStatAllocUs, kStatFreeUs, kStatImports, kStatImportBytes, kStatAllocBytes, kStatSteps, kStatStepUs, kStatDrawnSurface, kStatDrawnOwn, kStatHeldIn, kStatHeldOut, kStatCount };
+	             kStatDispatches, kStatDispatchUs, kStatSlotUs, kStatBuildUs, kStatWriteUs, kStatSubmitUs, kStatBarriers, kStatWaitUs, kStatRunUs, kStatEncodeUs, kStatRecordUs, kStatAllocs, kStatAllocUs, kStatFreeUs, kStatImports, kStatImportBytes, kStatAllocBytes, kStatSteps, kStatStepUs, kStatDrawnSurface, kStatDrawnOwn, kStatHeldIn, kStatHeldOut, kStatFramed, kStatVblMade, kStatVblCommitted, kStatVblDone, kStatMade0, kStatMade1, kStatMade2, kStatMade3, kStatMade4, kStatMade5, kStatCount };
 static std::atomic<uint64_t> gStats[kStatCount], gLatencyMaxUs, gEncodeMaxUs, gStepMaxUs;   // gLatencyMaxUs: the longest commit to done since the last report
 static std::atomic<int64_t> gHostLive, gHostCount, gOrderWaiting, gShadowLive, gShadowCount, gTexturesLive, gBuffersLive;   // gauges: host memory allocated (bytes, buffers), command buffers held back
 static uint64_t nowUs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000; }
@@ -114,6 +114,11 @@ static void statReport(void)
 	     v[kStatRunUs] / 1e3 / n, worst / 1e3, v[kStatEncodeUs] / 1e3 / n, v[kStatRecordUs] / 1e3 / n, worstEncode / 1e3);
 	RLOG(@"RDNA4MTL stats: drawn (covered) %.1f MB into IOSurfaces, %.1f MB into the device's own textures; surfaces held in VRAM: %.1f MB "
 	     @"filled, %.1f MB written back", v[kStatDrawnSurface] / 1e6, v[kStatDrawnOwn] / 1e6, v[kStatHeldIn] / 1e6, v[kStatHeldOut] / 1e6);
+	if (v[kStatFramed])
+		RLOG(@"RDNA4MTL stats: from display 0's VBL event (%llu command buffers within 20 ms of one): made %.2f ms, committed %.2f, done %.2f; "
+		     @"made under 1, 2, 4, 6, 8 ms and later: %llu/%llu/%llu/%llu/%llu/%llu", v[kStatFramed], v[kStatVblMade] / 1e3 / v[kStatFramed],
+		     v[kStatVblCommitted] / 1e3 / v[kStatFramed], v[kStatVblDone] / 1e3 / v[kStatFramed], v[kStatMade0], v[kStatMade1], v[kStatMade2],
+		     v[kStatMade3], v[kStatMade4], v[kStatMade5]);
 	RLOG(@"RDNA4MTL stats: %llu steps other than draws (%.1f ms, the longest %.2f ms)", v[kStatSteps], v[kStatStepUs] / 1e3, worstStep / 1e3);
 	RLOG(@"RDNA4MTL stats: %llu buffers allocated (%.1f MB), %llu imported (%.1f MB): %.1f ms, freeing %.1f ms", v[kStatAllocs] - v[kStatImports],
 	     v[kStatAllocBytes] / 1e6, v[kStatImports], v[kStatImportBytes] / 1e6, v[kStatAllocUs] / 1e3, v[kStatFreeUs] / 1e3);
@@ -2919,6 +2924,18 @@ RDNA4_ANSWER_MISSING
 		// between its old and new places (2026-11-20).
 		const uint64_t done = nowUs();
 		statAdd(kStatRunUs, done - started);
+		uint64_t vblNs = 0;   // the kext's last VBL event on display 0 (the same clock): where in the frame this one was made, committed, done
+		size_t vblLen = sizeof vblNs;
+		if (!sysctlbyname("debug.rdna4_pvvblat", &vblNs, &vblLen, NULL, 0) && vblNs / 1000 <= self->_createdUs && done - vblNs / 1000 < 20000) {
+			const uint64_t vbl = vblNs / 1000;
+			statAdd(kStatFramed, 1), statAdd(kStatVblMade, self->_createdUs - vbl), statAdd(kStatVblCommitted, self->_committedUs - vbl),
+				statAdd(kStatVblDone, done - vbl);
+			static const uint64_t edges[] = { 1000, 2000, 4000, 6000, 8000 };   // us: the made histogram's buckets
+			int bucket = 0;
+			while (bucket < 5 && self->_createdUs - vbl >= edges[bucket])
+				bucket++;
+			statAdd(static_cast<RDNA4Stat>(kStatMade0 + bucket), 1);
+		}
 		if (done - started >= 200000)
 			RLOG(@"RDNA4MTL: a command buffer (%@) ran %.0f ms: %lu steps, %lu draws, the longest step %lu (%s) %.0f ms", self.label ?: @"-",
 			     (done - started) / 1e3, (unsigned long)self->_ops.count, (unsigned long)self->_draws.count, (unsigned long)slowestAt,

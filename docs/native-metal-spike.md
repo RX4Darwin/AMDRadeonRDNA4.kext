@@ -427,3 +427,12 @@ Now the runtime polls the first 2 ms without the lock (the caller's own fence pa
 short turns with `pollDisplay` (cursor, VBL events, the interrupt) between them. Card: VBL events 240-400 -> 140 us late on average
 while a window moves, 1 in 5 s by 2 ms or more (the latest 4.4 ms, was 8-16); frames at the next vblank 97 %.
 
+**Where a frame's time goes (2026-11-20, evening):** Sunneva: dragging smoother, still slightly laggy. The one-second pointer freezes
+were the USB controller XH00 resetting (fixed by a power cycle and unplugging the UR22). New timing: `debug.rdna4_pvvblat` (when display
+0's last VBL event was raised, the same clock as the device's), the native device timing each command buffer from it, and per port a
+histogram of VBL to present. While the glass window moves on the 4K display: a command buffer is made 5.5 ms after the VBL on average,
+spread over the whole frame (WindowServer's own work: 9 % under 1 ms, 26 % after 8 ms), committed 0.4 ms later, done 1.7 ms after that;
+VBL to present 28 % under 4 ms, 30 % 4-8, 27 % 8-12, 13 % 12-16, 1 % later. `debug.rdna4_pvvbldelay` (us after the vblank to raise
+the VBL event, 0 by default) moves WindowServer's frame later in the period, so the frame waits less for the vblank: tried at 3 ms, about
+a fifth of the frames then miss the earlier vblank (a frame later), worse than 0. The device's own share is about 2 ms of a frame.
+
