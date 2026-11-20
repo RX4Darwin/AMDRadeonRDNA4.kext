@@ -21,6 +21,9 @@
 #include <sys/sysctl.h>
 
 #include "accelcensus.hpp"
+#ifdef AMDRadeonRDNA4_PVGPU
+#include "pvscanout.hpp"
+#endif
 #include "rdna4compute.h"
 #include "trial.hpp"
 #include "userclient.hpp"
@@ -248,6 +251,71 @@ RDNA4_ACCEL_STRUCTORS(RDNA4DisplayPipe, IOAccelDisplayPipe)
 class RDNA4DeviceControl : public AppleGraphicsDeviceControl {
 	OSDeclareDefaultStructors(RDNA4DeviceControl)
 
+	// Attribute 0x711, 0x196c bytes {u32 framebuffer (0-based, its place in 0x980's list), u32 query, answer from +8}: what CoreDisplay
+	// makes its display's devices of (without it: "capabilities with no devices" and an assert). As the paravirtual framebuffer answers
+	// (AppleParavirtFramebuffer::doDeviceAttribute): 1, 2, 4, 8 (cases of a table), 0x10 the mode (width, height), the rest flags.
+	IOReturn framebufferQuery(const uint32_t *in, uint8_t *o)
+	{
+		auto u32 = [o](uint32_t at, uint32_t v) { *reinterpret_cast<uint32_t *>(o + at) = v; };
+		auto u64 = [o](uint32_t at, uint64_t v) { *reinterpret_cast<uint64_t *>(o + at) = v; };
+		IORegistryEntry *fb[20];
+		const uint32_t n = framebuffers(fb, 20);
+		uint32_t width = 0, height = 0, port = 0;
+		if (in[0] < n) {   // its mode: its head's (the dependent index is the head), else the console's
+			if (auto *dep = OSDynamicCast(OSNumber, fb[in[0]]->getProperty("IOFBDependentIndex")))
+				port = dep->unsigned32BitValue();
+#ifdef AMDRadeonRDNA4_PVGPU
+			(void)PvScanout::mode(port, width, height);
+#endif
+			if (!width || !height) {
+				auto *w = OSDynamicCast(OSNumber, fb[in[0]]->getProperty("Console,Width"));
+				auto *h = OSDynamicCast(OSNumber, fb[in[0]]->getProperty("Console,Height"));
+				width = w ? w->unsigned32BitValue() : 1920;
+				height = h ? h->unsigned32BitValue() : 1080;
+			}
+		}
+		for (uint32_t i = 0; i < n; i++)
+			fb[i]->release();
+		if (in[0] >= n)
+			return kIOReturnBadArgument;
+		switch (in[1]) {
+		case 1:
+			u32(8, 1), u32(0xc, 5), u64(0x10, 0), u32(0x18, 0), u32(0x1c, 8), u32(0x20, 0), u64(0x24, 0), u32(0x2c, 0x30300);
+			u32(0x30, 0xbf800000u), u32(0x34, 0x3f800000u);   // -1.0, 1.0
+			return kIOReturnSuccess;
+		case 2:
+			u32(8, 1), u32(0xc, 5), u64(0x10, 0), u32(0x18, 0), u32(0x1c, 0x80), u32(0x20, 0), u64(0x24, 0), u32(0x2c, 0);
+			u32(0x30, 0x3f800000u), u64(0x34, 0);   // 1.0
+			return kIOReturnSuccess;
+		case 4:
+			u32(8, 1), bzero(o + 0xc, 0x30);
+			return kIOReturnSuccess;
+		case 8:
+			u32(8, 1), bzero(o + 0xc, 0x32c);
+			return kIOReturnSuccess;
+		case 0x10:   // the mode: its rectangle twice (height before width), 0x10000, in two records
+			u32(8, 1), bzero(o + 0xc, 0x1c), u64(0x28, 1);
+			u32(0x30, height), u32(0x34, width), u32(0x38, height), u32(0x3c, width), u32(0x40, 0x10000), bzero(o + 0x44, 0x16c);
+			u64(0x1b0, 1), u32(0x1b8, height), u32(0x1bc, width), u32(0x1c0, height), u32(0x1c4, width), u32(0x1c8, 0x10000);
+			bzero(o + 0x1cc, 0x16c);
+			return kIOReturnSuccess;
+		case 0x20: case 0x80: case 0x400: case 0x800:
+			u64(8, 1), u64(0x10, 0);
+			return kIOReturnSuccess;
+		case 0x100:
+			u32(8, 1), bzero(o + 0xc, 0x14);
+			return kIOReturnSuccess;
+		case 0x200: case 0x2000: case 0x4000:
+			u64(8, 1);
+			return kIOReturnSuccess;
+		case 0x1000: case 0x8000:
+			u32(8, 1), bzero(o + 0xc, 0x2c);
+			return kIOReturnSuccess;
+		default:
+			return kIOReturnUnsupported;
+		}
+	}
+
 	// the GPU's framebuffers (IOFramebuffers anywhere under its provider), retained, at most cap
 	uint32_t framebuffers(IORegistryEntry **out, uint32_t cap)
 	{
@@ -295,6 +363,11 @@ public:
 				*reinterpret_cast<uint64_t *>(o + 0x3c + 8 * i) = reinterpret_cast<uint64_t>(fb[i]);
 				fb[i]->release();
 			}
+			r = kIOReturnSuccess;
+		} else if (attribute == 0x711 && inLength == 0x196c && size == 0x196c && o && in) {   // a framebuffer's query (below)
+			r = framebufferQuery(reinterpret_cast<const uint32_t *>(in), o);
+		} else if (attribute == 0x925 && inLength == 0xc && size >= 0xc && o && in) {   // whether framebuffer n (1-based) shows: yes
+			*reinterpret_cast<uint32_t *>(o + 8) = 1;   // (the paravirtual framebuffer's flag at +0x1e0, bit 0)
 			r = kIOReturnSuccess;
 		} else if (attribute == 0x921 && size == 0xb0 && o) {   // the paravirtual GPU's capabilities, as it writes them
 			bzero(o, 0xb0);
