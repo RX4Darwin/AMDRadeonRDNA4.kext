@@ -14,6 +14,7 @@
 #include "pvdraw.hpp"
 #include "pm4.hpp"
 #include "pvscanout.hpp"
+#include "pvrange.hpp"
 #include "sku.hpp"
 #include "compute.hpp"
 #include "isa.hpp"
@@ -4277,13 +4278,13 @@ void RDNA4PvHost::keepOnCard(void *surface)
 
 	// Surface dimensions and offsets ultimately describe guest-backed memory: validate multiplication and
 	// the resulting range before retaining it for a GPU-resident copy.
-	if (!md || !height || bpr > ~0ull / height)
+	uint64_t bytes = 0;
+	if (!md || !height || !pvrange::multiply(bpr, height, bytes))
 		return;
-	const uint64_t bytes = bpr * height;
 	const uint64_t length = md->getLength();
 
-	if ((gInPlace & 32) || cardSurface(surface) || gSurfaceFns.planeCount(surface) > 1 || (bpr % 128) || (base & 0xff) || !bytes ||
-	    base > length || bytes > length - base)
+	if ((gInPlace & 32) || cardSurface(surface) || gSurfaceFns.planeCount(surface) > 1 || (bpr % 128) || (base & 0xff) ||
+	    !pvrange::contains(length, base, bytes) || !bytes)
 		return;
 
 	dropReleasedSurfaces();
@@ -5648,7 +5649,7 @@ bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t 
 	// each of kitty's draws an index buffer of its own, 4 KiB at a new address, and those were 91000 new mappings in 5 s of scrolling,
 	// the cache (256) finding none of them again.
 	static constexpr uint64_t kWindow = 2ull << 20;
-	if (!bytes || va > ~0ull - (bytes - 1))
+	if (!pvrange::addressRangeFits(va, bytes))
 		return false;
 	const uint64_t last = va + bytes - 1;
 	const uint64_t first = va & ~0xfffull;
@@ -5765,12 +5766,13 @@ bool RDNA4PvHost::mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_
 		return false;
 
 	const uint64_t length = memory->getLength();
-	if (offset > length || bytes > length - offset)
+	if (!pvrange::contains(length, offset, bytes))
 		return false;
 
 	const uint64_t first = offset & ~0xfffull;
-	const uint64_t span = offset - first;
-	const uint64_t count = ((span + bytes - 1) >> 12) + 1;
+	uint64_t count = 0;
+	if (!pvrange::pageCount(offset, bytes, 4096, count))
+		return false;
 	// Keep the same upper bound as the page-array allocation below, including cache lookups.
 
 	if (count > (256u << 8))
