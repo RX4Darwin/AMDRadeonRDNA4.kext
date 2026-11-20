@@ -128,6 +128,18 @@ is prelinked against the system collection's copies.
     on the paravirtual GPU, so the devices come from elsewhere: IOPresentment asks AGDC attributes 1, 0x980, 0x921, 3 (answered) and
     **0x711 (0x196c bytes), 0x925 (12)**, 0x923, 0x941, 0x2, 0x2001 (refused). The paravirtual GPU's framebuffers answer 0x704, 0x711
     (checks size 0x196c), 0x924, 0x925, 0x986 (`AppleParavirtFramebuffer::doDeviceAttribute`): 0x711 is the next thing to decode.
+  - **Then (9668f00, 4c62079):** 0x711 and 0x925 answered as the paravirtual framebuffer does (0x711's queries keyed by the framebuffer's
+    place in 0x980's list; 0x10 is its mode, height before width): the "no devices" assert is gone. CoreDisplay then asserted "Failed to
+    create MetalDevice for accelerator": our bundle's RDNA4MTLDevice made no device without `RDNA4_NATIVE_MTL`; it now does on our
+    accelerator (the `RDNA4Accelerator` property). The translator helper's request slot was made only by the paravirtual host, so
+    every shader WindowServer's device sent was refused (not ready): our accelerator makes it too (`pvTranslatorInit`).
+  - **Now:** WindowServer runs the Metal compositor on our device, starts loginwindow, and dies 2-8 s in:
+    `CA::OGL::Context::push_surface` asserts "found != slist->end ()" after "context(2) transient surface %p not found", from
+    `FlattenNode::retain_surface` (flattened layers are IOSurfaces; `MetalContext::create_surface_from_iosurface` tracks the surface it
+    makes; no texture of ours came back nil: logged). Not yet known what drops it from the context's list. CA's surface dump is
+    debug level: `log stream --level debug` over ssh shows debug lines without root (the dump itself did not appear). WindowServer
+    made 4 displays of our 6 IONDRV framebuffers (only 2 have an IODisplayConnect); listing only those in 0x980 did not change the
+    assert (stash "accel experiment: AGDC 0x980 lists only framebuffers with a display").
   - The test config is kept in the EFI's `rdna4-backups/20261120-214231/config.plist` (no `rdna4-pvgpu=1`, `rdna4-accel=4`); the
     rig is back on its paravirtual config (`~/rdna4/config.plist.before-accelws`).
 - Next: WindowServer on these framebuffers through our pipes: today the kext hides the IONDRV framebuffers from it (the paravirtual
