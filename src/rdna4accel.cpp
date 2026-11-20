@@ -264,6 +264,16 @@ class RDNA4DeviceControl : public AppleGraphicsDeviceControl {
 	}
 
 public:
+	// Not AppleGraphicsDevicePolicy's provider (it matches every AppleGraphicsDeviceControl): its start panicked on ours, at a boot's
+	// 18 s (safeMetaCast in AppleGraphicsDevicePolicy, 2026-11-20). ponytail: refused outright; what it wants of a controller is unknown.
+	bool matchPropertyTable(OSDictionary *table, SInt32 *score) APPLE_KEXT_OVERRIDE
+	{
+		auto *cls = table ? OSDynamicCast(OSString, table->getObject("IOClass")) : nullptr;
+		if (cls && cls->isEqualTo("AppleGraphicsDevicePolicy"))
+			return false;
+		return IOService::matchPropertyTable(table, score);
+	}
+
 	IOReturn vendor_doDeviceAttribute(unsigned int attribute, unsigned long *in, unsigned long inLength, unsigned long *out,
 	                                  unsigned long *outLength, IOExternalMethodArguments *) APPLE_KEXT_OVERRIDE
 	{
