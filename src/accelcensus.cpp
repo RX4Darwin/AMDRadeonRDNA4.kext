@@ -7,6 +7,9 @@
 
 #include "accelcensus.hpp"
 #include "klog.hpp"
+#ifdef AMDRadeonRDNA4_PVGPU
+#include "pvgpu.hpp"
+#endif
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -193,6 +196,9 @@ void routePv(IOService *acc, int route)
 			acc->setProperty("MetalPluginClassName", cls);
 		acc->removeProperty("RDNA4NativeProcesses");
 	}
+#ifdef AMDRadeonRDNA4_PVGPU
+	pvFramesInMemory(route == 3);   // the frames are the native device's: scanned out of their memory, not out of the host's copies
+#endif
 	rdna4Log("AMDRadeonRDNA4: accelcensus: %s's Metal plug-in: %s\n", acc->getName(),
 	         route == 3 ? "our router, WindowServer on the native device" : route ? "our router, nobody native" : "Apple's");
 }

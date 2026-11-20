@@ -263,6 +263,7 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 - (void)refresh;                            // an IOSurface's copy for the GPU made current (rows not 128-byte multiples)
 - (void)generateMipmaps;                    // levels 1 .. from level 0 (the CPU, 2x2 boxes)
 - (RDNA4MTLTexture *)copyForReading;        // its pixels now, in a texture of its own (kept for the next time); drained first by the caller
+- (uint32_t)sampleOr;                       // the OR of some of its pixels' first 4 bytes (the trace)
 @property (readonly) BOOL shadowed;         // the GPU reads a copy of an IOSurface's pixels (refresh)
 // A view of a buffer's memory (newLinearTextureWithDescriptor:): rows `bpr` apart from `offset`.
 - (instancetype)initWithBuffer:(RDNA4MTLBuffer *)buffer descriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset
@@ -342,6 +343,18 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 
 - (BOOL)shadowed { return _surfaceRows != NULL; }
 
+- (uint32_t)sampleOr
+{
+	uint32_t v = 0;
+	for (NSUInteger y = 0; !_isDepth && y < _height; y += MAX(_height / 37, (NSUInteger)1))
+		for (NSUInteger x = 0; x < _width; x += MAX(_width / 41, (NSUInteger)1)) {
+			uint32_t w;
+			memcpy(&w, self.bytes + y * _rowBytes + x * self.bpp, MIN(self.bpp, 4u));
+			v |= w;
+		}
+	return v;
+}
+
 - (RDNA4MTLTexture *)copyForReading
 {
 	static char key;
@@ -399,6 +412,7 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 	}
 	_plane = plane;
 	_offset = offset;
+	_type = MTLTextureType2D;   // (0 is MTLTextureType1D: its T# read row 0 only, the wallpaper came out flat)
 	RTRACE(40, @"IOSurface texture %u: format %lu %lux%lu of %zux%zu, plane %lu at %lu, %zu bytes a row, usage 0x%lx", IOSurfaceGetID(surface),
 	       (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height, width, height, (unsigned long)plane,
 	       (unsigned long)offset, bpr, (unsigned long)d.usage);
@@ -439,16 +453,26 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 	if (!(self = [super init]))
 		return nil;
 	_fm = textureFormat((uint32_t)d.pixelFormat);
-	if (d.textureType != MTLTextureType2D || !_fm || !d.width || !d.height || (offset & 255) || bpr % _fm->bpp || bpr < d.width * _fm->bpp ||
+	if (d.textureType != MTLTextureType2D || !_fm || !d.width || !d.height || bpr < d.width * _fm->bpp ||
 	    offset + bpr * (d.height - 1) + d.width * _fm->bpp > buffer.length) {
 		rdna4Error([NSString stringWithFormat:@"a texture of format %lu, %lux%lu over a buffer at %lu, %lu bytes a row: only 2D of pvdraw.hpp's "
-		                                      @"formats at a multiple of 256 bytes, inside the buffer, so far", (unsigned long)d.pixelFormat,
+		                                      @"formats inside the buffer, so far", (unsigned long)d.pixelFormat,
 		                                      (unsigned long)d.width, (unsigned long)d.height, (unsigned long)offset, (unsigned long)bpr], 0);
 		return nil;
 	}
-	_memory = buffer;
-	_offset = offset;
-	_rowBytes = bpr;
+	_type = MTLTextureType2D;
+	if ((offset & 255) || (bpr & 127) || bpr % _fm->bpp) {   // where the hardware cannot read it in place (Core Animation's at offset 32): a copy
+		_surfaceRows = (const uint8_t *)buffer.contents + offset;
+		_surfaceRowBytes = bpr;
+		_rowBytes = (d.width * _fm->bpp + 255) & ~(NSUInteger)255;
+		_memory = [[RDNA4MTLBuffer alloc] initWithDevice:(RDNA4MTLDevice *)buffer.device length:_rowBytes * d.height options:MTLResourceStorageModeShared];
+		RDNA4MTLBuffer *source = buffer;
+		[_memory keepOwner:^{ (void)source; }];   // the memory the copy is of stays while the texture does
+	} else {
+		_memory = buffer;
+		_offset = offset;
+		_rowBytes = bpr;
+	}
 	_device = (RDNA4MTLDevice *)buffer.device;
 	_width = d.width;
 	_height = d.height;
@@ -637,6 +661,12 @@ RDNA4_ANSWER_MISSING
 }
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr
+{
+	return [[RDNA4MTLTexture alloc] initWithBuffer:self descriptor:d offset:offset bytesPerRow:bpr];
+}
+
+// Metal's "tiled" textures over memory (Core Animation's, WindowServer): rows `bpr` apart all the same, so linear here.
+- (id<MTLTexture>)newTiledTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr
 {
 	return [[RDNA4MTLTexture alloc] initWithBuffer:self descriptor:d offset:offset bytesPerRow:bpr];
 }
@@ -1224,6 +1254,9 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 @interface RDNA4MTLCommandBuffer : NSObject <MTLCommandBuffer>
 - (instancetype)initWithQueue:(RDNA4MTLCommandQueue *)queue;
 - (void)record:(RDNA4Op)op;       // runs once the draws before it have finished
+// set*Bytes data: copied into a 256 KiB chunk of the command buffer's (256-byte aligned), so that thousands of them are not a buffer each
+// (WindowServer ran the kext's runtime out of buffers); returns the chunk, the data at *offset in it
+- (id<MTLBuffer>)stage:(const void *)bytes length:(NSUInteger)length offset:(NSUInteger *)offset;
 - (void)recordDraw:(RDNA4Op)op;   // a draw: submitted behind the draws before it, not waited for
 @end
 
@@ -1293,8 +1326,9 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 
 - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	id<MTLBuffer> copy = [self.device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared];
-	[self setBuffer:copy offset:0 atIndex:index];
+	NSUInteger at = 0;
+	id<MTLBuffer> chunk = [_commandBuffer stage:bytes length:length offset:&at];
+	[self setBuffer:chunk offset:at atIndex:index];
 }
 
 - (void)setAccelerationStructure:(id<MTLAccelerationStructure>)as atBufferIndex:(NSUInteger)index
@@ -1490,12 +1524,16 @@ RDNA4_ANSWER_MISSING
 
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	[self bind:0 buffer:[self.device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared] offset:0 index:index];
+	NSUInteger at = 0;
+	id<MTLBuffer> chunk = [_commandBuffer stage:bytes length:length offset:&at];
+	[self bind:0 buffer:chunk offset:at index:index];
 }
 
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	[self bind:1 buffer:[self.device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared] offset:0 index:index];
+	NSUInteger at = 0;
+	id<MTLBuffer> chunk = [_commandBuffer stage:bytes length:length offset:&at];
+	[self bind:1 buffer:chunk offset:at index:index];
 }
 
 - (void)setViewport:(MTLViewport)viewport { _viewport = viewport; }
@@ -1831,6 +1869,8 @@ RDNA4_ANSWER_MISSING
 	NSMutableArray<id<MTLDrawable>> *_drawables;   // presented once the work has run
 	dispatch_group_t _scheduledGroup, _done;
 	NSMutableDictionary *_userDictionary;
+	id<MTLBuffer> _chunk;   // set*Bytes data (stage:)
+	NSUInteger _chunkUsed;
 	_Atomic MTLCommandBufferStatus _status;
 	NSError *_error;
 }
@@ -1868,6 +1908,24 @@ RDNA4_ANSWER_MISSING
 }
 - (uint64_t)globalTraceObjectID { return (uint64_t)(uintptr_t)self; }
 - (void)record:(RDNA4Op)op { [_ops addObject:op]; }
+
+- (id<MTLBuffer>)stage:(const void *)bytes length:(NSUInteger)length offset:(NSUInteger *)offset
+{
+	enum { kChunk = 256 << 10, kAlone = 64 << 10 };
+	if (length > kAlone) {
+		*offset = 0;
+		return [self.device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared];
+	}
+	if (!_chunk || _chunkUsed + length > kChunk) {
+		_chunk = [self.device newBufferWithLength:kChunk options:MTLResourceStorageModeShared];
+		_chunkUsed = 0;
+	}
+	*offset = _chunkUsed;
+	if (length)
+		memcpy((uint8_t *)_chunk.contents + _chunkUsed, bytes, length);
+	_chunkUsed += (length + 255) & ~(NSUInteger)255;
+	return _chunk;
+}
 - (void)recordDraw:(RDNA4Op)op
 {
 	[_draws addIndex:_ops.count];
@@ -2387,7 +2445,126 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 
 - (BOOL)supportsRaytracing { return YES; }
 - (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count == 1; }
-- (uint64_t)recommendedMaxWorkingSetSize { return 8ull << 30; }
+
+// A texture over the caller's memory (Core Animation's tiled textures), as a buffer of it and a linear texture over that.
+- (id<MTLTexture>)newTiledTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d
+                                          offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr
+{
+	RDNA4MTLBuffer *b = (RDNA4MTLBuffer *)[self newBufferWithBytesNoCopy:bytes length:length options:MTLResourceStorageModeShared deallocator:nil];
+	return b ? [[RDNA4MTLTexture alloc] initWithBuffer:b descriptor:d offset:offset bytesPerRow:bpr] : nil;
+}
+
+// What Apple's paravirtual device answers (mtlprobe features, Tahoe 26.6.2, 2026-11-20): _MTLDevice's own defaults describe an Apple GPU
+// (Apple family 1, programmable blending, memoryless targets, ...), and Core Animation chose techniques of those for our device that
+// the paravirtual one never sees (an empty mask shader hung WindowServer). The same draws and the same translator serve both, so the same
+// answers; ray tracing and the buffer size limit are our own.
+- (BOOL)supportsFamily:(MTLGPUFamily)family { return family == 2001 || family == 3001 || family == 3002; }   // Mac1, Common1, Common2: Apple's device's
+- (uint64_t)dedicatedMemorySize { return 1073741824ull; }
+- (uint64_t)deviceLinearReadOnlyTextureAlignmentBytes { return 256ull; }
+- (uint64_t)deviceLinearTextureAlignmentBytes { return 256ull; }
+- (uint64_t)doubleFPConfig { return 0ull; }
+- (uint64_t)featureProfile { return 10000ull; }
+- (uint64_t)halfFPConfig { return 0ull; }
+- (uint64_t)iosurfaceReadOnlyTextureAlignmentBytes { return 16ull; }
+- (BOOL)isDepth24Stencil8PixelFormatSupported { return NO; }
+- (BOOL)isFixedLinePointFillDepthGradientSupported { return YES; }
+- (BOOL)isPlacementHeapSupported { return NO; }
+- (uint64_t)linearTextureAlignmentBytes { return 256ull; }
+- (uint64_t)llvmVersion { return 32023ull; }
+- (NSUInteger)maxArgumentBufferSamplerCount { return 1024ull; }
+- (uint64_t)maxColorAttachments { return 8ull; }
+- (uint64_t)maxComputeTextures { return 128ull; }
+- (uint64_t)maxComputeThreadgroupMemory { return 32768ull; }
+- (uint64_t)maxCustomSamplePositions { return 8ull; }
+- (uint64_t)maxFragmentTextures { return 128ull; }
+- (uint64_t)maxFramebufferStorageBits { return 1024ull; }
+- (uint64_t)maxIOCommandsInFlight { return 8ull; }
+- (uint64_t)maxIndirectBuffers { return 64ull; }
+- (uint64_t)maxIndirectSamplersPerDevice { return 1024ull; }
+- (uint64_t)maxIndirectTextures { return 128ull; }
+- (uint64_t)maxInterpolants { return 32ull; }
+- (uint64_t)maxInterpolatedComponents { return 124ull; }
+- (uint64_t)maxTessellationFactor { return 64ull; }
+- (uint64_t)maxTextureBufferWidth { return 134217728ull; }
+- (uint64_t)maxTextureDimensionCube { return 16384ull; }
+- (uint64_t)maxTextureHeight2D { return 16384ull; }
+- (uint64_t)maxTextureWidth1D { return 16384ull; }
+- (uint64_t)maxTextureWidth2D { return 16384ull; }
+- (uint64_t)maxTotalComputeThreadsPerThreadgroup { return 1024ull; }
+- (uint64_t)maxTransferRate { return 63015384608ull; }
+- (uint64_t)maxVertexTextures { return 128ull; }
+- (uint64_t)maxViewportCount { return 16ull; }
+- (uint64_t)maxVisibilityQueryOffset { return 262136ull; }
+- (uint64_t)metalAssertionsEnabled { return 0ull; }
+- (uint64_t)minConstantBufferAlignmentBytes { return 256ull; }
+- (MTLReadWriteTextureTier)readWriteTextureSupport { return MTLReadWriteTextureTier1; }
+- (uint64_t)sharedMemorySize { return 5726625792ull; }
+- (uint64_t)singleFPConfig { return 0ull; }
+- (uint64_t)supportPriorityBand { return 0ull; }
+- (BOOL)supportsArrayOfSamplers { return YES; }
+- (BOOL)supportsArrayOfTextures { return YES; }
+- (BOOL)supportsBaseVertexInstanceDrawing { return YES; }
+- (BOOL)supportsBlackOrWhiteSamplerBorderColors { return YES; }
+- (BOOL)supportsBufferPrefetchStatistics { return NO; }
+- (BOOL)supportsBufferWithIOSurface { return NO; }
+- (BOOL)supportsBufferlessClientStorageTexture { return YES; }
+- (BOOL)supportsCombinedMSAAStoreAndResolveAction { return YES; }
+- (BOOL)supportsCompressedTextureViewSPI { return NO; }
+- (BOOL)supportsCountingOcclusionQuery { return YES; }
+- (BOOL)supportsDeadlineProfile { return NO; }
+- (BOOL)supportsDepthClipMode { return YES; }
+- (BOOL)supportsDynamicControlPointCount { return NO; }
+- (BOOL)supportsFastMathInfNaNPropagation { return NO; }
+- (BOOL)supportsFillTexture { return NO; }
+- (BOOL)supportsFixedLinePointFillDepthGradient { return YES; }
+- (BOOL)supportsFloat16InfNanFiltering { return YES; }
+- (BOOL)supportsForceSeamsOnCubemaps { return YES; }
+- (BOOL)supportsFragmentBufferWrites { return YES; }
+- (BOOL)supportsFragmentOnlyEncoders { return NO; }
+- (BOOL)supportsIABHashForTools { return NO; }
+- (BOOL)supportsIndirectDrawAndDispatch { return YES; }
+- (BOOL)supportsIndirectTessellation { return YES; }
+- (BOOL)supportsIndirectTextures { return YES; }
+- (BOOL)supportsIndirectWritableTextures { return YES; }
+- (BOOL)supportsInvariantVertexPosition { return NO; }
+- (BOOL)supportsLayeredRendering { return YES; }
+- (BOOL)supportsLimitedYUVFormats { return NO; }
+- (BOOL)supportsMSAADepthResolve { return YES; }
+- (BOOL)supportsMemorylessRenderTargets { return NO; }
+- (BOOL)supportsMipLevelsSmallerThanBlockSize { return YES; }
+- (BOOL)supportsMirrorClampToEdgeSamplerMode { return YES; }
+- (BOOL)supportsMutableTier1ArgumentBuffers { return YES; }
+- (BOOL)supportsNonPrivateDepthStencilTextures { return NO; }
+- (BOOL)supportsNonPrivateMSAATextures { return NO; }
+- (BOOL)supportsNonUniformThreadgroupSize { return YES; }
+- (BOOL)supportsNonZeroTextureWriteLOD { return NO; }
+- (BOOL)supportsPacked32TextureBufferWrites { return YES; }
+- (BOOL)supportsPartialRenderMemoryBarrier { return YES; }
+- (BOOL)supportsPlacementHeaps { return NO; }
+- (BOOL)supportsPrimitiveRestartOverride { return NO; }
+- (BOOL)supportsProgrammableBlending { return NO; }
+- (BOOL)supportsRayTracingTraversalMetrics { return NO; }
+- (BOOL)supportsReadWriteBufferArguments { return YES; }
+- (BOOL)supportsReadWriteTextureArguments { return YES; }
+- (BOOL)supportsReadWriteTextureCubeArguments { return YES; }
+- (BOOL)supportsRelaxedTextureViewRequirements { return NO; }
+- (BOOL)supportsRenderMemoryBarrier { return YES; }
+- (BOOL)supportsRenderTargetTextureRotation { return NO; }
+- (BOOL)supportsRenderTextureWrites { return YES; }
+- (BOOL)supportsRenderToLinearTextures { return NO; }
+- (BOOL)supportsSIMDGroup { return YES; }
+- (BOOL)supportsSamplerCompareFunction { return YES; }
+- (BOOL)supportsSeparateDepthStencil { return NO; }
+- (BOOL)supportsShaderLODAverage { return NO; }
+- (BOOL)supportsSharedStorageHeapResources { return NO; }
+- (BOOL)supportsSharedStorageTextures { return NO; }
+- (BOOL)supportsSharedTextureHandles { return NO; }
+- (BOOL)supportsTessellation { return YES; }
+- (BOOL)supportsTextureCubeArray { return YES; }
+- (BOOL)supportsTextureOutOfBoundsReads { return YES; }
+- (BOOL)supportsViewportAndScissorArray { return YES; }
+
+- (uint64_t)recommendedMaxWorkingSetSize { return 1ull << 30; }
 - (NSUInteger)maxThreadgroupMemoryLength { return 32768; }
 
 - (MTLAccelerationStructureSizes)accelerationStructureSizesWithDescriptor:(MTLAccelerationStructureDescriptor *)d
@@ -2531,7 +2708,7 @@ RDNA4_ANSWER_MISSING
 // ---- the router (the native desktop)
 
 // The paravirtual accelerator's Metal plug-in class while the kext routes it here (src/accelcensus.cpp routePv: debug.rdna4_nativemtl=2 or 3,
-// rdna4-nativews): a process the accelerator's RDNA4NativeProcesses names (WindowServer), or one started with RDNA4_NATIVE_MTL=1, gets our
+// rdna4-nativews): a process the accelerator's RDNA4NativeProcesses names (WindowServer), or one started with RDNA4_NATIVE_MTL=router, gets our
 // device for it; every other process Apple's paravirtual device, from Apple's bundle (RDNA4AppleMetalPluginName, ...ClassName), as before.
 @interface RDNA4MTLRouter : _MTLDevice
 @end
@@ -2571,7 +2748,10 @@ static NSString *serviceString(io_service_t service, CFStringRef key)
 	self = [super init];   // _MTLDevice's dealloc expects its init to have run; this object goes, the one returned stays
 	NSString *me = @(getprogname());
 	NSArray *native = [serviceString(service, CFSTR("RDNA4NativeProcesses")) componentsSeparatedByString:@","];
-	if (getenv("RDNA4_NATIVE_MTL") || ([native containsObject:me] && !crashLooping(me))) {
+	// RDNA4_NATIVE_MTL=router: this process on our device here too (=1 alone makes our device for its own service, RDNA4NativeMetal, and
+	// leaves Apple's here: the checks compare the two)
+	const char *env = getenv("RDNA4_NATIVE_MTL");
+	if ((env && !strcmp(env, "router")) || ([native containsObject:me] && !crashLooping(me))) {
 		RDNA4MTLDevice *d = [[RDNA4MTLDevice alloc] initNativeWithAcceleratorPort:service];
 		RLOG(@"RDNA4MTLRouter: %@: the native device%s", me, d ? "" : " could not be made: Apple's paravirtual device");
 		if (d)

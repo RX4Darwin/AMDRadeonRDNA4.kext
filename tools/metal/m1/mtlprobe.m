@@ -79,6 +79,8 @@
 #import <QuartzCore/QuartzCore.h>
 #include <simd/simd.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
 #import <IOSurface/IOSurface.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -2341,6 +2343,29 @@ static CALayer *caScene(void)
 	[root addSublayer:pic];
 	CGContextRelease(cg);
 	CGColorSpaceRelease(rgb);
+	if (getenv("NATIVECA_YUV")) {   // a 10-bit 4:2:0 YCbCr IOSurface as contents (the Tahoe wallpaper's kind): a luma ramp, chroma a fixed tint
+		NSDictionary *props = @{ (id)kIOSurfaceWidth : @256, (id)kIOSurfaceHeight : @256, (id)kIOSurfacePixelFormat : @('x420'),
+		                         (id)kIOSurfacePlaneInfo : @[ @{ (id)kIOSurfacePlaneWidth : @256, (id)kIOSurfacePlaneHeight : @256,
+		                                                         (id)kIOSurfacePlaneBytesPerElement : @2, (id)kIOSurfacePlaneBytesPerRow : @512 },
+		                                                      @{ (id)kIOSurfacePlaneWidth : @128, (id)kIOSurfacePlaneHeight : @128,
+		                                                         (id)kIOSurfacePlaneBytesPerElement : @4, (id)kIOSurfacePlaneBytesPerRow : @512 } ] };
+		IOSurfaceRef yuv = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		IOSurfaceLock(yuv, 0, NULL);
+		uint16_t *y = IOSurfaceGetBaseAddressOfPlane(yuv, 0), *c = IOSurfaceGetBaseAddressOfPlane(yuv, 1);
+		for (int j = 0; j < 256; j++)
+			for (int i = 0; i < 256; i++)
+				y[j * 256 + i] = (uint16_t)((64 + (i * 876) / 255) << 6);   // video range 64..940, MSB-aligned
+		for (int j = 0; j < 128; j++)
+			for (int i = 0; i < 128; i++) {
+				c[2 * (j * 128 + i)] = (uint16_t)(400 << 6);
+				c[2 * (j * 128 + i) + 1] = (uint16_t)(600 << 6);
+			}
+		IOSurfaceUnlock(yuv, 0, NULL);
+		CALayer *video = [CALayer layer];
+		video.frame = CGRectMake(250, 300, 230, 180);
+		video.contents = (__bridge id)yuv;
+		[root addSublayer:video];
+	}
 	CALayer *glass = [CALayer layer];
 	glass.frame = CGRectMake(150, 250, 300, 200);
 	glass.backgroundColor = CGColorCreateGenericRGB(0.1, 0.7, 0.3, 0.5);
@@ -2743,6 +2768,49 @@ int main(int argc, char **argv) {
 			OUT("nativewin: %s: %d frames in %.1f s (%.1f a second), %d failed", frames && !failed ? "PASS (check the window)" : "FAIL", frames,
 			    -[start timeIntervalSinceNow], frames / -[start timeIntervalSinceNow], failed);
 			return failed || !frames;
+		}
+		if (!strcmp(mode, "features")) {   // the native desktop: every argument-free BOOL / integer query of MTLDevice(SPI), as a device answers it
+			for (id<MTLDevice> dev in MTLCopyAllDevices()) {
+				OUT("features: %s", NSStringFromClass([(id)dev class]).UTF8String);
+				const char *protos[2] = { "MTLDevice", "MTLDeviceSPI" };
+				for (int k = 0; k < 2; k++) {
+					Protocol *pr = objc_getProtocol(protos[k]);
+					for (int req = 0; req < 2 && pr; req++) {
+						unsigned n = 0;
+						struct objc_method_description *m = protocol_copyMethodDescriptionList(pr, req, YES, &n);
+						for (unsigned i = 0; i < n; i++) {
+							const char *t = m[i].types;
+							const char *name = sel_getName(m[i].name);
+							if (strchr(name, ':') || ![(id)dev respondsToSelector:m[i].name])
+								continue;
+							const char r = t[0];
+							NSMethodSignature *sig = [(id)dev methodSignatureForSelector:m[i].name];
+							if (!sig || sig.numberOfArguments != 2)
+								continue;
+							@try {
+								if (r == 'B' || r == 'c') {
+									BOOL v = ((BOOL(*)(id, SEL))objc_msgSend)((id)dev, m[i].name);
+									OUT("features:   %s = %d", name, v);
+								} else if (r == 'Q' || r == 'q' || r == 'I' || r == 'i' || r == 'L' || r == 'l') {
+									unsigned long long v = ((unsigned long long(*)(id, SEL))objc_msgSend)((id)dev, m[i].name);
+									OUT("features:   %s = %llu", name, v);
+								}
+							} @catch (NSException *e) {
+								OUT("features:   %s: throws", name);
+							}
+						}
+						free(m);
+					}
+				}
+				for (long f = 1001; f <= 1009; f++)
+					OUT("features:   supportsFamily(%ld) = %d", f, [dev supportsFamily:(MTLGPUFamily)f]);
+				for (long f = 2001; f <= 2002; f++)
+					OUT("features:   supportsFamily(%ld) = %d", f, [dev supportsFamily:(MTLGPUFamily)f]);
+				for (long f = 3001; f <= 3003; f++)
+					OUT("features:   supportsFamily(%ld) = %d", f, [dev supportsFamily:(MTLGPUFamily)f]);
+				OUT("features:   supportsFamily(5001 metal3) = %d, 5002 = %d", [dev supportsFamily:(MTLGPUFamily)5001], [dev supportsFamily:(MTLGPUFamily)5002]);
+			}
+			return 0;
 		}
 		if (!strcmp(mode, "nativecd")) {   // the native desktop: what CoreDisplay's CreateMetalDevice does with the display accelerator's device
 			io_service_t acc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleParavirtAccelerator"));

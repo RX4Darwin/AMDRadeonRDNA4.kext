@@ -66,6 +66,9 @@ static int gProfile;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvprofile, CTLFLAG_RW | CTLFLAG_LOCKED, &gProfile, 0,
 	   "AMDRadeonRDNA4: time each submit on the card and name the fragment functions (and copies) that took it longest in the draw stats");
 static int gInPlace = 3;
+// 32: the displays' frames not kept on the card; 16: no target held on the card either (the other processes' draws through the paravirtual
+// device, the wallpaper's, the menu bar's, the icons', which WindowServer on the native device reads from memory; held, they never got there)
+void pvFramesInMemory(bool on) { if (on) __atomic_fetch_or(&gInPlace, 32 | 16, __ATOMIC_RELAXED); else __atomic_fetch_and(&gInPlace, ~(32 | 16), __ATOMIC_RELAXED); }
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvinplace, CTLFLAG_RW | CTLFLAG_LOCKED, &gInPlace, 0,
 	   "AMDRadeonRDNA4: what draws use in place (1 textures, 2 colour targets; 4 not IOSurface textures, 8 not Metal's); the rest is staged "
 	   "(16: without shadows, each draw's own copy; 32: the displays' frames not kept on the card; 2048: indices staged; 8192: Metal's textures "

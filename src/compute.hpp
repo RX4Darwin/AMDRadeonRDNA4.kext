@@ -796,9 +796,10 @@ private:
 	static constexpr uint32_t kHeapOffset  = 32u << 20;
 	// The legacy global caps (modes 0 and 1). Buffers as many as there are slots: the paravirtual host alone keeps hundreds (mappings,
 	// shadows), and with 256 its allocations failed once those were made.
-	static constexpr uint32_t kMaxBuffers  = 1024;
+	// 4096: WindowServer on the native Metal device (a buffer per texture, IOSurface and pipeline beside the host's hundreds) ran out at 1024.
+	static constexpr uint32_t kMaxBuffers  = 4096;
 	static constexpr uint32_t kMaxPrograms = 32;
-	static constexpr uint32_t kBufferSlots  = 1024;        // rdna4-vmshared=2: array sizes; the cap is per client (accounting), not global
+	static constexpr uint32_t kBufferSlots  = 4096;        // rdna4-vmshared=2: array sizes; the cap is per client (accounting), not global
 	static constexpr uint32_t kProgramSlots = 256;
 	static constexpr uint32_t kClientBuffers  = 128;
 	static constexpr uint32_t kClientPrograms = 16;
