@@ -68,6 +68,9 @@ kern_return_t rdna4_alloc(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out);
 /* Allocate snooped system memory, mapped into the client's GPUVM and task. */
 kern_return_t rdna4_alloc_host(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out,
                                 void **cpu);
+/* The same with RDNA4_HOST_* flags (EXECUTABLE: an IB or shader code). */
+kern_return_t rdna4_alloc_host_flags(rdna4_t *dev, uint64_t bytes, uint64_t flags, rdna4_buffer_t *out,
+                                      void **cpu);
 /* Map a page-aligned range of this process's own memory (an IOSurface's) into its GPU address space; rdna4_free unmaps it. */
 kern_return_t rdna4_import_host(rdna4_t *dev, void *address, uint64_t bytes, uint64_t flags, rdna4_buffer_t *out);
 /* A Metal function (AIR: a metallib or bitcode) translated by the kext's translator helper into `out` (`room` bytes): a kernel's code

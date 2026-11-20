@@ -324,6 +324,29 @@ from the one before; all into level 0, the glass was transparent), read-only imp
 only read, shared by other processes, mapped for the GPU without WRITEABLE; copied once, the menu bars never updated), heaps.
 Finder, Safari, Mail, System Settings, Notes and Terminal render as on Apple's device by eye.
 
-Open: the 4K (HiDPI) display's menu bar shows no app menus (the 1080p one does; not found: the titles' vibrancy draws run, no errors);
-the Dock flashed at intervals once (Sunneva; not seen in frame grabs since); every draw is still its
-own IB (about 64 us each); colour matching of DeviceRGB images (`nativeca`); MSAA, stencil, heaps not yet.
+**Menu bars, speed, logouts (2026-11-20, later):** Sunneva saw slow window drags, parts of windows flashing, the 4K menu bar without
+app menus and falls back to the login window. A stats line in WindowServer's log every 5 s (`RDNA4MTL stats:`: command buffers, draws
+and their costs, copies, barriers, host memory, live textures) found where the time and memory went. Fixed:
+
+- Command buffers run in the order they were enqueued, not committed (Core Animation enqueues one, then another, and may commit the
+  second first): run in commit order, layers landed under the ones meant below them (flashing parts, stale blocks).
+- Menu bars: WindowServer draws the titles into an IOSurface whose rows are not 128-byte multiples (the 4K one's strip, 3752x60,
+  15040 bytes a row), so into its CPU-refreshed copy; the next refresh put the surface's old (empty) pixels over them. A copy the GPU
+  drew into is now left alone until the command buffer is done and then written back into the surface. Both menu bars show the app's
+  menus.
+- Logouts: a retain cycle (mip-level views cached on their texture, each view holding the texture) kept every blur texture: WindowServer
+  passed 7000 textures and 1-3 GB, its allocations failed, Core Animation aborted it, loginwindow ended the session. Views are cached
+  weakly now (steady at about 800 textures and 200-230 MB with 11 apps). Also: a shader the translator refuses gives a pipeline whose
+  draws are left out (Core Animation aborts WindowServer when one fails to build); imports (other processes' memory) no longer count
+  against the 1 GiB host quota; the runtime holds 16384 buffers.
+- Speed: the draw IB and state pages in host memory written in place (two kext calls a draw were 55 us of its 75); a draw that samples
+  its own target reads a copy the card makes (idle barrier, then DMA_DATA into VRAM), of the rows written since the last copy only, not
+  a 33 MB CPU copy after a drain (3.8 s of every 5 while a window moved); a texture drawn by a draw in flight is waited for on the card;
+  shadows refreshed once a command buffer. WindowServer went from about 34 to about 120 command buffers a second across both displays;
+  a window moved by a test app (`wmove`, 60 moves a second asked) 46 -> 56-59 on the 4K display, 39 on the 1080p one with 11 apps.
+- The kext: its paravirtual host opened the runtime from `runDraw`, 10 KB down the tick's command walk, and IOLog's path then ran the
+  timer thread's 16 KB stack out (double fault panic); opened from the tick now.
+
+Open: a draw reading its own target still copies all rows its scissor covers (Core Animation's are full-target quads of 6 vertices:
+about 9 MB a copy, 1500 copies a second), the card is the limit now; textures live in host memory (Core Animation's private surfaces
+would belong in VRAM); colour matching of DeviceRGB images (`nativeca`); MSAA, stencil not yet.

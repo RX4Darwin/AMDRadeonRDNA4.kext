@@ -20,6 +20,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - A real queue on the native device: `commit` returns at once, command buffers complete in order on a work thread, draws go out
   without waiting for each other, and a blit encoder. Card (2026-11-19): four command buffers in flight complete in order and right,
   1000 draws in one command buffer at 64 us each, `nativespin` still at 60 frames a second.
+- WindowServer on the native device (`rdna4-nativews=3`, Tahoe): both displays' menu bars show the app's menus; command buffers
+  run in enqueue order (no more flashing or stale parts of windows); no more logouts to the login window (a texture leak and
+  shaders that did not translate aborted WindowServer); about 3.5x the frames a second while windows move (draws written in
+  place, a draw's own target copied on the card). Card (2026-11-20): 11 apps open, windows moved on both displays, no crash.
+- The paravirtual host opens the runtime from its tick (from a draw, IOLog ran the timer thread's stack out: a double fault).
 
 ## 0.3.3 (2026-11-19)
 

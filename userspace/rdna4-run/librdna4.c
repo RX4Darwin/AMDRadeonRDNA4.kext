@@ -86,7 +86,12 @@ kern_return_t rdna4_alloc(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out) {
 
 kern_return_t rdna4_alloc_host(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out,
                                 void **cpu) {
-	const uint64_t in[2] = { bytes, 0 };
+	return rdna4_alloc_host_flags(dev, bytes, 0, out, cpu);
+}
+
+kern_return_t rdna4_alloc_host_flags(rdna4_t *dev, uint64_t bytes, uint64_t flags, rdna4_buffer_t *out,
+                                      void **cpu) {
+	const uint64_t in[2] = { bytes, flags };
 	uint64_t o[3] = { 0 };
 	uint32_t n = 3;
 	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodAllocHost,
