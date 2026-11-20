@@ -32,6 +32,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - Native WindowServer: render-pass clears filled on the card in order with the draws, not by the CPU after waiting for all of them.
 - Native WindowServer, `rdna4-nativeheld=1` (off by default): the displays' frames drawn in VRAM and presented from there (new runtime
   call `PresentSource`, WindowServer only); with many apps open a moving window's display 74 % -> 98 % of frames on time.
+- Smoother cursor and frame pacing: a client's wait for its gfx fence no longer holds the runtime's lock while it polls, and the
+  paravirtual host keeps moving the cursor and raising VBL events while it waits for the card (VBLs 2 ms or more late 15 -> 1 in 5 s).
 - The paravirtual host opens the runtime from its tick (from a draw, IOLog ran the timer thread's stack out: a double fault).
 
 ## 0.3.3 (2026-11-19)

@@ -610,6 +610,7 @@ private:
 	// and the interrupt. Apple's display pipe resets the GPU when a transaction is not complete within 300 ms (IOAccelDisplayPipe,
 	// "IOAccelDisplayPipeTransaction time out after 300ms"); with the channels alone it still did (2026-11-15: no VBL or stamp for 1.8 s).
 	void serveDisplay();
+	IOReturn waitFence(uint64_t fence, uint32_t ms, uint64_t &ns);   // the card's fence, the cursor and the VBLs served meanwhile
 	void dropIrqBits();
 	// Set around translations that run before anything is built (scanPipelines; runDraw and runCompute before their batch): a present may
 	// run meanwhile, mid-command-buffer showing its surface as the draws so far left it.
@@ -2224,7 +2225,7 @@ void RDNA4PvHost::waitDraws(uint32_t line)
 		return;
 
 	const uint64_t from = nowNs();
-	const IOReturn r = gCompute->rtWaitGfxFence(this, static_cast<uint32_t>(mLastFence), kBatchWait, ns);
+	const IOReturn r = waitFence(mLastFence, kBatchWait, ns);
 
 	noteWait(line);
 	mPhaseNs[2] += nowNs() - from;
@@ -2305,13 +2306,46 @@ void RDNA4PvHost::roomForDraw(uint32_t line)
 	waitFor(mFlight[mFlightAt], line);
 }
 
+// Fence `fence` waited for in short turns with the cursor and the VBL events served between them (pollDisplay): one wait of the host's
+// for the card, behind WindowServer's frames, left the cursor standing and the VBLs up to 16 ms late (2026-11-20). Past `ms` the runtime's
+// wait, which tells and ends a hang.
+IOReturn RDNA4PvHost::waitFence(uint64_t fence, uint32_t ms, uint64_t &ns)
+{
+	const uint64_t from = nowNs();
+	uint64_t polled = from;
+
+	for (uint32_t turns = 0;; turns++) {
+		if (gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(fence))) {
+			ns = nowNs() - from;
+			return kIOReturnSuccess;
+		}
+
+		const uint64_t now = nowNs();
+
+		if (now - from > static_cast<uint64_t>(ms) * 1000000)
+			return gCompute->rtWaitGfxFence(this, static_cast<uint32_t>(fence), ms, ns);
+
+		if (now - polled > 1000000 && !mInDisplayPoll) {
+			polled = now;
+			mInDisplayPoll = true;
+			pollDisplay();
+			mInDisplayPoll = false;
+		}
+
+		if (turns < 200)
+			IODelay(10);
+		else
+			IOSleep(1);
+	}
+}
+
 // The submits up to the one with `fence` waited for (and those before it: in order), not the ones after it.
 void RDNA4PvHost::waitFor(uint64_t fence, uint32_t line)
 {
 	static constexpr uint32_t kOldestWait = 50;   // ms
 	uint64_t ns = 0;
 	const uint64_t from = nowNs();
-	const IOReturn r = gCompute->rtWaitGfxFence(this, static_cast<uint32_t>(fence), kOldestWait, ns);
+	const IOReturn r = waitFence(fence, kOldestWait, ns);
 
 	noteWait(line);
 	mPhaseNs[2] += nowNs() - from;
@@ -7077,7 +7111,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			mPhaseNs[1] += nowNs() - targetFrom;
 			step = "fence";
 			const uint64_t fenceFrom = nowNs();
-			r = gCompute->rtWaitGfxFence(this, static_cast<uint32_t>(fence), kDrawWait, ns);
+			r = waitFence(fence, kDrawWait, ns);
 			afterFence = nowNs();
 			mPhaseNs[2] += afterFence - fenceFrom;
 			mPending = 0;   // in order: those before it are done too

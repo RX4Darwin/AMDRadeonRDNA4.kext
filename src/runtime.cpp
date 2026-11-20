@@ -3681,7 +3681,7 @@ bool RDNA4Compute::pauseUnlocked(const RtClient &c, const void *owner) {
 
 /* `pause`: the caller holds rtLock and nothing of the client's but the client itself; the lock is let go between the polls after the first
  * 2 ms (pauseUnlocked). */
-bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why, bool pause) {
+bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why, bool pause, uint32_t firstPoll) {
 	// Slow is not hung: past the timeout the wait goes on while the CP still moves (another IB, less of it left, or fences coming), up to
 	// kMovingMs in all, and ends only once nothing moved for kStillMs. Copies of 4K targets from the guest's memory took longer than the
 	// host's 50 ms in a batch, and the ring was ended under them (2026-11-07).
@@ -3694,7 +3694,7 @@ bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(kMovingMs) * 1000000, &moving);
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(kStillMs) * 1000000, &still);
 	bool done = false;
-	for (uint32_t polls = 0;; polls++) {
+	for (uint32_t polls = firstPoll;; polls++) {
 		done = fenceReached(*c.gfxFenceCpu, fence);
 		const uint64_t now = mach_absolute_time();
 
@@ -3805,6 +3805,25 @@ bool RDNA4Compute::rtGfxFenceDone(const void *owner, uint32_t fence) {
 }
 
 IOReturn RDNA4Compute::rtWaitGfxFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns) {
+	// The first 2 ms polled without the lock: held, it kept every other client from submitting meanwhile (WindowServer's frames waited
+	// behind the paravirtual host's waits and the other way round, the cursor and the VBL events late, 2026-11-20). The caller's own fence
+	// page stays while its call runs (a client is closed after its calls).
+	volatile uint32_t *own = nullptr;
+	{
+		Locked g(rtLock);
+		RtClient *c = ownerStateLocked(owner) == kIOReturnSuccess && vmEnabled ? vmClientFor(owner) : nullptr;
+		own = c && gfxMode && !gfxWedged && timeoutMs <= RDNA4_MAX_TIMEOUT_MS && static_cast<int32_t>(fence - c->gfxFence) <= 0 ? c->gfxFenceCpu
+		                                                                                                                      : nullptr;
+	}
+	const uint64_t t0 = mach_absolute_time();
+	uint32_t polls = 0;
+	for (; own && polls < 200; polls++) {
+		if (fenceReached(*own, fence)) {
+			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+			return kIOReturnSuccess;
+		}
+		IODelay(10);
+	}
 	Locked g(rtLock);
 	IdleUse idle(this, "wait-gfx");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
 	checkPresentationTimeoutLocked();
@@ -3823,7 +3842,7 @@ IOReturn RDNA4Compute::rtWaitGfxFence(const void *owner, uint32_t fence, uint32_
 	if (gfxWedged)
 		return kIOReturnNotResponding;
 	waitAborted = false;
-	if (gfxClientWait(*c, fence, timeoutMs ? timeoutMs : 1000, ns, "IB wait", true))
+	if (gfxClientWait(*c, fence, timeoutMs ? timeoutMs : 1000, ns, "IB wait", true, own ? polls : 0))
 		return kIOReturnSuccess;
 	if (c->owner != owner)
 		return kIOReturnNotOpen;

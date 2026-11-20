@@ -418,3 +418,12 @@ commit to done 4.5 -> 2.2 ms (at most 6), write-backs about 80 MB a second; the 
 Not tested: system sleep with held surfaces (VRAM is lost in sleep; the device does not refill on wake yet), a CPU screenshot
 (`screencapture` cannot capture over ssh), display mode changes.
 
+**Cursor and frame pacing (2026-11-20, evening):** Sunneva: dragging windows and moving the mouse still a bit laggy and choppy. The
+paravirtual host moves the hardware cursor and raises the VBL events WindowServer paces on from its tick; its VBL events came up to
+8-16 ms late (15 in 5 s by 2 ms or more) while a window moved. Two causes: `rtWaitGfxFence` busy-polled its first 2 ms holding the
+runtime's lock, so every wait (WindowServer's slot waits and drains, the host's ~400 a second) kept the other clients from submitting
+and the host from presenting; and the host's own waits for the card (behind WindowServer's frames) left the cursor and the VBLs standing.
+Now the runtime polls the first 2 ms without the lock (the caller's own fence page stays while its call runs), and the host waits in
+short turns with `pollDisplay` (cursor, VBL events, the interrupt) between them. Card: VBL events 240-400 -> 140 us late on average
+while a window moves, 1 in 5 s by 2 ms or more (the latest 4.4 ms, was 8-16); frames at the next vblank 97 %.
+
