@@ -507,7 +507,7 @@ void guardSet(const char *what)
 
 // rdna4-accel (a boot-arg, or a test boot's: rdna4-trial "armed rdna4-accel=4"): the steps at boot, before WindowServer if it can,
 // once the family is solved, the GPU known and its first framebuffer up (the rest of the boot heads a moment later).
-// rdna4-accel=4 as a boot-arg: IOKit kept busy (IOResources) from the plugin's start until the accelerator is registered, so that
+// rdna4-accel=4 as a boot-arg: IOKit kept busy (IOResources) from the GPU's attach until the accelerator is registered, so that
 // WindowServer, which waits for IOKit to be quiet before it starts (WSInitialize: IOKitWaitQuiet), finds it: without, it started first and
 // never used it (2026-11-20). Released on every way out of accelAtBoot.
 bool gHolding;
@@ -524,6 +524,13 @@ void accelAtBoot(void *, wait_result_t)
 {
 	for (int ms = 0; ms < 60000 && !RDNA4AccelCensus::gpu(); ms += 100)
 		IOSleep(100);
+	// held from here, not from the plugin's start: held from there, the GPU never attached (what attaches it waits for IOKit to be
+	// quiet too) and the attempt timed out (2026-11-20)
+	uint32_t early = 0;   // (the boot-arg; a test boot's option is read below)
+	if (RDNA4AccelCensus::gpu() && PE_parse_boot_argn("rdna4-accel", &early, sizeof(early)) && early == 4) {
+		IOService::getResourceService()->adjustBusy(1);
+		gHolding = true;
+	}
 	// asked only now: at the plugin's start NVRAM is not there yet and a test boot's options read as none (2026-11-20)
 	uint32_t want = 0;
 	if (!Trial::option("rdna4-accel", want) || want < 1 || want > 4) {
@@ -569,11 +576,6 @@ void RDNA4Accel::start()
 			familyLoaded(patcher, index, address, size);
 	}, nullptr);
 	sysctl_register_oid(&sysctl__debug_rdna4_accel);
-	uint32_t early = 0;   // (the boot-arg is readable now; a test boot's option is not)
-	if (PE_parse_boot_argn("rdna4-accel", &early, sizeof(early)) && early == 4) {
-		IOService::getResourceService()->adjustBusy(1);
-		gHolding = true;
-	}
 	thread_t th;   // (it waits for the GPU, then reads rdna4-accel)
 	if (kernel_thread_start(accelAtBoot, nullptr, &th) == KERN_SUCCESS)
 		thread_deallocate(th);
