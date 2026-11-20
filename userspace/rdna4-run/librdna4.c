@@ -101,6 +101,17 @@ kern_return_t rdna4_alloc_host(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out
 	return kr;
 }
 
+kern_return_t rdna4_translate(rdna4_t *dev, const void *air, uint64_t airBytes, const char *name, void *out, uint64_t room,
+                              uint64_t *bytes, uint32_t *buffers) {
+	const uint64_t in[5] = { (uint64_t)(uintptr_t)air, airBytes, (uint64_t)(uintptr_t)name, (uint64_t)(uintptr_t)out, room };
+	uint64_t o[2] = { 0 };
+	uint32_t n = 2;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodTranslate, in, 5, o, &n);
+	*bytes = kr == KERN_SUCCESS ? o[0] : 0;
+	*buffers = (uint32_t)o[1];
+	return kr;
+}
+
 kern_return_t rdna4_import_host(rdna4_t *dev, void *address, uint64_t bytes, uint64_t flags, rdna4_buffer_t *out) {
 	const uint64_t in[3] = { (uint64_t)(uintptr_t)address, bytes, flags };
 	uint64_t o[2] = { 0 };

@@ -251,4 +251,62 @@ a blit fill) without waiting: they complete in order with the right results, the
 draws in one command buffer, read back by a blit, right, 64 us a draw (two `rdna4_write` calls and a submit each: one IB per command
 buffer when that matters). `nativespin` still presents at 60 frames a second from the work queue.
 
-Next: the device for every app (no `RDNA4_NATIVE_MTL`) once it answers what ordinary apps ask, and WindowServer on it.
+## The native desktop: Core Animation, then WindowServer
+
+WindowServer composites with Core Animation's Metal renderer (`CA::OGL::MetalContext`). The same renderer runs in any process through
+`CARenderer`, so `mtlprobe nativeca` renders one layer tree (solid colours, rounded corners and borders, a gradient, text, an image, a
+half-transparent layer) on the paravirtual device and on ours and compares them pixel by pixel. What it needed, all ported from the PV
+host's `runDraw` (the bundle is Objective-C++ now and includes `src/pvdraw.hpp`, which got the PV host's `textureFormat` table):
+
+- Metal's own libraries (`_MTLDevice`'s `newLibraryWithURL:` / `Data:`): Core Animation makes its shaders with function constants
+  (`newFunctionWithDescriptor:`), which Metal's `_MTLLibrary` specialises; its functions give their AIR as `-bitcodeData` (gate 7's path).
+- Textures of every format of `textureFormat` (RGBA16Float, R8, RG16F, ...), IOSurface planes, textures over buffers
+  (`newLinearTextureWithDescriptor:`), clears of any of them.
+- Colour attachments of every `colourInfo` format; per attachment blend states and the PV host's choice of one attachment per draw (header
+  bits 20-30, `RDNA4_MTLC_TABLE_ATTACHMENT`); blending with the alpha-only second pass; blend colour; scissor rectangles; vertex
+  descriptors (`RDNA4_MTLC_TABLE_ATTRIBUTES`); explicit-LOD sampling (level T#s; one level so far); primitive restart.
+- `newBufferWithBytesNoCopy:` of read-only memory (a CGImage's pixels): the kext cannot wire it for the GPU, so it is copied.
+
+Result on the rig (2026-11-19): the native render matches the paravirtual one by eye; 6156 of 262144 pixels differ, all in the image,
+which the paravirtual path colour-matches (DeviceRGB to the target's space) and ours does not yet (open).
+
+WindowServer takes its device from the accelerator that drives the displays, the paravirtual one. The kext can point that accelerator's
+Metal plug-in at our bundle (`src/accelcensus.cpp` `routePv`; `debug.rdna4_nativemtl=2` / `3` at run time, `rdna4-nativews=2` / `3` from
+the boot), class `RDNA4MTLRouter`: in the processes the accelerator's `RDNA4NativeProcesses` names (WindowServer with 3), or started with
+`RDNA4_NATIVE_MTL=1`, it makes our device; everywhere else Apple's paravirtual device from Apple's bundle, as before. With
+`rdna4-client-policy=local` the kext also lets WindowServer (`_windowserver`, uid 88) open its runtime client, with the local
+restrictions. Route 2 (nobody native) checked on the rig: new processes get Apple's device through the router and its compute, render,
+texture, blend, depth and dual-source checks complete.
+
+### WindowServer on the native device (rdna4-nativews=3), 2026-11-20: where it stands
+
+What it took to get WindowServer composing on `RDNA4MTLDevice` (each found on the rig, one boot at a time):
+
+- WindowServer's sandbox: it may open only user clients whose class starts with `IOAccel` (`com.apple.WindowServer.sb`), so the kext's
+  runtime client is `IOAccelRDNA4ComputeClient` (a subclass, same code); and it may not start programs, so the device translates through
+  the kext (`kRDNA4MethodTranslate`, `rdna4_translate`): the kext queues the AIR to the translator helper in the paravirtual host's request
+  slot (`pvTranslateForClient`; the host's own requests and these take turns, `waitForSlot`).
+- `rdna4-client-policy=local` admits `_windowserver` (uid 88) as it does the console user. The device returns nil without its runtime
+  client (the router then makes Apple's device), and waits up to 15 s for the gfx ring (WindowServer makes its device about a second
+  before the kext's gfx ring is up).
+- Metal and CoreDisplay: `MTLCopyDeviceForRegistryID` hands out `[[service weakDevice] _deviceWrapper]` (ours: the device itself);
+  CoreDisplay loads its own `default.metallib` and needs a BGR10A2Unorm target and a 1D-array R32Float gamma LUT; SkyLight's
+  `CompositorMetal::new_compositor` picks the device whose `acceleratorPort` is the display's accelerator (else "null compositor", a
+  black desktop); WindowServer commits with `commitAndWaitUntilSubmitted` and its own completion queue (`setCompletionQueue:`);
+  MPS (the desktop's blurs) keeps its state in the command buffer's `userDictionary` and runs kernels with textures (the kernel texture
+  table, air2amdgpu.cpp's ABI).
+- The paravirtual host keeps presented display frames on the card (`keepOnCard`) and scans that copy out, which only Apple's driver's
+  draws update: with WindowServer native, `debug.rdna4_pvinplace` needs bit 32 (35) for the scanout to read the frames' memory.
+- Textures: mipmapped 2D (levels as images of their own, real level T#s, `generateMipmaps` by the CPU), 3D (the hardware's pitches),
+  IOSurfaces whose rows are not 128-byte multiples (a CPU-refreshed copy), the PV host's spare texel in unbound slots (an all-zero T# can
+  stall the texture unit), a barrier before reading what a draw in flight draws, a copy of the target when a draw samples it.
+- A safety net: the router counts WindowServer's starts on the native device (a file in its temporary directory); the third start within
+  two minutes gets Apple's device, so a crash loop ends with the desktop back.
+
+**Open (2026-11-20):** the compositor runs and draws (Core Animation's pipelines, CoreDisplay's), but one Core Animation shader,
+`VfxU10Xh / TkfhBvcmA2Xh_IsrcM1` (a fragment function with no values from the vertex stage, drawing into a 3840x192 or 896x448
+BGRA8 surface), hangs the gfx ring on every boot (fence after it never reached; draws before it finish); after that nothing draws until a
+reboot. Not yet known why: the same register sequence as the PV host's; reading its own target from a copy and a barrier before it did
+not change it. Next: log its RGFX registers (SPI_PS_INPUT_ENA/ADDR: a pixel shader enabling no barycentric input hangs AMD hardware)
+and compare with the PV host's run of it. `rdna4-nativews` is off in the rig's config.plist again; the kext and the bundle on the rig
+are this state (Apple's device for everything without the boot-arg).

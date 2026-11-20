@@ -413,7 +413,7 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 		return;
 	}
 	svc->compute = this;
-	svc->setProperty("IOUserClientClass", "RDNA4ComputeClient");
+	svc->setProperty("IOUserClientClass", "IOAccelRDNA4ComputeClient");   // RDNA4ComputeClient (userclient.hpp)
 	svc->setProperty("ABI", static_cast<uint64_t>(RDNA4_COMPUTE_ABI), 32);
 	svc->setProperty("HeapBytes", devHeap.size() ? devHeap.size() : heap.size(), 64);
 	svc->setProperty("DMA", dmaReady);

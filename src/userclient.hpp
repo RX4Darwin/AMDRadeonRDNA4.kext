@@ -82,10 +82,17 @@ private:
 	static IOReturn sSubmitGfxIb(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sWaitGfxFence(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sImportHost(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sTranslate(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sPvNext(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sPvAccess(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sPvDone(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sSensorsEx(OSObject *t, void *, IOExternalMethodArguments *a);
+};
+
+// The class clients get (runtime.cpp's IOUserClientClass): RDNA4ComputeClient under a name WindowServer's sandbox lets it open
+// (com.apple.WindowServer.sb allows iokit-open of classes prefixed IOAccel), for the native desktop (docs/native-metal-spike.md).
+class IOAccelRDNA4ComputeClient : public RDNA4ComputeClient {
+	OSDeclareDefaultStructors(IOAccelRDNA4ComputeClient)
 };
 
 #endif /* RDNA4UserClient_hpp */

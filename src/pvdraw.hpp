@@ -53,6 +53,7 @@ static inline uint32_t colourInfo(uint32_t format, bool swap) {
 	case 10: return 0x00020001u;    // R8Unorm
 	case 25: return 0x00020702u;    // R16Float
 	case 90: return 0x00020009u;    // RGB10A2Unorm
+	case 94: return 0x00020809u;    // BGR10A2Unorm: 2_10_10_10, COMP_SWAP ALT (WindowServer's display surfaces on the native device)
 	case 103: return 0x0003040bu;   // RG32Uint: 32_32 UINT, BLEND_BYPASS as Mesa's for integers (WindowServer's brim_init_lpf, Tahoe)
 	case 104: return 0x0003050bu;   // RG32Sint
 	case 63: return 0x00030405u;    // RG16Uint: 16_16 UINT, BLEND_BYPASS (WindowServer's brim_init_lpf at 4K, Tahoe)
@@ -150,6 +151,7 @@ static inline bool clearPattern(uint32_t format, const uint64_t rgba[4], uint32_
 	case 25: pattern = doubleAsHalf(rgba[0]) * 0x00010001u; return true;
 	case 65: pattern = doubleAsHalf(rgba[0]) | doubleAsHalf(rgba[1]) << 16; return true;
 	case 90: pattern = unormN(rgba[0], 10) | unormN(rgba[1], 10) << 10 | unormN(rgba[2], 10) << 20 | unormN(rgba[3], 2) << 30; return true;
+	case 94: pattern = unormN(rgba[2], 10) | unormN(rgba[1], 10) << 10 | unormN(rgba[0], 10) << 20 | unormN(rgba[3], 2) << 30; return true;
 	case 103: case 104: {   // RG32Uint, RG32Sint: both 32-bit halves the same whole number (WindowServer's brim passes, Tahoe)
 		int64_t x, y;
 		pattern = 0;
@@ -195,6 +197,37 @@ static inline uint32_t halfAsFloat(uint32_t n, bool negative) {
 
 // The same for a signed n, |n| < 2^24.
 static inline uint32_t halfAsFloat(int64_t n) { return halfAsFloat(static_cast<uint32_t>(n < 0 ? -n : n), n < 0); }
+
+// A Metal pixel format's gfx12 image format, DST_SEL and bytes a pixel (what textures may be), or nullptr.
+struct TextureFormat { uint32_t metal, gfx, sel, bpp; };
+
+static inline const TextureFormat *textureFormat(uint32_t metal) {
+	static const TextureFormat fmts[] = {{70, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {71, 66, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},    // RGBA8 unorm, sRGB
+	                                     {80, 42, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4}, {81, 66, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // BGRA8 unorm, sRGB
+	                                     {55, 22, 4 | 0 << 3 | 0 << 6 | 1 << 9, 4}, {115, 57, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // R32Float, RGBA16Float
+	                                     {125, 63, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16},                                             // RGBA32Float
+	                                     {110, 51, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},                                              // RGBA16 unorm
+	                                     {1, 1, 4 << 9, 1}, {10, 1, 4 | 1 << 9, 1}, {11, 64, 4 | 1 << 9, 1},         // A8, R8 unorm, sRGB
+	                                     {30, 14, 4 | 5 << 3 | 1 << 9, 2}, {31, 65, 4 | 5 << 3 | 1 << 9, 2},                      // RG8 unorm, sRGB
+	                                     {20, 7, 4 | 1 << 9, 2}, {25, 13, 4 | 1 << 9, 2},                                          // R16 unorm, float
+	                                     {60, 23, 4 | 5 << 3 | 1 << 9, 4}, {65, 29, 4 | 5 << 3 | 1 << 9, 4},                       // RG16 unorm, float
+	                                     {90, 36, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {94, 36, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // RGB10A2, BGR10A2
+	                                     {92, 30, 4 | 5 << 3 | 6 << 6 | 1 << 9, 4}, {110, 51, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // RG11B10Float, RGBA16
+	                                     // integer formats (VideoToolbox's scaler writes RGBA32Uint and reads HEIC tiles' chroma as RG8Uint):
+	                                     // gfx11/12 IMG_FORMAT 8_UINT 5, 16_UINT 11, 8_8_UINT 18, 32_UINT 20, 16_16_UINT 27, 8_8_8_8_UINT 46,
+	                                     // 32_32_UINT 48, 16_16_16_16_UINT 55, 32_32_32_32_UINT 61
+	                                     {13, 5, 4 | 1 << 9, 1}, {23, 11, 4 | 1 << 9, 2}, {53, 20, 4 | 1 << 9, 4},                 // R8, R16, R32 uint
+	                                     {33, 18, 4 | 5 << 3 | 1 << 9, 2},                                                         // RG8 uint
+	                                     {63, 27, 4 | 5 << 3 | 1 << 9, 4}, {73, 46, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},              // RG16, RGBA8 uint
+	                                     {103, 48, 4 | 5 << 3 | 1 << 9, 8}, {113, 55, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},            // RG32, RGBA16 uint
+	                                     {104, 49, 4 | 5 << 3 | 1 << 9, 8},                                                         // RG32 sint (32_32_SINT)
+	                                     {123, 61, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16}};                                           // RGBA32 uint
+	for (const TextureFormat &e : fmts)
+		if (e.metal == metal)
+			return &e;
+
+	return nullptr;
+}
 
 // A linear 2D image's T# (SQ_IMG_RSRC_WORD0-7, as ac_build_gfx12_texture_descriptor, one mip level, a custom pitch) at t: gfx12 image format,
 // DST_SEL x, y, z, w (4 X .. 7 W, 0 zero, 1 one), width, height, pitch in pixels.

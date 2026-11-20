@@ -7,8 +7,9 @@ out=Build/native/AMDRadeonRDNA4Metal.bundle
 rm -rf "$out"
 mkdir -p "$out/Contents/MacOS"
 cp tools/metal/native/Info.plist "$out/Contents/Info.plist"
-clang -arch x86_64 -mmacosx-version-min=13.0 -fobjc-arc -Wall -Wno-protocol -Wno-objc-protocol-property-synthesis -bundle \
-	-Iinclude -Iuserspace/rdna4-run tools/metal/native/RDNA4MTLDevice.m userspace/rdna4-run/librdna4.c \
+clang -arch x86_64 -mmacosx-version-min=13.0 -Wall -Iinclude -c userspace/rdna4-run/librdna4.c -o Build/native/librdna4.o
+clang++ -std=c++17 -arch x86_64 -mmacosx-version-min=13.0 -fobjc-arc -Wall -Wno-protocol -Wno-objc-protocol-property-synthesis -Wno-objc-protocol-method-implementation -bundle \
+	-Iinclude -Iuserspace/rdna4-run -Isrc tools/metal/native/RDNA4MTLDevice.mm Build/native/librdna4.o \
 	-framework Foundation -framework Metal -framework IOKit -framework IOSurface -framework QuartzCore -o "$out/Contents/MacOS/AMDRadeonRDNA4Metal"
 # its own translator when one is built (tools/metal/m3/build.sh helper), so the system's helper, which WindowServer's paravirtual
 # drawing uses, need not change for the native device

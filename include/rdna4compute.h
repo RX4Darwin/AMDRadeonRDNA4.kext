@@ -95,6 +95,11 @@ enum {
 	/* page-aligned address in the caller's task, bytes, flags (RDNA4_HOST_*) -> handle, GPU VA. The caller's own memory (an
 	 * IOSurface's) wired and mapped into its GPU address space; freed with Free, which unwires it. */
 	kRDNA4MethodImportHost,
+	/* AIR's address and bytes (a metallib or bitcode, at most RDNA4_MTLC_MAX_LIB), the function name's address (NUL-terminated, under 64
+	 * bytes), the result's address and room (RDNA4_MTLC_MAX_ELF) -> the result's bytes, the kernel's buffer count. The function translated
+	 * by the translator helper (include/rdna4mtlc.h): a kernel's code object or a shader's RGFX blob. For callers that cannot start the
+	 * translator themselves (WindowServer's sandbox); kIOReturnUnsupported in builds without the paravirtual GPU. */
+	kRDNA4MethodTranslate,
 	kRDNA4MethodCount
 };
 

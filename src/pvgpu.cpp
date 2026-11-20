@@ -3394,36 +3394,6 @@ bool PvScanout::copySurface(uint32_t sid, uint8_t *dst, uint32_t pitch, uint32_t
 }
 
 // Metal pixel format -> gfx12 image format, its DST_SEL x, y, z, w (4 X .. 7 W, 0 zero, 1 one), bytes per pixel
-struct TextureFormat { uint32_t metal, gfx, sel, bpp; };
-
-static const TextureFormat *textureFormat(uint32_t metal) {
-	static const TextureFormat fmts[] = {{70, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {71, 66, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},    // RGBA8 unorm, sRGB
-	                                     {80, 42, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4}, {81, 66, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // BGRA8 unorm, sRGB
-	                                     {55, 22, 4 | 0 << 3 | 0 << 6 | 1 << 9, 4}, {115, 57, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // R32Float, RGBA16Float
-	                                     {125, 63, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16},                                             // RGBA32Float
-	                                     {110, 51, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},                                              // RGBA16 unorm
-	                                     {1, 1, 4 << 9, 1}, {10, 1, 4 | 1 << 9, 1}, {11, 64, 4 | 1 << 9, 1},         // A8, R8 unorm, sRGB
-	                                     {30, 14, 4 | 5 << 3 | 1 << 9, 2}, {31, 65, 4 | 5 << 3 | 1 << 9, 2},                      // RG8 unorm, sRGB
-	                                     {20, 7, 4 | 1 << 9, 2}, {25, 13, 4 | 1 << 9, 2},                                          // R16 unorm, float
-	                                     {60, 23, 4 | 5 << 3 | 1 << 9, 4}, {65, 29, 4 | 5 << 3 | 1 << 9, 4},                       // RG16 unorm, float
-	                                     {90, 36, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {94, 36, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // RGB10A2, BGR10A2
-	                                     {92, 30, 4 | 5 << 3 | 6 << 6 | 1 << 9, 4}, {110, 51, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // RG11B10Float, RGBA16
-	                                     // integer formats (VideoToolbox's scaler writes RGBA32Uint and reads HEIC tiles' chroma as RG8Uint):
-	                                     // gfx11/12 IMG_FORMAT 8_UINT 5, 16_UINT 11, 8_8_UINT 18, 32_UINT 20, 16_16_UINT 27, 8_8_8_8_UINT 46,
-	                                     // 32_32_UINT 48, 16_16_16_16_UINT 55, 32_32_32_32_UINT 61
-	                                     {13, 5, 4 | 1 << 9, 1}, {23, 11, 4 | 1 << 9, 2}, {53, 20, 4 | 1 << 9, 4},                 // R8, R16, R32 uint
-	                                     {33, 18, 4 | 5 << 3 | 1 << 9, 2},                                                         // RG8 uint
-	                                     {63, 27, 4 | 5 << 3 | 1 << 9, 4}, {73, 46, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},              // RG16, RGBA8 uint
-	                                     {103, 48, 4 | 5 << 3 | 1 << 9, 8}, {113, 55, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},            // RG32, RGBA16 uint
-	                                     {104, 49, 4 | 5 << 3 | 1 << 9, 8},                                                         // RG32 sint (32_32_SINT)
-	                                     {123, 61, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16}};                                           // RGBA32 uint
-	for (const TextureFormat &e : fmts)
-		if (e.metal == metal)
-			return &e;
-
-	return nullptr;
-}
-
 // A texture's IOSurface: any format of textureFormat() for sampling (CoreAnimation's layers come as RGBA16Float too), the colour targets
 // check for BGRA8 themselves. Dword 13 of the descriptor is the plane: a texture of a biplanar surface's second plane (CoreAnimation's RG8
 // masks beside their colour, behind vibrancy) has that plane's offset, rows and size; taken as the whole surface's it was refused, and
@@ -7663,6 +7633,12 @@ uint32_t RDNA4PvHost::program(unsigned kernel) {
 // Whether a translator helper is connected, waiting up to kHelperWait for one: WindowServer draws its first frames before launchd has started
 // the helper, and a draw left out is not drawn again until its region changes. Waits once until a helper connects; while the helper
 // restarts (it exits when lld cannot run again) the same.
+// With gTr.lock held: until no request is in the slot (the host's and the runtime clients' requests take turns: pvTranslateForClient).
+static void waitForSlot() {
+	while (gTr.id)
+		IOLockSleep(gTr.lock, &gTr.seq, THREAD_UNINT);
+}
+
 static bool waitForHelper() {
 	static constexpr uint32_t kHelperWait = 20;   // seconds
 	uint64_t deadline = 0;
@@ -7728,6 +7704,7 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	mTranslations++;
 	const uint64_t askedAt = nowNs();
 	IOLockLock(gTr.lock);
+	waitForSlot();
 	gTr.id = ++gTr.seq ? gTr.seq : ++gTr.seq;   // never 0 (0 = no request)
 	gTr.taken = gTr.done = false;
 	gTr.lib = bytes;
@@ -7760,6 +7737,7 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	gTr.id = 0;
 	gTr.lib = nullptr;
 	gTr.elf = nullptr;
+	IOLockWakeup(gTr.lock, &gTr.seq, false);   // the slot is free (waitForSlot)
 	IOLockUnlock(gTr.lock);
 	IOFree(bytes, size);
 	if (!done) {
@@ -10477,3 +10455,42 @@ IOReturn pvTranslatorClient(IOService *service, task_t owningTask, void *securit
 }
 
 void pvgpu::routeGlPages(KernelPatcher &patcher) { routeGlPagesNow(patcher); }
+
+#ifdef AMDRadeonRDNA4_PVGPU
+// A runtime client's function translated by the helper (kRDNA4MethodTranslate: the native Metal device in WindowServer, whose sandbox does
+// not let it start the translator itself; docs/native-metal-spike.md): `lib` (a metallib or AIR bitcode, the caller's) and `name` in the
+// request slot, after any request before it; the result IOMalloc'd into *out (the caller frees it), or an error.
+IOReturn pvTranslateForClient(const uint8_t *lib, uint32_t libLen, const char *name, uint8_t *&out, uint32_t &outLen, uint32_t &buffers)
+{
+	out = nullptr;
+	outLen = buffers = 0;
+	if (!gTr.lock || !waitForHelper())
+		return kIOReturnNotReady;
+	IOLockLock(gTr.lock);
+	waitForSlot();
+	gTr.id = ++gTr.seq ? gTr.seq : ++gTr.seq;
+	gTr.taken = gTr.done = false;
+	gTr.lib = lib;
+	gTr.libLen = libLen;
+	strlcpy(gTr.name, name, sizeof(gTr.name));
+	IOLockWakeup(gTr.lock, &gTr.id, false);
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(20, kSecondScale, &deadline);   // WindowServer's largest shaders take the helper 6 s
+	while (!gTr.done && IOLockSleepDeadline(gTr.lock, &gTr.done, deadline, THREAD_UNINT) == THREAD_AWAKENED) {
+	}
+	const bool done = gTr.done;
+	out = done ? gTr.elf : nullptr;
+	outLen = done ? gTr.elfLen : 0;
+	buffers = done ? gTr.buffers : 0;
+	if (!done && gTr.elf)
+		IOFree(gTr.elf, gTr.elfLen);
+	gTr.id = 0;
+	gTr.lib = nullptr;
+	gTr.elf = nullptr;
+	IOLockWakeup(gTr.lock, &gTr.seq, false);
+	IOLockUnlock(gTr.lock);
+	if (!done)
+		return kIOReturnTimeout;
+	return out ? kIOReturnSuccess : kIOReturnUnsupported;   // delivered empty: the helper could not translate it
+}
+#endif

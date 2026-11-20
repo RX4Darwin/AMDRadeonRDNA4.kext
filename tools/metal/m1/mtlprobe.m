@@ -76,7 +76,7 @@
 //        -framework AppKit -framework QuartzCore -o mtlprobe
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
-#import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/QuartzCore.h>
 #include <simd/simd.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurface.h>
@@ -2301,6 +2301,54 @@ static float nativeRandom(uint32_t *seed)   // a fixed sequence (LCG), the same 
 // The native-Metal spike's gate 5: `kRays` rays from a grid at z = 0, tilted, against `kTris` random triangles at z 2-6 (a fixed seed), in
 // an acceleration structure; each ray's hit (distance, barycentrics, primitive id) against the nearest one by the CPU (Moller-Trumbore,
 // no structure). A distance within 1e-4 counts as the same hit (the primitive may then differ: two triangles at that distance).
+extern id<MTLDevice> MTLCopyDeviceForRegistryID(uint64_t registryID) NS_RETURNS_RETAINED;   // Metal's (CoreDisplay uses it)
+
+// A layer tree as an app's window has them: solid colours, rounded corners and borders, a gradient, text, an image, transparency.
+static CALayer *caScene(void)
+{
+	CALayer *root = [CALayer layer];
+	root.frame = CGRectMake(0, 0, 512, 512);
+	root.backgroundColor = CGColorCreateGenericRGB(0.95, 0.95, 0.97, 1);
+	CALayer *box = [CALayer layer];
+	box.frame = CGRectMake(32, 32, 200, 140);
+	box.backgroundColor = CGColorCreateGenericRGB(0.9, 0.2, 0.2, 1);
+	box.cornerRadius = 24;
+	box.borderWidth = 4;
+	box.borderColor = CGColorCreateGenericRGB(0.1, 0.2, 0.8, 1);
+	[root addSublayer:box];
+	CAGradientLayer *g = [CAGradientLayer layer];
+	g.frame = CGRectMake(270, 32, 210, 140);
+	g.colors = @[ (__bridge_transfer id)CGColorCreateGenericRGB(1, 0.8, 0, 1), (__bridge_transfer id)CGColorCreateGenericRGB(0, 0.6, 0.9, 1) ];
+	[root addSublayer:g];
+	CATextLayer *text = [CATextLayer layer];
+	text.frame = CGRectMake(32, 200, 448, 80);
+	text.string = @"RDNA4 native";
+	text.fontSize = 56;
+	text.foregroundColor = CGColorCreateGenericRGB(0.1, 0.1, 0.1, 1);
+	text.contentsScale = 1;
+	[root addSublayer:text];
+	CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
+	CGContextRef cg = CGBitmapContextCreate(NULL, 64, 64, 8, 256, rgb, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+	for (int y = 0; y < 8; y++)
+		for (int x = 0; x < 8; x++) {
+			CGContextSetRGBFillColor(cg, (x + y) & 1, 0.5, ((x + y) & 1) ^ 1, 1);
+			CGContextFillRect(cg, CGRectMake(8 * x, 8 * y, 8, 8));
+		}
+	CALayer *pic = [CALayer layer];
+	pic.frame = CGRectMake(32, 300, 180, 180);
+	pic.contents = (__bridge_transfer id)CGBitmapContextCreateImage(cg);
+	pic.magnificationFilter = kCAFilterNearest;
+	[root addSublayer:pic];
+	CGContextRelease(cg);
+	CGColorSpaceRelease(rgb);
+	CALayer *glass = [CALayer layer];
+	glass.frame = CGRectMake(150, 250, 300, 200);
+	glass.backgroundColor = CGColorCreateGenericRGB(0.1, 0.7, 0.3, 0.5);
+	glass.cornerRadius = 12;
+	[root addSublayer:glass];
+	return root;
+}
+
 // Gate 8: the queue. Command buffers committed without waiting complete in order; blits; many draws in one command buffer, timed.
 static BOOL nativeQueue(id<MTLDevice> d, id<MTLComputePipelineState> scale, id<MTLRenderPipelineState> rps, MTLRenderPassDescriptor *pass,
                         id<MTLTexture> tex)
@@ -2695,6 +2743,91 @@ int main(int argc, char **argv) {
 			OUT("nativewin: %s: %d frames in %.1f s (%.1f a second), %d failed", frames && !failed ? "PASS (check the window)" : "FAIL", frames,
 			    -[start timeIntervalSinceNow], frames / -[start timeIntervalSinceNow], failed);
 			return failed || !frames;
+		}
+		if (!strcmp(mode, "nativecd")) {   // the native desktop: what CoreDisplay's CreateMetalDevice does with the display accelerator's device
+			io_service_t acc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleParavirtAccelerator"));
+			uint64_t rid = 0;
+			IORegistryEntryGetRegistryEntryID(acc, &rid);
+			id<MTLDevice> d = MTLCopyDeviceForRegistryID(rid);
+			OUT("nativecd: MTLCopyDeviceForRegistryID(0x%llx): %s", rid, d ? NSStringFromClass([(id)d class]).UTF8String : "nil");
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				OUT("nativecd: listed: %s, registry ID 0x%llx", NSStringFromClass([(id)dev class]).UTF8String, dev.registryID);
+			d = d ?: MTLCopyDeviceForRegistryID(rid);
+			OUT("nativecd: again: %s", d ? NSStringFromClass([(id)d class]).UTF8String : "nil");
+			NSError *err = nil;
+			id<MTLLibrary> lib = [d newLibraryWithFile:@"/System/Library/Frameworks/CoreDisplay.framework/Versions/A/Resources/default.metallib" error:&err];
+			OUT("nativecd: library %s %s", lib ? NSStringFromClass([(id)lib class]).UTF8String : "nil", err.localizedDescription.UTF8String ?: "");
+			id<MTLFunction> f[3] = { [lib newFunctionWithName:@"ViewportToNDC"], [lib newFunctionWithName:@"TextureCopy"], [lib newFunctionWithName:@"ColorFill"] };
+			OUT("nativecd: functions %p %p %p", f[0], f[1], f[2]);
+			for (int k = 1; k < 3; k++) {
+				MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+				rd.vertexFunction = f[0];
+				rd.fragmentFunction = f[k];
+				rd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+				id<MTLRenderPipelineState> ps = [d newRenderPipelineStateWithDescriptor:rd error:&err];
+				OUT("nativecd: pipeline %s: %s %s", k == 1 ? "TextureCopy" : "ColorFill", ps ? "made" : "NOT made", ps ? "" : err.localizedDescription.UTF8String);
+			}
+			return 0;
+		}
+		if (!strcmp(mode, "nativeca")) {   // the native desktop's first step: Core Animation's own Metal renderer (CARenderer) on our device
+			id<MTLDevice> mine = nil, pv = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					mine = dev;
+				else
+					pv = dev;
+			if (!mine || !pv) {
+				OUT("nativeca: FAIL: want RDNA4MTLDevice and the paravirtual device (have %s, %s)", mine ? "ours" : "-", pv ? "PV" : "-");
+				return 1;
+			}
+			const char *dir = argc > 2 ? argv[2] : ".";
+			uint32_t *img[2];
+			id<MTLDevice> devs[2] = { pv, mine };
+			for (int k = 0; k < 2; k++) {
+				CALayer *root = caScene();
+				MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:512 height:512 mipmapped:NO];
+				td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+				td.storageMode = MTLStorageModeShared;
+				id<MTLTexture> t = [devs[k] newTextureWithDescriptor:td];
+				id<MTLCommandQueue> q = [devs[k] newCommandQueue];
+				CARenderer *r = [CARenderer rendererWithMTLTexture:t options:@{ kCARendererMetalCommandQueue : q }];
+				r.layer = root;
+				r.bounds = CGRectMake(0, 0, 512, 512);
+				[CATransaction flush];
+				[r beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];
+				[r addUpdateRect:r.bounds];
+				[r render];
+				[r endFrame];
+				id<MTLCommandBuffer> cb = [q commandBuffer];   // behind CA's own command buffers on this queue
+				[cb commit];
+				[cb waitUntilCompleted];
+				img[k] = calloc(512 * 512, 4);
+				[t getBytes:img[k] bytesPerRow:2048 fromRegion:MTLRegionMake2D(0, 0, 512, 512) mipmapLevel:0];
+				NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:512 pixelsHigh:512 bitsPerSample:8
+				                                                           samplesPerPixel:4 hasAlpha:YES isPlanar:NO
+				                                                            colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:2048 bitsPerPixel:32];
+				for (int i = 0; i < 512 * 512; i++) {   // BGRA -> RGBA
+					const uint32_t v = img[k][i];
+					((uint32_t *)rep.bitmapData)[i] = (v & 0xff00ff00u) | (v >> 16 & 0xff) | (v & 0xff) << 16;
+				}
+				NSString *path = [NSString stringWithFormat:@"%s/ca-%s.png", dir, k ? "native" : "pv"];
+				[[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:path atomically:YES];
+				OUT("nativeca: %s: rendered (%s), pixel (256,256) 0x%08x -> %s", k ? "native" : "PV", NSStringFromClass([(id)devs[k] class]).UTF8String,
+				    img[k][256 * 512 + 256], path.UTF8String);
+			}
+			int off = 0, worst = 0, firstX = -1, firstY = -1;
+			for (int i = 0; i < 512 * 512; i++) {
+				int m = 0;
+				for (int c = 0; c < 32; c += 8)
+					m = MAX(m, abs((int)(img[0][i] >> c & 0xff) - (int)(img[1][i] >> c & 0xff)));
+				worst = MAX(worst, m);
+				if (m > 8 && !off++)
+					firstX = i % 512, firstY = i / 512;
+			}
+			OUT("nativeca: %s: %d of %d pixels differ by more than 8 (worst %d)%s", off < 512 ? "PASS" : "FAIL", off, 512 * 512, worst,
+			    off ? [NSString stringWithFormat:@"; first at (%d,%d): PV 0x%08x, native 0x%08x", firstX, firstY, img[0][firstY * 512 + firstX],
+			                                     img[1][firstY * 512 + firstX]].UTF8String : "");
+			return off < 512 ? 0 : 1;
 		}
 		if (!strcmp(mode, "nativesrc")) {   // the native-Metal spike's gate 7: does Metal's own compiler make a library for RDNA4MTLDevice?
 			id<MTLDevice> d = nil;
