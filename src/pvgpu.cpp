@@ -319,8 +319,12 @@ void routeGlPagesNow(KernelPatcher &patcher) {
 	if (!gGlPatches && !gMac2Patch)
 		return;
 
+	// cs_validate_page is a function several Lilu plugins wrap (RestrictEvents on every Monterey or later, BlueToolFixup, FeatureUnlock,
+	// WhateverGreen, ...), each with routeMultipleLong, as Lilu demands of a function routed more than once: with a short jump here, the next
+	// plugin's route ends in Lilu's panic ("previous plugin had short jump type on a multiroute function") while PCI is being configured:
+	// the machine resets or hangs right after "console relocated", with no panic log (NVRAM is not up yet).
 	KernelPatcher::RouteRequest request {"_cs_validate_page", wrapValidatePage, orgValidatePage};
-	const bool ok = patcher.routeMultiple(KernelPatcher::KernelID, &request, 1);
+	const bool ok = patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1);
 
 	if (!ok)
 		patcher.clearError();
