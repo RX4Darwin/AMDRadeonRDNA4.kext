@@ -14,6 +14,10 @@ class IOAccelEventMachine2;
 class IOAccelEventMachineFast2;
 class IOAccelDisplayMachine;
 class IOAccelResource2;
+class IOAccelMemory;
+class IOAccelSysMemory;
+class IOAccelVidMemory;
+class IOAccelDisplayPipe;
 class IOAccelAllocationInfo;
 class IOAccelChannel2;
 class IOAccelClientSharedRO;
@@ -21,16 +25,15 @@ class IOAccelClientSharedRW;
 class IOAccelCommandDescriptor;
 class IOAccelConfig;
 class IOAccelContext2;
+class IOAccelDisplayPipeScaler;
+class IOAccelDisplayPipeTransaction2;
 class IOAccelEvent;
 class IOAccelEventQueue;
 class IOAccelGetResourceInfoReturnData;
-class IOAccelMemory;
 class IOAccelNewResourceArgs;
 class IOAccelResourcePrivate;
 class IOAccelShared2;
 class IOAccelSurface;
-class IOAccelSysMemory;
-class IOAccelVidMemory;
 class IOSurface;
 class vendevtBarrierRec;
 class vendevtCommandRec;
@@ -458,3 +461,185 @@ private:
 };
 static_assert(sizeof(IOAccelResource2) == 0x180, "the KDK's size");
 enum : size_t { kIOAccelResource2Size = 0x180 };
+
+class IOAccelMemory : public OSObject {
+public:
+	virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;   // the key function (see accelgen.py)
+	class MetaClass : public OSMetaClass { public: OSObject *alloc() const APPLE_KEXT_OVERRIDE; };
+	static MetaClass gMetaClass;   // a placeholder in our kext (ioaccel_thunks.S): our subclasses' superclass link is patched
+protected:
+	IOAccelMemory(const OSMetaClass *meta);
+	virtual ~IOAccelMemory() APPLE_KEXT_OVERRIDE;
+public:
+	// slots 35-59 its own (the KDK's order), the rest overrides; pure ones named after __ZTV16IOAccelSysMemory's
+	virtual void release() const APPLE_KEXT_OVERRIDE; // 5
+	virtual void free() APPLE_KEXT_OVERRIDE; // 18
+	virtual bool init(IOGraphicsAccelerator2*); // 35
+	virtual uintptr_t getLength() const; // 36
+	virtual uintptr_t getDirtySize() const = 0; // 37
+	virtual uintptr_t getResidentSize() const = 0; // 38
+	virtual uintptr_t createMappingInTask(IOAccelTask*, unsigned int); // 39
+	virtual uintptr_t createMappingInTaskAtAddressLength(IOAccelTask*, unsigned int, unsigned long long, unsigned long long); // 40
+	virtual uintptr_t prepare(); // 41
+	virtual uintptr_t complete(); // 42
+	virtual uintptr_t getPhysicalSegment(unsigned long long, unsigned long long*) = 0; // 43
+	virtual uintptr_t setPurgeable(unsigned int, unsigned int*) = 0; // 44
+	virtual uintptr_t setTag(unsigned int) = 0; // 45
+	virtual uintptr_t getTag() = 0; // 46
+	virtual uintptr_t matchForReuse(void*, unsigned long long) = 0; // 47
+	virtual uintptr_t _RESERVEDIOAccelMemory0(); // 48
+	virtual uintptr_t _RESERVEDIOAccelMemory1(); // 49
+	virtual uintptr_t _RESERVEDIOAccelMemory2(); // 50
+	virtual uintptr_t _RESERVEDIOAccelMemory3(); // 51
+	virtual uintptr_t _RESERVEDIOAccelMemory4(); // 52
+	virtual uintptr_t _RESERVEDIOAccelMemory5(); // 53
+	virtual uintptr_t wire() = 0; // 54
+	virtual uintptr_t unwire() = 0; // 55
+	virtual uintptr_t orphanIt(); // 56
+	virtual uintptr_t unorphanIt(IOAccelShared2*); // 57
+	virtual uintptr_t increment_wire_count() = 0; // 58
+	virtual uintptr_t decrement_wire_count() = 0; // 59
+
+private:
+	uint8_t opaque_[0xb0 - sizeof(OSObject)];
+};
+static_assert(sizeof(IOAccelMemory) == 0xb0, "the KDK's size");
+enum : size_t { kIOAccelMemorySize = 0xb0 };
+
+class IOAccelSysMemory : public IOAccelMemory {
+public:
+	virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;   // the key function (see accelgen.py)
+	class MetaClass : public OSMetaClass { public: OSObject *alloc() const APPLE_KEXT_OVERRIDE; };
+	static MetaClass gMetaClass;   // a placeholder in our kext (ioaccel_thunks.S): our subclasses' superclass link is patched
+protected:
+	IOAccelSysMemory(const OSMetaClass *meta);
+	virtual ~IOAccelSysMemory() APPLE_KEXT_OVERRIDE;
+public:
+	// slots 60-65 its own (the KDK's order), the rest overrides; pure ones named after -'s
+	virtual void free() APPLE_KEXT_OVERRIDE; // 18
+	virtual bool init(IOGraphicsAccelerator2*) APPLE_KEXT_OVERRIDE; // 35
+	virtual uintptr_t getDirtySize() const APPLE_KEXT_OVERRIDE; // 37
+	virtual uintptr_t getResidentSize() const APPLE_KEXT_OVERRIDE; // 38
+	virtual uintptr_t complete() APPLE_KEXT_OVERRIDE; // 42
+	virtual uintptr_t getPhysicalSegment(unsigned long long, unsigned long long*) APPLE_KEXT_OVERRIDE; // 43
+	virtual uintptr_t setPurgeable(unsigned int, unsigned int*) APPLE_KEXT_OVERRIDE; // 44
+	virtual uintptr_t setTag(unsigned int) APPLE_KEXT_OVERRIDE; // 45
+	virtual uintptr_t getTag() APPLE_KEXT_OVERRIDE; // 46
+	virtual uintptr_t matchForReuse(void*, unsigned long long) APPLE_KEXT_OVERRIDE; // 47
+	virtual uintptr_t wire() APPLE_KEXT_OVERRIDE; // 54
+	virtual uintptr_t unwire() APPLE_KEXT_OVERRIDE; // 55
+	virtual uintptr_t orphanIt() APPLE_KEXT_OVERRIDE; // 56
+	virtual uintptr_t unorphanIt(IOAccelShared2*) APPLE_KEXT_OVERRIDE; // 57
+	virtual uintptr_t increment_wire_count() APPLE_KEXT_OVERRIDE; // 58
+	virtual uintptr_t decrement_wire_count() APPLE_KEXT_OVERRIDE; // 59
+	virtual uintptr_t _RESERVEDIOAccelSysMemory0(); // 60
+	virtual uintptr_t _RESERVEDIOAccelSysMemory1(); // 61
+	virtual uintptr_t _RESERVEDIOAccelSysMemory2(); // 62
+	virtual uintptr_t _RESERVEDIOAccelSysMemory3(); // 63
+	virtual uintptr_t _RESERVEDIOAccelSysMemory4(); // 64
+	virtual uintptr_t _RESERVEDIOAccelSysMemory5(); // 65
+
+private:
+	uint8_t opaque_[0x198 - sizeof(IOAccelMemory)];
+};
+static_assert(sizeof(IOAccelSysMemory) == 0x198, "the KDK's size");
+enum : size_t { kIOAccelSysMemorySize = 0x198 };
+
+class IOAccelVidMemory : public IOAccelMemory {
+public:
+	virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;   // the key function (see accelgen.py)
+	class MetaClass : public OSMetaClass { public: OSObject *alloc() const APPLE_KEXT_OVERRIDE; };
+	static MetaClass gMetaClass;   // a placeholder in our kext (ioaccel_thunks.S): our subclasses' superclass link is patched
+protected:
+	IOAccelVidMemory(const OSMetaClass *meta);
+	virtual ~IOAccelVidMemory() APPLE_KEXT_OVERRIDE;
+public:
+	// slots 60-68 its own (the KDK's order), the rest overrides; pure ones named after __ZTV32AMDRadeonX6000_AMDAccelVidMemory's
+	virtual void free() APPLE_KEXT_OVERRIDE; // 18
+	virtual uintptr_t getDirtySize() const APPLE_KEXT_OVERRIDE; // 37
+	virtual uintptr_t getResidentSize() const APPLE_KEXT_OVERRIDE; // 38
+	virtual uintptr_t prepare() APPLE_KEXT_OVERRIDE; // 41
+	virtual uintptr_t complete() APPLE_KEXT_OVERRIDE; // 42
+	virtual uintptr_t setPurgeable(unsigned int, unsigned int*) APPLE_KEXT_OVERRIDE; // 44
+	virtual uintptr_t setTag(unsigned int) APPLE_KEXT_OVERRIDE; // 45
+	virtual uintptr_t getTag() APPLE_KEXT_OVERRIDE; // 46
+	virtual uintptr_t matchForReuse(void*, unsigned long long) APPLE_KEXT_OVERRIDE; // 47
+	virtual uintptr_t wire() APPLE_KEXT_OVERRIDE; // 54
+	virtual uintptr_t unwire() APPLE_KEXT_OVERRIDE; // 55
+	virtual uintptr_t orphanIt() APPLE_KEXT_OVERRIDE; // 56
+	virtual uintptr_t unorphanIt(IOAccelShared2*) APPLE_KEXT_OVERRIDE; // 57
+	virtual uintptr_t increment_wire_count() APPLE_KEXT_OVERRIDE; // 58
+	virtual uintptr_t decrement_wire_count() APPLE_KEXT_OVERRIDE; // 59
+	virtual bool init(IOGraphicsAccelerator2*, IOAccelShared2*, IOAccelResource2*, unsigned long long, void*); // 60
+	virtual uintptr_t allocPhysical() = 0; // 61
+	virtual uintptr_t deallocPhysical() = 0; // 62
+	virtual uintptr_t _RESERVEDIOAccelVidMemory0(); // 63
+	virtual uintptr_t _RESERVEDIOAccelVidMemory1(); // 64
+	virtual uintptr_t _RESERVEDIOAccelVidMemory2(); // 65
+	virtual uintptr_t _RESERVEDIOAccelVidMemory3(); // 66
+	virtual uintptr_t _RESERVEDIOAccelVidMemory4(); // 67
+	virtual uintptr_t _RESERVEDIOAccelVidMemory5(); // 68
+
+private:
+	uint8_t opaque_[0x110 - sizeof(IOAccelMemory)];
+};
+static_assert(sizeof(IOAccelVidMemory) == 0x110, "the KDK's size");
+enum : size_t { kIOAccelVidMemorySize = 0x110 };
+
+class IOAccelDisplayPipe : public IOService {
+public:
+	virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;   // the key function (see accelgen.py)
+	class MetaClass : public OSMetaClass { public: OSObject *alloc() const APPLE_KEXT_OVERRIDE; };
+	static MetaClass gMetaClass;   // a placeholder in our kext (ioaccel_thunks.S): our subclasses' superclass link is patched
+protected:
+	IOAccelDisplayPipe(const OSMetaClass *meta);
+	virtual ~IOAccelDisplayPipe() APPLE_KEXT_OVERRIDE;
+public:
+	// slots 266-305 its own (the KDK's order), the rest overrides; pure ones named after -'s
+	virtual void free() APPLE_KEXT_OVERRIDE; // 18
+	virtual bool init(IOGraphicsAccelerator2*, IOAccelDisplayMachine*, IOFramebuffer*, unsigned int); // 266
+	virtual uintptr_t initFramebufferResource(unsigned int, IOAccelResource2*); // 267
+	virtual uintptr_t destroyFramebufferResource(unsigned int, IOAccelResource2*); // 268
+	virtual uintptr_t displayModeWillChange(); // 269
+	virtual uintptr_t displayModeDidChange(); // 270
+	virtual uintptr_t enableVBLInterrupt(); // 271
+	virtual uintptr_t disableVBLInterrupt(); // 272
+	virtual uintptr_t enableTransactionInterrupt(); // 273
+	virtual uintptr_t disableTransactionInterrupt(); // 274
+	virtual uintptr_t newDisplayPipeTransaction(); // 275
+	virtual uintptr_t validateTransaction(IOAccelDisplayPipeTransaction2*); // 276
+	virtual uintptr_t performTransaction(IOAccelDisplayPipeTransaction2*); // 277
+	virtual uintptr_t isTransactionComplete(IOAccelDisplayPipeTransaction2*); // 278
+	virtual uintptr_t submitTransaction(IOAccelDisplayPipeTransaction2*); // 279
+	virtual uintptr_t getDisplayModePipeScalerSetup(IOAccelDisplayPipeScaler*); // 280
+	virtual uintptr_t createWorkLoop(); // 281
+	virtual uintptr_t copyCapabilities(); // 282
+	virtual uintptr_t beginTransaction(IOAccelEvent*); // 283
+	virtual uintptr_t signalTransactionComplete(IOAccelEvent*); // 284
+	virtual uintptr_t framebufferTerminated(); // 285
+	virtual uintptr_t wsaaEnterDefer(int); // 286
+	virtual uintptr_t wsaaWillExitDefer(int); // 287
+	virtual uintptr_t wsaaDidExitDefer(int); // 288
+	virtual uintptr_t wsaaWillEnterDefer(int); // 289
+	virtual uintptr_t wsaaDidEnterDefer(int); // 290
+	virtual uintptr_t willPowerOff(); // 291
+	virtual uintptr_t didPowerOn(); // 292
+	virtual uintptr_t logTransactionTimeoutDiagnosisReport(); // 293
+	virtual uintptr_t getStampIndex() const; // 294
+	virtual uintptr_t triage(char**, unsigned long long*); // 295
+	virtual uintptr_t _RESERVEDIOAccelDisplayPipe1(); // 296
+	virtual uintptr_t _RESERVEDIOAccelDisplayPipe2(); // 297
+	virtual uintptr_t _RESERVEDIOAccelDisplayPipe3(); // 298
+	virtual uintptr_t _RESERVEDIOAccelDisplayPipe4(); // 299
+	virtual uintptr_t _RESERVEDIOAccelDisplayPipe5(); // 300
+	virtual uintptr_t _RESERVEDIOAccelDisplayPipe6(); // 301
+	virtual uintptr_t _RESERVEDIOAccelDisplayPipe7(); // 302
+	virtual uintptr_t framebuffer_will_power_off(); // 303
+	virtual uintptr_t framebuffer_did_power_on(); // 304
+	virtual uintptr_t framebuffer_terminated(); // 305
+
+private:
+	uint8_t opaque_[0x318 - sizeof(IOService)];
+};
+static_assert(sizeof(IOAccelDisplayPipe) == 0x318, "the KDK's size");
+enum : size_t { kIOAccelDisplayPipeSize = 0x318 };

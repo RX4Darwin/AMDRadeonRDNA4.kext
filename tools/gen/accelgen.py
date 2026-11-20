@@ -71,6 +71,10 @@ CLASSES = [
     ('IOAccelEventMachineFast2', 'IOAccelEventMachine2', (AMD, '__ZTV35AMDRadeonX6000_AMDAccelEventMachine')),
     ('IOAccelDisplayMachine', 'IOService', (AMD, '__ZTV37AMDRadeonX6000_AMDAccelDisplayMachine')),
     ('IOAccelResource2', 'OSObject', (AMD, '__ZTV31AMDRadeonX6000_AMDAccelResource')),
+    ('IOAccelMemory', 'OSObject', (FAMILY, '__ZTV16IOAccelSysMemory')),   # (its pure ones named after the family's own system memory)
+    ('IOAccelSysMemory', 'IOAccelMemory', None),
+    ('IOAccelVidMemory', 'IOAccelMemory', (AMD, '__ZTV32AMDRadeonX6000_AMDAccelVidMemory')),
+    ('IOAccelDisplayPipe', 'IOService', None),
 ]
 
 

@@ -19,6 +19,9 @@
 #include <sys/sysctl.h>
 
 #include "accelcensus.hpp"
+#include "rdna4compute.h"
+#include "trial.hpp"
+#include "userclient.hpp"
 #include "ioaccel.hpp"
 #include "klog.hpp"
 #include "rdna4accel.hpp"
@@ -75,6 +78,10 @@ RDNA4_ACCEL_BASE(IOAccelEventMachine2)
 RDNA4_ACCEL_BASE(IOAccelEventMachineFast2)
 RDNA4_ACCEL_BASE(IOAccelDisplayMachine)
 RDNA4_ACCEL_BASE(IOAccelResource2)
+RDNA4_ACCEL_BASE(IOAccelMemory)
+RDNA4_ACCEL_BASE(IOAccelSysMemory)
+RDNA4_ACCEL_BASE(IOAccelVidMemory)
+RDNA4_ACCEL_BASE(IOAccelDisplayPipe)
 
 // The family objects the family's start asks for. The event machine's four (its stamps and barriers in command buffers) and the
 // memory map's three (the GPU page table) are for submissions through the family, which nothing makes yet: they do nothing.
@@ -132,6 +139,72 @@ public:
 };
 RDNA4_ACCEL_STRUCTORS(RDNA4Resource, IOAccelResource2)
 
+// System memory (an app's, an IOSurface's): the family's own handles all of it.
+class RDNA4SysMemory : public IOAccelSysMemory {
+	OSDeclareDefaultStructors(RDNA4SysMemory)
+};
+RDNA4_ACCEL_STRUCTORS(RDNA4SysMemory, IOAccelSysMemory)
+
+// Video memory: its physical pages are ours to give (the runtime's VRAM). Not yet: none.
+class RDNA4VidMemory : public IOAccelVidMemory {
+	OSDeclareDefaultStructors(RDNA4VidMemory)
+public:
+	uintptr_t getPhysicalSegment(unsigned long long, unsigned long long *length) APPLE_KEXT_OVERRIDE
+	{
+		if (length)
+			*length = 0;
+		return 0;
+	}
+	uintptr_t allocPhysical() APPLE_KEXT_OVERRIDE { return 0; }
+	uintptr_t deallocPhysical() APPLE_KEXT_OVERRIDE { return 0; }
+};
+RDNA4_ACCEL_STRUCTORS(RDNA4VidMemory, IOAccelVidMemory)
+
+// A display pipe (one a framebuffer). For now the family's own behaviour, each transaction hook logged (the first few): what
+// WindowServer's presents ask of a driver (AMD's pipe overrides these), before they go to the DCN.
+class RDNA4DisplayPipe : public IOAccelDisplayPipe {
+	OSDeclareDefaultStructors(RDNA4DisplayPipe)
+	using super = IOAccelDisplayPipe;
+	uint32_t logged = 0;
+	bool note(const char *what, const void *arg)
+	{
+		if (logged >= 64)
+			return false;
+		logged++;
+		rdna4Log("AMDRadeonRDNA4: accel: pipe %p: %s(%p)\n", this, what, arg);
+		return true;
+	}
+
+public:
+	uintptr_t validateTransaction(IOAccelDisplayPipeTransaction2 *t) APPLE_KEXT_OVERRIDE
+	{
+		note("validateTransaction", t);
+		return super::validateTransaction(t);
+	}
+	uintptr_t performTransaction(IOAccelDisplayPipeTransaction2 *t) APPLE_KEXT_OVERRIDE
+	{
+		note("performTransaction", t);
+		return super::performTransaction(t);
+	}
+	uintptr_t isTransactionComplete(IOAccelDisplayPipeTransaction2 *t) APPLE_KEXT_OVERRIDE { return super::isTransactionComplete(t); }
+	uintptr_t submitTransaction(IOAccelDisplayPipeTransaction2 *t) APPLE_KEXT_OVERRIDE
+	{
+		note("submitTransaction", t);
+		return super::submitTransaction(t);
+	}
+	uintptr_t beginTransaction(IOAccelEvent *e) APPLE_KEXT_OVERRIDE
+	{
+		note("beginTransaction", e);
+		return super::beginTransaction(e);
+	}
+	uintptr_t initFramebufferResource(unsigned int i, IOAccelResource2 *r) APPLE_KEXT_OVERRIDE
+	{
+		note("initFramebufferResource", r);
+		return super::initFramebufferResource(i, r);
+	}
+};
+RDNA4_ACCEL_STRUCTORS(RDNA4DisplayPipe, IOAccelDisplayPipe)
+
 class RDNA4Accelerator : public IOGraphicsAccelerator2 {
 	OSDeclareDefaultStructors(RDNA4Accelerator)
 	using super = IOGraphicsAccelerator2;
@@ -165,8 +238,9 @@ public:
 	IOAccelSurface *newSurface() APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelContext2 *new2DContext() APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelContext2 *newVideoContext() APPLE_KEXT_OVERRIDE { return nullptr; }
-	IOAccelSysMemory *newSysMemory() APPLE_KEXT_OVERRIDE { return nullptr; }
-	IOAccelVidMemory *newVidMemory() APPLE_KEXT_OVERRIDE { return nullptr; }
+	IOAccelSysMemory *newSysMemory() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4SysMemory); }
+	IOAccelVidMemory *newVidMemory() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4VidMemory); }
+	uintptr_t newDisplayPipe() APPLE_KEXT_OVERRIDE { return reinterpret_cast<uintptr_t>(OSTypeAlloc(RDNA4DisplayPipe)); }
 	IOAccelResource2 *newResource() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4Resource); }
 	IOAccelMemoryMap *newMemoryMap() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4MemoryMap); }
 };
@@ -200,10 +274,22 @@ void RDNA4Accelerator::stop(IOService *provider)
 	super::stop(provider);
 }
 
-IOReturn RDNA4Accelerator::newUserClient(task_t, void *, UInt32 type, IOUserClient **)
+static bool gFamilyClients;   // the family's own user clients (display pipes, devices, shared, ...) handed out: rdna4-accel=4 only
+
+// Our runtime's client (the native Metal device opens it through its accelerator, as through the paravirtual one: pvhooks.cpp); the
+// family's own types only when this boot's WindowServer is to use us (rdna4-accel=4), else refused.
+IOReturn RDNA4Accelerator::newUserClient(task_t task, void *security, UInt32 type, IOUserClient **handler)
 {
-	rdna4Log("AMDRadeonRDNA4: accel: user client of type 0x%x refused (skeleton)\n", static_cast<unsigned>(type));
-	return kIOReturnUnsupported;
+	if (type == RDNA4_NATIVE_UC_TYPE)
+		return rdna4AcceleratorClient(this, task, security, handler);
+	static uint32_t logged;
+	if (logged++ < 64) {
+		char name[32] = "";
+		proc_selfname(name, sizeof(name));
+		rdna4Log("AMDRadeonRDNA4: accel: user client of type 0x%x for %s: %s\n", static_cast<unsigned>(type), name,
+		         gFamilyClients ? "the family's" : "refused");
+	}
+	return gFamilyClients ? super::newUserClient(task, security, type, handler) : kIOReturnUnsupported;
 }
 
 namespace {
@@ -224,6 +310,9 @@ const Derived kDerived[] = {
 	RDNA4_DERIVED(RDNA4Task, IOAccelTask, 11),
 	RDNA4_DERIVED(RDNA4MemoryMap, IOAccelMemoryMap, 16),
 	RDNA4_DERIVED(RDNA4Resource, IOAccelResource2, 16),
+	RDNA4_DERIVED(RDNA4SysMemory, IOAccelSysMemory, 16),
+	RDNA4_DERIVED(RDNA4VidMemory, IOAccelVidMemory, 16),
+	RDNA4_DERIVED(RDNA4DisplayPipe, IOAccelDisplayPipe, 18),
 };
 constexpr size_t kDerivedCount = sizeof(kDerived) / sizeof(kDerived[0]);
 
@@ -277,14 +366,12 @@ bool gStarted;              // the family's start ran (debug.rdna4_accel=2)
 bool gDisplays;             // the display machine started (debug.rdna4_accel=3)
 
 // In steps, each logged: 1 makes one (the family's own constructor runs) and attaches it under the GPU; 2 runs the family's start;
-// 3 initialises and starts the display machine on the GPU (the family's: a display pipe for each framebuffer it finds).
-int accelSysctl SYSCTL_HANDLER_ARGS
+// 3 initialises and starts the display machine on the GPU (the family's: a display pipe for each framebuffer it finds); 4 (a test boot
+// whose WindowServer is to use us: rdna4-accel=4 with the paravirtual GPU off) also names our Metal bundle, hands out the family's
+// user clients and registers the accelerator.
+int accelTo(int value)
 {
-	int value = gDisplays ? 3 : gStarted ? 2 : gAccel ? 1 : 0;
-	const int err = sysctl_handle_int(oidp, &value, 0, req);
-	if (err || !req->newptr)
-		return err;
-	if (value < 1 || value > 3)
+	if (value < 1 || value > 4)
 		return EINVAL;
 	// (accelcensus.cpp's: an extern of its variable, which is in an anonymous namespace, linked as an unresolved lookup that OpenCore
 	// bound to junk: reading it panicked the rig, 2026-11-20)
@@ -322,7 +409,7 @@ int accelSysctl SYSCTL_HANDLER_ARGS
 			return EIO;
 		gStarted = true;
 	}
-	if (value == 3 && !gDisplays) {
+	if (value >= 3 && !gDisplays) {
 		RDNA4DisplayMachine *dm = gAccel->displayMachine;
 		if (!dm)
 			return ENODEV;
@@ -333,7 +420,39 @@ int accelSysctl SYSCTL_HANDLER_ARGS
 		rdna4Log("AMDRadeonRDNA4: accel: display machine started\n");
 		gDisplays = true;
 	}
+	if (value == 4 && !gFamilyClients) {
+		gAccel->setProperty("MetalPluginName", "AMDRadeonRDNA4Metal");   // as the native spike's service (accelcensus.cpp, level 3)
+		gAccel->setProperty("MetalPluginClassName", "RDNA4MTLDevice");
+		gFamilyClients = true;
+		gAccel->registerService();
+		rdna4Log("AMDRadeonRDNA4: accel: registered for WindowServer: our Metal bundle, the family's user clients\n");
+	}
 	return 0;
+}
+
+int accelSysctl SYSCTL_HANDLER_ARGS
+{
+	int value = gFamilyClients ? 4 : gDisplays ? 3 : gStarted ? 2 : gAccel ? 1 : 0;
+	const int err = sysctl_handle_int(oidp, &value, 0, req);
+	return err || !req->newptr ? err : accelTo(value);
+}
+
+// rdna4-accel (a boot-arg, or a test boot's: rdna4-trial "armed rdna4-accel=4"): the steps at boot, before WindowServer if it can,
+// once the family is solved, the GPU known and its first framebuffer up (the rest of the boot heads a moment later).
+void accelAtBoot(void *, wait_result_t)
+{
+	uint32_t want = 0;
+	(void)Trial::option("rdna4-accel", want);
+	for (int ms = 0; ms < 60000 && !(gReady && RDNA4AccelCensus::gpu()); ms += 100)
+		IOSleep(100);
+	OSDictionary *match = IOService::serviceMatching("IONDRVFramebuffer");
+	IOService *fb = match ? IOService::waitForMatchingService(match, 60ull * NSEC_PER_SEC) : nullptr;
+	OSSafeReleaseNULL(match);
+	OSSafeReleaseNULL(fb);
+	IOSleep(2000);
+	const int err = accelTo(static_cast<int>(want));
+	rdna4Log("AMDRadeonRDNA4: accel: rdna4-accel=%u at boot: %s (%d)\n", want, err ? "FAILED" : "done", err);
+	thread_terminate(current_thread());
 }
 
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_accel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, accelSysctl, "I",
@@ -347,4 +466,8 @@ void RDNA4Accel::start()
 			familyLoaded(patcher, index, address, size);
 	}, nullptr);
 	sysctl_register_oid(&sysctl__debug_rdna4_accel);
+	uint32_t want = 0;
+	thread_t th;
+	if (Trial::option("rdna4-accel", want) && want >= 1 && want <= 4 && kernel_thread_start(accelAtBoot, nullptr, &th) == KERN_SUCCESS)
+		thread_deallocate(th);
 }
