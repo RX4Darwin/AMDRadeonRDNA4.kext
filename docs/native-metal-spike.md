@@ -392,3 +392,14 @@ a frame. A 2D target whose pixel is a 32-bit pattern repeated (4-byte formats, a
 DMA_DATA with SRC_SEL DATA behind the idle barrier, in order with the draws; the CPU fills the rest as before. Card: non-draw steps
 2800 -> about 0 per 5 s while a window moves, waiting for draws 350 -> 130-200 ms per 5 s; Mission Control and window drags render right.
 
+**The bus is the limit (2026-11-20, afternoon):** with more apps open (Safari, Mail, Maps, Photos, ...) the glass window's drag on the
+4K display fell back to about 40 frames a second (409 of 556 at the next vblank), the card about 94 % busy. Measured: of what draws
+cover, about 94 % goes into IOSurfaces (WindowServer's displays' frames, made as render targets), about 6 % into the device's own
+textures, so private textures in VRAM would barely help. A blended full-screen 4K quad took 0.92 ms on the card into host memory and
+0.17 ms into VRAM (`mtlprobe nativebench`, in the stash below). Tried: the displays' surfaces held in VRAM (drawn and read there, the
+rows drawn written back into the surface after each command buffer, filled again when the CPU wrote it): Core Animation redraws most of
+the frame, the write-backs came to about 3 GB/s, and frames got worse (387 of 538 at the next vblank). Kept as the stash "experiment:
+held display surfaces in VRAM (rdna4-nativeheld=1) + mtlprobe nativebench". What would pay: the kext presenting from the VRAM copy
+(no write-back; other readers, screenshots, given the surface on demand), and bounds for `VfxXgb` (vertex pulling, three layouts) so its
+full-frame self-read copies shrink.
+
