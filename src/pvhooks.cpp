@@ -6,6 +6,7 @@
  */
 
 #include "pvhooks.hpp"
+#include "rdna4accel.hpp"
 #include "klog.hpp"
 #include "pvscanout.hpp"
 #include "userclient.hpp"
@@ -268,6 +269,8 @@ int wrapServiceOpen(void *service, void *task, uint32_t type, uint64_t ndr, void
 			if (PvScanout::enabled()) {
 				PLOG("WindowServer opens the GPU wrangler: held for the paravirtual GPU");
 				waitForParavirtDisplay();
+			} else {
+				RDNA4Accel::waitForWindowServer();   // our own accelerator (rdna4-accel=4), if this boot makes one
 			}
 		}
 	}

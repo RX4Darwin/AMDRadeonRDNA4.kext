@@ -507,41 +507,28 @@ void guardSet(const char *what)
 
 // rdna4-accel (a boot-arg, or a test boot's: rdna4-trial "armed rdna4-accel=4"): the steps at boot, before WindowServer if it can,
 // once the family is solved, the GPU known and its first framebuffer up (the rest of the boot heads a moment later).
-// rdna4-accel=4 as a boot-arg: IOKit kept busy (IOResources) from the GPU's attach until the accelerator is registered, so that
-// WindowServer, which waits for IOKit to be quiet before it starts (WSInitialize: IOKitWaitQuiet), finds it: without, it started first and
-// never used it (2026-11-20). Released on every way out of accelAtBoot.
-bool gHolding;
-void holdRelease()
+// The boot thread's end (whatever the outcome): what WindowServer's first wrangler open waits for (RDNA4Accel::waitForWindowServer)
+bool gBootDone;
+void bootDone()
 {
-	if (gHolding) {
-		gHolding = false;
-		IOService::getResourceService()->adjustBusy(-1);
-		rdna4Log("AMDRadeonRDNA4: accel: IOKit released (WindowServer may start)\n");
-	}
+	gBootDone = true;
 }
 
 void accelAtBoot(void *, wait_result_t)
 {
 	for (int ms = 0; ms < 60000 && !RDNA4AccelCensus::gpu(); ms += 100)
 		IOSleep(100);
-	// held from here, not from the plugin's start: held from there, the GPU never attached (what attaches it waits for IOKit to be
-	// quiet too) and the attempt timed out (2026-11-20)
-	uint32_t early = 0;   // (the boot-arg; a test boot's option is read below)
-	if (RDNA4AccelCensus::gpu() && PE_parse_boot_argn("rdna4-accel", &early, sizeof(early)) && early == 4) {
-		IOService::getResourceService()->adjustBusy(1);
-		gHolding = true;
-	}
 	// asked only now: at the plugin's start NVRAM is not there yet and a test boot's options read as none (2026-11-20)
 	uint32_t want = 0;
 	if (!Trial::option("rdna4-accel", want) || want < 1 || want > 4) {
-		holdRelease();
+		bootDone();
 		thread_terminate(current_thread());
 		return;
 	}
 	if (guardIs("pending")) {
 		rdna4Log("AMDRadeonRDNA4: accel: rdna4-accel=%u: the last attempt did not survive %u s (guard \"pending\"): skipped; "
 		         "debug.rdna4_accel=0 clears the guard\n", want, kGuardSeconds);
-		holdRelease();
+		bootDone();
 		thread_terminate(current_thread());
 		return;
 	}
@@ -558,7 +545,7 @@ void accelAtBoot(void *, wait_result_t)
 	IOSleep(2000);
 	const int err = accelTo(static_cast<int>(want));
 	rdna4Log("AMDRadeonRDNA4: accel: rdna4-accel=%u at boot: %s (%d)\n", want, err ? "FAILED" : "done", err);
-	holdRelease();
+	bootDone();
 	IOSleep(kGuardSeconds * 1000);
 	guardSet("survived");
 	rdna4Log("AMDRadeonRDNA4: accel: rdna4-accel=%u survived %u s: guard cleared\n", want, kGuardSeconds);
@@ -568,6 +555,20 @@ void accelAtBoot(void *, wait_result_t)
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_accel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, accelSysctl, "I",
             "AMDRadeonRDNA4: our own IOGraphicsAccelerator2: 1 makes and attaches one, 2 runs the family's start, 3 starts the display machine (docs/native-driver-plan.md)");
 }   // namespace
+
+// WindowServer's first open of the GPU wrangler (pvhooks.cpp wrapServiceOpen): with rdna4-accel=4 as a boot-arg, held until the boot
+// thread has made and registered the accelerator (or given up), at most 60 s: WindowServer's wrangler lists each GPU's accelerator
+// when it opens, and it opened before ours existed ("accel 0x0", 2026-11-20). (A test boot's option is not known this early.)
+void RDNA4Accel::waitForWindowServer()
+{
+	uint32_t want = 0;
+	if (!PE_parse_boot_argn("rdna4-accel", &want, sizeof(want)) || want != 4)
+		return;
+	rdna4Log("AMDRadeonRDNA4: accel: WindowServer opens the GPU wrangler: held until the accelerator is registered\n");
+	for (int ms = 0; ms < 60000 && !gBootDone; ms += 50)
+		IOSleep(50);
+	rdna4Log("AMDRadeonRDNA4: accel: WindowServer let go (%s)\n", gFamilyClients ? "registered" : "NOT registered");
+}
 
 void RDNA4Accel::start()
 {
