@@ -282,6 +282,11 @@ PVDRAW_TEST   = $(HOST)/pvdraw-test
 $(PVDRAW_TEST): test/pvdraw-test.cpp src/pvdraw.hpp
 	@mkdir -p $(HOST)
 	$(CXX) -std=c++17 -Wall -O1 -o $@ test/pvdraw-test.cpp
+PVRANGE_TEST = $(HOST)/pvrange-test
+$(PVRANGE_TEST): test/pvrange-test.cpp src/pvrange.hpp
+	@mkdir -p $(HOST)
+	$(CXX) -std=c++17 -Wall -Wextra -O1 -o $@ test/pvrange-test.cpp
+
 DMUBLOAD_TEST = $(HOST)/dmubload-test
 $(DMUBLOAD_TEST): test/dmubload-test.cpp src/dmubload.cpp src/dmubload.hpp test/ref/dmub_start_linux.inc
 	@mkdir -p $(HOST)
@@ -307,11 +312,12 @@ $(HOST)/test-w12k-pm4: test/test-w12k-pm4.cpp src/pm4.cpp src/pm4.hpp
 check-isa:
 	bash test/check-isa.sh
 
-test: $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(DMUBLOAD_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
+test: $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(DMUBLOAD_TEST) $(PVRANGE_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
 	@if [ -f $(ROM) ]; then echo "$(ATOMDUMP) $(ROM)"; $(ATOMDUMP) $(ROM); else echo "$(ATOMDUMP)   (no $(ROM))"; $(ATOMDUMP); fi
 	$(PVSTREAM_TEST)
 	$(PVDRAW_TEST)
 	$(DMUBLOAD_TEST)
+	$(PVRANGE_TEST)
 	$(HOST)/test-gfx12tri
 	$(HOST)/test-gfx12tricol
 	$(HOST)/test-w12k-pm4
