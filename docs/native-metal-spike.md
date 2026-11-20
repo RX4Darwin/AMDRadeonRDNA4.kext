@@ -317,5 +317,13 @@ but for a translucent notification banner (opaque here). What the last steps wer
 - The kext keeps nothing of the paravirtual host's on the card while WindowServer is native (`debug.rdna4_pvinplace` bits 32 and 16
   from the boot): the display frames and the other processes' targets (they still draw through Apple's device) are read from memory.
 
-Open: the Dock flashes at intervals (Sunneva, watching the rig; 24 frame grabs over 33 s did not catch it); every draw is still its
+Since then (2026-11-20, fef6ef4 .. this): compute pipelines from descriptors (Core Animation's average-luma kernel: WindowServer
+aborted and logged the user out when Finder opened), the spare buffer and texture table for kernels (every dispatch faulted on address 0),
+texture views, a render pass's attachment level drawn into that level (Liquid Glass: Core Animation's blur chain draws each mip level
+from the one before; all into level 0, the glass was transparent), read-only imports (`RDNA4_HOST_READ_ONLY`: memory WindowServer may
+only read, shared by other processes, mapped for the GPU without WRITEABLE; copied once, the menu bars never updated), heaps.
+Finder, Safari, Mail, System Settings, Notes and Terminal render as on Apple's device by eye.
+
+Open: the 4K (HiDPI) display's menu bar shows no app menus (the 1080p one does; not found: the titles' vibrancy draws run, no errors);
+the Dock flashed at intervals once (Sunneva; not seen in frame grabs since); every draw is still its
 own IB (about 64 us each); colour matching of DeviceRGB images (`nativeca`); MSAA, stencil, heaps not yet.
