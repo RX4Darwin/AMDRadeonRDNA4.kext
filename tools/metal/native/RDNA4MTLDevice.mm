@@ -72,8 +72,8 @@ extern "C" {
 }
 // Where WindowServer's time goes (window drags were slow, 2026-11-20): totals, logged every 5 s while there is work ("RDNA4MTL stats: ...").
 enum RDNA4Stat { kStatBuffers, kStatDraws, kStatDrawUs, kStatDrainUs, kStatShadowBytes, kStatShadowUs, kStatSelfReads, kStatSelfReadBytes,
-	             kStatDispatches, kStatDispatchUs, kStatSlotUs, kStatBuildUs, kStatWriteUs, kStatSubmitUs, kStatBarriers, kStatWaitUs, kStatRunUs, kStatEncodeUs, kStatRecordUs, kStatAllocs, kStatAllocUs, kStatFreeUs, kStatImports, kStatImportBytes, kStatAllocBytes, kStatCount };
-static std::atomic<uint64_t> gStats[kStatCount], gLatencyMaxUs, gEncodeMaxUs;   // gLatencyMaxUs: the longest commit to done since the last report
+	             kStatDispatches, kStatDispatchUs, kStatSlotUs, kStatBuildUs, kStatWriteUs, kStatSubmitUs, kStatBarriers, kStatWaitUs, kStatRunUs, kStatEncodeUs, kStatRecordUs, kStatAllocs, kStatAllocUs, kStatFreeUs, kStatImports, kStatImportBytes, kStatAllocBytes, kStatSteps, kStatStepUs, kStatCount };
+static std::atomic<uint64_t> gStats[kStatCount], gLatencyMaxUs, gEncodeMaxUs, gStepMaxUs;   // gLatencyMaxUs: the longest commit to done since the last report
 static std::atomic<int64_t> gHostLive, gHostCount, gOrderWaiting, gShadowLive, gShadowCount, gTexturesLive, gBuffersLive;   // gauges: host memory allocated (bytes, buffers), command buffers held back
 static uint64_t nowUs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000; }
 static void statAdd(RDNA4Stat s, uint64_t v) { gStats[s] += v; }
@@ -101,7 +101,7 @@ static void statReport(void)
 	uint64_t v[kStatCount];
 	for (int i = 0; i < kStatCount; i++)
 		v[i] = gStats[i].exchange(0);
-	const uint64_t worst = gLatencyMaxUs.exchange(0), worstEncode = gEncodeMaxUs.exchange(0), n = v[kStatBuffers] ?: 1;
+	const uint64_t worst = gLatencyMaxUs.exchange(0), worstEncode = gEncodeMaxUs.exchange(0), worstStep = gStepMaxUs.exchange(0), n = v[kStatBuffers] ?: 1;
 	const double sec = (now - then) / 1e6;
 	RLOG(@"RDNA4MTL stats: %.1f s: %llu command buffers, %llu draws (%.1f ms submitting), %.1f ms waiting for draws, shadows %.1f MB (%.1f ms), "
 	     @"self-reads %llu %.1f MB copied on the card, %llu barriers on the card, %llu dispatches (%.1f ms); a draw's slot wait %.1f ms, build %.1f, writes %.1f, submit %.1f",
@@ -111,6 +111,7 @@ static void statReport(void)
 	RLOG(@"RDNA4MTL stats: a command buffer from commit to done %.2f ms (%.2f waiting for the queue, %.2f running), at most %.2f ms; "
 	     @"made to committed %.2f ms (%.2f in its draw calls), at most %.2f", (v[kStatWaitUs] + v[kStatRunUs]) / 1e3 / n, v[kStatWaitUs] / 1e3 / n,
 	     v[kStatRunUs] / 1e3 / n, worst / 1e3, v[kStatEncodeUs] / 1e3 / n, v[kStatRecordUs] / 1e3 / n, worstEncode / 1e3);
+	RLOG(@"RDNA4MTL stats: %llu steps other than draws (%.1f ms, the longest %.2f ms)", v[kStatSteps], v[kStatStepUs] / 1e3, worstStep / 1e3);
 	RLOG(@"RDNA4MTL stats: %llu buffers allocated (%.1f MB), %llu imported (%.1f MB): %.1f ms, freeing %.1f ms", v[kStatAllocs] - v[kStatImports],
 	     v[kStatAllocBytes] / 1e6, v[kStatImports], v[kStatImportBytes] / 1e6, v[kStatAllocUs] / 1e3, v[kStatFreeUs] / 1e3);
 	RLOG(@"RDNA4MTL stats: host memory %.1f MB in %lld buffers (shadows %.1f MB in %lld), %lld command buffers held back for one enqueued before them; "
@@ -406,6 +407,8 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface
                          plane:(NSUInteger)plane;
 - (void)clearTo:(MTLClearColor)colour;
+// The clear as a 32-bit pattern over `bytes` from gpuBase (a 2D colour texture whose pixel is that pattern repeated), for the card to fill
+- (BOOL)fillFor:(MTLClearColor)colour pattern:(uint32_t *)pattern bytes:(uint64_t *)bytes;
 - (NSError *)clearDepthTo:(double)depth;
 // A view (newTextureViewWithPixelFormat:...): the same memory from level `levels.location` on, read as `format` (of the same size a pixel).
 - (instancetype)initViewOf:(RDNA4MTLTexture *)texture format:(MTLPixelFormat)format type:(MTLTextureType)type levels:(NSRange)levels
@@ -1036,9 +1039,9 @@ static char gCopyKey;
 
 // A clear load action by the CPU: the colour packed as the format stores it (pvdraw.hpp clearPattern; RGBA16Float as four halves).
 // ponytail: a CPU fill; a GPU clear when it shows in a profile.
-- (void)clearTo:(MTLClearColor)c
+// A clear colour as the texture's pixel (8 bytes: a 4-byte pixel twice).
+- (uint64_t)pixelFor:(MTLClearColor)c
 {
-	[self wroteAll];
 	const double ch[4] = { c.red, c.green, c.blue, c.alpha };
 	uint64_t bits[4];
 	memcpy(bits, ch, sizeof bits);
@@ -1051,6 +1054,24 @@ static char gCopyKey;
 			RLOG(@"RDNA4MTL: a clear of a format %lu target to (%g %g %g %g): cleared to zero", (unsigned long)_format, c.red, c.green, c.blue, c.alpha);
 		px = pattern | (uint64_t)pattern << 32;
 	}
+	return px;
+}
+
+- (BOOL)fillFor:(MTLClearColor)c pattern:(uint32_t *)pattern bytes:(uint64_t *)bytes
+{
+	const uint32_t bpp = self.bpp;
+	const uint64_t px = [self pixelFor:c];
+	if (_type != MTLTextureType2D || !_fm || (bpp != 4 && bpp != 8) || (uint32_t)px != (uint32_t)(px >> 32) || (self.gpuBase & 3))
+		return NO;
+	*pattern = (uint32_t)px;
+	*bytes = (_rowBytes * (_height - 1) + _width * bpp + 3) & ~3ull;   // the rows and what lies between them (row padding)
+	return YES;
+}
+
+- (void)clearTo:(MTLClearColor)c
+{
+	[self wroteAll];
+	const uint64_t px = [self pixelFor:c];
 	const uint32_t bpp = self.bpp;
 	uint8_t one[16];
 	for (uint32_t i = 0; i < bpp; i++)
@@ -1453,7 +1474,7 @@ typedef struct {
 	uint32_t depthWidth, depthHeight, depthCompare, depthWrite;
 } RDNA4Draw;
 
-typedef struct { uint64_t src, dst, bytes; } RDNA4Copy;   // GPU addresses
+typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // GPU addresses; src 0: a fill with the pattern
 
 @interface RDNA4MTLDevice ()
 - (BOOL)gfx;   // the client may submit gfx IBs and the device's gfx buffers exist
@@ -1939,7 +1960,21 @@ RDNA4_ANSWER_MISSING
 			continue;
 		first = first ?: t;
 		const MTLClearColor c = a.clearColor;
-		if (a.loadAction == MTLLoadActionClear)
+		// on the card, behind the draws before it (a step of its own drained them all and the CPU filled up to 33 MB: Core Animation clears
+		// about 9 targets a frame, 2026-11-20); the CPU's for what a 32-bit pattern cannot fill
+		uint32_t pattern = 0;
+		uint64_t bytes = 0;
+		RDNA4MTLDevice *device = (RDNA4MTLDevice *)commandBuffer.device;
+		if (a.loadAction != MTLLoadActionClear)
+			continue;
+		if ([t fillFor:c pattern:&pattern bytes:&bytes])
+			[commandBuffer recordDraw:^NSError * {
+				[t wroteAll];
+				[commandBuffer drewInto:t];
+				const RDNA4Copy fill = { 0, t.gpuBase, bytes, pattern };
+				return [device gpuBarrier:&fill count:1];
+			}];
+		else
 			[commandBuffer record:^NSError * {
 				[t clearTo:c];
 				[commandBuffer drewInto:t];
@@ -2619,10 +2654,16 @@ RDNA4_ANSWER_MISSING
 		dispatch_queue_t handlers = self->_queue.handlers;
 		NSError *why = nil;
 		for (NSUInteger i = 0; i < self->_ops.count && !why; i++) {
-			if (![self->_draws containsIndex:i])
+			const BOOL draw = [self->_draws containsIndex:i];
+			if (!draw)
 				why = [device drainGfx];
+			const uint64_t t0 = draw ? 0 : nowUs();
 			if (!why)
 				why = self->_ops[i]();
+			if (!draw) {
+				const uint64_t us = nowUs() - t0;
+				statAdd(kStatSteps, 1), statAdd(kStatStepUs, us), statMax(gStepMaxUs, us);
+			}
 		}
 		NSError *drained = [device drainGfx];
 		self->_error = why ?: drained;
@@ -2874,9 +2915,11 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 			return rdna4Error([NSString stringWithFormat:@"%u copies on the card: more than their IB holds", count], 0);
 		const uint32_t len = (uint32_t)MIN(bytes - at, (uint64_t)1 << 20);
 		const uint64_t from = copies[c].src + at, to = copies[c].dst + at;
-		total += len;
-		const uint32_t dma[7] = { 0xc0055000u, 3u << 20 | 3u << 29 | (c + 1 == count && at + len >= bytes ? 1u << 31 : 0), (uint32_t)from, (uint32_t)(from >> 32),
-			                      (uint32_t)to, (uint32_t)(to >> 32), len };   // DST_SEL, SRC_SEL: the L2; CP_SYNC on the last
+		const bool fill = !copies[c].src;   // SRC_SEL DATA: the pattern (in SRC_ADDR_LO) over the bytes
+		total += fill ? 0 : len;
+		const uint32_t dma[7] = { 0xc0055000u, 3u << 20 | (fill ? 2u : 3u) << 29 | (c + 1 == count && at + len >= bytes ? 1u << 31 : 0),
+			                      fill ? copies[c].pattern : (uint32_t)from, fill ? 0 : (uint32_t)(from >> 32), (uint32_t)to, (uint32_t)(to >> 32),
+			                      len };   // DST_SEL, SRC_SEL: the L2; CP_SYNC on the last
 		memcpy(ib + n, dma, sizeof dma);
 		n += 7;
 		at += len;

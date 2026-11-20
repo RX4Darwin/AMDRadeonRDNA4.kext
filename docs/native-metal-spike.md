@@ -387,3 +387,8 @@ every frame, and each import and its free were kext calls of about 1 ms (700 imp
 Card, the glass window moving on the 4K display: made to committed 3.5 -> 0.6 ms, imports 700 -> 40 and allocation calls 350 -> 80 ms
 per 5 s; frames shown at the next vblank 24 of 370 -> 633 of 680 (about 59 a second).
 
+Render-pass clears on the card: each was a step of its own (a drain of every draw before it, then the CPU filling up to 33 MB), about 9
+a frame. A 2D target whose pixel is a 32-bit pattern repeated (4-byte formats, and 8-byte ones whose halves match) is now filled by
+DMA_DATA with SRC_SEL DATA behind the idle barrier, in order with the draws; the CPU fills the rest as before. Card: non-draw steps
+2800 -> about 0 per 5 s while a window moves, waiting for draws 350 -> 130-200 ms per 5 s; Mission Control and window drags render right.
+
