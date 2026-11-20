@@ -37,7 +37,10 @@ extern "C" uintptr_t rdna4AccelMissing()
 }
 
 namespace {
-const char *const kSymbols[] = {
+const struct {
+	uint32_t kext;   // its index in kKexts
+	const char *name;
+} kSymbols[] = {
 #include "ioaccel_symbols.inc"
 };
 constexpr size_t kThunks = sizeof(kSymbols) / sizeof(kSymbols[0]);
@@ -49,11 +52,20 @@ const struct {
 #include "ioaccel_slots.inc"
 };
 
-bool gReady;   // the thunks are filled and checked
-const char *kPath = "/System/Library/Extensions/IOAcceleratorFamily2.kext/Contents/MacOS/IOAcceleratorFamily2";
-KernelPatcher::KextInfo kextAccel {
-	"com.apple.iokit.IOAcceleratorFamily2", &kPath, 1, { true }, {}, KernelPatcher::KextInfo::Unloaded,
+// The kexts whose classes we derive from (ioaccel_kexts.inc), each solved when it loads (familyLoaded)
+struct KextName {
+	const char *bundle;
+	const char *path;
 };
+const KextName kKexts[] = {
+#include "ioaccel_kexts.inc"
+};
+constexpr size_t kKextCount = sizeof(kKexts) / sizeof(kKexts[0]);
+const char *gKextPath[kKextCount];
+KernelPatcher::KextInfo gKextInfo[kKextCount];
+uint32_t gSolved, gFailed;   // bit k: kKexts[k] solved and checked / found wrong
+
+bool gReady;   // every kext's thunks filled and checked
 }   // namespace
 
 // OSDefineMetaClassAndStructors(cls, base) written out, without the class's superClass pointer: OpenCore's linker patches every class
@@ -84,6 +96,7 @@ RDNA4_ACCEL_BASE(IOAccelMemory)
 RDNA4_ACCEL_BASE(IOAccelSysMemory)
 RDNA4_ACCEL_BASE(IOAccelVidMemory)
 RDNA4_ACCEL_BASE(IOAccelDisplayPipe)
+RDNA4_ACCEL_BASE(AppleGraphicsDeviceControl)
 
 // The family objects the family's start asks for. The event machine's four (its stamps and barriers in command buffers) and the
 // memory map's three (the GPU page table) are for submissions through the family, which nothing makes yet: they do nothing.
@@ -227,6 +240,45 @@ public:
 };
 RDNA4_ACCEL_STRUCTORS(RDNA4DisplayPipe, IOAccelDisplayPipe)
 
+// The GPU's AGDC service (AppleGraphicsControl's AppleGraphicsDeviceControl): IOPresentment maps GPUs, framebuffers and accelerators
+// from these (ioPresentmentCreateAssociationMap), asking each for its vendor information and GPU capabilities; without one for our GPU
+// it made no display pipes ("Unable to get AGDC information", "Unable to locate service dependencies"). Answered as Apple's paravirtual
+// GPU's (AppleParavirtGPUControl::vendor_doDeviceAttribute): attribute 1, vendor information (0x2c bytes), 0x921, the GPU's
+// capabilities (0xb0 bytes, its values); the rest (3: it makes its own framebuffers; 0x980; the framebuffers' own) not ours: refused.
+class RDNA4DeviceControl : public AppleGraphicsDeviceControl {
+	OSDeclareDefaultStructors(RDNA4DeviceControl)
+
+public:
+	IOReturn vendor_doDeviceAttribute(unsigned int attribute, unsigned long *in, unsigned long inLength, unsigned long *out,
+	                                  unsigned long *outLength, IOExternalMethodArguments *) APPLE_KEXT_OVERRIDE
+	{
+		auto *o = reinterpret_cast<uint8_t *>(out);
+		const unsigned long size = outLength ? *outLength : 0;
+		IOReturn r = kIOReturnUnsupported;
+		if (attribute == 1 && size == 0x2c && o) {   // version 1.0, a name of 32 bytes, vendor | device << 16, 2 (the paravirtual GPU's)
+			bzero(o, 0x2c);
+			*reinterpret_cast<uint32_t *>(o) = 0x10000;
+			strlcpy(reinterpret_cast<char *>(o + 4), "AMD Radeon RDNA4", 32);
+			*reinterpret_cast<uint32_t *>(o + 0x24) = 0x1002 | 0x7550u << 16;
+			*reinterpret_cast<uint32_t *>(o + 0x28) = 2;
+			r = kIOReturnSuccess;
+		} else if (attribute == 0x921 && size == 0xb0 && o) {   // the paravirtual GPU's capabilities, as it writes them
+			bzero(o, 0xb0);
+			*reinterpret_cast<uint64_t *>(o + 0x08) = 1;
+			*reinterpret_cast<uint64_t *>(o + 0x1c) = 0x40000000500ull;
+			*reinterpret_cast<uint32_t *>(o + 0x44) = 0x500;
+			*reinterpret_cast<uint64_t *>(o + 0x50) = 0x40000000000ull;
+			*reinterpret_cast<uint64_t *>(o + 0x84) = 1;
+			r = kIOReturnSuccess;
+		}
+		static uint32_t logged;
+		if (logged++ < 32)
+			rdna4Log("AMDRadeonRDNA4: accel: AGDC attribute 0x%x (in %lu, out %lu): 0x%x\n", attribute, inLength, size, r);
+		return r;
+	}
+};
+RDNA4_ACCEL_STRUCTORS(RDNA4DeviceControl, AppleGraphicsDeviceControl)
+
 class RDNA4Accelerator : public IOGraphicsAccelerator2 {
 	OSDeclareDefaultStructors(RDNA4Accelerator)
 	using super = IOGraphicsAccelerator2;
@@ -322,9 +374,11 @@ struct Derived {
 	const OSMetaClass *placeholder;
 	uint32_t ourSize;
 	uint32_t baseSize;
+	uint32_t kext;   // the base's kext (kKexts)
 };
-#define RDNA4_DERIVED(cls, base, n) \
-	{ &cls::gMetaClass, "__ZN" #n #base "10gMetaClassE", &base::gMetaClass, sizeof(cls), k##base##Size }
+#define RDNA4_DERIVED(cls, base, n) RDNA4_DERIVED_IN(cls, base, n, 0)
+#define RDNA4_DERIVED_IN(cls, base, n, kext) \
+	{ &cls::gMetaClass, "__ZN" #n #base "10gMetaClassE", &base::gMetaClass, sizeof(cls), k##base##Size, kext }
 const Derived kDerived[] = {
 	RDNA4_DERIVED(RDNA4Accelerator, IOGraphicsAccelerator2, 22),
 	RDNA4_DERIVED(RDNA4EventMachine, IOAccelEventMachineFast2, 24),
@@ -335,27 +389,33 @@ const Derived kDerived[] = {
 	RDNA4_DERIVED(RDNA4SysMemory, IOAccelSysMemory, 16),
 	RDNA4_DERIVED(RDNA4VidMemory, IOAccelVidMemory, 16),
 	RDNA4_DERIVED(RDNA4DisplayPipe, IOAccelDisplayPipe, 18),
+	RDNA4_DERIVED_IN(RDNA4DeviceControl, AppleGraphicsDeviceControl, 26, 1),
 };
 constexpr size_t kDerivedCount = sizeof(kDerived) / sizeof(kDerived[0]);
 
-// The thunks filled from the loaded family, checked; our metaclasses given the real superclasses.
-void familyLoaded(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size)
+// Kext `kext`'s thunks filled, checked; our metaclasses whose base is in it given the real superclasses.
+void familyLoaded(uint32_t kext, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size)
 {
-	uint32_t missing = 0, wrongSlots = 0;
+	uint32_t missing = 0, wrongSlots = 0, thunks = 0;
 	for (size_t i = 0; i < kThunks; i++) {
-		const mach_vm_address_t a = patcher.solveSymbol(index, kSymbols[i], address, size);
+		if (kSymbols[i].kext != kext)
+			continue;
+		thunks++;
+		const mach_vm_address_t a = patcher.solveSymbol(index, kSymbols[i].name, address, size);
 		if (a)
 			rdna4AccelThunks[i] = a;
 		else if (missing++ < 4)
-			rdna4Log("AMDRadeonRDNA4: accel: %s not found\n", kSymbols[i]);
+			rdna4Log("AMDRadeonRDNA4: accel: %s not found\n", kSymbols[i].name);
 		patcher.clearError();
 	}
 	for (const auto &s : kSlots) {
+		if (kSymbols[s.thunk].kext != kext)
+			continue;
 		const mach_vm_address_t vt = patcher.solveSymbol(index, s.vtable, address, size);
 		patcher.clearError();
 		const uintptr_t inSlot = vt ? reinterpret_cast<const uintptr_t *>(vt + 16)[s.slot] : 0;
 		if (inSlot != rdna4AccelThunks[s.thunk] && wrongSlots++ < 4)
-			rdna4Log("AMDRadeonRDNA4: accel: slot %u of %s does not hold %s\n", s.slot, s.vtable, kSymbols[s.thunk]);
+			rdna4Log("AMDRadeonRDNA4: accel: slot %u of %s does not hold %s\n", s.slot, s.vtable, kSymbols[s.thunk].name);
 	}
 	// each of our classes: its metaclass's superclass link and size where OSMetaClass keeps them, then the real base's metaclass
 	// (the base's size is checked when one is made: here the family's static constructors have not run yet, its metaclass reads 0)
@@ -363,6 +423,8 @@ void familyLoaded(KernelPatcher &patcher, size_t index, mach_vm_address_t addres
 	const OSMetaClass *real[kDerivedCount] = {};
 	for (size_t i = 0; i < kDerivedCount; i++) {
 		const Derived &d = kDerived[i];
+		if (d.kext != kext)
+			continue;
 		real[i] = reinterpret_cast<const OSMetaClass *>(patcher.solveSymbol(index, d.baseMeta, address, size));
 		patcher.clearError();
 		auto *ours = reinterpret_cast<const uint8_t *>(d.ours);
@@ -375,12 +437,16 @@ void familyLoaded(KernelPatcher &patcher, size_t index, mach_vm_address_t addres
 	}
 	if (!missing && !wrongSlots && !bad) {
 		for (size_t i = 0; i < kDerivedCount; i++)
-			*reinterpret_cast<const OSMetaClass **>(reinterpret_cast<uint8_t *>(const_cast<OSMetaClass *>(kDerived[i].ours)) + 16) = real[i];
-		gReady = true;
+			if (kDerived[i].kext == kext)
+				*reinterpret_cast<const OSMetaClass **>(reinterpret_cast<uint8_t *>(const_cast<OSMetaClass *>(kDerived[i].ours)) + 16) = real[i];
+		gSolved |= 1u << kext;
+	} else {
+		gFailed |= 1u << kext;
 	}
-	rdna4Log("AMDRadeonRDNA4: accel: IOAcceleratorFamily2: %zu thunks, %u not found, %u slots not the KDK's, %u of %zu classes not as "
-	         "expected: %s\n", kThunks, missing, wrongSlots, bad, kDerivedCount,
-	         gReady ? "ready (debug.rdna4_accel=1 makes one, 2 starts it, 3 its displays)" : "NOT usable");
+	gReady = gSolved == (1u << kKextCount) - 1 && !gFailed;
+	rdna4Log("AMDRadeonRDNA4: accel: %s: %u thunks, %u not found, %u slots not the KDK's, %u classes not as expected: %s\n",
+	         kKexts[kext].bundle, thunks, missing, wrongSlots, bad,
+	         gReady ? "ready (debug.rdna4_accel=1 makes one, 2 starts it, 3 its displays)" : gFailed ? "NOT usable" : "solved");
 }
 
 RDNA4Accelerator *gAccel;   // made and attached (debug.rdna4_accel=1)
@@ -455,6 +521,13 @@ int accelTo(int value)
 			caps->release();
 		}
 		gFamilyClients = true;
+		// the GPU's AGDC service, for IOPresentment (RDNA4DeviceControl)
+		auto *agdc = OSTypeAlloc(RDNA4DeviceControl);
+		const bool agdcUp = agdc && agdc->init() && agdc->attach(gpu) && agdc->start(gpu);
+		if (agdcUp)
+			agdc->registerService();
+		rdna4Log("AMDRadeonRDNA4: accel: AGDC service %s\n", agdcUp ? "started" : "NOT started");
+		OSSafeReleaseNULL(agdc);   // (the registry keeps a started one)
 		gAccel->registerService();
 		rdna4Log("AMDRadeonRDNA4: accel: registered for WindowServer: our Metal bundle, the family's user clients\n");
 	}
@@ -543,8 +616,10 @@ void accelAtBoot(void *, wait_result_t)
 	}
 	guardSet("pending");
 	// Without the paravirtual GPU nothing loads the family (our kext cannot depend on it): loaded here, solved when it comes
-	const OSReturn loaded = OSKextLoadKextWithIdentifier("com.apple.iokit.IOAcceleratorFamily2");
-	rdna4Log("AMDRadeonRDNA4: accel: loading IOAcceleratorFamily2: 0x%x\n", loaded);
+	for (const KextName &k : kKexts) {
+		const OSReturn loaded = OSKextLoadKextWithIdentifier(k.bundle);
+		rdna4Log("AMDRadeonRDNA4: accel: loading %s: 0x%x\n", k.bundle, loaded);
+	}
 	for (int ms = 0; ms < 30000 && !gReady; ms += 100)
 		IOSleep(100);
 	OSDictionary *match = IOService::serviceMatching("IONDRVFramebuffer");
@@ -581,9 +656,14 @@ void RDNA4Accel::waitForWindowServer()
 
 void RDNA4Accel::start()
 {
-	lilu.onKextLoadForce(&kextAccel, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-		if (index == kextAccel.loadIndex)
-			familyLoaded(patcher, index, address, size);
+	for (size_t k = 0; k < kKextCount; k++) {
+		gKextPath[k] = kKexts[k].path;
+		gKextInfo[k] = { kKexts[k].bundle, &gKextPath[k], 1, { true }, {}, KernelPatcher::KextInfo::Unloaded };
+	}
+	lilu.onKextLoadForce(gKextInfo, kKextCount, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+		for (uint32_t k = 0; k < kKextCount; k++)
+			if (index == gKextInfo[k].loadIndex)
+				familyLoaded(k, patcher, index, address, size);
 	}, nullptr);
 	sysctl_register_oid(&sysctl__debug_rdna4_accel);
 	thread_t th;   // (it waits for the GPU, then reads rdna4-accel)

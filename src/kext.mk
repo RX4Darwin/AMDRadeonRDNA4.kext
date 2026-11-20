@@ -84,8 +84,8 @@ LDFLAGS   = \
 # Base::f() call through the family's vtable symbol, 2026-11-20).
 $(PRODUCT): $(OBJS)
 	$(CXX) $(LDFLAGS) $(OBJS) -o $@
-	@if nm -u $@ | grep -E '^_(g[A-Z]|rdna4|RDNA4)|IOAccel|IOGraphicsAccelerator2' | grep -v -E '^_g(IO|OS)'; then \
-		echo "our own or IOAcceleratorFamily2's symbols above are undefined in $@" >&2; rm -f $@; exit 1; fi
+	@if nm -u $@ | grep -E '^_(g[A-Z]|rdna4|RDNA4)|IOAccel|IOGraphicsAccelerator2|AppleGraphicsDeviceControl' | grep -v -E '^_g(IO|OS)'; then \
+		echo "our own or a derived-from family's symbols above are undefined in $@" >&2; rm -f $@; exit 1; fi
 
 .cpp.o:
 	$(CXX) $(CXXFLAGS) -c $< -o $@

@@ -1533,11 +1533,101 @@ __ZN18IOAccelDisplayPipeC2EPK11OSMetaClass:
 	.private_extern __ZN18IOAccelDisplayPipeD2Ev
 __ZN18IOAccelDisplayPipeD2Ev:
 	jmpq *_rdna4AccelThunks+3056(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControlD1Ev
+__ZN26AppleGraphicsDeviceControlD1Ev:
+	jmpq *_rdna4AccelThunks+3064(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControlD0Ev
+__ZN26AppleGraphicsDeviceControlD0Ev:
+	jmpq *_rdna4AccelThunks+3072(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl5startEP9IOService
+__ZN26AppleGraphicsDeviceControl5startEP9IOService:
+	jmpq *_rdna4AccelThunks+3080(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl4stopEP9IOService
+__ZN26AppleGraphicsDeviceControl4stopEP9IOService:
+	jmpq *_rdna4AccelThunks+3088(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl9terminateEj
+__ZN26AppleGraphicsDeviceControl9terminateEj:
+	jmpq *_rdna4AccelThunks+3096(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl7messageEjP9IOServicePv
+__ZN26AppleGraphicsDeviceControl7messageEjP9IOServicePv:
+	jmpq *_rdna4AccelThunks+3104(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl13newUserClientEP4taskPvjP12OSDictionaryPP12IOUserClient
+__ZN26AppleGraphicsDeviceControl13newUserClientEP4taskPvjP12OSDictionaryPP12IOUserClient:
+	jmpq *_rdna4AccelThunks+3112(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl24vendor_doDeviceAttributeEjPmmS0_S0_P17AGDCClientState_t
+__ZN26AppleGraphicsDeviceControl24vendor_doDeviceAttributeEjPmmS0_S0_P17AGDCClientState_t:
+	jmpq *_rdna4AccelThunks+3120(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl0Ev
+__ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl0Ev:
+	jmpq *_rdna4AccelThunks+3128(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl1Ev
+__ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl1Ev:
+	jmpq *_rdna4AccelThunks+3136(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl2Ev
+__ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl2Ev:
+	jmpq *_rdna4AccelThunks+3144(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl3Ev
+__ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl3Ev:
+	jmpq *_rdna4AccelThunks+3152(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl4Ev
+__ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl4Ev:
+	jmpq *_rdna4AccelThunks+3160(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl5Ev
+__ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl5Ev:
+	jmpq *_rdna4AccelThunks+3168(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl6Ev
+__ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl6Ev:
+	jmpq *_rdna4AccelThunks+3176(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl7Ev
+__ZN26AppleGraphicsDeviceControl36_RESERVEDAppleGraphicsDeviceControl7Ev:
+	jmpq *_rdna4AccelThunks+3184(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControlC2EPK11OSMetaClass
+__ZN26AppleGraphicsDeviceControlC2EPK11OSMetaClass:
+	jmpq *_rdna4AccelThunks+3192(%rip)
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControlD2Ev
+__ZN26AppleGraphicsDeviceControlD2Ev:
+	jmpq *_rdna4AccelThunks+3200(%rip)
 
 	.data
 	.p2align 3
 	.private_extern _rdna4AccelThunks
 _rdna4AccelThunks:
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
 	.quad _rdna4AccelMissing
 	.quad _rdna4AccelMissing
 	.quad _rdna4AccelMissing
@@ -1964,4 +2054,8 @@ __ZN16IOAccelVidMemory10gMetaClassE:
 	.p2align 4
 	.private_extern __ZN18IOAccelDisplayPipe10gMetaClassE
 __ZN18IOAccelDisplayPipe10gMetaClassE:
+	.space 64
+	.p2align 4
+	.private_extern __ZN26AppleGraphicsDeviceControl10gMetaClassE
+__ZN26AppleGraphicsDeviceControl10gMetaClassE:
 	.space 64

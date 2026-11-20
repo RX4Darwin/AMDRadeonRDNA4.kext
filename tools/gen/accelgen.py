@@ -45,6 +45,9 @@ OVERRIDES = {
                                                 'APPLE_KEXT_OVERRIDE;',
     'newUserClient(task*, void*, unsigned int, IOUserClient**)':
         'virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;',
+    'newUserClient(task*, void*, unsigned int, OSDictionary*, IOUserClient**)':
+        'virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) '
+        'APPLE_KEXT_OVERRIDE;',
 }
 SDK_SLOTS = {'OSObject': 35, 'IOService': 266}   # the SDK's vtable sizes (checked: the same as Tahoe 26.6.2's)
 
@@ -56,13 +59,22 @@ RETURNS = {
     'newDisplayMachine': 'IOAccelDisplayMachine *', 'newGLContext': 'IOAccelContext2 *', 'newCLContext': 'IOAccelContext2 *',
     'newSurface': 'IOAccelSurface *', 'new2DContext': 'IOAccelContext2 *', 'newVideoContext': 'IOAccelContext2 *',
     'newSysMemory': 'IOAccelSysMemory *', 'newVidMemory': 'IOAccelVidMemory *', 'newResource': 'IOAccelResource2 *',
-    'newMemoryMap': 'IOAccelMemoryMap *', 'init': 'bool',
+    'newMemoryMap': 'IOAccelMemoryMap *', 'init': 'bool', 'vendor_doDeviceAttribute': 'IOReturn',
 }
 
+# The kexts whose classes we derive from: (bundle id, binary under the KDK's and macOS's /System/Library/Extensions). A class's thunks are
+# solved when its kext loads (src/rdna4accel.cpp).
+KEXTS = [
+    ('com.apple.iokit.IOAcceleratorFamily2', 'IOAcceleratorFamily2.kext/Contents/MacOS/IOAcceleratorFamily2'),
+    ('com.apple.AppleGraphicsDeviceControl',
+     'AppleGraphicsControl.kext/Contents/PlugIns/AppleGraphicsDeviceControl.kext/Contents/MacOS/AppleGraphicsDeviceControl'),
+]
+
 # The family classes we derive from (each after its base): (class, its base, a subclass in the KDK that implements its pure virtuals:
-# binary, vtable symbol; None if it has none)
+# binary, vtable symbol; None if it has none[, the kext's index in KEXTS: 0 if left out])
 FAMILY = 'IOAcceleratorFamily2'
 AMD = 'AMDRadeonX6000'
+PARAVIRT = 'AppleParavirtGPU'
 CLASSES = [
     ('IOGraphicsAccelerator2', 'IOService', (AMD, '__ZTV43AMDRadeonX6000_AMDNavi21GraphicsAccelerator')),
     ('IOAccelTask', 'OSObject', None),
@@ -75,6 +87,7 @@ CLASSES = [
     ('IOAccelSysMemory', 'IOAccelMemory', None),
     ('IOAccelVidMemory', 'IOAccelMemory', (AMD, '__ZTV32AMDRadeonX6000_AMDAccelVidMemory')),
     ('IOAccelDisplayPipe', 'IOService', None),
+    ('AppleGraphicsDeviceControl', 'IOService', (PARAVIRT, '__ZTV23AppleParavirtGPUControl'), 1),
 ]
 
 
@@ -82,7 +95,8 @@ KNOWN_TYPES = {'UInt32', 'UInt64', 'IOOptionBits', 'IOReturn', 'OSObject', 'IOSe
                'OSNumber', 'OSSymbol', 'IOMemoryDescriptor', 'IOBufferMemoryDescriptor', 'IOWorkLoop', 'IOPCIDevice', 'IOUserClient',
                'IOFramebuffer', 'IOReportChannelList', 'IORangeAllocator', 'IOInterruptEventSource', 'IOTimerEventSource', 'IOCommandGate',
                'IOEventSource', 'IOLock', 'IORecursiveLock', 'IOSimpleLock', 'OSSet', 'OSCollection', 'OSIterator', 'OSBoolean',
-               'IOMemoryMap', 'IODMACommand', 'IOGeneralMemoryDescriptor', 'IOSubMemoryDescriptor', 'IOMultiMemoryDescriptor'}
+               'IOMemoryMap', 'IODMACommand', 'IOGeneralMemoryDescriptor', 'IOSubMemoryDescriptor', 'IOMultiMemoryDescriptor',
+               'IOExternalMethodArguments'}
 
 
 def run(*args):
@@ -97,20 +111,26 @@ class Binary:
     def __init__(self, path):
         self.path = path
         self.data = open(path, 'rb').read()
+        if self.data[:4] == b'\xca\xfe\xba\xbe':   # fat: the x86_64 slice (CPU_TYPE_X86_64 0x01000007)
+            n = struct.unpack_from('>I', self.data, 4)[0]
+            for k in range(n):
+                cpu, _, off, size, _ = struct.unpack_from('>5I', self.data, 8 + 20 * k)
+                if cpu == 0x01000007:
+                    self.data = self.data[off:off + size]
         self.syms, self.byname = {}, {}
-        for line in run('nm', '-m', path).splitlines():
+        for line in run('nm', '-arch', 'x86_64', '-m', path).splitlines():
             m = re.match(r'([0-9a-f]{16}) \(([^)]*)\) .*? (\S+)$', line)
             if m:
                 a = int(m.group(1), 16)
                 self.syms.setdefault(a, m.group(3))
                 self.byname[m.group(3)] = a
         self.ext = {}
-        for line in run('otool', '-rv', path).splitlines():
+        for line in run('otool', '-arch', 'x86_64', '-rv', path).splitlines():
             p = line.split()
             if len(p) >= 8 and re.match(r'^[0-9a-f]{8}$', p[0]) and p[4] == 'True':
                 self.ext[int(p[0], 16)] = p[-1]
         self.secs, cur = [], {}
-        for line in run('otool', '-l', path).splitlines():
+        for line in run('otool', '-arch', 'x86_64', '-l', path).splitlines():
             t = line.split()
             if len(t) == 2 and t[0] in ('sectname', 'segname', 'addr', 'size', 'offset'):
                 cur[t[0]] = t[1]
@@ -138,7 +158,7 @@ class Binary:
         """sizeof the class, from its MetaClass constructor's OSMetaClass(name, super, size) call."""
         n = len(cls)
         sym = '__ZN%d%s9MetaClassC2Ev' % (n, cls)
-        dis = run('otool', '-tV', '-p', sym, self.path).splitlines()
+        dis = run('otool', '-arch', 'x86_64', '-tV', '-p', sym, self.path).splitlines()
         for line in dis[2:40]:
             m = re.search(r'movl\s+\$0x([0-9a-f]+), %ecx', line)
             if m:
@@ -164,9 +184,9 @@ def main():
     decls, thunks, forward, slotted = [], [], set(), []   # slotted: (thunk index, vtable symbol, slot) to check at run time
     bins, sdk_root, nslots = {}, {}, dict(SDK_SLOTS)
 
-    def binary(name):
+    def binary(name):   # a kext's name (its binary in its bundle) or a path under Extensions
         if name not in bins:
-            bins[name] = Binary(os.path.join(ext, name + '.kext/Contents/MacOS', name))
+            bins[name] = Binary(os.path.join(ext, name if '/' in name else name + '.kext/Contents/MacOS/' + name))
         return bins[name]
 
     def note_types(text):   # the classes and structs it names (pointers and references to them)
@@ -175,8 +195,12 @@ def main():
                                                   'task', 'volatile', 'const'):
                 forward.add(t)
 
-    for cls, base, impl in CLASSES:
-        b = binary(FAMILY)
+    kext_of = {}
+    for entry in CLASSES:
+        cls, base, impl = entry[:3]
+        kext = entry[3] if len(entry) > 3 else 0
+        kext_of[cls] = kext
+        b = binary(KEXTS[kext][1])
         n = len(cls)
         vt = '__ZTV%d%s' % (n, cls)
         slots = b.vtable(vt)
@@ -192,7 +216,7 @@ def main():
             if i < first and not sym.startswith(prefix):
                 continue   # inherited unchanged
             if sym.startswith(prefix) and (sym.endswith('D1Ev') or sym.endswith('D0Ev')):
-                thunks.append(sym)   # the destructor (declared below): the base's vtable, emitted in our kext, holds them
+                thunks.append((kext, sym))   # the destructor (declared below): the base's vtable, emitted in our kext, holds them
                 continue
             if sym == '__ZNK%d%s12getMetaClassEv' % (n, cls):
                 continue   # declared first, defined in our kext: the key function (below)
@@ -219,20 +243,20 @@ def main():
                                                                ' APPLE_KEXT_OVERRIDE' if over else '', ' = 0' if pure else '', i))
             if not pure:
                 slotted.append((len(thunks), vt, i))
-                thunks.append(sym)
+                thunks.append((kext, sym))
         for extra in ('__ZN%d%sC2EPK11OSMetaClass' % (n, cls), '__ZN%d%sD2Ev' % (n, cls)):
             if extra not in b.byname:
                 sys.exit('accelgen: %s has no %s' % (cls, extra))
-            thunks.append(extra)
+            thunks.append((kext, extra))
         decls.append((cls, base, size, body, '__ZN%d%s10gMetaClassE' % (n, cls)))
         forward.discard(cls)
 
-    forward -= {c for c, _, _ in CLASSES}
+    forward -= {e[0] for e in CLASSES}
     hpp = ['// Generated by tools/gen/accelgen.py from %s: do not edit.' % os.path.basename(a.kdk),
            '// IOAcceleratorFamily2\'s classes as our kext derives from them (src/rdna4accel.cpp fills the thunks).',
            '#pragma once', '#include <IOKit/IOService.h>', '#include <IOKit/IOUserClient.h>', '#include <IOKit/IORangeAllocator.h>', '',
            'class IOPCIDevice;', 'class IOFramebuffer;']
-    hpp += ['class %s;' % c for c, _, _ in CLASSES]
+    hpp += ['class %s;' % e[0] for e in CLASSES]
     hpp += ['class %s;' % t for t in sorted(forward)]
     for cls, base, size, body, gmeta in decls:
         # getMetaClass first and defined in our kext (rdna4accel.cpp RDNA4_ACCEL_BASE): the key function, so that the compiler emits the
@@ -252,7 +276,7 @@ def main():
     asm = ['// Generated by tools/gen/accelgen.py from %s: do not edit.' % os.path.basename(a.kdk),
            '// Each base function our classes reach: a jump through _rdna4AccelThunks (filled by src/rdna4accel.cpp), else to rdna4AccelMissing.',
            '\t.text']
-    for i, sym in enumerate(thunks):
+    for i, (_, sym) in enumerate(thunks):
         asm += ['\t.p2align 4', '\t.private_extern %s' % sym, '%s:' % sym, '\tjmpq *_rdna4AccelThunks+%d(%%rip)' % (8 * i)]
     asm += ['', '\t.data', '\t.p2align 3', '\t.private_extern _rdna4AccelThunks', '_rdna4AccelThunks:']
     asm += ['\t.quad _rdna4AccelMissing'] * len(thunks)
@@ -260,14 +284,21 @@ def main():
         asm += ['\t.p2align 4', '\t.private_extern %s' % gmeta, '%s:' % gmeta, '\t.space 64']
     open(os.path.join(ROOT, 'src/ioaccel_thunks.S'), 'w').write('\n'.join(asm) + '\n')
 
-    inc = ['// Generated by tools/gen/accelgen.py from %s: do not edit. _rdna4AccelThunks\' symbols, in order.' % os.path.basename(a.kdk)]
-    inc += ['"%s",' % s for s in thunks]   # (the Mach-O names, as Lilu's solveSymbol takes them: src/pvhooks.cpp)
+    inc = ['// Generated by tools/gen/accelgen.py from %s: do not edit. _rdna4AccelThunks\' {kext (ioaccel_kexts.inc), symbol}, in order.'
+           % os.path.basename(a.kdk)]
+    inc += ['{ %d, "%s" },' % t for t in thunks]   # (the Mach-O names, as Lilu's solveSymbol takes them: src/pvhooks.cpp)
     open(os.path.join(ROOT, 'src/ioaccel_symbols.inc'), 'w').write('\n'.join(inc) + '\n')
 
     inc = ['// Generated by tools/gen/accelgen.py from %s: do not edit. {thunk, vtable, slot}: the running vtable\'s slot must hold the thunk\'s'
            ' function (else the KDK\'s layout is not this macOS\'s).' % os.path.basename(a.kdk)]
     inc += ['{ %d, "%s", %d },' % t for t in slotted]
     open(os.path.join(ROOT, 'src/ioaccel_slots.inc'), 'w').write('\n'.join(inc) + '\n')
+    inc = ['// Generated by tools/gen/accelgen.py: do not edit. The kexts whose classes we derive from: {bundle id, binary}.']
+    inc += ['{ "%s", "/System/Library/Extensions/%s" },' % k for k in KEXTS]
+    open(os.path.join(ROOT, 'src/ioaccel_kexts.inc'), 'w').write('\n'.join(inc) + '\n')
+    inc = ['// Generated by tools/gen/accelgen.py: do not edit. Each derived-from class\'s kext (ioaccel_kexts.inc).']
+    inc += ['{ "%s", %d },' % (e[0], kext_of[e[0]]) for e in CLASSES]
+    open(os.path.join(ROOT, 'src/ioaccel_classes.inc'), 'w').write('\n'.join(inc) + '\n')
     print('accelgen: %d classes, %d thunks' % (len(decls), len(thunks)))
 
 

@@ -18,6 +18,8 @@ class IOAccelMemory;
 class IOAccelSysMemory;
 class IOAccelVidMemory;
 class IOAccelDisplayPipe;
+class AppleGraphicsDeviceControl;
+class AGDCClientState_t;
 class IOAccelAllocationInfo;
 class IOAccelChannel2;
 class IOAccelClientSharedRO;
@@ -643,3 +645,35 @@ private:
 };
 static_assert(sizeof(IOAccelDisplayPipe) == 0x318, "the KDK's size");
 enum : size_t { kIOAccelDisplayPipeSize = 0x318 };
+
+class AppleGraphicsDeviceControl : public IOService {
+public:
+	virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;   // the key function (see accelgen.py)
+	class MetaClass : public OSMetaClass { public: OSObject *alloc() const APPLE_KEXT_OVERRIDE; };
+	static MetaClass gMetaClass;   // a placeholder in our kext (ioaccel_thunks.S): our subclasses' superclass link is patched
+protected:
+	AppleGraphicsDeviceControl(const OSMetaClass *meta);
+	virtual ~AppleGraphicsDeviceControl() APPLE_KEXT_OVERRIDE;
+public:
+	// slots 266-275 its own (the KDK's order), the rest overrides; pure ones named after __ZTV23AppleParavirtGPUControl's
+	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE; // 184
+	virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE; // 185
+	virtual bool terminate(IOOptionBits options = 0) APPLE_KEXT_OVERRIDE; // 192
+	virtual IOReturn message(UInt32 type, IOService *provider, void *argument = 0) APPLE_KEXT_OVERRIDE; // 230
+	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE; // 238
+	virtual IOReturn vendor_doDeviceAttribute(unsigned int, unsigned long*, unsigned long, unsigned long*, unsigned long*, IOExternalMethodArguments*) = 0; // 266
+	virtual IOReturn vendor_doDeviceAttribute(unsigned int, unsigned long*, unsigned long, unsigned long*, unsigned long*, AGDCClientState_t*); // 267
+	virtual uintptr_t _RESERVEDAppleGraphicsDeviceControl0(); // 268
+	virtual uintptr_t _RESERVEDAppleGraphicsDeviceControl1(); // 269
+	virtual uintptr_t _RESERVEDAppleGraphicsDeviceControl2(); // 270
+	virtual uintptr_t _RESERVEDAppleGraphicsDeviceControl3(); // 271
+	virtual uintptr_t _RESERVEDAppleGraphicsDeviceControl4(); // 272
+	virtual uintptr_t _RESERVEDAppleGraphicsDeviceControl5(); // 273
+	virtual uintptr_t _RESERVEDAppleGraphicsDeviceControl6(); // 274
+	virtual uintptr_t _RESERVEDAppleGraphicsDeviceControl7(); // 275
+
+private:
+	uint8_t opaque_[0x110 - sizeof(IOService)];
+};
+static_assert(sizeof(AppleGraphicsDeviceControl) == 0x110, "the KDK's size");
+enum : size_t { kAppleGraphicsDeviceControlSize = 0x110 };
