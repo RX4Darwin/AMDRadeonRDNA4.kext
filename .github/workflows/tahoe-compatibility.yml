@@ -4,9 +4,12 @@ on:
   push:
     branches:
       - tahoe-26.7.3-compat-audit
+      - tahoe-26.7.3-experimental
   pull_request:
     branches:
       - main
+      - tahoe-26.7.3-compat-audit
+      - tahoe-26.7.3-experimental
   workflow_dispatch:
 
 permissions:
