@@ -595,7 +595,7 @@ private:
 	// display pipes (docs/m1-stream.md s.1b): the shared-state pages the guest announced, the events the host puts into them
 	void dropPipes();
 	void dropPipe(uint32_t port, const char *why);
-	bool pipeStillOurs(uint32_t port);
+	bool pipeStillOurs(uint32_t port, uint32_t &enabled);
 	void pollDisplay();
 	void unmapFifo();
 	// child channels (docs/m1-stream.md s.1): DefineChannel -> state record in the root page -> page-list ring
@@ -8853,14 +8853,14 @@ void RDNA4PvHost::dropPipes() {
 // physical page can be anything, and the host writes into it every frame. So before every host write the page must still look like the pipe's: the u16 at +0x12
 // is the port the host wrote there, and the enabled mask holds only the three event bits the driver ever stores (0xc, 0, 1, 0xd). If not, the pipe is let go and
 // never written again. (The check cannot close the race between it and the write; it closes the long window after a teardown.)
-bool RDNA4PvHost::pipeStillOurs(uint32_t port) {
+bool RDNA4PvHost::pipeStillOurs(uint32_t port, uint32_t &enabled) {
 	const Pipe &p = mPipe[port];
 	if (!p.live || !p.map)
 		return false;
 	const uint8_t *va = reinterpret_cast<const uint8_t *>(p.map->getVirtualAddress());
 	uint16_t seen;
 	memcpy(&seen, va + pvstream::disp::kPort, 2);
-	const uint32_t enabled = *reinterpret_cast<const volatile uint32_t *>(va + pvstream::disp::kEnabled);
+	enabled = *reinterpret_cast<const volatile uint32_t *>(va + pvstream::disp::kEnabled);
 	const uint32_t known = pvstream::disp::kEventVbl | pvstream::disp::kEventOnline | pvstream::disp::kEventOffline;
 	if (seen == port && !(enabled & ~known))
 		return true;
@@ -9137,13 +9137,13 @@ void RDNA4PvHost::pollDisplay() {
 		Pipe &p = mPipe[port];
 		if (!p.live)
 			continue;
-		if (!pipeStillOurs(port)) {
+		uint32_t enabled = 0;
+		if (!pipeStillOurs(port, enabled)) {
 			dropPipe(port, nullptr);
 			continue;
 		}
 		uint8_t *va = reinterpret_cast<uint8_t *>(p.map->getVirtualAddress());
 		uint32_t *pending = reinterpret_cast<uint32_t *>(va + pvstream::disp::kPending);
-		const uint32_t enabled = *reinterpret_cast<volatile uint32_t *>(va + pvstream::disp::kEnabled);
 		if (enabled != p.lastEnabled) {
 			pvlog("host: display pipe %u: enabled mask 0x%x -> 0x%x%s", port, p.lastEnabled, enabled,
 			      (enabled & pvstream::disp::kEventOnline) && !(p.lastEnabled & pvstream::disp::kEventOnline) ? " (enable())" : "");
