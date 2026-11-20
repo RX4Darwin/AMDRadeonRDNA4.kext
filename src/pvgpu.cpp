@@ -689,6 +689,7 @@ private:
 	Deleted mDeleted[256] {};
 	uint32_t mDeletedAt { 0 };
 	bool mRtOpen { false };              // M2: this host is a client of the card's runtime
+	uint64_t mRtTried { 0 };             // the tick of tick()'s last try at opening it
 	// mapPages' mappings kept from draw to draw, by their page list: WindowServer draws with the same textures, buffers and targets every
 	// frame, and each mapping costs SDMA jobs (page tables) of about 2 ms.
 	// Found without its page list by a key as well: an IOSurface's memory (held while cached, so its pages stay) or a task's VA, valid
@@ -1413,6 +1414,12 @@ void RDNA4PvHost::tick() {
 	dropIrqBits();
 	const uint32_t cmds = mCmds;
 
+	// The runtime opened here, on the tick's own shallow stack, once the guest is talking (then once a second until it opens): opened first from
+	// runDraw, 10 KB down the command walk, IOLog's os_log path ran the timer thread's 16 KB kernel stack out (double fault panic, 2026-11-20).
+	if (gCompute && !mRtOpen && mCmds && (!mRtTried || mTicks - mRtTried >= 1000)) {
+		mRtTried = mTicks;
+		(void)openRuntime();
+	}
 	completeLate();
 	pollRegisters();
 	mapRoot();

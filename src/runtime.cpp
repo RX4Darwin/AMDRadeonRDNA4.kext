@@ -2592,7 +2592,7 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 IOReturn RDNA4Compute::rtImportHost(const void *owner, task_t task, uint64_t address, uint64_t bytes, uint64_t flags,
                                     uint64_t &handle, uint64_t &gpu) {
 	Locked g(rtLock);
-	IOReturn r = (address & (GpuVm::kPageBytes - 1)) ? kIOReturnBadArgument : hostChecks(owner, bytes, flags);
+	IOReturn r = (address & (GpuVm::kPageBytes - 1)) ? kIOReturnBadArgument : hostChecks(owner, bytes, flags, false);
 	if (r != kIOReturnSuccess)
 		return r;
 	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
@@ -2610,7 +2610,7 @@ IOReturn RDNA4Compute::rtImportHost(const void *owner, task_t task, uint64_t add
 }
 
 // What a host buffer may be: a client with its own VM and DMA, flags the API knows, the per-buffer, per-client and total limits, a free slot.
-IOReturn RDNA4Compute::hostChecks(const void *owner, uint64_t bytes, uint64_t flags) {
+IOReturn RDNA4Compute::hostChecks(const void *owner, uint64_t bytes, uint64_t flags, bool counted) {
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
 		return state;
@@ -2622,7 +2622,8 @@ IOReturn RDNA4Compute::hostChecks(const void *owner, uint64_t bytes, uint64_t fl
 	if (!bytes || bytes > kHostMaxBuffer || (flags & ~static_cast<uint64_t>(RDNA4_HOST_EXECUTABLE | RDNA4_HOST_READ_ONLY)))
 		return bytes > kHostMaxBuffer ? kIOReturnNoResources : kIOReturnBadArgument;
 	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
-	if (rounded < bytes || rounded > kHostMaxBuffer || rounded > kHostMaxClient - c->hostBytes || rounded > kHostMaxTotal - hostBytesTotal)
+	if (rounded < bytes || rounded > kHostMaxBuffer ||
+	    (counted && (rounded > kHostMaxClient - c->hostBytes || rounded > kHostMaxTotal - hostBytesTotal)))
 		return kIOReturnNoResources;
 	uint32_t slot = 0;
 	while (slot < bufferCap() && buffers[slot].owner)
@@ -2728,8 +2729,11 @@ IOReturn RDNA4Compute::mapHostLocked(const void *owner, IOMemoryDescriptor *memo
 		b.owner = nullptr;
 		return kIOReturnNotResponding;
 	}
-	c->hostBytes += rounded;
-	hostBytesTotal += rounded;
+	if (!imported) {   // imports allocate nothing: the VA and the buffer slots limit them (WindowServer on the native device imports every
+		               // window's surface; counted, they ran it past 1 GiB and its own allocations failed, 2026-11-20)
+		c->hostBytes += rounded;
+		hostBytesTotal += rounded;
+	}
 	handle = makeHandle(slot, b.gen);
 	gpu = b.va;
 	user = b.hostUser;
@@ -2816,7 +2820,7 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	if (c && b->va && forgotten)
 		vaGive(*c, b->va, b->bytes);   // after the invalidation: nothing cached reaches the range when it is mapped again
 	if (host) {
-		if (c && !b->mapped) {
+		if (c && !b->mapped && !b->hostImported) {
 			const uint64_t rounded = (b->bytes + GpuVm::kPageBytes - 1) &
 			                         ~(GpuVm::kPageBytes - 1);
 			if (c->hostBytes >= rounded)
@@ -4100,8 +4104,8 @@ void RDNA4Compute::rtRelease(const void *owner) {
 
 	for (RtBuffer &b : buffers) {
 		if (b.owner == owner && b.host) {
-			const uint64_t rounded = b.mapped ? 0 : (b.bytes + GpuVm::kPageBytes - 1) &
-			                                        ~(GpuVm::kPageBytes - 1);
+			const uint64_t rounded = b.mapped || b.hostImported ? 0 : (b.bytes + GpuVm::kPageBytes - 1) &
+			                                                          ~(GpuVm::kPageBytes - 1);
 			if (c && c->hostBytes >= rounded)
 				c->hostBytes -= rounded;
 			if (hostBytesTotal >= rounded)

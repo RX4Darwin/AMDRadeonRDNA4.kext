@@ -796,10 +796,11 @@ private:
 	static constexpr uint32_t kHeapOffset  = 32u << 20;
 	// The legacy global caps (modes 0 and 1). Buffers as many as there are slots: the paravirtual host alone keeps hundreds (mappings,
 	// shadows), and with 256 its allocations failed once those were made.
-	// 4096: WindowServer on the native Metal device (a buffer per texture, IOSurface and pipeline beside the host's hundreds) ran out at 1024.
-	static constexpr uint32_t kMaxBuffers  = 4096;
+	// 4096: WindowServer on the native Metal device (a buffer per texture, IOSurface and pipeline beside the host's hundreds) ran out at 1024;
+	// 16384: and at 4096 after a login that brought 11 apps back (2803 allocations and the windows' imports, 2026-11-20). Handles hold 16 bits.
+	static constexpr uint32_t kMaxBuffers  = 16384;
 	static constexpr uint32_t kMaxPrograms = 32;
-	static constexpr uint32_t kBufferSlots  = 4096;        // rdna4-vmshared=2: array sizes; the cap is per client (accounting), not global
+	static constexpr uint32_t kBufferSlots  = 16384;       // rdna4-vmshared=2: array sizes; the cap is per client (accounting), not global
 	static constexpr uint32_t kProgramSlots = 256;
 	static constexpr uint32_t kClientBuffers  = 128;
 	static constexpr uint32_t kClientPrograms = 16;
@@ -1111,7 +1112,7 @@ private:
 	bool vmInvalidateOwned(RtClient &c, const char *tag);
 	void logClientFault(RtClient &client, const char *tag);
 	void scrubFaultPage();
-	IOReturn hostChecks(const void *owner, uint64_t bytes, uint64_t flags);
+	IOReturn hostChecks(const void *owner, uint64_t bytes, uint64_t flags, bool counted = true);   // counted: against the host quotas
 	IOReturn mapHostLocked(const void *owner, IOMemoryDescriptor *memory, IOMemoryMap *map, uint64_t userAddress, bool imported, uint64_t bytes,
 	                       uint64_t flags, uint64_t &handle, uint64_t &gpu, uint64_t &user);
 	void releaseHost(RtBuffer &buffer);
