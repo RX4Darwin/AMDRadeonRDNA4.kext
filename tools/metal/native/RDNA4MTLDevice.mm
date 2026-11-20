@@ -972,6 +972,7 @@ enum { kRgfxMagic = 0x58464752u, kHead = 8 };
 @property (readonly) uint32_t outs, ins;        // values the vertex function writes, the fragment function reads
 @property (readonly) const uint32_t *inputCntl; // SPI_PS_INPUT_CNTL_0 .. ins - 1
 @property (readonly) BOOL sprite;               // a fragment input is the point's coordinate
+@property (readonly) BOOL exportsNothing;       // the fragment code has no export instruction (drawn as a shader without a colour)
 @property (readonly) uint64_t code;             // GPU address: VS at +0, PS at +RDNA4_TRI_PS_OFFSET
 @property (readonly) MTLPixelFormat format;     // colour attachment 0's
 - (const uint32_t *)blendOf:(NSUInteger)attachment;   // its blend state as the PV host reads it (pvdraw.hpp readBlendStates): [2] on,
@@ -1092,6 +1093,12 @@ typedef struct {
 		if (h[7] & 0x7fff0000u & ~(k ? 0x7ff10000u : 0x00010000u))   // dual source: not yet (several attachments: the PV host's choice)
 			return rdna4Error([NSString stringWithFormat:@"%@: attributes 0x%x not supported yet", fn[k].name, h[7]], 0);
 	}
+	// A fragment function whose colour LLVM left out entirely (Core Animation's TkfhBvcmA2Xh_IsrcM1 is s_endpgm alone) has no export, while its
+	// header says it has a colour: drawn with a colour format the hardware waits for an export forever (WindowServer's gfx ring hung,
+	// 2026-11-20). An export is a dword with bits 31-26 111110 (gfx12 VEXPORT); none in the code: drawn as a shader without a colour.
+	_exportsNothing = YES;
+	for (uint32_t i = 0; i < ps[2] / 4 && _exportsNothing; i++)
+		_exportsNothing = (ps[kHead + i] >> 26) != 0x3e;
 	_outs = vs[7] & 0xffff;
 	_ins = ps[7] & 0xffff;
 	// input k reads the vertex output with its name (SPI_PS_INPUT_CNTL_k OFFSET, FLAT_SHADE), as the PV host's runDraw
@@ -1581,7 +1588,9 @@ RDNA4_ANSWER_MISSING
 	d.levelT = (const uint8_t *)levelT.bytes;
 	if (pipeline && !pipeline.described) {   // what each pipeline's first draw binds: a hang's draw named (drainGfx), this says what it read
 		pipeline.described = YES;
-		NSMutableString *what = [NSMutableString stringWithFormat:@"pipeline %@: vs 0x%08x ps 0x%08x, blend", pipeline.names, pipeline.vs[7], pipeline.ps[7]];
+		NSMutableString *what = [NSMutableString stringWithFormat:@"pipeline %@: vs 0x%08x ps 0x%08x, vs rsrc %08x %08x, ps rsrc %08x %08x ena %08x addr %08x, blend",
+		                                                          pipeline.names, pipeline.vs[7], pipeline.ps[7], pipeline.vs[3], pipeline.vs[4],
+		                                                          pipeline.ps[3], pipeline.ps[4], pipeline.ps[5], pipeline.ps[6]];
 		for (int k = 2; k < 10; k++)
 			[what appendFormat:@" %u", [pipeline blendOf:d.attachment][k]];
 		for (int st = 0; st < 2; st++)
@@ -1625,6 +1634,7 @@ RDNA4_ANSWER_MISSING
 		}
 		if (!pipeline || !target)
 			return rdna4Error(@"a draw without a render pipeline or a colour attachment of this device", 0);
+
 		why = [device draw:&dd pipeline:pipeline target:target];
 		return why;
 	}];
@@ -2102,6 +2112,7 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 }
 
 - (uint64_t)gfxRings { return rdna4_trirun_rings_va(_rings.gpu); }
+
 - (BOOL)drawnInFlight:(RDNA4MTLTexture *)t { return [_drawnInFlight containsObject:t]; }
 
 // As the PV host's stageTextures: an image instruction on an all-zero T# can stall the texture unit (an unbound slot hung WindowServer's
@@ -2162,7 +2173,7 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 	_slotFence[slot] = 0;
 	const uint64_t miscGpu = _misc.gpu + (uint64_t)slot * kMiscBytes, ibOffset = (uint64_t)slot * RDNA4_TRIRUN_PAGE;
 	const uint32_t *vs = p.vs, *ps = p.ps, outs = p.outs, ins = p.ins;
-	const BOOL noColour = ps[7] >> 31;
+	const BOOL noColour = (ps[7] >> 31) || p.exportsNothing;
 	// Blending as the PV host's runDraw: the colour pass and, when alpha's equation differs and both are written, an alpha-only pass after it
 	// (the card ignores SEPARATE_ALPHA_BLEND). ponytail: a colour factor reading destination alpha sees the alpha from before the draw.
 	const uint32_t *blend = [p blendOf:d->attachment];
