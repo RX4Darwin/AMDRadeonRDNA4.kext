@@ -248,6 +248,21 @@ RDNA4_ACCEL_STRUCTORS(RDNA4DisplayPipe, IOAccelDisplayPipe)
 class RDNA4DeviceControl : public AppleGraphicsDeviceControl {
 	OSDeclareDefaultStructors(RDNA4DeviceControl)
 
+	// the GPU's framebuffers (IOFramebuffers anywhere under its provider), retained, at most cap
+	uint32_t framebuffers(IORegistryEntry **out, uint32_t cap)
+	{
+		uint32_t n = 0;
+		IORegistryIterator *it = getProvider() ? IORegistryIterator::iterateOver(getProvider(), gIOServicePlane, kIORegistryIterateRecursively)
+		                                        : nullptr;
+		while (IORegistryEntry *e = it ? it->getNextObject() : nullptr)
+			if (n < cap && e->metaCast("IOFramebuffer")) {
+				e->retain();
+				out[n++] = e;
+			}
+		OSSafeReleaseNULL(it);
+		return n;
+	}
+
 public:
 	IOReturn vendor_doDeviceAttribute(unsigned int attribute, unsigned long *in, unsigned long inLength, unsigned long *out,
 	                                  unsigned long *outLength, IOExternalMethodArguments *) APPLE_KEXT_OVERRIDE
@@ -261,6 +276,24 @@ public:
 			strlcpy(reinterpret_cast<char *>(o + 4), "AMD Radeon RDNA4", 32);
 			*reinterpret_cast<uint32_t *>(o + 0x24) = 0x1002 | 0x7550u << 16;
 			*reinterpret_cast<uint32_t *>(o + 0x28) = 2;
+			r = kIOReturnSuccess;
+		} else if (attribute == 3 && size == 4 && o && !inLength) {   // the framebuffer flags it may be asked to set: none (the paravirtual
+			*reinterpret_cast<uint32_t *>(o) = 0;                   // GPU's 3: it makes its own framebuffers when asked; ours exist)
+			r = kIOReturnSuccess;
+		} else if (attribute == 0x980 && size == 0xdc && o) {   // its framebuffers, as the paravirtual GPU's: four masks of n bits (from
+			IORegistryEntry *fb[20];                             // bit 1), n five times, the provider, then one entry each (its object:
+			const uint32_t n = framebuffers(fb, 20);              // here its registry ID, no kernel address to user space)
+			const uint64_t mask = static_cast<uint64_t>(~(0xffffffffu << n)) * 2;
+			bzero(o, 0xdc);
+			for (int i = 0; i < 4; i++)
+				*reinterpret_cast<uint64_t *>(o + 8 * i) = mask;
+			for (int i = 0; i < 5; i++)
+				*reinterpret_cast<uint32_t *>(o + 0x20 + 4 * i) = n;
+			*reinterpret_cast<uint64_t *>(o + 0x34) = getProvider() ? getProvider()->getRegistryEntryID() : 0;
+			for (uint32_t i = 0; i < n; i++) {
+				*reinterpret_cast<uint64_t *>(o + 0x3c + 8 * i) = fb[i]->getRegistryEntryID();
+				fb[i]->release();
+			}
 			r = kIOReturnSuccess;
 		} else if (attribute == 0x921 && size == 0xb0 && o) {   // the paravirtual GPU's capabilities, as it writes them
 			bzero(o, 0xb0);
