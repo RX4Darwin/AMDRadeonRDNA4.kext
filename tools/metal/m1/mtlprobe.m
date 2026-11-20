@@ -11,6 +11,7 @@
 //                      translated at run time
 //   mtlprobe nativewin [S]  a window whose CAMetalLayer draws on our own device for S seconds (10): the colour triangle each frame
 //   mtlprobe nativespin [S]  spin on our own device (3D: depth test, a texture and sampler, indexed instanced draws)
+//   mtlprobe nativestencil [1|4]  stencil (Depth32Float_Stencil8) and 4x multisampling with a resolve on our own device
 //   mtlprobe nativesrc a kernel compiled from source (Metal's own compiler) on our own device, run and checked (as native)
 //   mtlprobe dualsrc   dual-source blending: every pixel of a quad whose colour and second source depend on its parity, checked
 //   mtlprobe devices   every Metal device MTLCopyAllDevices returns, its class and registry ID (docs/native-metal-spike.md)
@@ -477,6 +478,147 @@ static void simd(id<MTLDevice> d, id<MTLCommandQueue> q) {
 			}
 	}
 	OUT("simd: %s, %d of %d results wrong (0 = executed)", ran ? "ran" : "NOT RUN", bad, N * 11 - 8);
+}
+
+// Stencil and multisampling on our own device (Maps' passes: Depth32Float_Stencil8, 4x BGRA8 sRGB resolved into the drawable): a 64x64
+// target, the left half marked in the stencil (ref 1, replace), then a full quad drawn where the stencil equals 1 (green). With `samples` 4
+// the target and the stencil are 4x and resolved into a 1x texture. Then a 4x white triangle on black: its edges' resolved pixels between.
+static BOOL stencilPass(id<MTLDevice> d, id<MTLCommandQueue> q, id<MTLLibrary> lib, NSUInteger samples, MTLPixelFormat format)
+{
+	NSError *err = nil;
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"st_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"st_f"];
+	pd.colorAttachments[0].pixelFormat = format;
+	pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	pd.rasterSampleCount = samples;
+	id<MTLRenderPipelineState> ps = [d newRenderPipelineStateWithDescriptor:pd error:&err];
+	MTLDepthStencilDescriptor *mark = [MTLDepthStencilDescriptor new], *test = [MTLDepthStencilDescriptor new];
+	mark.frontFaceStencil.stencilCompareFunction = MTLCompareFunctionAlways;
+	mark.frontFaceStencil.depthStencilPassOperation = MTLStencilOperationReplace;
+	mark.backFaceStencil = mark.frontFaceStencil;
+	mark.depthCompareFunction = MTLCompareFunctionLessEqual;   // tested, not written (z 0.5 against the cleared 1): stencil writes with Z on
+	test.frontFaceStencil.stencilCompareFunction = MTLCompareFunctionEqual;
+	test.backFaceStencil = test.frontFaceStencil;
+	id<MTLDepthStencilState> markState = [d newDepthStencilStateWithDescriptor:mark], testState = [d newDepthStencilStateWithDescriptor:test];
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	id<MTLTexture> one = [d newTextureWithDescriptor:td];
+	td.storageMode = MTLStorageModePrivate;
+	td.pixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	if (samples > 1) {
+		td.textureType = MTLTextureType2DMultisample;
+		td.sampleCount = samples;
+	}
+	id<MTLTexture> zs = [d newTextureWithDescriptor:td];
+	td.pixelFormat = format;
+	id<MTLTexture> many = samples > 1 ? [d newTextureWithDescriptor:td] : one;
+	if (!ps || !one || !zs || !many) {
+		OUT("nativestencil: %lux: FAIL: %s", (unsigned long)samples, ps ? "no textures" : err.localizedDescription.UTF8String);
+		return NO;
+	}
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = many;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+	rp.colorAttachments[0].storeAction = samples > 1 ? MTLStoreActionMultisampleResolve : MTLStoreActionStore;
+	rp.colorAttachments[0].resolveTexture = samples > 1 ? one : nil;
+	rp.depthAttachment.texture = rp.stencilAttachment.texture = zs;
+	rp.depthAttachment.loadAction = rp.stencilAttachment.loadAction = MTLLoadActionClear;
+	rp.stencilAttachment.clearStencil = 0;
+	const float left[8] = { -1, -1, 0, -1, -1, 1, 0, 1 }, all[8] = { -1, -1, 1, -1, -1, 1, 1, 1 }, red[4] = { 1, 0, 0, 1 }, green[4] = { 0, 1, 0, 1 };
+	const float half = 0.5f, more = 0.75f;
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	[re setVertexBytes:&half length:4 atIndex:1];
+	[re setDepthStencilState:markState];
+	[re setStencilReferenceValue:1];
+	[re setVertexBytes:left length:sizeof left atIndex:0];
+	[re setFragmentBytes:red length:sizeof red atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[re setDepthStencilState:testState];
+	[re setVertexBytes:all length:sizeof all atIndex:0];
+	[re setFragmentBytes:green length:sizeof green atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[re endEncoding];
+	run(cb, samples > 1 ? "nativestencil 4x" : "nativestencil 1x");
+	uint32_t px[64 * 64];
+	[one getBytes:px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+	int wrong = 0, wrongLeft = 0, first = -1, last = -1;
+	for (int i = 0; i < 64 * 64; i++)
+		if (px[i] != (i % 64 < 32 ? 0xff00ff00u : 0xff000000u)) {
+			wrong++;
+			wrongLeft += i % 64 < 32;
+			first = first < 0 ? i : first;
+			last = i;
+		}
+	OUT("nativestencil: %lux stencil %s: %d of 4096 pixels wrong (%d of them left; left green 0xff00ff00, right black), first (%d,%d) 0x%08x, "
+	    "last (%d,%d) 0x%08x", (unsigned long)samples, wrong ? "FAIL" : "PASS", wrong, wrongLeft, first % 64, first / 64, first < 0 ? 0 : px[first],
+	    last % 64, last / 64, last < 0 ? 0 : px[last]);
+	for (int y = 0; wrong && y < 64; y += 8) {   // where: g green, r red, . black, ? other (every 8th row)
+		char row[65];
+		for (int x = 0; x < 64; x++) {
+			const uint32_t v = px[y * 64 + x];
+			row[x] = v == 0xff00ff00u ? 'g' : v == 0xffff0000u ? 'r' : v == 0xff000000u ? '.' : '?';
+		}
+		row[64] = 0;
+		OUT("nativestencil: row %2d %s", y, row);
+	}
+	// the depth test beside the stencil: the left half at z 0.5 (written), then all at 0.75 where less (the right half, cleared to 1)
+	MTLDepthStencilDescriptor *zw = [MTLDepthStencilDescriptor new], *zt = [MTLDepthStencilDescriptor new];
+	zw.depthWriteEnabled = YES;
+	zt.depthCompareFunction = MTLCompareFunctionLess;
+	cb = [q commandBuffer];
+	re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	[re setDepthStencilState:[d newDepthStencilStateWithDescriptor:zw]];
+	[re setVertexBytes:left length:sizeof left atIndex:0];
+	[re setVertexBytes:&half length:4 atIndex:1];
+	[re setFragmentBytes:red length:sizeof red atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[re setDepthStencilState:[d newDepthStencilStateWithDescriptor:zt]];
+	[re setVertexBytes:all length:sizeof all atIndex:0];
+	[re setVertexBytes:&more length:4 atIndex:1];
+	[re setFragmentBytes:green length:sizeof green atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[re endEncoding];
+	run(cb, "nativestencil depth");
+	[one getBytes:px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+	int zwrong = 0;
+	for (int i = 0; i < 64 * 64; i++)
+		zwrong += px[i] != (i % 64 < 32 ? 0xffff0000u : 0xff00ff00u);
+	OUT("nativestencil: %lux depth %s: %d of 4096 pixels wrong (left red 0xffff0000, right green); (16,16) 0x%08x, (48,16) 0x%08x",
+	    (unsigned long)samples, zwrong ? "FAIL" : "PASS", zwrong, px[16 * 64 + 16], px[16 * 64 + 48]);
+	wrong += zwrong;
+	if (samples == 1)
+		return !wrong;
+	// a triangle's edges: their resolved pixels between black and white
+	const float tri[8] = { -0.9f, -0.9f, 0.9f, -0.7f, -0.2f, 0.9f, -0.2f, 0.9f }, white[4] = { 1, 1, 1, 1 };
+	rp.depthAttachment.texture = rp.stencilAttachment.texture = nil;
+	pd.depthAttachmentPixelFormat = pd.stencilAttachmentPixelFormat = MTLPixelFormatInvalid;
+	id<MTLRenderPipelineState> plain = [d newRenderPipelineStateWithDescriptor:pd error:&err];
+	cb = [q commandBuffer];
+	re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:plain];
+	[re setVertexBytes:tri length:sizeof tri atIndex:0];
+	[re setVertexBytes:&half length:4 atIndex:1];
+	[re setFragmentBytes:white length:sizeof white atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[re endEncoding];
+	run(cb, "nativestencil msaa");
+	[one getBytes:px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+	int lit = 0, between = 0;
+	for (int i = 0; i < 64 * 64; i++) {
+		const uint32_t g = px[i] >> 8 & 0xff;
+		lit += g == 255;
+		between += g && g != 255;
+	}
+	const BOOL ok = !wrong && plain && lit > 600 && between > 40;
+	OUT("nativestencil: 4x resolve %s: %d pixels white, %d between (edges; one sample: 0), centre 0x%08x", ok ? "PASS" : "FAIL", lit, between,
+	    px[32 * 64 + 28]);
+	return ok;
 }
 
 static void tri(id<MTLDevice> d, id<MTLCommandQueue> q) {
@@ -2687,6 +2829,28 @@ int main(int argc, char **argv) {
 			const BOOL raysOk = nativeRays(d, lib);
 			const BOOL queueOk = nativeQueue(d, scale, rps, pass, tex);
 			return computeOk && renderOk && raysOk && queueOk ? 0 : 1;
+		}
+		if (!strcmp(mode, "nativestencil")) {   // stencil and 4x multisampling on our own device (stencilPass)
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			NSError *err = nil;
+			id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+			                                              "struct V { float4 pos [[position]]; };\n"
+			                                              "vertex V st_v(uint vid [[vertex_id]], constant float2 *p [[buffer(0)]], constant float &z [[buffer(1)]]) { V v; v.pos = float4(p[vid], z, 1); return v; }\n"
+			                                              "fragment float4 st_f(constant float4 &c [[buffer(0)]]) { return c; }"
+			                                     options:nil
+			                                       error:&err];
+			if (!lib) {
+				OUT("nativestencil: FAIL: %s", d ? err.localizedDescription.UTF8String : "no RDNA4MTLDevice");
+				return 1;
+			}
+			id<MTLCommandQueue> q = [d newCommandQueue];
+			const char *only = argc > 2 ? argv[2] : NULL;   // one of the passes alone: mtlprobe nativestencil 1 or 4
+			const BOOL ok = (only && atoi(only) == 4 ? YES : stencilPass(d, q, lib, 1, MTLPixelFormatBGRA8Unorm)) &
+			                (only && atoi(only) == 1 ? YES : stencilPass(d, q, lib, 4, MTLPixelFormatBGRA8Unorm));
+			return ok ? 0 : 1;
 		}
 		if (!strcmp(mode, "nativespin")) {   // the native-Metal spike's gate 10: spin (3D: depth, textures, instances) on our own device
 			id<MTLDevice> d = nil;

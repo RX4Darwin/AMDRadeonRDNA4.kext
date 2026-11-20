@@ -40,6 +40,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - Native Metal for apps: `debug.rdna4_nativeapps` / `rdna4-nativeapps` name processes that get the native device besides WindowServer
   (Safari runs on it); sandboxed apps reach the runtime through the paravirtual accelerator; WebKit's GPU process gets Apple's Metal
   plug-in again (it had none since the native desktop: the plug-in name is now answered per process).
+- Stencil and multisampling on the native device (ported from the paravirtual host): Depth32Float_Stencil8 and Stencil8
+  attachments, front and back stencil states and references, depth and stencil clears as fills on the card, 2x and 4x colour and
+  depth-stencil textures drawn with all their samples and resolved on the card (sRGB in linear light). Card (2026-11-20): `mtlprobe
+  nativestencil` passes stencil, depth and resolve at 1x and 4x; Maps runs on the native device (`Safari,Maps`), its map, labels and
+  pins as on Apple's paravirtual path.
 - The paravirtual host opens the runtime from its tick (from a draw, IOLog ran the timer thread's stack out: a double fault).
 
 ## 0.3.3 (2026-11-19)

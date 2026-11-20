@@ -480,3 +480,21 @@ one work queue), `commandBufferWithDescriptor:`. Maps then runs, its interface r
 Depth32Float_Stencil8 attachment, refused ("not yet"), and it makes 2D multisample textures. Stencil and MSAA (the PV host has both) are
 what the native device needs next for Maps and 3D apps; Maps stays off the list until then.
 
+Round 3 (2026-11-20): stencil and MSAA, as the PV host's `runDraw`, `stencilFor`, `msaaSurface` and `resolveMsaa`.
+- Depth textures may be Depth32Float, Stencil8 or Depth32Float_Stencil8, 1, 2 or 4 samples: one VRAM allocation, the depth (Z_32_FLOAT)
+  then the stencil (STENCIL_8), both 64KB_2D in whole 256x256 blocks. Their clears are DMA fills behind the pass's earlier draws (the
+  depth clear was a CPU write that drained the ring).
+- Multisampled colour textures (2DMultisample, 2x or 4x, 4 or 8 bytes a pixel) live in VRAM, 64KB_2D, the colour block's pitch their
+  width; draws into them patch the PV host's MSAA registers. A resolve (`MultisampleResolve`, `StoreAndMultisampleResolve`, also set by
+  `setColorStoreAction:atIndex:`) runs `rdna4_resolve` / `rdna4_resolve_srgb` from `src/mtlkernels.h` on the compute queue at the end of
+  the encoder.
+- Z is on only when the state tests or writes depth (the PV host's rule). With Z on, compare always and no write, a 4x pass lost its
+  stencil writes in a pattern of 8x16-pixel tiles (correct only on the diagonal); with a real depth test, or Z off, they are right.
+- `mtlprobe nativestencil [1|4]`: the stencil marks the left half (replace, depth tested), a full quad drawn where it is 1; a depth test
+  beside it; a 4x triangle resolved (its edges between black and white). All pass on the card.
+- Maps (`Safari,Maps`) draws its map with labels and pins, the same picture as on Apple's paravirtual path. Its glyph uploads failed
+  before: the buffer-to-texture bounds check took 4 bytes a pixel (its atlas is 1). Also new for it: `setViewports:count:` and
+  `setScissorRects:count:` (the first one), `setDepthBias:...` and `setDepthClipMode:` ignored.
+- The device opens the runtime client through the accelerator only if that client answers `rdna4_info`: the spike's own service
+  (`debug.rdna4_nativemtl=1`, mtlprobe's) makes a client of the same type that is not the runtime's, and mtlprobe had no gfx.
+
