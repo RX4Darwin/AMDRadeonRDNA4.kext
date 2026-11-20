@@ -7,7 +7,11 @@
 #   3. no raw SOPP-looking literal (0xbf8/9/a/b/c......) is written in src/*.cpp outside isa.hpp: hand-written words go through src/isa.hpp.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# The stale-header check needs the LLVM the headers were made with (19, tools/gen/build-shaders.sh): LLVM 23 encodes an unused VOP3
+# operand (src2 of v_cmp_*_e64) as the constant 0 instead of s0, which the hardware ignores but the byte compare does not.
 MC=${LLVM_MC:-llvm-mc}
+OBJCOPY=${LLVM_OBJCOPY:-$(dirname "$(command -v "$MC" 2>/dev/null || echo .)")/llvm-objcopy}   # beside llvm-mc (Homebrew's llvm is not on PATH)
+command -v "$OBJCOPY" >/dev/null 2>&1 || OBJCOPY=llvm-objcopy
 if ! command -v "$MC" >/dev/null 2>&1; then
 	echo "check-isa: SKIPPED ($MC not found; set LLVM_MC)"
 	exit 0
@@ -50,7 +54,7 @@ for hdr in src/*_kernel.h; do
 	[ -f "src/shaders/$name.s" ] || { bad "$hdr has no src/shaders/$name.s"; continue; }
 	have=$(grep -o '0x[0-9a-f]\{8\}' "$hdr" | paste -sd' ' -)
 	want=$("$MC" -triple=amdgcn-amd-amdhsa -mcpu=gfx1201 $attr -filetype=obj -o /tmp/check-isa.$$.o "src/shaders/$name.s" 2>&1 \
-	       && (command -v llvm-objcopy >/dev/null && llvm-objcopy -O binary --only-section=.text /tmp/check-isa.$$.o /tmp/check-isa.$$.bin \
+	       && (command -v "$OBJCOPY" >/dev/null && "$OBJCOPY" -O binary --only-section=.text /tmp/check-isa.$$.o /tmp/check-isa.$$.bin \
 	           && python3 -c '
 import sys
 d=open(sys.argv[1],"rb").read()
@@ -63,7 +67,7 @@ print(" ".join("0x%08x" % int.from_bytes(d[i:i+4],"little") for i in range(0,len
 	fi
 	text=$(DISASM_ATTR=$attr disasm $have)
 	echo "$text" | grep -qi "invalid\|unknown\|warning\|error" && bad "$name: llvm-mc cannot disassemble the header's words: $(echo "$text" | grep -i 'invalid\|unknown\|warning\|error' | head -2 | tr '\n' ' ')"
-	last=$(echo "$text" | grep -v '^\s*\.' | sed 's/^[ \t]*//; s/ *;.*//' | grep -v '^$' | tail -1)
+	last=$(echo "$text" | grep -v '^\s*\.' | sed 's/^[[:space:]]*//; s/ *;.*//' | grep -v '^$' | tail -1)
 	[ "$last" = "s_endpgm" ] || bad "$name: the last instruction is '$last', not s_endpgm"
 	echo "$text" | grep -q "s_setkill" && bad "$name: contains s_setkill (the gfx6-10 s_endpgm encoding read on gfx12)"
 done

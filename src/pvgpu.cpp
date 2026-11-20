@@ -6269,11 +6269,11 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	static Jit nullPs;
 
 	if (!nullPs.gfx) {
-		const uint32_t head[8] = {0x58464752, 2, 64 * 4, 0x020f0000, 0, 1, 1, 0x80000000u}, code[3] = {0xf8000800, 0, 0xbfb00000};
+		const uint32_t head[8] = {0x58464752, 2, 64 * 4, 0x020f0000, 0, 1, 1, 0x80000000u}, code[3] = {0xf8000800, 0, Isa::kSEndpgm};
 
 		memcpy(nullPsBlob, head, sizeof(head));
 		for (uint32_t i = 0; i < 64; i++)
-			nullPsBlob[8 + i] = i < 3 ? code[i] : 0xbf9f0000;   // then s_code_end
+			nullPsBlob[8 + i] = i < 3 ? code[i] : Isa::kSCodeEnd;
 		nullPs.gfx = reinterpret_cast<uint8_t *>(nullPsBlob);
 		nullPs.gfxLen = sizeof(nullPsBlob);
 	}
