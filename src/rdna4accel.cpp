@@ -16,6 +16,8 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_patcher.hpp>
 #include <IOKit/IOLib.h>
+#include <IOKit/IODeviceTreeSupport.h>
+#include <libkern/OSKextLib.h>
 #include <sys/sysctl.h>
 
 #include "accelcensus.hpp"
@@ -432,18 +434,64 @@ int accelTo(int value)
 	return 0;
 }
 
+void guardSet(const char *what);
+
 int accelSysctl SYSCTL_HANDLER_ARGS
 {
 	int value = gFamilyClients ? 4 : gDisplays ? 3 : gStarted ? 2 : gAccel ? 1 : 0;
 	const int err = sysctl_handle_int(oidp, &value, 0, req);
-	return err || !req->newptr ? err : accelTo(value);
+	if (err || !req->newptr)
+		return err;
+	if (value == 0) {   // the boot-arg's guard cleared: the next boot tries again
+		guardSet("cleared");
+		return 0;
+	}
+	return accelTo(value);
+}
+
+// The boot-arg's guard (rdna4-accel in config.plist survives a crash, a test boot's option does not): "pending" while an attempt runs,
+// "survived" once it has lasted kGuardSeconds; a boot that finds "pending" skips the attempt (the last one hung or panicked).
+// debug.rdna4_accel=0 clears it. Written as trial.cpp writes its variable (IORegistryEntry's own calls on /options).
+const char *kGuardKey = "4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-accel-guard";
+constexpr uint32_t kGuardSeconds = 120;
+
+bool guardIs(const char *what)
+{
+	IORegistryEntry *nvram = IORegistryEntry::fromPath("/options", gIODTPlane);
+	OSObject *v = nvram ? nvram->copyProperty(kGuardKey) : nullptr;
+	char text[32] = "";
+	if (auto *str = OSDynamicCast(OSString, v))
+		strlcpy(text, str->getCStringNoCopy(), sizeof(text));
+	else if (auto *d = OSDynamicCast(OSData, v))
+		strlcpy(text, static_cast<const char *>(d->getBytesNoCopy()), MIN(sizeof(text), d->getLength() + 1));
+	OSSafeReleaseNULL(v);
+	OSSafeReleaseNULL(nvram);
+	return !strcmp(text, what);
+}
+
+void guardSet(const char *what)
+{
+	IORegistryEntry *nvram = IORegistryEntry::fromPath("/options", gIODTPlane);
+	const OSSymbol *key = OSSymbol::withCString(kGuardKey);
+	OSString *value = OSString::withCString(what);
+	OSDictionary *sync = OSDictionary::withCapacity(1);
+	OSString *yes = OSString::withCString("1");
+	if (nvram && key && value)
+		nvram->setProperty(key, value);
+	if (nvram && sync && yes && sync->setObject("IONVRAM-FORCESYNCNOW-PROPERTY", yes))
+		nvram->setProperties(sync);
+	OSSafeReleaseNULL(yes);
+	OSSafeReleaseNULL(sync);
+	OSSafeReleaseNULL(value);
+	OSSafeReleaseNULL(key);
+	OSSafeReleaseNULL(nvram);
 }
 
 // rdna4-accel (a boot-arg, or a test boot's: rdna4-trial "armed rdna4-accel=4"): the steps at boot, before WindowServer if it can,
 // once the family is solved, the GPU known and its first framebuffer up (the rest of the boot heads a moment later).
 void accelAtBoot(void *, wait_result_t)
 {
-	for (int ms = 0; ms < 60000 && !(gReady && RDNA4AccelCensus::gpu()); ms += 100)
+	for (int ms = 0; ms < 60000 && !RDNA4AccelCensus::gpu(); ms += 100)
 		IOSleep(100);
 	// asked only now: at the plugin's start NVRAM is not there yet and a test boot's options read as none (2026-11-20)
 	uint32_t want = 0;
@@ -451,6 +499,18 @@ void accelAtBoot(void *, wait_result_t)
 		thread_terminate(current_thread());
 		return;
 	}
+	if (guardIs("pending")) {
+		rdna4Log("AMDRadeonRDNA4: accel: rdna4-accel=%u: the last attempt did not survive %u s (guard \"pending\"): skipped; "
+		         "debug.rdna4_accel=0 clears the guard\n", want, kGuardSeconds);
+		thread_terminate(current_thread());
+		return;
+	}
+	guardSet("pending");
+	// Without the paravirtual GPU nothing loads the family (our kext cannot depend on it): loaded here, solved when it comes
+	const OSReturn loaded = OSKextLoadKextWithIdentifier("com.apple.iokit.IOAcceleratorFamily2");
+	rdna4Log("AMDRadeonRDNA4: accel: loading IOAcceleratorFamily2: 0x%x\n", loaded);
+	for (int ms = 0; ms < 30000 && !gReady; ms += 100)
+		IOSleep(100);
 	OSDictionary *match = IOService::serviceMatching("IONDRVFramebuffer");
 	IOService *fb = match ? IOService::waitForMatchingService(match, 60ull * NSEC_PER_SEC) : nullptr;
 	OSSafeReleaseNULL(match);
@@ -458,6 +518,9 @@ void accelAtBoot(void *, wait_result_t)
 	IOSleep(2000);
 	const int err = accelTo(static_cast<int>(want));
 	rdna4Log("AMDRadeonRDNA4: accel: rdna4-accel=%u at boot: %s (%d)\n", want, err ? "FAILED" : "done", err);
+	IOSleep(kGuardSeconds * 1000);
+	guardSet("survived");
+	rdna4Log("AMDRadeonRDNA4: accel: rdna4-accel=%u survived %u s: guard cleared\n", want, kGuardSeconds);
 	thread_terminate(current_thread());
 }
 
