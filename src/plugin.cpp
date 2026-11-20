@@ -37,6 +37,7 @@
 #include <mach/kmod.h>
 
 #include "accelcensus.hpp"
+#include "rdna4accel.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
 #include "pvhooks.hpp"
@@ -1774,6 +1775,7 @@ void pluginStart() {
 	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "", pvGpu ? ", FAKE PARAVIRT GPU (VM only)" : "");
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
 	lilu.onKextLoadForce(&kextIOGraphics, 1, processGraphics, nullptr);
+	RDNA4Accel::start();   // our own accelerator: nothing published unless debug.rdna4_accel=1 (rdna4accel.cpp)
 #ifdef AMDRadeonRDNA4_PVGPU
 	// whether this boot has the fake GPU is only known once NVRAM is (rdna4-trial): the functions are resolved in any case
 	lilu.onKextLoadForce(&kextIOSurface, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {

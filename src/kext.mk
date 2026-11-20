@@ -34,7 +34,7 @@ OPT_DEBUG      = -O0 -DDEBUG
 # In link order. plugin_start.cpp is Lilu's (lib/Lilu/Lilu/Library); fwblobs.o is the firmware, or nothing.
 USER_OBJS = klog.o trial.o vrambench.o regsnap.o plugin.o device.o clk.o cursor.o ndrv.o modeset.o pipe2.o dptrain.o dpphy.o dmubload.o dcninit.o compute.o gfxring.o pmidle.o \
             flip.o amdfw.o psp.o sdma.o ih.o ihdecode.o pm4.o codeobj.o gpuheap.o gpuvm.o vmtree.o n48n.o \
-            n48nkext.o vmid.o ptpages.o gpuvmtable.o runtime.o vmtest.o vmshared.o userclient.o accelcensus.o \
+            n48nkext.o vmid.o ptpages.o gpuvmtable.o runtime.o vmtest.o vmshared.o userclient.o accelcensus.o rdna4accel.o ioaccel_thunks.o \
             $(PVGPU_OBJS_$(PVGPU)) plugin_start.o atombios.o ipdiscovery.o edid.o otgtiming.o modes.o pipe.o \
             $(VMTEST_OBJS_$(VMTEST)) fwblobs.o
 # kmod_info.o is linked after the other objects.
@@ -101,6 +101,10 @@ fwblobs.o: $(ROOT)/src/fwblobs.S fwconfig.h
 		echo "$(CC) $(TARGET) -I$(ROOT) -c $(ROOT)/src/fwblobs.S -o $@"; \
 		$(CC) $(TARGET) -I$(ROOT) -c $(ROOT)/src/fwblobs.S -o $@; \
 	fi
+
+# IOAcceleratorFamily2's functions our accelerator reaches, as jumps through a table (tools/gen/accelgen.py, src/rdna4accel.cpp).
+ioaccel_thunks.o: $(ROOT)/src/ioaccel_thunks.S
+	$(CC) $(TARGET) -c $(ROOT)/src/ioaccel_thunks.S -o $@
 
 # Header dependencies from -MMD.
 -include $(OBJS:.o=.d)

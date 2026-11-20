@@ -43,6 +43,34 @@ service of our own). Two ways out, both changing how the Mac boots:
   asks to approve it in System Settings > Privacy & Security, then a reboot; updates go through `kmutil`. Its code runs late (after
   WindowServer may have started), so the paravirtual layer stays for the boot.
 
+### A is not possible on Tahoe; D instead (2026-11-20)
+
+`Kernel -> Force` loads a kext's executable from the system volume, and since macOS 11 the families have none there: on the rig
+`/System/Library/Extensions/IOGraphicsFamily.kext`, `IOAcceleratorFamily2.kext`, `IOSurface.kext`, `IOReportFamily.kext` and
+`IOPCIFamily.kext` have no `Contents/MacOS` (their code is only inside the kernel collections). Injecting the KDK's copies into the boot
+collection would not help either: every system-collection kext that uses them (the paravirtual driver, IONDRVSupport, the wrangler, ...)
+is prelinked against the system collection's copies.
+
+- **D. Derive at run time (chosen, needs no boot change and no approval).** The base classes are declared from the KDK
+  (`tools/gen/accelgen.py` -> `src/ioaccel.hpp`: vtable order and instance size; Tahoe's IOService vtable has the SDK's 266 slots).
+  Every base function our classes reach is a thunk in our kext (`src/ioaccel_thunks.S`), a jump through a table that
+  `src/rdna4accel.cpp` fills with Lilu's `solveSymbol` when IOAcceleratorFamily2 loads, after checking each virtual against the
+  running vtable's slot and the class size. The base's `gMetaClass` is a placeholder; our metaclass's superclass link (+16) is set to the
+  real one then. Our classes' metaclasses are written out, without the `superClass` pointer symbol that
+  `OSDefineMetaClassAndStructors` makes: OpenCore's linker patches every class with one against its superclass's vtable, which must be
+  one it linked itself (only the kext's own patched vtables and its dependencies count); a copy of the base's vtable in our kext did not
+  count, and the first try made OpenCore drop the whole kext (the rig booted without it; restored from `~/rdna4/kext.prev`).
+  Checked with the build: the base's vtable compiled from `src/ioaccel.hpp` equals the KDK's slot for slot.
+- Milestone 1 under D: `debug.rdna4_accel=1` (a sysctl, not a boot-arg: a mistake costs one boot, not every boot) makes an
+  `RDNA4Accelerator` under the GPU with `IOService::start` only, user clients refused, the 17 required functions empty.
+- **Card, 2026-11-20 (Tahoe 26.6.2, kext 80b30b47):** the kext loads with the accelerator in it; at IOAcceleratorFamily2's load all 84
+  thunks are found and all 83 checked virtuals sit in the KDK's (26.5.2) slots. The family's metaclass reads size 0 at that point (its
+  static constructors have not run yet): the size is checked when one is made. **`debug.rdna4_accel=1` HUNG THE RIG** (ssh stopped
+  answering, no panic reboot in 15 min; needs a power cycle). Not known yet what hangs: the publication (`registerService`) wakes
+  whoever watches accelerators (AppleGPUWrangler walks them, per the M0 notes; WindowServer and Metal enumerate them) and they call into
+  an object whose family state was never set up (the family's `start` did not run). Next: make it without `registerService` (attached
+  only), then with the family's own `start` and the 17 functions implemented, and only then published; look for a panic report first.
+
 ## Milestones
 
 1. A skeleton `IOGraphicsAccelerator2` subclass loads (A or B) beside today's stack and publishes without anything matching it.
