@@ -5534,6 +5534,9 @@ bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t 
 	static constexpr uint64_t kWindow = 2ull << 20;
 	const uint64_t window = va & ~(kWindow - 1);
 
+	if (va > ~0ull - 0xfff || bytes > ~0ull - 0xfff - va)
+		return false;   // va + bytes, rounded up to a page, would wrap (the page count below with it)
+
 	if (bytes && bytes <= kWindow / 4 && va + bytes <= window + kWindow) {
 		Mapping *m = keyedMapping(nullptr, task, window, kWindow >> 12);
 
@@ -5641,6 +5644,8 @@ bool RDNA4PvHost::mapGuestPages(uint32_t task, uint64_t first, uint64_t count, b
 
 // The same for `bytes` of a prepared memory descriptor (an IOSurface's) from `offset`, which must be 256-byte aligned (an image's base).
 bool RDNA4PvHost::mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
+	if (offset > ~0ull - 0xfff || bytes > ~0ull - 0xfff - offset)
+		return false;   // offset + bytes, rounded up to a page, would wrap
 	const uint64_t first = offset & ~0xfffull, count = (offset + bytes + 0xfff - first) >> 12;
 
 	if (const Mapping *m = !(offset & 0xff) ? keyedMapping(memory, 0, first, count) : nullptr) {
@@ -10289,14 +10294,14 @@ void RDNA4PvNub::tahoeConfigWrite(UInt32 width, UInt8 offset, UInt32 data) {
 }
 IOReturn RDNA4PvNub::tahoeDeviceMemoryRead(UInt8, UInt64 offset, void *data, UInt8 size) {
 	PVCALL("tahoeDeviceMemoryRead");
-	if (!mBar0 || !data || !size || offset + size > kBar0Size)
+	if (!mBar0 || !data || !size || offset > kBar0Size || size > kBar0Size - offset)   // (offset + size could wrap)
 		return kIOReturnBadArgument;
 	memcpy(data, static_cast<uint8_t *>(mBar0) + offset, size);
 	return kIOReturnSuccess;
 }
 IOReturn RDNA4PvNub::tahoeDeviceMemoryWrite(UInt8, UInt64 offset, UInt64 data, UInt8 size) {
 	PVCALL("tahoeDeviceMemoryWrite");
-	if (!mBar0 || !size || size > 8 || offset + size > kBar0Size)
+	if (!mBar0 || !size || size > 8 || offset > kBar0Size || size > kBar0Size - offset)
 		return kIOReturnBadArgument;
 	memcpy(static_cast<uint8_t *>(mBar0) + offset, &data, size);
 	return kIOReturnSuccess;

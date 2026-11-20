@@ -672,6 +672,8 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	uint64_t physical = 0;
 	if (!gpuPhysical(mc, physical))
 		return false;
+	if (bytes > ~0ull - (GpuVm::kPageBytes - 1))
+		return false;   // the round-up would wrap (to a small size that passes the checks below)
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
 	if (end < va || end > GpuVm::kVaEnd)
 		return false;
@@ -748,8 +750,8 @@ bool RDNA4Compute::initRuntimeHeap() {
 }
 
 void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
-	if (!poolCpu || !hasTables(c) || !bytes || va & (GpuVm::kPageBytes - 1))
-		return;
+	if (!poolCpu || !hasTables(c) || !bytes || va & (GpuVm::kPageBytes - 1) || bytes > ~0ull - (GpuVm::kPageBytes - 1))
+		return;   // (the last: the round-up would wrap)
 	c.tlbSeq++;      /* a removed PTE: the next job on any VMID this client owns flushes first (amdgpu's tlb_seq) */
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
 	if (c.sp) {
