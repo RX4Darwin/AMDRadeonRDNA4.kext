@@ -79,8 +79,11 @@ LDFLAGS   = \
 	-lkmodc++ -lkmod \
 	-Wl,-no_deduplicate
 
+# Our own globals (g..., rdna4..., RDNA4...) must never be left undefined: the kernel cannot bind them, OpenCore bound one to junk and
+# reading it panicked the rig (an extern of a variable in another file's anonymous namespace, 2026-11-20).
 $(PRODUCT): $(OBJS)
 	$(CXX) $(LDFLAGS) $(OBJS) -o $@
+	@if nm -u $@ | grep -E '^_(g[A-Z]|rdna4|RDNA4)' | grep -v -E '^_g(IO|OS)'; then echo "our own symbols above are undefined in $@" >&2; rm -f $@; exit 1; fi
 
 .cpp.o:
 	$(CXX) $(CXXFLAGS) -c $< -o $@

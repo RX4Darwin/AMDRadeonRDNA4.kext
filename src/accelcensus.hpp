@@ -37,6 +37,7 @@ public:
 	// The GPU the native spike publishes under, and its switch: sysctl debug.rdna4_nativemtl=1 publishes level 3 then, after WindowServer chose its
 	// Metal device (at boot it could take a device that cannot draw yet).
 	static void setProvider(IOService *gpu);
+	static IOService *gpu();   // the GPU's PCI nub once setProvider ran, else nullptr
 	static uint32_t level();
 
 	const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;

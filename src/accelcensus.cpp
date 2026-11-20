@@ -298,6 +298,8 @@ bool accelNativeCaller()
 	return false;
 }
 
+IOService *RDNA4AccelCensus::gpu() { return gNativeGpu; }
+
 void RDNA4AccelCensus::setProvider(IOService *gpu)
 {
 	if (gNativeGpu || !gpu)

@@ -9,7 +9,7 @@
 //  - the running class has the KDK's size;
 //  - our metaclass's superclass link and size are where OSMetaClass keeps them (+16, +32), then the link is set to the real class.
 //
-//  debug.rdna4_accel=1 makes one, attached to the GPU (gNativeGpu) and published. Milestone 1: IOService::start only (not the family's
+//  debug.rdna4_accel=1 makes one, attached to the GPU (RDNA4AccelCensus::gpu) and published. Milestone 1: IOService::start only (not the family's
 //  start), no user clients; the 17 functions every accelerator must have return nothing.
 //
 #include <Headers/kern_api.hpp>
@@ -17,11 +17,11 @@
 #include <IOKit/IOLib.h>
 #include <sys/sysctl.h>
 
+#include "accelcensus.hpp"
 #include "ioaccel.hpp"
 #include "klog.hpp"
 #include "rdna4accel.hpp"
 
-extern IOService *gNativeGpu;   // accelcensus.cpp: the GPU's PCI nub, once known
 
 extern "C" uintptr_t rdna4AccelThunks[];
 extern "C" uintptr_t rdna4AccelMissing()
@@ -162,7 +162,10 @@ int accelSysctl SYSCTL_HANDLER_ARGS
 		return EINVAL;
 	if (gAccel)
 		return 0;
-	if (!gReady || !gNativeGpu)
+	// (accelcensus.cpp's: an extern of its variable, which is in an anonymous namespace, linked as an unresolved lookup that OpenCore
+	// bound to junk: reading it panicked the rig, 2026-11-20)
+	IOService *gpu = RDNA4AccelCensus::gpu();
+	if (!gReady || !gpu)
 		return ENODEV;
 	const OSMetaClass *base = RDNA4Accelerator::gMetaClass.getSuperClass();
 	if (base->getClassSize() != kIOGraphicsAccelerator2Size) {
@@ -176,12 +179,12 @@ int accelSysctl SYSCTL_HANDLER_ARGS
 		return ENOMEM;
 	}
 	a->setName("RDNA4Accelerator");
-	if (!a->attach(gNativeGpu)) {
+	if (!a->attach(gpu)) {
 		a->release();
 		return EBUSY;
 	}
-	if (!a->start(gNativeGpu)) {
-		a->detach(gNativeGpu);
+	if (!a->start(gpu)) {
+		a->detach(gpu);
 		a->release();
 		return EIO;
 	}

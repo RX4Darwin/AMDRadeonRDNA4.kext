@@ -65,11 +65,12 @@ is prelinked against the system collection's copies.
   `RDNA4Accelerator` under the GPU with `IOService::start` only, user clients refused, the 17 required functions empty.
 - **Card, 2026-11-20 (Tahoe 26.6.2, kext 80b30b47):** the kext loads with the accelerator in it; at IOAcceleratorFamily2's load all 84
   thunks are found and all 83 checked virtuals sit in the KDK's (26.5.2) slots. The family's metaclass reads size 0 at that point (its
-  static constructors have not run yet): the size is checked when one is made. **`debug.rdna4_accel=1` HUNG THE RIG** (ssh stopped
-  answering, no panic reboot in 15 min; needs a power cycle). Not known yet what hangs: the publication (`registerService`) wakes
-  whoever watches accelerators (AppleGPUWrangler walks them, per the M0 notes; WindowServer and Metal enumerate them) and they call into
-  an object whose family state was never set up (the family's `start` did not run). Next: make it without `registerService` (attached
-  only), then with the family's own `start` and the 17 functions implemented, and only then published; look for a panic report first.
+  static constructors have not run yet): the size is checked when one is made. **`debug.rdna4_accel=1` panicked the rig** (no reboot
+  after it: it looked like a hang). The panic report: a page fault in our sysctl handler itself, before anything was made: `extern
+  IOService *gNativeGpu` named a variable in accelcensus.cpp's anonymous namespace, so it linked as an unresolved lookup that OpenCore
+  bound to junk. Fixed (`RDNA4AccelCensus::gpu()`), and the kext build now fails if any of our own globals is left undefined. The
+  skeleton itself has not run yet. The boots after it: two warm restarts failed the compute bring-up at SDMA's test write (as once
+  before after a warm restart), the cold boot hit the SimpleHDA race (IONDRVSupport loaded unseen, the GPU never attached).
 
 ## Milestones
 
