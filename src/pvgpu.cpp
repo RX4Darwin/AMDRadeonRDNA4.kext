@@ -111,9 +111,13 @@ uint8_t *gPhysmap { nullptr }, *gPhysmapEnd { nullptr };
 // Physical memory at `pa` for `bytes` through the physmap, or nullptr without one or past its end.
 static uint8_t *physPtr(uint64_t pa, uint64_t bytes)
 {
-	const uint64_t mapped = static_cast<uint64_t>(gPhysmapEnd - gPhysmap);
+	// Check the mapping before subtracting its pointers: null (or absent) physmap bounds
+	// must never reach pointer arithmetic, even when the caller only wants a rejected range.
+	if (!gPhysmap || !gPhysmapEnd || pa + bytes < pa)
+		return nullptr;
 
-	if (!gPhysmap || pa + bytes < pa || pa + bytes > mapped)
+	const uint64_t mapped = static_cast<uint64_t>(gPhysmapEnd - gPhysmap);
+	if (pa + bytes > mapped)
 		return nullptr;
 
 	return gPhysmap + pa;
