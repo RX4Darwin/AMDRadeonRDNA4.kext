@@ -161,6 +161,7 @@ static NSError *rdna4Error(NSString *what, kern_return_t kr)
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device bytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options
                    deallocator:(void (^)(void *, NSUInteger))deallocator;
 - (void)keepOwner:(void (^)(void))release;   // called when the buffer goes
+@property (readonly) BOOL imported, readOnly;   // the caller's memory; mapped for the GPU to read only
 @end
 
 @implementation RDNA4MTLBuffer {
@@ -185,8 +186,9 @@ static NSError *rdna4Error(NSString *what, kern_return_t kr)
 	kern_return_t kr = ((uintptr_t)pointer & 4095) ? kIOReturnBadArgument : rdna4_import_host(device.gpu, pointer, bytes, 0, &_buf);
 	// memory this process may only read (Core Animation's shared with WindowServer): for the GPU to read, so its updates are seen (copied,
 	// the menu bar's app menus never changed after the first)
-	if (kr == KERN_PROTECTION_FAILURE)
-		kr = rdna4_import_host(device.gpu, pointer, bytes, RDNA4_HOST_READ_ONLY, &_buf);
+	if (kr == KERN_PROTECTION_FAILURE && !(kr = rdna4_import_host(device.gpu, pointer, bytes, RDNA4_HOST_READ_ONLY, &_buf)))
+		_readOnly = YES;
+	_imported = !kr;
 	if (kr) {
 		rdna4Error([NSString stringWithFormat:@"%lu bytes at %p into the GPU", (unsigned long)length, pointer], kr);
 		return nil;
@@ -271,6 +273,7 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 - (void)generateMipmaps;                    // levels 1 .. from level 0 (the CPU, 2x2 boxes)
 - (RDNA4MTLTexture *)copyForReading;        // its pixels now, in a texture of its own (kept for the next time); drained first by the caller
 - (uint32_t)sampleOr;                       // the OR of some of its pixels' first 4 bytes (the trace)
+- (NSString *)origin;                       // where its pixels are (the trace)
 - (RDNA4MTLTexture *)level:(NSUInteger)level;   // level `level` as a texture of its own (kept): a render pass's attachment level
 @property (readonly) BOOL shadowed;         // the GPU reads a copy of an IOSurface's pixels (refresh)
 // A view of a buffer's memory (newLinearTextureWithDescriptor:): rows `bpr` apart from `offset`.
@@ -351,6 +354,13 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 }
 
 - (BOOL)shadowed { return _surfaceRows != NULL; }
+
+- (NSString *)origin
+{
+	return [NSString stringWithFormat:@"%@%@%@ rows %lu", _surface ? [NSString stringWithFormat:@"iosurface %u plane %lu", IOSurfaceGetID(_surface), (unsigned long)_plane]
+	                                                       : _parent ? @"view" : _memory.imported ? @"buffer" : @"own",
+	                                 _surfaceRows ? @" shadowed" : @"", _memory.readOnly ? @" read-only" : @"", (unsigned long)(_surfaceRows ? _surfaceRowBytes : _rowBytes)];
+}
 
 - (uint32_t)sampleOr
 {
