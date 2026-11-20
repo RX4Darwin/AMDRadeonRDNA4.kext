@@ -3106,8 +3106,12 @@ enum { kSlots = 128, kBatchSlots = 32 };   // a batch is submitted at kBatchSlot
 	IOObjectRetain(service);
 	_service = service;
 	IORegistryEntryGetRegistryEntryID(service, &_registryID);
-	const kern_return_t kr = rdna4_open(&_gpu);
+	// through the accelerator first (a sandboxed app, WebKit's GPU process, may open only an IOAccelerator's clients), else our service
+	const kern_return_t viaAccel = rdna4_open_accelerator(&_gpu, service);
+	const kern_return_t kr = viaAccel ? rdna4_open(&_gpu) : KERN_SUCCESS;
 	_open = kr == KERN_SUCCESS;
+	if (viaAccel)
+		RTRACE(4, @"RDNA4MTLDevice: the runtime client through the accelerator: %s", rdna4_error(viaAccel));
 	// user-interactive: WindowServer's main thread waits for its submits (commitAndWaitUntilSubmitted); at the default QoS it ran at 31
 	_work = dispatch_queue_create("RDNA4MTL work", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
 	RLOG(@"RDNA4MTLDevice: for service 0x%x (registry ID 0x%llx): the kext's runtime client: %s", service, _registryID,

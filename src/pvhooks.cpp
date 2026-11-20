@@ -8,6 +8,9 @@
 #include "pvhooks.hpp"
 #include "klog.hpp"
 #include "pvscanout.hpp"
+#include "userclient.hpp"
+#include "accelcensus.hpp"
+#include "rdna4compute.h"
 #include "trial.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -46,10 +49,12 @@ constexpr const char kNdrvFramebuffer[] = "IONDRVFramebuffer";
 mach_vm_address_t orgDisable;
 mach_vm_address_t orgWait;
 mach_vm_address_t orgNewUserClient;
+mach_vm_address_t orgAccelNewUserClient;   /* IOGraphicsAccelerator2::newUserClient */
 mach_vm_address_t orgReadEdid;   /* IODisplay::readFramebufferEDID() */
 mach_vm_address_t fbOpen;   /* IOFramebuffer::open() */
 mach_vm_address_t orgMatchInternal;   /* IOService::matchInternal(OSDictionary *, UInt32, UInt32 *) */
 mach_vm_address_t orgServiceOpen;   /* is_io_service_open_extended */
+mach_vm_address_t orgPropertyBin;   /* is_io_registry_entry_get_property_bin_buf */
 void *ndrvVtable;   /* IONDRVFramebuffer's, once the heads are the paravirtual displays */
 mach_vm_address_t enable;
 uint32_t skipped;
@@ -221,6 +226,24 @@ IOService *oldestNdrvFramebuffer()
  * QuartzCore (2026-11-14). Held here, no IOKit lock is taken yet. With it,
  * the first WindowServer of the boot lives (the rig, 2026-11-14).
  */
+/*
+ * is_io_registry_entry_get_property_bin_buf (IORegistryEntryCreateCFProperty, SearchCFProperty): a native process
+ * (accelNativeCaller) reading the paravirtual accelerator's MetalPluginName or MetalPluginClassName reads RDNA4MetalPluginName /
+ * ClassName, ours; every other process Apple's (its sandbox may not map our bundle: WebKit's GPU process).
+ */
+int wrapPropertyBin(void *entry, char *plane, char *name, uint32_t options, uint64_t buf, uint64_t *bufsize, void *properties,
+                    uint32_t *propertiesCnt)
+{
+	char ours[128];
+	if (entry && name && (!strcmp(name, "MetalPluginName") || !strcmp(name, "MetalPluginClassName")) && isParavirt(entry) &&
+	    accelNativeCaller()) {
+		snprintf(ours, sizeof(ours), "RDNA4%s", name);
+		name = ours;
+	}
+	return reinterpret_cast<int (*)(void *, char *, char *, uint32_t, uint64_t, uint64_t *, void *, uint32_t *)>(orgPropertyBin)(
+		entry, plane, name, options, buf, bufsize, properties, propertiesCnt);
+}
+
 int wrapServiceOpen(void *service, void *task, uint32_t type, uint64_t ndr, void *properties, uint32_t propertiesCnt, int *result,
                     void *connection)
 {
@@ -363,9 +386,24 @@ void route(KernelPatcher &patcher, size_t index, mach_vm_address_t address,
 	patcher.clearError();
 }
 
+/* IOGraphicsAccelerator2::newUserClient: type RDNA4_NATIVE_UC_TYPE on the paravirtual accelerator is the runtime's compute client
+ * (userclient.cpp rdna4AcceleratorClient), for the native Metal device in sandboxed apps. */
+IOReturn wrapAccelNewUserClient(void *accel, void *task, void *security, uint32_t type, void **handler)
+{
+	if (type == RDNA4_NATIVE_UC_TYPE && isParavirt(accel))
+		return rdna4AcceleratorClient(static_cast<IOService *>(accel), static_cast<task_t>(task), security,
+		                              reinterpret_cast<IOUserClient **>(handler));
+
+	return reinterpret_cast<IOReturn (*)(void *, void *, void *, uint32_t, void **)>(orgAccelNewUserClient)(accel, task, security, type,
+	                                                                                                     handler);
+}
+
 void processAccel(void *, KernelPatcher &patcher, size_t index,
 		  mach_vm_address_t address, size_t size)
 {
+	KernelPatcher::RouteRequest accelNewUserClient {
+		"__ZN22IOGraphicsAccelerator213newUserClientEP4taskPvjPP12IOUserClient", wrapAccelNewUserClient, orgAccelNewUserClient,
+	};
 	KernelPatcher::RouteRequest disable {
 		"__ZN22IOGraphicsAccelerator218disableAcceleratorEv", wrapDisable,
 		orgDisable,
@@ -387,6 +425,7 @@ void processAccel(void *, KernelPatcher &patcher, size_t index,
 	patcher.clearError();
 	route(patcher, index, address, size, disable);
 	route(patcher, index, address, size, wait);
+	route(patcher, index, address, size, accelNewUserClient);
 }
 
 void processGraphics(void *, KernelPatcher &patcher, size_t index,
@@ -408,6 +447,12 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index,
 	};
 
 	KernelPatcher::RouteRequest serviceOpen {"_is_io_service_open_extended", wrapServiceOpen, orgServiceOpen};
+	KernelPatcher::RouteRequest propertyBin {"_is_io_registry_entry_get_property_bin_buf", wrapPropertyBin, orgPropertyBin};
+
+	if (!patcher.routeMultiple(KernelPatcher::KernelID, &propertyBin, 1))
+		PLOG("is_io_registry_entry_get_property_bin_buf not routed (error %d): native processes get Apple's Metal plug-in", patcher.getError());
+
+	patcher.clearError();
 
 	if (!patcher.routeMultiple(KernelPatcher::KernelID, &serviceOpen, 1))
 		PLOG("is_io_service_open_extended not routed (error %d): WindowServer is not held for the paravirtual GPU", patcher.getError());

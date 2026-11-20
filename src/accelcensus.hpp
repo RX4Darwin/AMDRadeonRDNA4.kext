@@ -77,4 +77,8 @@ private:
 	int mPid { 0 };
 };
 
+// Whether the calling process gets our Metal plug-in from the paravirtual accelerator (rdna4-nativews=3: WindowServer and
+// debug.rdna4_nativeapps' names): pvhooks.cpp answers its MetalPluginName / ClassName reads with RDNA4MetalPluginName / ClassName.
+bool accelNativeCaller();
+
 #endif /* RDNA4AccelCensus_hpp */

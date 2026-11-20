@@ -78,6 +78,8 @@ kern_return_t rdna4_import_host(rdna4_t *dev, void *address, uint64_t bytes, uin
 kern_return_t rdna4_translate(rdna4_t *dev, const void *air, uint64_t airBytes, const char *name, void *out, uint64_t room,
                               uint64_t *bytes, uint32_t *buffers);
 kern_return_t rdna4_free(rdna4_t *dev, const rdna4_buffer_t *buf);
+/* The runtime's client through the paravirtual accelerator (a sandboxed process may open an IOAccelerator's clients only). */
+kern_return_t rdna4_open_accelerator(rdna4_t *dev, io_service_t accelerator);
 /* IOSurface `surface`'s frames presented from VRAM buffer `buf` (laid out as the surface; NULL: from its memory again). WindowServer only. */
 kern_return_t rdna4_present_source(rdna4_t *dev, uint32_t surface, const rdna4_buffer_t *buf);
 kern_return_t rdna4_write(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,

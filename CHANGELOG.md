@@ -37,6 +37,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - Native WindowServer: its main thread no longer waits for the card to finish each frame (a command buffer is scheduled once its draws
   are on the ring; 128 draw slots; the runtime takes 128 gfx submissions in flight), and its draws go onto the ring 32 at a time in one
   submit, not one kext call each.
+- Native Metal for apps: `debug.rdna4_nativeapps` / `rdna4-nativeapps` name processes that get the native device besides WindowServer
+  (Safari runs on it); sandboxed apps reach the runtime through the paravirtual accelerator; WebKit's GPU process gets Apple's Metal
+  plug-in again (it had none since the native desktop: the plug-in name is now answered per process).
 - The paravirtual host opens the runtime from its tick (from a draw, IOLog ran the timer thread's stack out: a double fault).
 
 ## 0.3.3 (2026-11-19)

@@ -453,3 +453,24 @@ scheduled (its draws must be on the ring before WindowServer presents). Card: ke
 per 5 s while a window moves; WindowServer's main thread waiting for the device 152 -> 89 samples of 1000 (230 before a0b36cc);
 frames 328 of 329 at the next vblank, no torn frames, no hangs, Mission Control right.
 
+**Apps on the native device, step 1: Safari (2026-11-20, evening).** `debug.rdna4_nativeapps` (and the boot-arg `rdna4-nativeapps`): process
+names besides WindowServer that get the native device (with `rdna4-nativews=3`). What it took:
+
+- **Sandboxes.** Safari's processes may open only an IOAccelerator's user clients (`(iokit-connection "IOAccelerator")` in WebKit's
+  profiles; their message filter allows every method, "with report"): ours (`RDNA4ComputeService`) was refused ("not permitted").
+  `IOAccelerator` lives in IOGraphicsFamily, which is in the system kernel collection and not the boot one OpenCore injects into, so our
+  service cannot subclass it. Instead the kext routes `IOGraphicsAccelerator2::newUserClient`: type `RDN4` (`RDNA4_NATIVE_UC_TYPE`) on the
+  paravirtual accelerator is the runtime's compute client, attached to the accelerator (`rdna4AcceleratorClient`). The device opens
+  that first (`rdna4_open_accelerator`), our service second. WindowServer goes this way too now.
+- **The plug-in per process.** With route 3 the accelerator's `MetalPluginName` was ours for every process, and WebKit's GPU process,
+  whose sandbox maps code only from the system volume (`/System/Library/Extensions`, ...), failed to load it ("file system sandbox
+  blocked mmap() of /Library/GPUBundles/..."): no Metal device there at all since the native desktop (54 failures in 6 hours), web pages
+  drawn without the GPU. Now the accelerator keeps Apple's names, ours are `RDNA4MetalPluginName` / `ClassName`, and the kext routes
+  `is_io_registry_entry_get_property_bin_buf`: a native process (`accelNativeCaller`: WindowServer and the list) reading the plug-in
+  name reads ours. Every other process loads Apple's paravirtual bundle again.
+- **What runs on it.** Safari's own process (its windows' Metal use); its pages are drawn in WebKit's GPU process, which cannot map our
+  bundle from `/Library/GPUBundles`: that would need it in `/System/Library/Extensions` (SIP and the sealed system volume off; Sunneva's
+  call). Card: Safari opens, loads Wikipedia, its window right.
+- **Maps** (`Safari,Maps`): VectorKit aborted ("Metal returned null texture"): cube textures (type 5) are not supported yet, `newFence`
+  is missing. Taken off the list.
+

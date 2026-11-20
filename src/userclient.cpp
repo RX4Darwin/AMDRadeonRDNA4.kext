@@ -80,8 +80,31 @@ void RDNA4ComputeClient::free() {
 	IOUserClient::free();
 }
 
+RDNA4ComputeService *gComputeService;
+
+// Through the paravirtual accelerator: an app's sandbox lets it open an IOAccelerator's clients only ((iokit-connection "IOAccelerator"),
+// WebKit's GPU process: Safari on the native device was refused ours, 2026-11-20). The client is the runtime's all the same.
+IOReturn rdna4AcceleratorClient(IOService *accel, task_t task, void *security, IOUserClient **handler) {
+	if (!gComputeService || !gComputeService->compute)
+		return kIOReturnNotReady;
+	auto *client = OSTypeAlloc(RDNA4ComputeClient);
+	if (!client)
+		return kIOReturnNoMemory;
+	if (!client->initWithTask(task, security, RDNA4_NATIVE_UC_TYPE, nullptr) || !client->attach(accel)) {
+		static_cast<OSObject *>(client)->release();   // (RDNA4ComputeClient::release is the client's own close)
+		return kIOReturnNotPermitted;
+	}
+	if (!client->start(accel)) {
+		client->detach(accel);
+		static_cast<OSObject *>(client)->release();
+		return kIOReturnNotPermitted;
+	}
+	*handler = client;
+	return kIOReturnSuccess;
+}
+
 bool RDNA4ComputeClient::start(IOService *provider) {
-	auto *svc = OSDynamicCast(RDNA4ComputeService, provider);
+	auto *svc = OSDynamicCast(RDNA4ComputeService, provider) ?: gComputeService;   // (the accelerator: rdna4AcceleratorClient)
 	rdna4Step("user client: start");
 	if (!svc || !svc->compute || !IOUserClient::start(provider))
 		return false;

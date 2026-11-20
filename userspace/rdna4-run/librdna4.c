@@ -23,6 +23,11 @@ kern_return_t rdna4_open(rdna4_t *dev) {
 	return kr;
 }
 
+kern_return_t rdna4_open_accelerator(rdna4_t *dev, io_service_t accelerator) {
+	dev->conn = IO_OBJECT_NULL;
+	return IOServiceOpen(accelerator, mach_task_self(), RDNA4_NATIVE_UC_TYPE, &dev->conn);
+}
+
 void rdna4_close(rdna4_t *dev) {
 	if (dev->conn != IO_OBJECT_NULL)
 		IOServiceClose(dev->conn);

@@ -31,6 +31,9 @@
 #include <stdint.h>
 
 #define RDNA4_COMPUTE_SERVICE   "RDNA4ComputeService"
+/* The compute client through the paravirtual accelerator: IOServiceOpen of it with this type (sandboxed apps, WebKit's, may open an
+ * IOAccelerator's clients, not RDNA4ComputeService's). */
+#define RDNA4_NATIVE_UC_TYPE    0x52444e34u   /* 'RDN4' */
 #define RDNA4_COMPUTE_ABI       4u   /* 4: per-client GPUVM and one MEC queue per client */
 
 /* Largest kernarg block a dispatch carries; bytes past what the caller

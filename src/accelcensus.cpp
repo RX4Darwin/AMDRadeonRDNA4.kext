@@ -6,6 +6,7 @@
 //
 
 #include "accelcensus.hpp"
+#include <sys/proc.h>
 #include "klog.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
@@ -171,6 +172,9 @@ bool RDNA4AccelCensus::publish(IOService *provider, uint32_t level) {
 namespace {
 IOService *gNativeGpu { nullptr };   // retained once, kept for the boot
 int gRoute { 0 };                    // the paravirtual accelerator's Metal plug-in: 0 Apple's, 2 our router (nobody native), 3 WindowServer native
+// Other processes on the native device with route 3 (rdna4-nativeapps, debug.rdna4_nativeapps): names as getprogname gives them, comma-
+// separated ("Safari,com.apple.WebKit.GPU"); a process reads them when it makes its Metal devices.
+char gNativeApps[256] {};
 IONotifier *gPvNotifier { nullptr };
 
 // The native desktop (docs/native-metal-spike.md): the paravirtual accelerator, which drives the displays and so is WindowServer's, gets our
@@ -185,22 +189,33 @@ void routePv(IOService *acc, int route)
 		if (OSObject *cls = acc->getProperty("MetalPluginClassName"))
 			acc->setProperty("RDNA4AppleMetalPluginClassName", cls);
 	}
-	if (route) {
+	// Route 3: the plug-in only for the native processes (accelNativeCaller, pvhooks.cpp): set for every process, it was ours in WebKit's GPU
+	// process too, whose sandbox maps code only from the system volume: no Metal there at all, Safari's pages without the GPU (2026-11-20).
+	acc->setProperty("RDNA4MetalPluginName", "AMDRadeonRDNA4Metal");
+	acc->setProperty("RDNA4MetalPluginClassName", "RDNA4MTLRouter");
+	if (route == 2) {   // every process through the router (RDNA4_NATIVE_MTL=router picks ours)
 		acc->setProperty("MetalPluginName", "AMDRadeonRDNA4Metal");
 		acc->setProperty("MetalPluginClassName", "RDNA4MTLRouter");
-		acc->setProperty("RDNA4NativeProcesses", route == 3 ? "WindowServer" : "");
-	} else {
+	} else {   // Apple's (route 3: ours for the native processes alone)
 		if (OSObject *name = acc->getProperty("RDNA4AppleMetalPluginName"))
 			acc->setProperty("MetalPluginName", name);
 		if (OSObject *cls = acc->getProperty("RDNA4AppleMetalPluginClassName"))
 			acc->setProperty("MetalPluginClassName", cls);
+	}
+	if (route) {
+		char names[sizeof(gNativeApps) + 16] = "";
+		if (route == 3)
+			snprintf(names, sizeof(names), "WindowServer%s%s", gNativeApps[0] ? "," : "", gNativeApps);
+		acc->setProperty("RDNA4NativeProcesses", names);
+	} else {
 		acc->removeProperty("RDNA4NativeProcesses");
 	}
 #ifdef AMDRadeonRDNA4_PVGPU
 	pvFramesInMemory(route == 3);   // the frames are the native device's: scanned out of their memory, not out of the host's copies
 #endif
-	rdna4Log("AMDRadeonRDNA4: accelcensus: %s's Metal plug-in: %s\n", acc->getName(),
-	         route == 3 ? "our router, WindowServer on the native device" : route ? "our router, nobody native" : "Apple's");
+	rdna4Log("AMDRadeonRDNA4: accelcensus: %s's Metal plug-in: %s%s%s\n", acc->getName(),
+	         route == 3 ? "our router, WindowServer on the native device" : route ? "our router, nobody native" : "Apple's",
+	         route == 3 && gNativeApps[0] ? ", and " : "", route == 3 ? gNativeApps : "");
 }
 
 bool pvPublished(void *, void *, IOService *acc, IONotifier *)
@@ -234,9 +249,53 @@ int nativeMtlSysctl SYSCTL_HANDLER_ARGS
 	return 0;
 }
 
+// debug.rdna4_nativeapps: the other processes on the native device (gNativeApps), applied to the accelerator when written.
+int nativeAppsSysctl SYSCTL_HANDLER_ARGS
+{
+	char value[sizeof(gNativeApps)];
+	strlcpy(value, gNativeApps, sizeof(value));
+	const int err = sysctl_handle_string(oidp, value, sizeof(value), req);
+
+	if (err || !req->newptr)
+		return err;
+	for (const char *c = value; *c; c++)   // names and commas only
+		if (!(*c == ',' || *c == '.' || *c == '-' || *c == '_' || *c == ' ' || (*c >= '0' && *c <= '9') || (*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z')))
+			return EINVAL;
+	strlcpy(gNativeApps, value, sizeof(gNativeApps));
+	OSDictionary *match = IOService::serviceMatching("AppleParavirtAccelerator");
+	IOService *acc = match ? IOService::copyMatchingService(match) : nullptr;
+	OSSafeReleaseNULL(match);
+	if (acc && gRoute)
+		routePv(acc, gRoute);
+	OSSafeReleaseNULL(acc);
+	return 0;
+}
+
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_nativeapps, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, nativeAppsSysctl, "A",
+            "AMDRadeonRDNA4: processes on the native Metal device besides WindowServer (comma-separated names; with rdna4-nativews=3)");
+
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_nativemtl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, nativeMtlSysctl, "I",
             "AMDRadeonRDNA4: 1 publishes the native-Metal spike's IOAccelerator service; 2, 3 route the paravirtual accelerator's Metal "
             "plug-in through it (docs/native-metal-spike.md)");
+}
+
+bool accelNativeCaller()
+{
+	if (gRoute != 3)
+		return false;
+	char me[64] = "";
+	proc_selfname(me, sizeof(me));
+	if (!strcmp(me, "WindowServer"))
+		return true;
+	const size_t n = strlen(me);
+	for (const char *at = gNativeApps; n && *at;) {   // the comma-separated names
+		const char *end = strchr(at, ',');
+		const size_t len = end ? static_cast<size_t>(end - at) : strlen(at);
+		if (len == n && !strncmp(at, me, n))
+			return true;
+		at += len + (end ? 1 : 0);
+	}
+	return false;
 }
 
 void RDNA4AccelCensus::setProvider(IOService *gpu)
@@ -246,6 +305,8 @@ void RDNA4AccelCensus::setProvider(IOService *gpu)
 	gpu->retain();
 	gNativeGpu = gpu;
 	sysctl_register_oid(&sysctl__debug_rdna4_nativemtl);
+	sysctl_register_oid(&sysctl__debug_rdna4_nativeapps);
+	PE_parse_boot_argn("rdna4-nativeapps", gNativeApps, sizeof(gNativeApps));
 	// rdna4-nativews=2 or 3: route from the boot on (debug.rdna4_nativemtl's values), at the paravirtual accelerator's first publication:
 	// before WindowServer makes its device. Our own service stays unpublished (the router needs none).
 	int route = 0;

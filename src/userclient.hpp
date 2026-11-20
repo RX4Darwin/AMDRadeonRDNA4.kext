@@ -35,6 +35,11 @@ public:
 	                       IOService *whatDevice) APPLE_KEXT_OVERRIDE;
 };
 
+// The published service (the runtime's), for clients made through the paravirtual accelerator (rdna4AcceleratorClient).
+extern RDNA4ComputeService *gComputeService;
+// A compute client for `task`, attached to the IOAccelerator `accel` it opened with type RDNA4_NATIVE_UC_TYPE (pvhooks.cpp).
+IOReturn rdna4AcceleratorClient(IOService *accel, task_t task, void *security, IOUserClient **handler);
+
 class RDNA4ComputeClient : public IOUserClient {
 	OSDeclareDefaultStructors(RDNA4ComputeClient)
 public:
