@@ -27,6 +27,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - Native WindowServer: no more torn frames while a window moves (a command buffer counts as scheduled once its draws are done);
   draws that read their own target copy only the rows they cover (the translator records the textures a shader uses and a
   matrix-times-attribute vertex position), and the wallpaper's video frame is no longer copied on the CPU every frame.
+- Native WindowServer: a moving window's display at about 59 frames a second, not 30: IOSurface imports kept and shared between the
+  textures made of them every frame, and freed host memory reused (each import, allocation and free was a kext call of about 1 ms).
 - The paravirtual host opens the runtime from its tick (from a draw, IOLog ran the timer thread's stack out: a double fault).
 
 ## 0.3.3 (2026-11-19)

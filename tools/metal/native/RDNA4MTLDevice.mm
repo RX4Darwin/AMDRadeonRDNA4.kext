@@ -59,6 +59,8 @@
 #import <objc/runtime.h>
 #import <os/log.h>
 #include <atomic>
+#include <mutex>
+#include <vector>
 
 // NSLog's %@ arguments are <private> in the unified log (WindowServer's messages were unreadable): the text, formatted, as public
 #define RLOG(...) os_log(OS_LOG_DEFAULT, "%{public}s", [NSString stringWithFormat:__VA_ARGS__].UTF8String)
@@ -70,11 +72,21 @@ extern "C" {
 }
 // Where WindowServer's time goes (window drags were slow, 2026-11-20): totals, logged every 5 s while there is work ("RDNA4MTL stats: ...").
 enum RDNA4Stat { kStatBuffers, kStatDraws, kStatDrawUs, kStatDrainUs, kStatShadowBytes, kStatShadowUs, kStatSelfReads, kStatSelfReadBytes,
-	             kStatDispatches, kStatDispatchUs, kStatSlotUs, kStatBuildUs, kStatWriteUs, kStatSubmitUs, kStatBarriers, kStatCount };
-static std::atomic<uint64_t> gStats[kStatCount];
+	             kStatDispatches, kStatDispatchUs, kStatSlotUs, kStatBuildUs, kStatWriteUs, kStatSubmitUs, kStatBarriers, kStatWaitUs, kStatRunUs, kStatEncodeUs, kStatRecordUs, kStatAllocs, kStatAllocUs, kStatFreeUs, kStatImports, kStatImportBytes, kStatAllocBytes, kStatCount };
+static std::atomic<uint64_t> gStats[kStatCount], gLatencyMaxUs, gEncodeMaxUs;   // gLatencyMaxUs: the longest commit to done since the last report
 static std::atomic<int64_t> gHostLive, gHostCount, gOrderWaiting, gShadowLive, gShadowCount, gTexturesLive, gBuffersLive;   // gauges: host memory allocated (bytes, buffers), command buffers held back
 static uint64_t nowUs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000; }
 static void statAdd(RDNA4Stat s, uint64_t v) { gStats[s] += v; }
+static void statMax(std::atomic<uint64_t> &m, uint64_t v)
+{
+	for (uint64_t was = m; v > was && !m.compare_exchange_weak(was, v);)
+		;
+}
+struct StatTime {   // the time until the end of the scope, added to a stat
+	RDNA4Stat stat;
+	uint64_t t0 = nowUs();
+	~StatTime() { statAdd(stat, nowUs() - t0); }
+};
 static void statReport(void)
 {
 	static std::atomic<uint64_t> last;
@@ -89,12 +101,18 @@ static void statReport(void)
 	uint64_t v[kStatCount];
 	for (int i = 0; i < kStatCount; i++)
 		v[i] = gStats[i].exchange(0);
+	const uint64_t worst = gLatencyMaxUs.exchange(0), worstEncode = gEncodeMaxUs.exchange(0), n = v[kStatBuffers] ?: 1;
 	const double sec = (now - then) / 1e6;
 	RLOG(@"RDNA4MTL stats: %.1f s: %llu command buffers, %llu draws (%.1f ms submitting), %.1f ms waiting for draws, shadows %.1f MB (%.1f ms), "
 	     @"self-reads %llu %.1f MB copied on the card, %llu barriers on the card, %llu dispatches (%.1f ms); a draw's slot wait %.1f ms, build %.1f, writes %.1f, submit %.1f",
 	     sec, v[kStatBuffers], v[kStatDraws], v[kStatDrawUs] / 1e3, v[kStatDrainUs] / 1e3, v[kStatShadowBytes] / 1e6, v[kStatShadowUs] / 1e3,
 	     v[kStatSelfReads], v[kStatSelfReadBytes] / 1e6, v[kStatBarriers], v[kStatDispatches], v[kStatDispatchUs] / 1e3, v[kStatSlotUs] / 1e3,
 	     v[kStatBuildUs] / 1e3, v[kStatWriteUs] / 1e3, v[kStatSubmitUs] / 1e3);
+	RLOG(@"RDNA4MTL stats: a command buffer from commit to done %.2f ms (%.2f waiting for the queue, %.2f running), at most %.2f ms; "
+	     @"made to committed %.2f ms (%.2f in its draw calls), at most %.2f", (v[kStatWaitUs] + v[kStatRunUs]) / 1e3 / n, v[kStatWaitUs] / 1e3 / n,
+	     v[kStatRunUs] / 1e3 / n, worst / 1e3, v[kStatEncodeUs] / 1e3 / n, v[kStatRecordUs] / 1e3 / n, worstEncode / 1e3);
+	RLOG(@"RDNA4MTL stats: %llu buffers allocated (%.1f MB), %llu imported (%.1f MB): %.1f ms, freeing %.1f ms", v[kStatAllocs] - v[kStatImports],
+	     v[kStatAllocBytes] / 1e6, v[kStatImports], v[kStatImportBytes] / 1e6, v[kStatAllocUs] / 1e3, v[kStatFreeUs] / 1e3);
 	RLOG(@"RDNA4MTL stats: host memory %.1f MB in %lld buffers (shadows %.1f MB in %lld), %lld command buffers held back for one enqueued before them; "
 	     @"%lld textures, %lld command buffers alive", gHostLive / 1e6, (long long)gHostCount, gShadowLive / 1e6, (long long)gShadowCount,
 	     (long long)gOrderWaiting, (long long)gTexturesLive, (long long)gBuffersLive);
@@ -199,6 +217,75 @@ static NSError *rdna4Error(NSString *what, kern_return_t kr)
 @property (readonly) BOOL imported, readOnly;   // the caller's memory; mapped for the GPU to read only
 @end
 
+// Host memory freed, kept 2 s for an allocation of the same size (at most kPoolBytes): Core Animation makes and drops a few textures and
+// buffers a frame, each allocation and free a kext call of about 1 ms (2026-11-20). Handed out zeroed, as new memory is.
+namespace {
+struct Pooled { rdna4_t *gpu; rdna4_buffer_t buf; void *cpu; uint64_t bytes; CFAbsoluteTime at; };
+constexpr uint64_t kPoolBytes = 128ull << 20;
+std::mutex gPoolLock;
+std::vector<Pooled> gPool;
+uint64_t gPooledBytes;
+
+// The entries older than 2 s out of the pool, freed by the caller (outside the lock).
+void poolExpired(std::vector<Pooled> &out, CFAbsoluteTime now)
+{
+	for (size_t i = 0; i < gPool.size();)
+		if (now - gPool[i].at > 2) {
+			gPooledBytes -= gPool[i].bytes;
+			out.push_back(gPool[i]);
+			gPool[i] = gPool.back();
+			gPool.pop_back();
+		} else {
+			i++;
+		}
+}
+
+void poolFree(std::vector<Pooled> &freed)
+{
+	for (Pooled &p : freed)
+		rdna4_free(p.gpu, &p.buf);
+}
+
+bool poolTake(rdna4_t *gpu, uint64_t bytes, rdna4_buffer_t *buf, void **cpu)
+{
+	std::vector<Pooled> freed;
+	bool found = false;
+	{
+		std::lock_guard<std::mutex> hold(gPoolLock);
+		poolExpired(freed, CFAbsoluteTimeGetCurrent());
+		for (size_t i = 0; i < gPool.size() && !found; i++)
+			if (gPool[i].gpu == gpu && gPool[i].bytes == bytes) {
+				*buf = gPool[i].buf, *cpu = gPool[i].cpu;
+				gPooledBytes -= bytes;
+				gPool[i] = gPool.back();
+				gPool.pop_back();
+				found = true;
+			}
+	}
+	poolFree(freed);
+	if (found)
+		memset(*cpu, 0, bytes);
+	return found;
+}
+
+void poolPut(rdna4_t *gpu, rdna4_buffer_t buf, void *cpu, uint64_t bytes)
+{
+	const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+	std::vector<Pooled> freed;
+	{
+		std::lock_guard<std::mutex> hold(gPoolLock);
+		poolExpired(freed, now);
+		if (gPooledBytes + bytes <= kPoolBytes) {
+			gPool.push_back({ gpu, buf, cpu, bytes, now });
+			gPooledBytes += bytes;
+		} else {
+			freed.push_back({ gpu, buf, cpu, bytes, now });
+		}
+	}
+	poolFree(freed);
+}
+}   // namespace
+
 @implementation RDNA4MTLBuffer {
 	RDNA4MTLDevice *_device;
 	rdna4_buffer_t _buf;
@@ -225,6 +312,8 @@ static NSError *rdna4Error(NSString *what, kern_return_t kr)
 	if (!(self = [super init]) || !device.gpu)
 		return nil;
 	const uint64_t bytes = ((length ?: 1) + 4095) & ~4095ull;
+	const StatTime timed { kStatAllocUs };
+	statAdd(kStatAllocs, 1), statAdd(kStatImports, 1), statAdd(kStatImportBytes, bytes);
 	kern_return_t kr = ((uintptr_t)pointer & 4095) ? kIOReturnBadArgument : rdna4_import_host(device.gpu, pointer, bytes, 0, &_buf);
 	// memory this process may only read (Core Animation's shared with WindowServer): for the GPU to read, so its updates are seen (copied,
 	// the menu bar's app menus never changed after the first)
@@ -248,7 +337,9 @@ static NSError *rdna4Error(NSString *what, kern_return_t kr)
 	if (!(self = [super init]) || !device.gpu)
 		return nil;
 	const uint64_t bytes = ((length ?: 1) + 4095) & ~4095ull;
-	const kern_return_t kr = rdna4_alloc_host(device.gpu, bytes, &_buf, &_cpu);
+	const StatTime timed { kStatAllocUs };
+	statAdd(kStatAllocs, 1), statAdd(kStatAllocBytes, bytes);
+	const kern_return_t kr = poolTake(device.gpu, bytes, &_buf, &_cpu) ? KERN_SUCCESS : rdna4_alloc_host(device.gpu, bytes, &_buf, &_cpu);
 	if (kr) {
 		rdna4Error([NSString stringWithFormat:@"a buffer of %lu bytes", (unsigned long)length], kr);
 		return nil;
@@ -263,8 +354,13 @@ static NSError *rdna4Error(NSString *what, kern_return_t kr)
 
 - (void)dealloc
 {
-	if (_cpu)
-		rdna4_free(_device.gpu, &_buf);   // an imported range unmapped and unwired, not freed
+	if (_cpu) {
+		const StatTime timed { kStatFreeUs };
+		if (_allocated)
+			poolPut(_device.gpu, _buf, _cpu, _allocated);
+		else
+			rdna4_free(_device.gpu, &_buf);   // an imported range unmapped and unwired, not freed
+	}
 	gHostLive -= _allocated, gHostCount -= _allocated ? 1 : 0;
 	if (_shadow)
 		gShadowLive -= _allocated, gShadowCount -= 1;
@@ -361,6 +457,42 @@ static void wrote(uint64_t lo, uint64_t hi)
 		for (RDNA4MTLTexture *t in gCopied)
 			[t written:lo to:hi];
 	}
+}
+
+// An IOSurface's memory mapped into the GPU, shared by the textures made of it and kept 2 s after the last was made: WindowServer makes
+// textures of the same surfaces (the displays', the windows') every frame, and each import and its free were kext calls of about 1 ms,
+// 2 s of every 5 while a window moved (2026-11-20). The import holds the surface.
+static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surface, void *base, size_t bytes)
+{
+	static NSMutableDictionary<NSNumber *, NSArray *> *kept;   // ID -> {import, last use (s)}
+	static CFAbsoluteTime swept;
+	const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+	NSNumber *key = @(IOSurfaceGetID(surface));
+	@synchronized([RDNA4MTLBuffer class]) {
+		kept = kept ?: [NSMutableDictionary dictionary];
+		if (now - swept > 1) {
+			swept = now;
+			for (NSNumber *k in kept.allKeys)
+				if (now - [kept[k][1] doubleValue] > 2)
+					[kept removeObjectForKey:k];
+		}
+		RDNA4MTLBuffer *b = kept[key][0];
+		if (b && b.contents == base && b.length == bytes) {
+			kept[key] = @[ b, @(now) ];
+			return b;
+		}
+	}
+	CFRetain(surface);
+	RDNA4MTLBuffer *b = [[RDNA4MTLBuffer alloc] initWithDevice:device bytesNoCopy:base length:bytes options:MTLResourceStorageModeShared
+	                                               deallocator:^(void *p, NSUInteger n) { CFRelease(surface); }];
+	if (!b) {
+		CFRelease(surface);
+		return nil;
+	}
+	@synchronized([RDNA4MTLBuffer class]) {
+		kept[key] = @[ b, @(now) ];
+	}
+	return b;
 }
 
 @implementation RDNA4MTLTexture {
@@ -632,8 +764,8 @@ static char gCopyKey;
 		[_memory keepOwner:^{ CFRelease(surface); }];
 		[_memory countAsShadow];
 	} else {
-		_memory = [[RDNA4MTLBuffer alloc] initWithDevice:device bytesNoCopy:base length:bytes options:MTLResourceStorageModeShared
-		                                     deallocator:^(void *p, NSUInteger n) { CFRelease(surface); }];
+		_memory = importedSurface(device, surface, base, bytes);
+		CFRelease(surface);   // the import holds it
 		_rowBytes = bpr;
 	}
 	if (!_memory)
@@ -1967,6 +2099,7 @@ RDNA4_ANSWER_MISSING
 - (void)record:(MTLPrimitiveType)type start:(NSUInteger)start count:(NSUInteger)count instances:(NSUInteger)instances
     baseInstance:(NSUInteger)baseInstance indices:(id<MTLBuffer>)indexBuffer offset:(NSUInteger)indexOffset type:(MTLIndexType)indexType
 {
+	const StatTime timed { kStatRecordUs };
 	RDNA4Draw d = { .type = (uint32_t)type, .start = (uint32_t)start, .count = (uint32_t)count, .instances = (uint32_t)instances,
 		            .baseInstance = (uint32_t)baseInstance,
 		            .viewport = { (float)_viewport.originX, (float)_viewport.originY, (float)_viewport.width, (float)_viewport.height },
@@ -2310,6 +2443,7 @@ RDNA4_ANSWER_MISSING
 	id<MTLBuffer> _chunk;   // set*Bytes data (stage:)
 	NSUInteger _chunkUsed;
 	_Atomic MTLCommandBufferStatus _status;
+	uint64_t _createdUs, _committedUs;   // (the stats)
 	NSError *_error;
 }
 + (instancetype)allocWithZone:(NSZone *)zone
@@ -2330,6 +2464,7 @@ RDNA4_ANSWER_MISSING
 		_scheduled = [NSMutableArray array];
 		_drawables = [NSMutableArray array];
 		_scheduledGroup = dispatch_group_create();
+		_createdUs = nowUs();
 		_done = dispatch_group_create();
 	}
 	return self;
@@ -2465,6 +2600,9 @@ RDNA4_ANSWER_MISSING
 	if (_status >= MTLCommandBufferStatusCommitted)
 		return;
 	[self enqueue];
+	_committedUs = nowUs();
+	statAdd(kStatEncodeUs, _committedUs - _createdUs);
+	statMax(gEncodeMaxUs, _committedUs - _createdUs);
 	_status = MTLCommandBufferStatusCommitted;
 	dispatch_group_enter(_scheduledGroup);
 	dispatch_group_enter(_done);
@@ -2476,6 +2614,8 @@ RDNA4_ANSWER_MISSING
 {
 	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
 	dispatch_async(device.work, ^{
+		const uint64_t started = nowUs();
+		statAdd(kStatWaitUs, started - self->_committedUs);
 		dispatch_queue_t handlers = self->_queue.handlers;
 		NSError *why = nil;
 		for (NSUInteger i = 0; i < self->_ops.count && !why; i++) {
@@ -2492,6 +2632,9 @@ RDNA4_ANSWER_MISSING
 		// Scheduled once its draws are done, not when they start: WindowServer hands its frame to the display when its command buffer is
 		// scheduled (Apple's GPUs: the display waits for the GPU's writes), and the display showed frames half drawn, a moving window torn
 		// between its old and new places (2026-11-20).
+		const uint64_t done = nowUs();
+		statAdd(kStatRunUs, done - started);
+		statMax(gLatencyMaxUs, done - self->_committedUs);
 		self->_status = MTLCommandBufferStatusScheduled;
 		dispatch_group_leave(self->_scheduledGroup);
 		NSArray<MTLCommandBufferHandler> *scheduled = [self->_scheduled copy];

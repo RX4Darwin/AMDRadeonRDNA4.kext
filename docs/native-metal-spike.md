@@ -372,3 +372,18 @@ Card, moving the glass window on the 4K display: copies for draws reading their 
 6.4 -> 0.07 GB per 5 s. Open: `VfxXgb` (vertex pulling, three layouts) is not bounded, its full-target `Xgc` draws still copy all
 written rows; each draw is still a kext call (submit about 9 us) and each self-read an idle barrier on the card; textures still in host
 memory.
+
+**Frames shown at half rate (2026-11-20, afternoon):** the kext's frame timing (`frames:` in its log) showed the 4K display taking a
+new frame every second vblank while a window moved (326 of 370 frames two VBLs after the one before: 30 fps), the frames reaching it
+about 10 ms after the vblank. New stats lines: commit to done, made to committed (and of that, the draw calls), allocations and imports.
+A command buffer ran in about 4.5 ms; Core Animation took 3.5 ms from making one to committing it, only 0.2 ms of it in the draw calls:
+the rest was the device's allocations, mainly imports. WindowServer makes textures of the same IOSurfaces (the displays', the windows')
+every frame, and each import and its free were kext calls of about 1 ms (700 imports, 7 GB, 2 s of kext calls every 5 s). Now:
+
+- An IOSurface's import is shared by the textures of it and kept 2 s after the last was made (by the surface's ID; the import holds the
+  surface).
+- Freed host memory is kept 2 s for an allocation of the same size (at most 128 MB), handed out zeroed.
+
+Card, the glass window moving on the 4K display: made to committed 3.5 -> 0.6 ms, imports 700 -> 40 and allocation calls 350 -> 80 ms
+per 5 s; frames shown at the next vblank 24 of 370 -> 633 of 680 (about 59 a second).
+
