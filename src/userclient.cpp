@@ -357,7 +357,7 @@ IOReturn RDNA4ComputeClient::sPresentSource(OSObject *t, void *, IOExternalMetho
 IOReturn RDNA4ComputeClient::sTranslate(OSObject *, void *, IOExternalMethodArguments *a) {
 #ifdef AMDRadeonRDNA4_PVGPU
 	const uint64_t *in = a->scalarInput;
-	char name[64] = {};
+	char name[RDNA4_MTLC_NAME] = {};
 	size_t got = 0;
 	if (!in[1] || in[1] > RDNA4_MTLC_MAX_LIB || copyinstr(static_cast<user_addr_t>(in[2]), name, sizeof(name), &got))
 		return kIOReturnBadArgument;

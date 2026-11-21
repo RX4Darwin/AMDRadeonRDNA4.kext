@@ -1409,26 +1409,80 @@ static NSError *translateByKext(rdna4_t *gpu, NSString *input, NSString *name, N
 	return nil;
 }
 
-static NSError *translateFunction(id<MTLFunction> function, NSData **blob, uint32_t *buffers)
+// `function`'s AIR: our library's metallib (the translator picks the function by name), or the bitcode of a function Metal's own compiler
+// made; nil without either.
+static NSData *functionAir(id<MTLFunction> function)
+{
+	if ([(id)function isKindOfClass:[RDNA4MTLFunction class]])
+		return [NSData dataWithContentsOfFile:((RDNA4MTLFunction *)function).library.path];
+	id bitcode = [(id)function respondsToSelector:@selector(bitcodeData)] ? [(id)function performSelector:@selector(bitcodeData)] : nil;
+	return [bitcode isKindOfClass:[NSData class]] ? bitcode : nil;
+}
+
+// One entry of a container of linked functions (air2amdgpu.cpp linkEntries): {u32 name bytes, name, u32 data bytes, data}
+static BOOL appendLinkEntry(NSMutableData *box, NSString *name, NSData *data)
+{
+	NSData *n = [name dataUsingEncoding:NSUTF8StringEncoding];
+	const uint32_t nameBytes = (uint32_t)n.length, dataBytes = (uint32_t)data.length;
+	if (!n || !data)
+		return NO;
+	[box appendBytes:&nameBytes length:4];
+	[box appendData:n];
+	[box appendBytes:&dataBytes length:4];
+	[box appendData:data];
+	return YES;
+}
+
+// `linked`: the functions `function` calls (a render stage's private linked functions, X.MTL_VISIBLE_FN_REF: RenderBox's custom shaders),
+// sent with it in one container that the translator links before translating
+static NSError *translateFunction(id<MTLFunction> function, NSArray<id<MTLFunction>> *linked, NSData **blob, uint32_t *buffers)
 {
 	// the bundle's own (build.sh: the translator these functions need, ray queries say), else the paravirtual GPU's helper
 	NSString *own = [[NSBundle bundleForClass:[RDNA4MTLFunction class]] pathForResource:@"air2amdgpu" ofType:nil];
 	NSString *tool = NSProcessInfo.processInfo.environment[@"RDNA4_AIR2AMDGPU"] ?: own ?: @"/usr/local/libexec/rdna4-air2amdgpu";
-	NSString *out = [NSTemporaryDirectory() stringByAppendingPathComponent:
-	                                            [NSString stringWithFormat:@"rdna4mtl-%d-%@.bin", getpid(), function.name]];
+	// (a short stand-in for long names in file names: Core Image's stitched kernels' run to hundreds of characters, past a file name's 255)
+	NSString *fileName = function.name.length < 100 ? function.name : [NSString stringWithFormat:@"h%lx", (unsigned long)function.name.hash];
+	NSString *out = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"rdna4mtl-%d-%@.bin", getpid(), fileName]];
 	// The input: our library's metallib, or the AIR bitcode of a function Metal's own compiler made (newLibraryWithSource: and the other
 	// library calls _MTLDevice answers: an _MTLFunctionInternal, its -bitcodeData)
 	NSString *input = nil, *scratch = nil;
 	if ([(id)function isKindOfClass:[RDNA4MTLFunction class]]) {
 		input = ((RDNA4MTLFunction *)function).library.path;
-	} else if ([(id)function respondsToSelector:@selector(bitcodeData)]) {
-		NSData *bitcode = [(id)function performSelector:@selector(bitcodeData)];
-		scratch = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"rdna4mtl-%d-%@.bc", getpid(), function.name]];
-		if ([bitcode isKindOfClass:[NSData class]] && [bitcode writeToFile:scratch atomically:NO])
+	} else if (NSData *bitcode = functionAir(function)) {
+		scratch = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"rdna4mtl-%d-%@.bc", getpid(), fileName]];
+		if ([bitcode writeToFile:scratch atomically:NO])
 			input = scratch;
 	}
-	if (!input)
+	if (!input) {
+		// (diagnostic) what such a function has instead: Core Image's (2026-11-21, icons without their layers on our accelerator)
+		id f = function;
+		auto has = ^NSString *(NSString *sel) {
+			if (![f respondsToSelector:NSSelectorFromString(sel)])
+				return @"-";
+			id v = [f valueForKey:sel];
+			return !v ? @"nil" : [v isKindOfClass:[NSData class]] ? [NSString stringWithFormat:@"%lu bytes", (unsigned long)[v length]]
+			                                                      : [NSString stringWithFormat:@"%@", [v class]];
+		};
+		RTRACE(24, @"no AIR: %@ (%@): bitcodeDataInternal %@, filePath %@, airScript %@, stitchingAirScript %@, specializationAirScript %@, "
+		       "functionConstantsDictionary %@, precompiledOutput %@, pluginData %@", function.name, [f class], has(@"bitcodeDataInternal"),
+		       has(@"filePath"), has(@"airScript"), has(@"stitchingAirScript"), has(@"specializationAirScript"),
+		       has(@"functionConstantsDictionary"), has(@"precompiledOutput"), has(@"pluginData"));
 		return rdna4Error([NSString stringWithFormat:@"%@: a function of class %@ with no AIR to translate", function.name, [(id)function class]], 0);
+	}
+	if (linked.count) {
+		NSMutableData *box = [NSMutableData dataWithBytes:"RDLK" length:4];
+		const uint32_t count = (uint32_t)linked.count + 1;
+		[box appendBytes:&count length:4];
+		BOOL ok = appendLinkEntry(box, function.name, [NSData dataWithContentsOfFile:input]);
+		for (id<MTLFunction> f in linked)
+			ok = ok && appendLinkEntry(box, f.name, functionAir(f));
+		NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"rdna4mtl-%d-%@.rdlk", getpid(), fileName]];
+		if (scratch)
+			[NSFileManager.defaultManager removeItemAtPath:scratch error:nil];
+		if (!ok || ![box writeToFile:path atomically:NO])
+			return rdna4Error([NSString stringWithFormat:@"%@: a linked function (%@) without AIR", function.name, [linked valueForKey:@"name"]], 0);
+		input = scratch = path;
+	}
 	NSTask *task = [NSTask new];
 	NSPipe *pipe = [NSPipe pipe];
 	task.executableURL = [NSURL fileURLWithPath:tool];
@@ -1484,10 +1538,12 @@ static NSError *translateFunction(id<MTLFunction> function, NSData **blob, uint3
 	if (!_device.gpu)
 		return rdna4Error(@"the kext's runtime client is not open (root only)", 0);
 	NSData *elf = nil;
-	NSError *why = translateFunction(function, &elf, &_buffers);
+	NSError *why = translateFunction(function, nil, &elf, &_buffers);
 	if (why)
 		return why;
-	const kern_return_t kr = rdna4_load(_device.gpu, elf.bytes, elf.length, function.name.UTF8String, &_program);
+	// the kernel's symbol: its name cut at 63 bytes (air2amdgpu.cpp; RDNA4_MAX_NAME)
+	NSString *symbol = function.name.length > 63 ? [function.name substringToIndex:63] : function.name;
+	const kern_return_t kr = rdna4_load(_device.gpu, elf.bytes, elf.length, symbol.UTF8String, &_program);
 	return kr ? rdna4Error([NSString stringWithFormat:@"loading %@", function.name], kr) : nil;
 }
 
@@ -1830,9 +1886,10 @@ static void heldIdle(RDNA4MTLDevice *device)
 		uint32_t unused;
 		NSData *blob = nil;
 		_names = [NSString stringWithFormat:@"%@ / %@", fn[0].name, fn[1].name];
-		NSError *why = translateFunction(fn[k], &blob, &unused);
+		NSArray *linked = (k ? desc.fragmentLinkedFunctions : desc.vertexLinkedFunctions).privateFunctions;
+		NSError *why = translateFunction(fn[k], linked, &blob, &unused);
 		if (why)   // once more: the helper may have been out of memory or busy
-			why = translateFunction(fn[k], &blob, &unused);
+			why = translateFunction(fn[k], linked, &blob, &unused);
 		if (why) {
 			// A pipeline whose draws are left out, not none: Core Animation aborts WindowServer when one fails to build (the session
 			// logged out when TkfhBvcmXc_Iclr did not translate, 2026-11-20). Stand-in shaders (s_endpgm) keep the rest of the setup whole.
@@ -3856,6 +3913,9 @@ static void abortStack(int sig)
 - (NSString *)name { return @"AMD Radeon RDNA4 (native Metal, spike)"; }
 - (uint64_t)registryID { return _registryID; }
 - (BOOL)hasUnifiedMemory { return NO; }
+// (0 by the catch-all before: Core Image's icon kernels asked) 256 bytes, the sampler's linear and buffer texture base alignment
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format { return 256; }
+- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)format { return 256; }
 - (NSUInteger)maxBufferLength { return 64ull << 20; }   // ponytail: the kext's host-memory BO limit; VRAM buffers when a gate needs more
 - (MTLSize)maxThreadsPerThreadgroup { return MTLSizeMake(1024, 1024, 1024); }
 

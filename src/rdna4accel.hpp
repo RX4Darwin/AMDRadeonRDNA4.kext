@@ -24,4 +24,6 @@ bool hidesFromMatch(IORegistryEntry *service, OSDictionary *table);
 bool showsFramebuffer(IORegistryEntry *fb);
 // Whether `object` is a lit framebuffer of ours that user space is to see as AMD's (pvhooks.cpp wrapObjectGetClass): rdna4-accel=4
 bool namesAsAmd(OSObject *object);
+// Whether `accel` is our accelerator (pvhooks.cpp wrapAccelNewUserClient: the native Metal device's client in sandboxed processes)
+bool isOurs(const void *accel);
 }

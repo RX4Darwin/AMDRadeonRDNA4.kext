@@ -1110,6 +1110,8 @@ SYSCTL_PROC(_debug, OID_AUTO, rdna4_accel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LO
 
 IOGraphicsAccelerator2 *ourAccelerator() { return gAccel; }
 
+bool RDNA4Accel::isOurs(const void *accel) { return accel && accel == gAccel; }
+
 namespace {
 // Whether framebuffer `fb` has a monitor, as the kext knows its heads (plugin.cpp). Not an IODisplayConnect under it: those came
 // more than 10 s late in some boots (2026-11-21), all six framebuffers were then hidden and WindowServer ran without displays.

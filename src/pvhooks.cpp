@@ -434,11 +434,12 @@ void route(KernelPatcher &patcher, size_t index, mach_vm_address_t address,
 	patcher.clearError();
 }
 
-/* IOGraphicsAccelerator2::newUserClient: type RDNA4_NATIVE_UC_TYPE on the paravirtual accelerator is the runtime's compute client
- * (userclient.cpp rdna4AcceleratorClient), for the native Metal device in sandboxed apps. */
+/* IOGraphicsAccelerator2::newUserClient: type RDNA4_NATIVE_UC_TYPE on the paravirtual accelerator, or on our own (rdna4-accel=4: every
+ * process is on the native device there), is the runtime's compute client (userclient.cpp rdna4AcceleratorClient), for the native Metal
+ * device in sandboxed apps (their sandbox allows IOAccelerator connections only). */
 IOReturn wrapAccelNewUserClient(void *accel, void *task, void *security, uint32_t type, void **handler)
 {
-	if (type == RDNA4_NATIVE_UC_TYPE && isParavirt(accel))
+	if (type == RDNA4_NATIVE_UC_TYPE && (isParavirt(accel) || RDNA4Accel::isOurs(accel)))
 		return rdna4AcceleratorClient(static_cast<IOService *>(accel), static_cast<task_t>(task), security,
 		                              reinterpret_cast<IOUserClient **>(handler));
 

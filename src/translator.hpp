@@ -13,6 +13,8 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOUserClient.h>
 
+#include "rdna4mtlc.h"
+
 // The one request slot between the requesters and the helper. A requester posts a function (id != 0) and waits on &done; the helper's
 // kMtlcNext waits on &id, copies the metallib out and sets taken; kMtlcDeliver fills elf and sets done.
 struct Translation {
@@ -24,7 +26,7 @@ struct Translation {
 	bool taken, done;
 	const uint8_t *lib;
 	uint32_t libLen;
-	char name[64];
+	char name[RDNA4_MTLC_NAME];
 	uint8_t *elf;                 // IOMalloc'd by kMtlcDeliver, freed by the requester
 	uint32_t elfLen, buffers, written, texturesWritten;
 };

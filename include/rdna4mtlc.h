@@ -5,7 +5,8 @@
  *  (tools/metal/m3/air2amdgpu.cpp --serve) to translate them. The helper opens a user client of type RDNA4_MTLC_TYPE on RDNA4ComputeService
  *  (one helper at a time) and loops:
  *
- *    kMtlcNext     scalars in {buffer address, buffer bytes}; out {request id, metallib bytes}; structure out: char name[64].
+ *    kMtlcNext     scalars in {buffer address, buffer bytes}; out {request id, metallib bytes}; structure out: char name[64 or more]
+ *                  (RDNA4_MTLC_NAME: as much of the name as fits; Core Image's stitched kernels' names run to hundreds of characters).
  *                  Blocks until the host has a function to translate; the guest's whole metallib is copied into the buffer.
  *    kMtlcDeliver  scalars in {request id, code object address, code object bytes (0 = could not translate), buffers, written mask
  *                  [, textures written mask]}: the linked gfx1201 code object and its interface as air2amdgpu describes it (8-byte buffer
@@ -19,6 +20,7 @@
 #define RDNA4_MTLC_TYPE 0x4d544c43u   /* 'MTLC' */
 #define RDNA4_MTLC_MAX_LIB (1u << 20)
 #define RDNA4_MTLC_MAX_ELF (1u << 20)
+#define RDNA4_MTLC_NAME 512u   /* a function's name, its terminating zero included */
 
 enum { kMtlcNext = 0, kMtlcDeliver = 1 };
 

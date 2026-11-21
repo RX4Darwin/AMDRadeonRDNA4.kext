@@ -59,6 +59,7 @@
 #include <map>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 #include "../../../include/rdna4mtlc.h"
 
@@ -1896,8 +1897,78 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	return "";
 }
 
-// The kernel `fname` of `input` (AIR bitcode, or a metallib holding it) as a code object; the reason when it cannot be translated.
+// A render pipeline's linked functions (tools/metal/native/RDNA4MTLDevice.mm, its MTLLinkedFunctions): "RDLK", u32 count, then per entry
+// {u32 name bytes, the name, u32 data bytes, AIR bitcode or a metallib}: the function to translate first, then the functions it calls through
+// `X.MTL_VISIBLE_FN_REF` (RenderBox's custom shaders call their private `custom_fn` so: Tahoe's icons). Empty when malformed.
+struct LinkEntry { StringRef name, data; };
+
+static std::vector<LinkEntry> linkEntries(StringRef in) {
+	std::vector<LinkEntry> out;
+	const uint64_t n = in.size() >= 8 ? le(in, 4, 4) : 0;
+	size_t at = 8;
+	for (uint64_t i = 0; i < n; i++) {
+		LinkEntry e;
+		for (StringRef *part : {&e.name, &e.data}) {
+			const uint64_t bytes = at + 4 <= in.size() ? le(in, at, 4) : ~0ull;
+			if (bytes > in.size() - at - 4)
+				return {};
+			*part = in.substr(at + 4, bytes);
+			at += 4 + bytes;
+		}
+		out.push_back(e);
+	}
+	return out;
+}
+
+// The linked functions of `linked` (after the first, the translated one) linked into `m`, and each call through `X.MTL_VISIBLE_FN_REF` made
+// a call of X and inlined: the module as plain AIR again, which is what the rest of the translation knows.
+static std::string linkFunctions(Module &m, const std::vector<LinkEntry> &linked) {
+	for (size_t i = 1; i < linked.size(); i++) {
+		std::string fn = linked[i].name.str();
+		const StringRef bitcode = linked[i].data.starts_with("MTLB") ? functionBitcode(linked[i].data, linked[i].name, fn) : linked[i].data;
+		if (bitcode.empty())
+			return "no linked function " + fn;
+		SMDiagnostic diag;
+		std::unique_ptr<Module> other = parseIR(MemoryBufferRef(bitcode, "linked"), diag, m.getContext());
+		if (!other)
+			return "cannot read the linked function " + fn + ": " + diag.getMessage().str();
+		other->setTargetTriple(m.getTargetTriple());
+		other->setDataLayout(m.getDataLayout());
+		if (Linker::linkModules(m, std::move(other)))
+			return "the linked function " + fn + " does not link";
+		Function *ref = m.getFunction(fn + ".MTL_VISIBLE_FN_REF"), *def = m.getFunction(fn);
+		if (!ref || !def || def->isDeclaration())
+			continue;
+		SmallVector<CallInst *, 4> calls;
+		for (User *u : ref->users())
+			if (auto *c = dyn_cast<CallInst>(u))
+				calls.push_back(c);
+		for (CallInst *c : calls) {
+			if (c->getFunctionType() != def->getFunctionType())
+				return "a call of the linked function " + fn + " with another signature";
+			c->setCalledFunction(def);
+			InlineFunctionInfo ifi;
+			if (!InlineFunction(*c, ifi).isSuccess())
+				return "the linked function " + fn + " cannot be inlined";
+		}
+		if (ref->use_empty())
+			ref->eraseFromParent();
+		if (def->use_empty())
+			def->eraseFromParent();
+	}
+	return "";
+}
+
+// The kernel `fname` of `input` (AIR bitcode, or a metallib holding it, or a container of linked functions) as a code object; the reason
+// when it cannot be translated.
 static std::string translate(StringRef input, StringRef requested, Kernel &out) {
+	std::vector<LinkEntry> linkedFns;
+	if (input.starts_with("RDLK")) {
+		linkedFns = linkEntries(input);
+		if (linkedFns.empty())
+			return "a malformed container of linked functions";
+		input = linkedFns[0].data;
+	}
 	std::string found = requested.str();
 	const StringRef bitcode = input.starts_with("MTLB") ? functionBitcode(input, requested, found) : input;
 	const StringRef fname = found;
@@ -1908,6 +1979,8 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 	std::unique_ptr<Module> m = parseIR(MemoryBufferRef(bitcode, "air"), diag, ctx);
 	if (!m)
 		return "cannot read the AIR: " + diag.getMessage().str();
+	if (const std::string why = linkFunctions(*m, linkedFns); !why.empty())
+		return why;
 	Function *air = m->getFunction(fname);
 	for (const char *list : {"air.vertex", "air.fragment"})
 		for (unsigned i = 0; air && m->getNamedMetadata(list) && i < m->getNamedMetadata(list)->getNumOperands(); i++)
@@ -2002,7 +2075,10 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 	air->setName(name + ".air");
 	air->setLinkage(GlobalValue::InternalLinkage);
 	air->addFnAttr(Attribute::AlwaysInline);
-	Function *kernel = Function::Create(FunctionType::get(Type::getVoidTy(ctx), params, false), GlobalValue::ExternalLinkage, name, m.get());
+	// The kernel's symbol: at most 63 bytes, what the runtime loads by (RDNA4_MAX_NAME, NUL included); the only one in its code object, so
+	// a longer name is cut (Core Image's stitched kernels'; RDNA4MTLDevice.mm and the paravirtual host load by the same cut name)
+	Function *kernel = Function::Create(FunctionType::get(Type::getVoidTy(ctx), params, false), GlobalValue::ExternalLinkage, name.substr(0, 63),
+	                                    m.get());
 	kernel->setCallingConv(CallingConv::AMDGPU_KERNEL);
 	kernel->addFnAttr("amdgpu-flat-work-group-size", "1,1024");
 	IRBuilder<> b(BasicBlock::Create(ctx, "entry", kernel));
@@ -2252,7 +2328,7 @@ static int serve() {
 		const uint64_t in[2] = {reinterpret_cast<uint64_t>(lib.data()), lib.size()};
 		uint64_t req[2] = {};
 		uint32_t nReq = 2;
-		char name[64] = {};
+		char name[RDNA4_MTLC_NAME] = {};
 		size_t nameLen = sizeof(name);
 		const kern_return_t kr = IOConnectCallMethod(conn, kMtlcNext, in, 2, nullptr, 0, req, &nReq, name, &nameLen);
 		if (kr != KERN_SUCCESS)

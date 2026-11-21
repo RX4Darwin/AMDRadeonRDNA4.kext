@@ -1094,6 +1094,8 @@ IOReturn wrapSetCursorImage(void *fb, void *image)
 		gCursorHot[port][0] = info.cursorHotSpotX;
 		gCursorHot[port][1] = info.cursorHotSpotY;
 	}
+	if (!ok)   // IOFramebuffer draws this one itself: the plane's image before must not stay beside it (two pointers)
+		(void)PvScanout::cursorMove(static_cast<uint32_t>(port), 0, 0, false);
 	static uint32_t logged;
 	if (logged++ < 6)
 		FBLOG("cursor: our accelerator's: port %d: image %ux%u, hot spot %u,%u: %s", port, info.cursorWidth, info.cursorHeight,
@@ -2337,10 +2339,14 @@ static bool pvOnCursorPipe(uint32_t port, Call call)
 
 	if (!dev)
 		return false;
+
+	// held for the boot head as well: the device's cursor state is one for both heads, and our accelerator's framebuffers call from
+	// their own threads at once (the paravirtual host from its one work loop): a boot-head move in the middle of the second head's
+	// image went to the wrong pipe
+	RDNA4Device::ExtraHold hold(*dev);
 	if (!extra)
 		return call(*dev);
 
-	RDNA4Device::ExtraHold hold(*dev);
 	dev->selectExtra(extra->slot);
 	dev->setCursorPipe(dev->xp().pipe);
 	const bool ok = call(*dev);

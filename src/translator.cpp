@@ -85,7 +85,7 @@ IOReturn RDNA4MtlcClient::externalMethod(uint32_t selector, IOExternalMethodArgu
 	if (!mHelper)
 		return kIOReturnNotOpen;
 	if (selector == kMtlcNext && a->scalarInputCount == 2 && a->scalarOutputCount == 2 && a->structureOutput &&
-	    a->structureOutputSize == sizeof(gTr.name))
+	    a->structureOutputSize >= 64)   // (an older helper's: 64, the name cut there)
 		return next(a);
 	if (selector == kMtlcDeliver && (a->scalarInputCount == 5 || a->scalarInputCount == 6) && a->scalarInput[2] <= RDNA4_MTLC_MAX_ELF)
 		return deliver(a);
@@ -112,7 +112,7 @@ IOReturn RDNA4MtlcClient::next(IOExternalMethodArguments *a) {
 	if (r == kIOReturnSuccess) {
 		a->scalarOutput[0] = gTr.id;
 		a->scalarOutput[1] = gTr.libLen;
-		memcpy(a->structureOutput, gTr.name, sizeof(gTr.name));
+		strlcpy(static_cast<char *>(a->structureOutput), gTr.name, a->structureOutputSize);
 		gTr.taken = true;
 	}
 	IOLockUnlock(gTr.lock);
