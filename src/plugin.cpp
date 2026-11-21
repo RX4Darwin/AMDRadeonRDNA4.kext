@@ -1680,9 +1680,30 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index, mach_vm_addre
 }
 
 bool ndrvRouted = false;   // processKext ran: by Lilu's load notice, or by lateNdrvCheck
+bool lateRouting = false;  // processKext is lateNdrvCheck's (the rdna4-ndrvdelay test hook leaves it be)
+// (test) rdna4-ndrvdelay=<ms>: Lilu's notice of IONDRVSupport acted on that much later, on a thread call: the boot framebuffer then starts
+// before our routes, as when another kext loads IONDRVSupport ahead of the notice (the race lateNdrvCheck has to win).
+struct DelayedRoute { KernelPatcher *patcher; size_t index; mach_vm_address_t address; size_t size; } gDelayedRoute;
+thread_call_t gDelayedRouteCall = nullptr;
+void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+void delayedRoute(thread_call_param_t, thread_call_param_t) {
+	FBLOG("ndrv: (test) rdna4-ndrvdelay: routing IONDRVSupport now");
+	processKext(nullptr, *gDelayedRoute.patcher, gDelayedRoute.index, gDelayedRoute.address, gDelayedRoute.size);
+}
 
 void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address,
                  size_t size) {
+	uint32_t delayMs = 0;
+	if (index == kextIONDRVSupport.loadIndex && !gDelayedRouteCall && !lateRouting &&
+	    PE_parse_boot_argn("rdna4-ndrvdelay", &delayMs, sizeof(delayMs)) && delayMs &&
+	    (gDelayedRouteCall = thread_call_allocate(delayedRoute, nullptr))) {   // (never freed: once a boot)
+		gDelayedRoute = { &patcher, index, address, size };
+		uint64_t deadline;
+		clock_interval_to_deadline(delayMs, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gDelayedRouteCall, deadline);
+		FBLOG("ndrv: (test) rdna4-ndrvdelay=%u: IONDRVSupport routed %u ms late", delayMs, delayMs);
+		return;
+	}
 	if (index != kextIONDRVSupport.loadIndex || __atomic_exchange_n(&ndrvRouted, true, __ATOMIC_SEQ_CST))
 		return;
 	KernelPatcher::RouteRequest request {
@@ -1800,53 +1821,52 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	patcher.clearError();
 }
 
-// Boots where IONDRVSupport is loaded where Lilu does not see it: SimpleHDA loads it itself the moment the system kext collection is ready
-// (2026-10-22: at 18 s, the framebuffer published 0.4 s later; Lilu's first load notice of the boot at 21 s). Lilu then never calls
-// processKext, IONDRVFramebuffer starts without our routes and is gone, and the card is never brought up (only the firmware's picture).
-// From 30 s on (by then the boot's kexts have loaded; on other boots processKext has run long before): if processKext has not run and
-// IONDRVSupport is in the kernel's kext list, run it with that kext's address, then register the GPU again so that IONDRVFramebuffer matches
-// again, now through our routes. Tried every 2 s until 120 s.
+// Boots where IONDRVSupport is loaded where Lilu does not see it in time: SimpleHDA loads it itself the moment the system kext collection is
+// ready (2026-10-22: at 18 s, the framebuffer published 0.4 s later; Lilu's first load notice of the boot at 21 s). Then IONDRVFramebuffer
+// starts without our routes and is gone, and the card is never brought up (only the firmware's picture): lateNdrvCheck below.
 KernelPatcher *gPatcher = nullptr;
 thread_call_t gLateNdrv = nullptr;
-
+// IONDRVSupport routed from the kernel's kext list when Lilu has not told us of its load: polled every 20 ms from 1 s on (every 2 s from 60
+// s, until 120 s), so the routes are in before its framebuffers match. SimpleHDA loads IONDRVSupport itself inside the catalog hook and
+// holds its personalities until its own linking is done (~0.5 s on the rig); Lilu's notice came after the boot framebuffer had started in
+// some boots, which used up the boot display's NDRV for good: the card never came up. Matching the framebuffers again afterwards (the
+// framebuffers terminated, the display nubs or the GPU registered again) did not bring it back on the card (2026-11-21): be in time.
+// Card: with Lilu's notice held back 3 s (rdna4-ndrvdelay=3000) routed at 9.8 s from the list, the card up as on a normal boot.
 void lateNdrvCheck(thread_call_param_t, thread_call_param_t) {
-	if (__atomic_load_n(&ndrvRouted, __ATOMIC_SEQ_CST) || !gPatcher)
-		return;
-	kmod_info_t *ndrv = nullptr;
-	if (auto **kmods = reinterpret_cast<kmod_info_t **>(gPatcher->solveSymbol(KernelPatcher::KernelID, "_kmod")))
-		for (kmod_info_t *k = *kmods; k && !ndrv; k = k->next)   // as Lilu walks it (kern_patcher.cpp processAlreadyLoadedKexts)
-			if (!strncmp(k->name, kextIONDRVSupport.id, KMOD_MAX_NAME))
-				ndrv = k;
-	gPatcher->clearError();
 	uint64_t up = 0;
 	absolutetime_to_nanoseconds(mach_absolute_time(), &up);
-	if (!ndrv) {
-		if (up < 120ull * NSEC_PER_SEC) {
-			uint64_t deadline;
-			clock_interval_to_deadline(2, kSecondScale, &deadline);
-			thread_call_enter_delayed(gLateNdrv, deadline);
-		} else {
+	auto again = [](uint64_t ms) {
+		uint64_t deadline;
+		clock_interval_to_deadline(static_cast<uint32_t>(ms), kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gLateNdrv, deadline);
+	};
+	if (__atomic_load_n(&ndrvRouted, __ATOMIC_SEQ_CST))   // Lilu told us in time
+		return;
+	static kmod_info_t **kmods;
+	if (!kmods && gPatcher) {
+		kmods = reinterpret_cast<kmod_info_t **>(gPatcher->solveSymbol(KernelPatcher::KernelID, "_kmod"));
+		gPatcher->clearError();
+	}
+	kmod_info_t *ndrv = nullptr;
+	for (kmod_info_t *k = kmods ? *kmods : nullptr; k && !ndrv; k = k->next)   // as Lilu walks it (kern_patcher.cpp processAlreadyLoadedKexts)
+		if (!strncmp(k->name, kextIONDRVSupport.id, KMOD_MAX_NAME))
+			ndrv = k;
+	static uint32_t seen;   // polls that found it: Lilu's own notice gets one more poll, and the load its end
+	if (!ndrv || ++seen < 2) {
+		if (up < 120ull * NSEC_PER_SEC)
+			again(up < 60ull * NSEC_PER_SEC ? 20 : 2000);
+		else
 			FBLOG("ndrv: IONDRVSupport never loaded and Lilu never reported it: the card is not brought up");
-		}
 		return;
 	}
-	FBLOG("ndrv: Lilu did not report IONDRVSupport's load (another kext loaded it); routing it now, at %llu s", up / NSEC_PER_SEC);
+	FBLOG("ndrv: Lilu has not reported IONDRVSupport's load (another kext loaded it); routing it from the kext list at %llu ms",
+	      up / NSEC_PER_MSEC);
 	// As Lilu before its load callbacks (kern_api.cpp processKextLoadCallbacks): the kext's running symbols, and its whole size (a kmod's is
 	// only __TEXT since 11.0). Without this its symbols cannot be solved ("no loaded symbols buffer found", seen on the rig 2026-10-22).
 	const size_t size = gPatcher->updateRunningInfo(kextIONDRVSupport.loadIndex, ndrv->address, ndrv->size);
 	gPatcher->clearError();
+	lateRouting = true;
 	processKext(nullptr, *gPatcher, kextIONDRVSupport.loadIndex, ndrv->address, size);
-	// The GPU again: IONDRVFramebuffer matches again (its first instance did not start without our routes).
-	OSDictionary *match = IOService::serviceMatching("IOPCIDevice");
-	OSIterator *it = match ? IOService::getMatchingServices(match) : nullptr;
-	OSSafeReleaseNULL(match);
-	while (OSObject *o = it ? it->getNextObject() : nullptr)
-		if (auto *pci = OSDynamicCast(IOPCIDevice, o))
-			if (pci->configRead16(kIOPCIConfigVendorID) == 0x1002 && pci->configRead8(kIOPCIConfigClassCode + 2) == 0x03) {
-				FBLOG("ndrv: registering %s again for IONDRVFramebuffer", pci->getName());
-				pci->registerService();
-			}
-	OSSafeReleaseNULL(it);
 }
 
 void pluginStart() {
@@ -1936,7 +1956,7 @@ void pluginStart() {
 	});
 	if ((gLateNdrv = thread_call_allocate(lateNdrvCheck, nullptr))) {   // ponytail: never freed, it lives for the boot
 		uint64_t deadline;
-		clock_interval_to_deadline(30, kSecondScale, &deadline);
+		clock_interval_to_deadline(1, kSecondScale, &deadline);   // (the poll: lateNdrvCheck)
 		thread_call_enter_delayed(gLateNdrv, deadline);
 	}
 }
