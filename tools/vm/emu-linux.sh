@@ -78,7 +78,7 @@ done
 [ "$DIAG$CENSUS" != 11 ] || { echo "--diag and --census cannot be combined" >&2; exit 2; }
 [ -n "$BOOT" ] || [ -n "$ARGS" ] || { echo "usage: $0 <boot> [options] (try -h)" >&2; exit 2; }
 
-for f in "$QEMU_BIN" "$HERE/Build/emu/rdna4.rom" "$KEXT/Contents/MacOS/AMDRadeonRDNA4" \
+for f in "$QEMU_BIN" "${ROM:-$HERE/Build/emu/rdna4.rom}" "$KEXT/Contents/MacOS/AMDRadeonRDNA4" \
 	"$LILU/Contents/Info.plist" "$BASE_IMG" "$OSXKVM/OpenCore/OpenCore.qcow2" "$EMU/local/bin/mcopy"; do
 	[ -e "$f" ] || { echo "emu-linux: missing $f (docs/emu-linux.md says how to make it)" >&2; exit 1; }
 done

@@ -7,6 +7,13 @@
  *  - PCI identity and BAR layout of the card: BAR0/1 VRAM aperture, BAR2/3
  *    doorbells (the MEC compute queue), BAR4 I/O (inert), BAR5 registers, expansion ROM
  *    (romfile=, normally the card's legacy AtomBIOS image + an EFI GOP driver).
+ *    chip=navi44 makes it an RX 9060 XT (1002:7590) instead: the PCI identity
+ *    and the firmware versions the PSP and SMU report change, nothing else
+ *    (register bases, VRAM size and GB_ADDR_CONFIG are the same on both chips).
+ *    fwdir=<firmware/amdgpu> stands in for the PSP's signature check: a
+ *    bootloader component or TOC must be a whole part of the chip's own sOS
+ *    package, a LOAD_IP_FW image must be found whole in one of the chip's
+ *    firmware files; anything else is refused. No signature is verified.
  *  - VRAM: the aperture is RAM; the rest of VRAM is reachable through
  *    MM_INDEX/MM_DATA, with the top 64 MiB modelled (the IP discovery copy
  *    the PSP leaves at VRAM top - 64 KiB lives there).
@@ -263,7 +270,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define REG_SMU_RESP         ((MP1_SEG1 + 0x009a) * 4)
 #define SMU_RESP_OK          0x01
 #define SMU_RESP_UNKNOWN     0xfe
-#define SMU_PMFW_VERSION     0x00685000 /* smu_14_0_3.bin's ucode_version */
+#define SMU_PMFW_VERSION_N48 0x00685000 /* smu_14_0_3.bin's ucode_version */
+#define SMU_PMFW_VERSION_N44 0x00664700 /* smu_14_0_2.bin's, as an RX 9060 XT reports it under amdgpu */
 
 /*
  * PSP (MP0 14.0.3) mailbox: MPASP_SMN_C2PMSG_n, MP0 segment 0 (dword 0x16000).
@@ -283,7 +291,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define PSP_READY            0x80000000u
 #define PSP_BL_SYSDRV        0x10000
 #define PSP_BL_SOSDRV        0x20000
-#define PSP_SOS_VERSION      0x003a1214     /* psp_14_0_3_sos.bin's sOS */
+#define PSP_SOS_VERSION_N48  0x003a1214     /* psp_14_0_3_sos.bin's sOS */
+#define PSP_SOS_VERSION_N44  0x003b0f0d     /* psp_14_0_2_sos.bin's, as an RX 9060 XT reports it under amdgpu */
 #define PSP_FRAME_SIZE       64
 #define PSP_CMD_ID           8              /* psp_gfx_cmd_resp.cmd_id */
 #define PSP_CMD_ARGS         28             /* .cmd */
@@ -296,6 +305,35 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define PSP_CMD_FB_RESERV    0x50
 #define PSP_FW_TYPE_SMU      18
 #define PSP_ERR_AUTOLOAD     0x9            /* model: GC firmware set incomplete */
+#define PSP_ERR_SIGNATURE    0xfffe         /* model's own value: a blob that is not from the chip's set (fwdir=) */
+
+/*
+ * The two RDNA 4 chips (chip=). Register bases, VRAM size and GB_ADDR_CONFIG
+ * are the same on both (read on an RX 9060 XT under amdgpu); the PCI identity
+ * and the firmware set differ. fw[] is the chip's set in firmware/amdgpu/.
+ */
+#define RDNA4_FW_MAX 10
+#define RDNA4_SOS_PARTS 16
+typedef struct RDNA4Chip {
+    const char *name;
+    const char *desc;
+    uint16_t    device_id, subsystem_vendor_id, subsystem_id;
+    uint32_t    smu_version, sos_version;
+    const char *fw[RDNA4_FW_MAX];
+} RDNA4Chip;
+
+static const RDNA4Chip rdna4_chips[] = {
+    { "navi48", "RX 9070 XT", 0x7550, 0x1da2, 0xe489,   /* Sapphire, from the card's ATOM header */
+      SMU_PMFW_VERSION_N48, PSP_SOS_VERSION_N48,
+      { "psp_14_0_3_sos.bin", "smu_14_0_3.bin", "sdma_7_0_1.bin", "gc_12_0_1_pfp.bin",
+        "gc_12_0_1_me.bin", "gc_12_0_1_mec.bin", "gc_12_0_1_uni_mes.bin", "gc_12_0_1_imu.bin",
+        "gc_12_0_1_rlc.bin", "dcn_4_0_1_dmcub.bin" } },
+    { "navi44", "RX 9060 XT", 0x7590, 0x1458, 0x2438,   /* Gigabyte, from the card's ATOM header */
+      SMU_PMFW_VERSION_N44, PSP_SOS_VERSION_N44,
+      { "psp_14_0_2_sos.bin", "smu_14_0_2.bin", "sdma_7_0_0.bin", "gc_12_0_0_pfp.bin",
+        "gc_12_0_0_me.bin", "gc_12_0_0_mec.bin", "gc_12_0_0_uni_mes.bin", "gc_12_0_0_imu.bin",
+        "gc_12_0_0_rlc.bin", "dcn_4_0_1_dmcub.bin" } },
+};
 
 /*
  * GC 12.0.1 registers the RLC autoload changes (GC seg0 dword 0x1260, seg1
@@ -456,6 +494,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define REG_GFX_SPI_SHADER_COL_FORMAT GFX12_CTX_DW(0xa195)
 #define REG_GFX_SPI_PS_INPUT_ENA    GFX12_CTX_DW(0xa197)
 #define REG_GFX_SPI_PS_INPUT_ADDR   GFX12_CTX_DW(0xa198)
+#define REG_GFX_SPI_PS_INPUT_CNTL_0 GFX12_CTX_DW(0xa199)
+#define REG_GFX_SPI_ATTRIBUTE_RING_BASE GFX12_UCFG_DW(0xc446)   /* VA >> 16 */
+#define REG_GFX_SPI_ATTRIBUTE_RING_SIZE GFX12_UCFG_DW(0xc447)   /* MEM_SIZE [7:0]: 64 KiB units per SE, minus 1 */
+/* G4, the colour triangle (docs/g4-colour.md). What the hardware hands the shaders, as far as it is known:
+ * gs_attr_offset (NGG s5) was 0 in ten G3 runs on the RX 9070 XT and is not measured for a G4 draw; the model gives 0.
+ * PrimMask is the PS's first system SGPR; its real value is not known, the model gives a value of its own and
+ * takes any other m0 at a ds_param_load as a shader that did not copy it. */
+#define RDNA4_GFX_GS_ATTR_OFFSET    0u
+#define RDNA4_GFX_PRIM_MASK         0x50524d4bu
 #define REG_GFX_SPI_PS_IN_CONTROL   GFX12_CTX_DW(0xa190)
 #define REG_GFX_PA_CL_VTE_CNTL      GFX12_CTX_DW(0xa205)
 #define REG_GFX_PA_SU_SC_MODE_CNTL  GFX12_CTX_DW(0xa207)
@@ -635,6 +682,7 @@ struct RDNA4State {
     bool     cursor_reject_logged;
     bool     cursor_ttu_hypothesis; /* reject the cursor plane while DCN_CUR0_TTU_CNTL0's delivery is 0 (cursor-ttu-hypothesis) */
     uint32_t gfx_break;      /* corrupt one G3 MUST register at draw time */
+    uint32_t gfx_break_last; /* what gfx-break 5 or 7 last wrote: a stream that does not rewrite the register is not shifted twice */
     bool     gfx_golden_strict; /* refuse a draw when the amdgpu golden registers are unset (gfx-golden-strict) */
     bool     gfx_golden_warned;
     bool     gfx_trace;      /* trace G3 vertices and effective scissors */
@@ -647,6 +695,15 @@ struct RDNA4State {
     uint32_t edid_len;
     uint8_t  *discovery;      /* IP discovery binary from the flash image */
     uint32_t discovery_len;
+    char     *chip_name;      /* chip=: navi48 (default) or navi44 */
+    const RDNA4Chip *chip;
+    char     *fw_dir;         /* fwdir=: the firmware sets, for the signature model */
+    char     *fw_data[RDNA4_FW_MAX];
+    gsize    fw_len[RDNA4_FW_MAX];
+    unsigned nfw;
+    const char *sos_part[RDNA4_SOS_PARTS];   /* the parts of the sOS package (fw_data[0]) */
+    uint32_t sos_part_len[RDNA4_SOS_PARTS];
+    unsigned nsos_parts;
 
     RDNA4I2C     i2c;
     int64_t      otg_epoch[NUM_OTG];
@@ -1685,10 +1742,34 @@ static void rdna4_gfx_autoload(RDNA4State *s)
 /* SmuMetrics_t power-management fields (smu14_driver_if_v14_0.h:1649-1727).
  * The real PMFW bumps MetricsCounter on its own tick (about 1 ms), so it is the
  * virtual clock in ms: two reads a second apart differ, and a table the SMU did
- * not rewrite keeps whatever the driver put there. The activity values are the
- * emulator's idle card (no queue is executing), not a claim about silicon. */
+ * not rewrite keeps whatever the driver put there. */
+
+/*
+ * GFX activity and socket power follow the model's state, with the figures the
+ * RX 9070 XT gave in those states (docs/power-gfx.md s.1): a wave that never
+ * ends pins the card at 100 % / 75-81 W whatever the gating (F2); without clock
+ * gating it idles at 100 % / 131 W, with it (RLC_CGCG_CGLS_CTRL.CGCG_EN, the
+ * kext's default) at 3 % / 19-20 W (F6). GFXOFF keeps the model's own 0 % / 8 W.
+ * They say what state the driver left the model in, nothing about a card.
+ */
+static void rdna4_smu_activity_power(RDNA4State *s, uint16_t *activity, uint16_t *watts)
+{
+    if (s->gfxoff_active) {
+        *activity = 0; *watts = 8;
+    } else if (s->mec_hung) {
+        *activity = 100; *watts = 80;
+    } else if (reg_get(s, GC_SEG1(0x4c49)) & 1u) {      /* RLC_CGCG_CGLS_CTRL.CGCG_EN */
+        *activity = 3; *watts = 19;
+    } else {
+        *activity = 100; *watts = 131;
+    }
+}
+
 static void rdna4_smu_metrics_pm_fields(RDNA4State *s, uint8_t *table)
 {
+    uint16_t activity, watts;
+
+    rdna4_smu_activity_power(s, &activity, &watts);
     stl_le_p(table + RDNA4_SMU_METRICS_COUNTER,
              (uint32_t)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) & 0x7fffffff));
     /* PPCLK_GFXCLK follows a SetSoftMaxByFreq below the idle clock; the soft
@@ -1698,7 +1779,7 @@ static void rdna4_smu_metrics_pm_fields(RDNA4State *s, uint8_t *table)
         gfxclk = s->smu_gfx_soft_max - 1;
     stl_le_p(table + RDNA4_SMU_METRICS_CURR_CLOCK + 0 * 4, gfxclk);    /* PPCLK_GFXCLK */
     stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFXCLK_PRE_DS, 2100);
-    stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY, 3);
+    stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY, activity);
     stw_le_p(table + RDNA4_SMU_METRICS_AVG_UCLK_ACTIVITY, 1);
     stw_le_p(table + RDNA4_SMU_METRICS_AVG_VOLTAGE + 0 * 2, 850);      /* SVI_PLANE_VDD_GFX, mV */
     stw_le_p(table + RDNA4_SMU_METRICS_AVG_CURRENT + 0 * 2, 12);
@@ -1724,7 +1805,7 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
     case 0x1:                                      /* TestMessage */
         break;
     case 0x2:                                      /* GetSmuVersion */
-        reg_set(s, REG_SMU_PARAM, SMU_PMFW_VERSION);
+        reg_set(s, REG_SMU_PARAM, s->chip->smu_version);
         break;
     case 0x3:                                      /* GetDriverIfVersion */
         reg_set(s, REG_SMU_PARAM, 0x2e);
@@ -1782,12 +1863,15 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS, 1000);
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_TEMPERATURE + 0 * 2, 42);
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_TEMPERATURE + 1 * 2, 55);
-        stw_le_p(table + RDNA4_SMU_METRICS_AVG_SOCKET_POWER, s->gfxoff_active ? 8 : 120);
-        if (s->gfxoff_active) {
-            stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY, 0);
+        {
+            uint16_t activity, watts;
+
+            rdna4_smu_activity_power(s, &activity, &watts);
+            stw_le_p(table + RDNA4_SMU_METRICS_AVG_SOCKET_POWER, watts);
+            stw_le_p(table + RDNA4_SMU_METRICS_AVG_FAN_RPM, 900);
+            fprintf(stderr, "rdna4: smu: synthetic metrics 42C/55C, 2100/1000 MHz, %u %%, %u W, 900 RPM\n",
+                    activity, watts);
         }
-        stw_le_p(table + RDNA4_SMU_METRICS_AVG_FAN_RPM, 900);
-        fprintf(stderr, "rdna4: smu: synthetic metrics 42C/55C, 2100/1000 MHz, 120 W, 900 RPM\n");
         break;
     }
     case 0x19:                                     /* SetSoftMinByFreq: accepted, no model */
@@ -1893,6 +1977,53 @@ static bool rdna4_psp_buffer_ok(RDNA4State *s, uint64_t mc, uint32_t len)
 }
 
 /*
+ * fwdir=: is this buffer from the chip's own firmware set? The PSP checks each
+ * blob's signature, so it refuses the other chip's. The model has no keys; it
+ * compares contents instead, over the whole length (the two sets share short
+ * prefixes: the first 64 bytes of SPL are the same in both sOS packages).
+ * Without fwdir= nothing is checked.
+ *
+ * A bootloader component or the TOC must be one whole part of the sOS package.
+ * The bootloader's buffer is 1 MiB and carries no length, so `len` is the
+ * buffer's size there and a part matches when the buffer starts with all of it.
+ */
+static bool rdna4_fw_sos_part(RDNA4State *s, uint64_t mc, uint32_t len, const char *what)
+{
+    if (!s->nfw) {
+        return true;
+    }
+    for (unsigned i = 0; i < s->nsos_parts; i++) {
+        uint8_t *p = s->sos_part_len[i] <= len ? rdna4_mc_span(s, mc, s->sos_part_len[i]) : NULL;
+
+        if (p && !memcmp(p, s->sos_part[i], s->sos_part_len[i])) {
+            return true;
+        }
+    }
+    fprintf(stderr, "rdna4: psp: %s is not a part of the %s sOS package: refused, as the PSP's "
+            "signature check would\n", what, s->chip->name);
+    return false;
+}
+
+/* A LOAD_IP_FW image must be found whole in one of the set's files. */
+static bool rdna4_fw_image(RDNA4State *s, uint64_t mc, uint32_t len, uint32_t type)
+{
+    uint8_t *p;
+
+    if (!s->nfw) {
+        return true;
+    }
+    p = len ? rdna4_mc_span(s, mc, len) : NULL;
+    for (unsigned f = 0; p && f < s->nfw; f++) {
+        if (memmem(s->fw_data[f], s->fw_len[f], p, len)) {
+            return true;
+        }
+    }
+    fprintf(stderr, "rdna4: psp: LOAD_IP_FW type %u (%u bytes) is not in the %s firmware set: refused, "
+            "as the PSP's signature check would\n", type, len, s->chip->name);
+    return false;
+}
+
+/*
  * Bit for a bootloader command in psp_bl_loaded: the driver-component
  * commands are 0x10000..0xF0000 (bits 1..15 by their [19:16]); SPL and
  * SPDM (0x10000000, 0x20000000) take bits 16 and 17.
@@ -1915,12 +2046,15 @@ static void rdna4_psp_bootloader(RDNA4State *s, uint32_t cmd)
                 "buffer (MC 0x%" PRIx64 "), not answering\n", cmd, buf);
         return;                         /* stays busy: the driver times out */
     }
+    if (!rdna4_fw_sos_part(s, buf, 1 * MiB, "a bootloader component")) {
+        return;                         /* model: stays busy, the driver times out */
+    }
     if (cmd == PSP_BL_SOSDRV) {
         if (!(s->psp_bl_loaded & (1u << rdna4_psp_bl_bit(PSP_BL_SYSDRV)))) {
             fprintf(stderr, "rdna4: psp: sOS without its system driver, not starting\n");
             return;
         }
-        reg_set(s, REG_PSP_SOS, PSP_SOS_VERSION);
+        reg_set(s, REG_PSP_SOS, s->chip->sos_version);
         reg_set(s, REG_PSP_RING_CTL, PSP_READY);     /* TOS ready for a ring */
     }
     s->psp_bl_loaded |= 1u << rdna4_psp_bl_bit(cmd);
@@ -1960,10 +2094,12 @@ static void rdna4_psp_command(RDNA4State *s, uint64_t cmd)
         uint64_t toc = rdna4_mc_get(s, cmd + PSP_CMD_ARGS) |
                        ((uint64_t)rdna4_mc_get(s, cmd + PSP_CMD_ARGS + 4) << 32);
         uint32_t len = rdna4_mc_get(s, cmd + PSP_CMD_ARGS + 8);
-        if (rdna4_psp_buffer_ok(s, toc, len)) {
-            rdna4_mc_set(s, cmd + PSP_RESP_TMR_SIZE, PSP_TMR_SIZE);
-        } else {
+        if (!rdna4_psp_buffer_ok(s, toc, len)) {
             status = 0xffff;
+        } else if (!rdna4_fw_sos_part(s, toc, len, "the TOC")) {
+            status = PSP_ERR_SIGNATURE;
+        } else {
+            rdna4_mc_set(s, cmd + PSP_RESP_TMR_SIZE, PSP_TMR_SIZE);
         }
         break;
     }
@@ -1974,6 +2110,10 @@ static void rdna4_psp_command(RDNA4State *s, uint64_t cmd)
         uint32_t type = rdna4_mc_get(s, cmd + PSP_CMD_ARGS + 12);
         if (!rdna4_psp_buffer_ok(s, fw, len)) {
             status = 0xffff;
+            break;
+        }
+        if (!rdna4_fw_image(s, fw, len, type)) {
+            status = PSP_ERR_SIGNATURE;
             break;
         }
         if (type == PSP_FW_TYPE_SMU) {
@@ -4773,11 +4913,27 @@ typedef struct RDNA4GfxWave {
     bool mrt_valid[32];
     uint32_t mrt_enable;
     unsigned alloc_count;
+    /* G4: attribute 0 of the primitive's three vertices, as SPI takes it out of the attribute ring for the PS,
+     * and what ds_param_load made of one channel of it. The hardware keeps P0, P10 and P20 in three lanes of each
+     * quad of the destination register; the model has no quads and keeps them beside the register. */
+    bool have_attr;
+    float attr[3][4];
+    float param[256][3];
+    bool param_valid[256];
+    uint64_t attr_store_va[32];        /* where this wave's attribute stores went */
+    unsigned nattr_stores;
+    /* The VGPRs SPI_SHADER_PGM_RSRC1 gives the wave: (VGPRS + 1) * 8 for wave32 (Mesa: VGPRS = (n - 1) / 8).
+     * A shader that uses more runs into registers it does not own; on the card an over-budget probe ended in a
+     * ring reset (docs/g4-colour.md s.5). The model stops the wave. */
+    uint32_t vgprs;
 } RDNA4GfxWave;
 
 typedef struct RDNA4GfxTriangle {
     float x[3], y[3], z[3];
     uint32_t primitive;
+    float ox[3], oy[3];                /* the vertices in the primitive's own order (x, y may be swapped for the winding) */
+    bool have_attr;
+    float attr[3][4];
 } RDNA4GfxTriangle;
 
 static uint32_t rdna4_gfx_inline(uint32_t src, bool *ok)
@@ -4876,7 +5032,21 @@ static bool rdna4_gfx_read_code(RDNA4State *s, uint64_t pc, uint32_t vmid,
     return true;
 }
 
-/* Execute the exact subset emitted by src/shaders/ngg.s and src/shaders/psred.s.
+static bool rdna4_gfx_vgpr_ok(const RDNA4GfxWave *w, uint32_t reg, bool ngg)
+{
+    if (reg < w->vgprs) {
+        return true;
+    }
+    fprintf(stderr, "rdna4: gfx: %s shader uses v%u, but SPI_SHADER_PGM_RSRC1 gives the wave %u VGPRs\n",
+            ngg ? "NGG" : "PS", reg, w->vgprs);
+    return false;
+}
+
+/* An operand that may be a VGPR (256..511) or an SGPR/constant. */
+#define RDNA4_GFX_OPND_OK(w, src, ngg) ((src) < 256 || rdna4_gfx_vgpr_ok(w, (src) - 256, ngg))
+
+/* Execute the exact subset emitted by src/shaders/ngg.s and src/shaders/psred.s, and by
+ * src/shaders/nggcol.s and src/shaders/pscol.s (G4: the attribute store, ds_param_load, v_interp).
  * SALU runs once, VALU runs only on EXEC lanes, and exports are captured as
  * the stage boundary.  This is intentionally not a native shader shortcut. */
 static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
@@ -4938,6 +5108,16 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                     goto unknown;
                 if ((dw & 0xffu) == 0xffu)                   /* a literal follows (src/shaders/nggstore.s) */
                     n = 2;
+            } else if (op == 0x1c) {                         /* s_wqm_b32: every quad with a live lane, whole */
+                uint32_t src = rdna4_gfx_sreg(w, dw & 0xff), out = 0;
+
+                for (unsigned q = 0; q < 8; q++) {
+                    if ((src >> (4 * q)) & 0xfu)
+                        out |= 0xfu << (4 * q);
+                }
+                if (!rdna4_gfx_set_sreg(w, dst, out))
+                    goto unknown;
+                w->scc = out != 0;
             } else {
                 goto unknown;
             }
@@ -4983,6 +5163,12 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                 w->s[dst + 1] = (uint32_t)(mask >> 32);
                 break;
             }
+            case 0: {                                        /* s_add_co_u32 */
+                uint64_t sum = (uint64_t)a + b;
+                if (!rdna4_gfx_set_sreg(w, dst, (uint32_t)sum)) goto unknown;
+                w->scc = (sum >> 32) != 0;
+                break;
+            }
             case 8: value = a << (b & 31); if (!rdna4_gfx_set_sreg(w, dst, value)) goto unknown; break;
             case 22: value = a & b; if (!rdna4_gfx_set_sreg(w, dst, value)) goto unknown; break;
             case 24: value = a | b; if (!rdna4_gfx_set_sreg(w, dst, value)) goto unknown; break;
@@ -4996,6 +5182,11 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
             uint32_t s1 = (dw1 >> 9) & 0x1ff;
             uint32_t s2 = (dw1 >> 18) & 0x1ff;
 
+            if (!RDNA4_GFX_OPND_OK(w, s0, ngg) || !RDNA4_GFX_OPND_OK(w, s1, ngg) || !RDNA4_GFX_OPND_OK(w, s2, ngg) ||
+                (op != 0x4a && !rdna4_gfx_vgpr_ok(w, dst, ngg)))
+                return false;
+            if (op != 0x4a)
+                w->param_valid[dst] = false;
             if (op == 0x4a) {                                /* v_cmp_eq_u32_e64 */
                 uint32_t mask = 0;
                 for (unsigned lane = 0; lane < 32; lane++) {
@@ -5032,6 +5223,9 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
             uint32_t dst = (dw >> 17) & 0xff;
 
             if (op != 1) goto unknown;                       /* v_mov_b32 */
+            if (!rdna4_gfx_vgpr_ok(w, dst, ngg) || !RDNA4_GFX_OPND_OK(w, dw & 0x1ff, ngg))
+                return false;
+            w->param_valid[dst] = false;
             for (unsigned lane = 0; lane < 32; lane++) {
                 if ((w->exec >> lane) & 1u)
                     w->v[dst][lane] = rdna4_gfx_vsrc(w, dw & 0x1ff, lane, dw1);
@@ -5041,6 +5235,9 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
         } else if ((dw & 0x80000000u) == 0 && ((dw >> 25) & 0x3f) == 0x18) {   /* VOP2 v_lshlrev_b32 */
             uint32_t dst = (dw >> 17) & 0xff, vsrc1 = (dw >> 9) & 0xff, src0 = dw & 0x1ff;
 
+            if (!rdna4_gfx_vgpr_ok(w, dst, ngg) || !rdna4_gfx_vgpr_ok(w, vsrc1, ngg) || !RDNA4_GFX_OPND_OK(w, src0, ngg))
+                return false;
+            w->param_valid[dst] = false;
             for (unsigned lane = 0; lane < 32; lane++) {
                 if ((w->exec >> lane) & 1u)
                     w->v[dst][lane] = w->v[vsrc1][lane] << (rdna4_gfx_vsrc(w, src0, lane, dw1) & 31);
@@ -5057,6 +5254,8 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
 
             if (saddr >= 106 || (dw2 & 0x00ffff00u))
                 goto unknown;
+            if (!rdna4_gfx_vgpr_ok(w, vdata, ngg) || !rdna4_gfx_vgpr_ok(w, vaddr, ngg))
+                return false;
             base = (uint64_t)w->s[saddr] | ((uint64_t)w->s[saddr + 1] << 32);
             for (unsigned lane = 0; lane < 32; lane++) {
                 if ((w->exec >> lane) & 1u) {
@@ -5064,13 +5263,124 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
 
                     if (!rdna4_gfx_mem_write(s, base + w->v[vaddr][lane], &value,
                                              sizeof(value), vmid)) {
-                        fprintf(stderr, "rdna4: gfx: PS global_store to 0x%" PRIx64 " faulted\n",
-                                base + w->v[vaddr][lane]);
+                        fprintf(stderr, "rdna4: gfx: %s global_store to 0x%" PRIx64 " faulted\n",
+                                ngg ? "NGG" : "PS", base + w->v[vaddr][lane]);
                         return false;
                     }
                 }
             }
             n = 3;
+        } else if ((dw & 0xfc7fc000u) == 0xc4074000u) {
+            /* VBUFFER buffer_store_b128 vdata, vaddr, srsrc, soffset idxen (96-bit form; fields read off
+             * llvm-mc -mcpu=gfx1201 encodings of variants of nggcol.s's store): dw0 [6:0] soffset, [21:14]
+             * opcode 0x1d, [22] tfe (not modelled: unknown); dw1 [7:0] vdata, [15:9] srsrc, [30] offen,
+             * [31] idxen; dw2 [7:0] vaddr, [31:8] offset.
+             * The buffer is the attribute ring, described by the four SGPRs (ac_build_attr_ring_descriptor):
+             * dword0 VA[31:0]; dword1 VA[47:32], stride [29:16], swizzle [31:30] (3 = 16-byte elements);
+             * dword2 the number of records the range check compares the index with (Mesa and the kext put the
+             * ring's size in bytes there); dword3 0x0043ffac (R32G32B32A32_FLOAT, index stride 32, range
+             * check "structured with offset"). Layout (docs/g4-colour.md s.2.1): the subgroup's region starts
+             * at soffset; in it, vertex i of a group of 32 is at i * 16, a group takes stride * 32 bytes.
+             * Modelled: that descriptor with one parameter (stride 16) and instruction offset 0, which is all
+             * nggcol.s does. With that range check the hardware drops a store whose index is not below the
+             * number of records; soffset is not part of the check. */
+            uint32_t soff = dw & 0x7f, vdata = dw1 & 0xff, rsrc = (dw1 >> 9) & 0x7f;
+            uint32_t vaddr = dw2 & 0xff, inst_off = dw2 >> 8;
+            uint32_t d0, d1, d2, d3, stride;
+            uint64_t base;
+
+            if (!ngg || !(dw1 >> 31) || ((dw1 >> 30) & 1u) || soff >= 106 || rsrc + 3 >= 106 || vdata + 3 > 255)
+                goto unknown;
+            if (!rdna4_gfx_vgpr_ok(w, vdata + 3, ngg) || !rdna4_gfx_vgpr_ok(w, vaddr, ngg))
+                return false;
+            d0 = w->s[rsrc]; d1 = w->s[rsrc + 1]; d2 = w->s[rsrc + 2]; d3 = w->s[rsrc + 3];
+            base = (uint64_t)d0 | ((uint64_t)(d1 & 0xffffu) << 32);
+            stride = (d1 >> 16) & 0x3fffu;
+            if (d3 != 0x0043ffacu || (d1 >> 30) != 3 || stride != 16 || inst_off) {
+                fprintf(stderr, "rdna4: gfx: NGG attribute store with descriptor %08x %08x %08x %08x, offset %u: only "
+                        "the one-parameter attribute ring descriptor with offset 0 is modelled (stride 16, swizzle 3, "
+                        "dword3 0x0043ffac)\n", d0, d1, d2, d3, inst_off);
+                return false;
+            }
+            for (unsigned lane = 0; lane < 32; lane++) {
+                uint32_t index, vec[4];
+                uint64_t off;
+
+                if (!((w->exec >> lane) & 1u))
+                    continue;
+                index = w->v[vaddr][lane];
+                if (index >= d2) {
+                    fprintf(stderr, "rdna4: gfx: NGG attribute store of vertex %u is not below the descriptor's "
+                            "%u records: dropped\n", index, d2);
+                    continue;
+                }
+                off = (uint64_t)w->s[soff] + (uint64_t)(index / 32) * stride * 32 + (index % 32) * 16;
+                for (unsigned c = 0; c < 4; c++)
+                    vec[c] = cpu_to_le32(w->v[vdata + c][lane]);
+                if (!rdna4_gfx_mem_write(s, base + off, vec, sizeof(vec), vmid)) {
+                    fprintf(stderr, "rdna4: gfx: NGG attribute store to 0x%" PRIx64 " faulted\n", base + off);
+                    return false;
+                }
+                if (w->nattr_stores < ARRAY_SIZE(w->attr_store_va))
+                    w->attr_store_va[w->nattr_stores++] = base + off;
+            }
+            n = 3;
+        } else if ((dw & 0xff700000u) == 0xce000000u) {
+            /* VDSDIR ds_param_load vdst, attrN.chan (llvm-mc: ce8f0002 for v2, attr0.x; [7:0] vdst, [9:8] channel,
+             * [15:10] attribute; the wait fields above are timing only). SPI has put the primitive's parameters
+             * where m0 (PrimMask) says; the load gives P0, P10 = P1 - P0 and P20 = P2 - P0 of one channel. A PS that
+             * did not put PrimMask into m0 reads something else on the card: here it gets a value outside 0..1. */
+            uint32_t vdst = dw & 0xff, chan = (dw >> 8) & 3, attr = (dw >> 10) & 0x3f;
+
+            if (ngg || attr != 0)
+                goto unknown;
+            if (!rdna4_gfx_vgpr_ok(w, vdst, ngg))
+                return false;
+            if (!w->have_attr) {
+                fprintf(stderr, "rdna4: gfx: PS ds_param_load, but the draw exports no parameter (NO_PC_EXPORT is on)\n");
+                return false;
+            }
+            if (w->m0 != RDNA4_GFX_PRIM_MASK) {
+                fprintf(stderr, "rdna4: gfx: PS ds_param_load with m0 0x%08x, which is not the PrimMask the wave "
+                        "was given: the parameter is garbage\n", w->m0);
+                w->param[vdst][0] = -1.0f; w->param[vdst][1] = 0.0f; w->param[vdst][2] = 0.0f;
+            } else {
+                w->param[vdst][0] = w->attr[0][chan];
+                w->param[vdst][1] = w->attr[1][chan] - w->attr[0][chan];
+                w->param[vdst][2] = w->attr[2][chan] - w->attr[0][chan];
+            }
+            w->param_valid[vdst] = true;
+        } else if ((dw & 0xff000000u) == 0xcd000000u) {
+            /* VINTERP (llvm-mc: cd000205 040a0102 = v_interp_p10_f32 v5, v2, v0, v2; cd010705 04160302 =
+             * v_interp_p2_f32 v5, v2, v1, v5): dw0 [7:0] vdst, [22:16] opcode (0 p10_f32, 1 p2_f32); dw1 src0 [8:0],
+             * src1 [17:9], src2 [26:18]. p10: dst = P10(src0) * src1 + P0(src2); p2: dst = P20(src0) * src1 + src2,
+             * with src1 the barycentric i, then j. */
+            uint32_t op = (dw >> 16) & 0x7f, dst = dw & 0xff;
+            uint32_t s0 = dw1 & 0x1ff, s1 = (dw1 >> 9) & 0x1ff, s2 = (dw1 >> 18) & 0x1ff;
+
+            /* clamp (dw0 [15]), op_sel (dw0 [14:11]) and the three neg bits (dw1 [31:29]) are not modelled. */
+            if (ngg || op > 1 || s0 < 256 || s1 < 256 || s2 < 256 || (dw & 0xf800u) || (dw1 & 0xe0000000u))
+                goto unknown;
+            s0 -= 256; s1 -= 256; s2 -= 256;
+            if (!rdna4_gfx_vgpr_ok(w, dst, ngg) || !rdna4_gfx_vgpr_ok(w, s0, ngg) || !rdna4_gfx_vgpr_ok(w, s1, ngg) ||
+                !rdna4_gfx_vgpr_ok(w, s2, ngg))
+                return false;
+            if (!w->param_valid[s0] || (op == 0 && !w->param_valid[s2])) {
+                fprintf(stderr, "rdna4: gfx: PS v_interp on v%u, which no ds_param_load filled\n",
+                        w->param_valid[s0] ? s2 : s0);
+                return false;
+            }
+            for (unsigned lane = 0; lane < 32; lane++) {
+                if ((w->exec >> lane) & 1u) {
+                    float k = rdna4_f(w->v[s1][lane]);
+                    float r = op == 0 ? w->param[s0][1] * k + w->param[s2][0]
+                                      : w->param[s0][2] * k + rdna4_f(w->v[s2][lane]);
+
+                    w->v[dst][lane] = rdna4_u(r);
+                }
+            }
+            w->param_valid[dst] = false;
+            n = 2;
         } else if ((dw & 0xffff0000u) == 0xf8000000u) {     /* EXPORT */
             uint32_t target = (dw >> 4) & 0x3f;
             uint32_t enable = dw & 0xf;
@@ -5080,6 +5390,10 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
              * field form; primitive and position exports use [9:4]. */
             if (!target)
                 target = (dw >> 8) & 0x3f;
+            for (unsigned c = 0; c < 4; c++) {
+                if (((enable >> c) & 1u) && !rdna4_gfx_vgpr_ok(w, src + c, ngg))
+                    return false;
+            }
 
             if (target == 20) {                              /* SQ_EXP_PRIM */
                 if (!ngg || enable != 1) goto unknown;
@@ -5182,6 +5496,29 @@ static void rdna4_gfx_break_must(RDNA4State *s)
         break;
     case 4: /* no PS barycentrics */
         reg_set(s, REG_GFX_SPI_PS_INPUT_ENA, 0);
+        break;
+    /* 5-7 only change a G4 draw (docs/g4-colour.md): they are the negative controls of the attribute-ring model. */
+    case 5: { /* the attribute ring registers point 64 KiB past where the shader stores */
+        uint32_t cur = reg_get(s, REG_GFX_SPI_ATTRIBUTE_RING_BASE);
+        if (cur != s->gfx_break_last) {
+            s->gfx_break_last = cur + 1;
+            reg_set(s, REG_GFX_SPI_ATTRIBUTE_RING_BASE, cur + 1);
+        }
+        break;
+    }
+    case 6: /* PS input 0 is not attribute slot 0 */
+        reg_set(s, REG_GFX_SPI_PS_INPUT_CNTL_0, 1);
+        break;
+    case 7: { /* one more user SGPR: PrimMask arrives one register later than the PS expects */
+        uint32_t cur = reg_get(s, REG_GFX_SPI_SHADER_PGM_RSRC2_PS);
+        if (cur != s->gfx_break_last) {
+            s->gfx_break_last = cur + 2;
+            reg_set(s, REG_GFX_SPI_SHADER_PGM_RSRC2_PS, cur + 2);
+        }
+        break;
+    }
+    case 8: /* the NGG stage gets 8 VGPRs (RSRC1_GS.VGPRS = 0): the G4 stream's VGPRS delta is lost */
+        reg_set(s, REG_GFX_SPI_SHADER_RSRC1_GS, reg_get(s, REG_GFX_SPI_SHADER_RSRC1_GS) & ~0x3fu);
         break;
     default:
         break;
@@ -5349,14 +5686,38 @@ static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
         return rdna4_gfx_draw_refuse(s, "SPI_PS_INPUT_ADDR", "does not cover SPI_PS_INPUT_ENA");
     if (!(reg_get(s, REG_GFX_SPI_PS_IN_CONTROL) & (1u << 15)))
         return rdna4_gfx_draw_refuse(s, "SPI_PS_IN_CONTROL", "PS_W32_EN is off");
-    /* NO_PC_EXPORT = 0 (with NUM_INTERP > 0) is the attribute-ring path of the G4 colour triangle (rdna4-gfxcol=1, docs/g4-colour.md): the NGG stage
-     * stores the colour with buffer_store_b128 and the PS reads it with ds_param_load / v_interp, none of which this model has. It is refused HERE, before
-     * any shader runs, like the wave64 case: the ring is not stopped, the stream's own RELEASE_MEM still completes the fence, the target stays empty (0 px)
-     * and the kext reports "gfx-col FAIL" (never a false PASS). G4 is deliberately not modelled. */
-    if (!(reg_get(s, REG_GFX_SPI_SHADER_GS_OUT_CONFIG_PS) & (1u << 10)))
-        return rdna4_gfx_draw_refuse(s, "SPI_SHADER_GS_OUT_CONFIG_PS",
-                                     "NO_PC_EXPORT is off: the attribute-ring path (G4: buffer stores, ds_param_load, v_interp) is not modelled");
     ses = rdna4_gfx_discovery_num_se(s);
+    /* NO_PC_EXPORT = 0 is the attribute-ring path of the G4 colour triangle (rdna4-gfxcol=1, docs/g4-colour.md): the NGG stage stores
+     * the colour in the attribute ring and the PS reads it with ds_param_load / v_interp. It is modelled for what the kext's G4 stream
+     * is: one parameter, PS input 0 = attribute slot 0, smooth, PERSP_CENTER barycentrics alone. A register state outside that is
+     * refused HERE, before any shader runs, like the wave64 case: the ring is not stopped, the stream's own RELEASE_MEM still completes
+     * the fence, the target stays empty (0 px) and the kext reports "gfx-col FAIL". What the shaders do wrong is met later: a
+     * descriptor, instruction form or VGPR the model does not take stops the wave (and the ring with it), a parameter that was not
+     * stored in this draw or was read without PrimMask gives a wrong colour. Not checked at all, so a mistake there can still PASS
+     * here: a missing s_wqm or wait_exp (the model has no quads and no timing), an unwritten SPI_PS_INPUT_CNTL_0 (reads 0 unless
+     * ctx-garbage=on), a shader that ignores gs_attr_offset (the model gives 0). The model follows Mesa and docs/g4-colour.md;
+     * what it draws is not evidence about a card. */
+    {
+        uint32_t out = reg_get(s, REG_GFX_SPI_SHADER_GS_OUT_CONFIG_PS);
+
+        if (!(out & (1u << 10))) {
+            uint64_t ring = (uint64_t)reg_get(s, REG_GFX_SPI_ATTRIBUTE_RING_BASE) << 16;
+            uint64_t per_se = ((uint64_t)(reg_get(s, REG_GFX_SPI_ATTRIBUTE_RING_SIZE) & 0xffu) + 1) << 16;
+
+            if (((out >> 11) & 0x3fu) != 1 || (out & 0x3ffu) || (out >> 17))
+                return rdna4_gfx_draw_refuse(s, "SPI_SHADER_GS_OUT_CONFIG_PS",
+                                             "NO_PC_EXPORT is off: the attribute-ring path is modelled for NUM_INTERP = 1 and no other export");
+            if (reg_get(s, REG_GFX_SPI_PS_INPUT_CNTL_0))
+                return rdna4_gfx_draw_refuse(s, "SPI_PS_INPUT_CNTL_0", "only 0 is modelled: attribute slot 0, smooth, no default value");
+            /* SPI_PS_INPUT_ADDR lays the barycentrics out in the PS's VGPRs: with anything before PERSP_CENTER in it, i and j are
+             * not in v0/v1, where the model puts them. */
+            if (reg_get(s, REG_GFX_SPI_PS_INPUT_ENA) != 2 || reg_get(s, REG_GFX_SPI_PS_INPUT_ADDR) != 2)
+                return rdna4_gfx_draw_refuse(s, "SPI_PS_INPUT_ENA/ADDR",
+                                             "the attribute-ring path is modelled with PERSP_CENTER alone (both 2): i, j in v0, v1");
+            if (!ring || !ses || !rdna4_gfx_mem_mapped(s, ring, per_se * ses, vmid, false, false))
+                return rdna4_gfx_draw_refuse(s, "SPI_ATTRIBUTE_RING_BASE/SIZE", "the attribute ring is not mapped for every shader engine");
+        }
+    }
     if (!ses || ses > REG_GFX_GE_RING_MIN_SE)
         return rdna4_gfx_draw_refuse(s, "gc_info gc_num_se", "shader-engine count is not modelled");
     pos_bytes = rdna4_gfx_ring_bytes(s, REG_GFX_GE_POS_RING_BASE,
@@ -5451,25 +5812,30 @@ static bool rdna4_gfx_ps_wave(RDNA4State *s, const RDNA4GfxTriangle *tri,
         if (nuser > 1)
             w.s[1] = reg_get(s, REG_GFX_SPI_SHADER_USER_DATA_PS_1);
     }
+    /* PrimMask is the first system SGPR, after the user SGPRs. */
+    w.s[(reg_get(s, REG_GFX_SPI_SHADER_PGM_RSRC2_PS) >> 1) & 0x1f] = RDNA4_GFX_PRIM_MASK;
+    w.vgprs = MIN(((reg_get(s, REG_GFX_SPI_SHADER_RSRC1_PS) & 0x3fu) + 1) * 8, 256u);   /* there are 256 VGPRs */
+    w.have_attr = tri->have_attr;
+    memcpy(w.attr, tri->attr, sizeof(w.attr));
     w.exec = count == 32 ? UINT32_MAX : ((1u << count) - 1u);
-    for (unsigned lane = 0; lane < count; lane++) {
-        float area = (float)rdna4_gfx_edge(
-            (int64_t)nearbyintf(tri->x[0] * 256.0f), (int64_t)nearbyintf(tri->y[0] * 256.0f),
-            (int64_t)nearbyintf(tri->x[1] * 256.0f), (int64_t)nearbyintf(tri->y[1] * 256.0f),
-            (int64_t)nearbyintf(px[lane] * 256.0f + 128.0f),
-            (int64_t)nearbyintf(py[lane] * 256.0f + 128.0f));
-        float area2 = (float)rdna4_gfx_edge(
-            (int64_t)nearbyintf(tri->x[0] * 256.0f), (int64_t)nearbyintf(tri->y[0] * 256.0f),
-            (int64_t)nearbyintf(tri->x[2] * 256.0f), (int64_t)nearbyintf(tri->y[2] * 256.0f),
-            (int64_t)nearbyintf(px[lane] * 256.0f + 128.0f),
-            (int64_t)nearbyintf(py[lane] * 256.0f + 128.0f));
-        float denom = (float)rdna4_gfx_edge(
-            (int64_t)nearbyintf(tri->x[0] * 256.0f), (int64_t)nearbyintf(tri->y[0] * 256.0f),
-            (int64_t)nearbyintf(tri->x[1] * 256.0f), (int64_t)nearbyintf(tri->y[1] * 256.0f),
-            (int64_t)nearbyintf(tri->x[2] * 256.0f), (int64_t)nearbyintf(tri->y[2] * 256.0f));
-        /* PERSP_CENTER inputs are real barycentrics even though ps_red ignores them. */
-        w.v[0][lane] = rdna4_u(area / denom);
-        w.v[1][lane] = rdna4_u(area2 / denom);
+    {
+        /* PERSP_CENTER i and j: the weights of the primitive's second and third vertex at the pixel centre, in the
+         * primitive's own vertex order (an attribute is P0 + P10 * i + P20 * j). All three vertices have w = 1 in
+         * what this model draws, so perspective and linear are the same. */
+        int64_t qx[3], qy[3];
+        float denom;
+
+        for (unsigned i = 0; i < 3; i++) {
+            qx[i] = (int64_t)nearbyintf(tri->ox[i] * 256.0f);
+            qy[i] = (int64_t)nearbyintf(tri->oy[i] * 256.0f);
+        }
+        denom = (float)rdna4_gfx_edge(qx[0], qy[0], qx[1], qy[1], qx[2], qy[2]);
+        for (unsigned lane = 0; lane < count; lane++) {
+            int64_t cx = (int64_t)px[lane] * 256 + 128, cy = (int64_t)py[lane] * 256 + 128;
+
+            w.v[0][lane] = rdna4_u((float)rdna4_gfx_edge(qx[0], qy[0], cx, cy, qx[2], qy[2]) / denom);
+            w.v[1][lane] = rdna4_u((float)rdna4_gfx_edge(qx[0], qy[0], qx[1], qy[1], cx, cy) / denom);
+        }
     }
     if (!rdna4_gfx_wave_run(s, &w, false, false, vmid))
         return false;
@@ -5547,6 +5913,8 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
     ngg.s[1] = reg_get(s, REG_GFX_SPI_SHADER_PGM_HI_GS);
     ngg.s[2] = 0x00403000;             /* gs_tg_info: 3 verts, 1 prim */
     ngg.s[3] = 0x10000103;             /* merged_wave_info: wave 0 of 1 */
+    ngg.s[5] = RDNA4_GFX_GS_ATTR_OFFSET;
+    ngg.vgprs = MIN(((reg_get(s, REG_GFX_SPI_SHADER_RSRC1_GS) & 0x3fu) + 1) * 8, 256u);   /* there are 256 VGPRs */
     /* W46: gfx12 hands the NGG wave the primitive export value ALREADY PACKED in VGPR0 ("NGG passthrough mode: the HW already packs the
      * primitive export value to a single register", ac_nir_lower_intrinsics_to_args.c; the vertices are ubfe(v0, 9 * v, 8), ac_nir_lower_ngg.c):
      * indices 0,1,2 at a 9-bit stride. The earlier model gave byte-packed indices (0x04020100) and converted them at the
@@ -5599,6 +5967,34 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
         tri.y[i] += (int16_t)(reg_get(s, REG_GFX_PA_SC_WINDOW_OFFSET) >> 16);
         tri.x[i] = nearbyintf(tri.x[i] * 256.0f) / 256.0f;
         tri.y[i] = nearbyintf(tri.y[i] * 256.0f) / 256.0f;
+        tri.ox[i] = tri.x[i];
+        tri.oy[i] = tri.y[i];
+    }
+    if (!(reg_get(s, REG_GFX_SPI_SHADER_GS_OUT_CONFIG_PS) & (1u << 10))) {
+        /* SPI's side of the attribute ring: parameter 0 of the primitive's three vertices, from where the ring
+         * registers point, at the subgroup's offset and the vertices' indices in it (docs/g4-colour.md s.2.1).
+         * Only what the NGG wave stored in this draw counts. */
+        uint64_t ring = ((uint64_t)reg_get(s, REG_GFX_SPI_ATTRIBUTE_RING_BASE) << 16) +
+                        (uint64_t)(RDNA4_GFX_GS_ATTR_OFFSET & 0x7fffu) * 512;
+
+        for (unsigned i = 0; i < 3; i++) {
+            uint8_t raw[16];
+
+            bool stored = false;
+
+            if (!rdna4_gfx_mem_read(s, ring + indices[i] * 16, raw, sizeof(raw), vmid, false))
+                return rdna4_gfx_draw_refuse(s, "SPI_ATTRIBUTE_RING_BASE", "the vertex's parameter is not readable");
+            for (unsigned k = 0; k < ngg.nattr_stores; k++)
+                stored |= ngg.attr_store_va[k] == ring + indices[i] * 16;
+            /* What an earlier draw left there is not this draw's parameter: on the card it would be whatever the
+             * ring holds, here a value outside 0..1, so that a stale colour never passes. */
+            if (!stored)
+                fprintf(stderr, "rdna4: gfx: the NGG stage stored no parameter for vertex %u where SPI reads it "
+                        "(0x%" PRIx64 "): the PS gets garbage\n", indices[i], ring + indices[i] * 16);
+            for (unsigned c = 0; c < 4; c++)
+                tri.attr[i][c] = stored ? rdna4_f(ldl_le_p(raw + 4 * c)) : -1.0f;
+        }
+        tri.have_attr = true;
     }
 
     {
@@ -7227,6 +7623,60 @@ static void rdna4_load_discovery(RDNA4State *s)
     warn_report("rdna4: no IP discovery binary in '%s'", s->flash_file);
 }
 
+/* chip= and fwdir=: which chip this is, and its firmware set for the signature model. */
+static bool rdna4_load_chip(RDNA4State *s, Error **errp)
+{
+    const char *name = s->chip_name ? s->chip_name : rdna4_chips[0].name;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(rdna4_chips); i++) {
+        if (!strcmp(name, rdna4_chips[i].name)) {
+            s->chip = &rdna4_chips[i];
+        }
+    }
+    if (!s->chip) {
+        error_setg(errp, "rdna4: chip must be navi48 or navi44, not '%s'", name);
+        return false;
+    }
+    for (unsigned i = 0; s->fw_dir && i < RDNA4_FW_MAX && s->chip->fw[i]; i++) {
+        g_autofree char *path = g_build_filename(s->fw_dir, s->chip->fw[i], NULL);
+
+        if (!g_file_get_contents(path, &s->fw_data[s->nfw], &s->fw_len[s->nfw], NULL)) {
+            error_setg(errp, "rdna4: fwdir: cannot read '%s'", path);
+            return false;
+        }
+        s->nfw++;
+    }
+    /*
+     * The sOS package (the set's first file) is a psp_firmware_header_v2_0:
+     * common_firmware_header (32 bytes, ucode_array_offset_bytes at 24), then
+     * psp_fw_bin_count and that many { fw_type, fw_version, offset_bytes,
+     * size_bytes }, offsets counted from the ucode array.
+     */
+    if (s->nfw) {
+        const char *d = s->fw_data[0];
+        gsize len = s->fw_len[0];
+        uint32_t base = len >= 36 ? ldl_le_p(d + 24) : 0, n = len >= 36 ? ldl_le_p(d + 32) : 0;
+
+        if (len < 36 || lduw_le_p(d + 8) != 2 || !n || n > RDNA4_SOS_PARTS || 36 + 16ull * n > len) {
+            error_setg(errp, "rdna4: fwdir: '%s' is not a v2 PSP firmware package", s->chip->fw[0]);
+            return false;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t off = ldl_le_p(d + 36 + 16 * i + 8), size = ldl_le_p(d + 36 + 16 * i + 12);
+
+            if (!size || (uint64_t)base + off + size > len) {
+                error_setg(errp, "rdna4: fwdir: part %u of '%s' is outside the file", i, s->chip->fw[0]);
+                return false;
+            }
+            s->sos_part[s->nsos_parts] = d + base + off;
+            s->sos_part_len[s->nsos_parts++] = size;
+        }
+    }
+    fprintf(stderr, "rdna4: chip %s (%s, 1002:%04x), firmware set: %s\n", s->chip->name, s->chip->desc,
+            s->chip->device_id, s->nfw ? "checked against fwdir" : "not checked (no fwdir=)");
+    return true;
+}
+
 static void rdna4_load_edid(RDNA4State *s, Error **errp)
 {
     g_autofree char *data = NULL;
@@ -7466,6 +7916,12 @@ static void rdna4_realize(PCIDevice *dev, Error **errp)
         error_setg(errp, "rdna4: state=<register image> is required");
         return;
     }
+    if (!rdna4_load_chip(s, errp)) {
+        return;
+    }
+    pci_config_set_device_id(dev->config, s->chip->device_id);
+    pci_set_word(dev->config + PCI_SUBSYSTEM_VENDOR_ID, s->chip->subsystem_vendor_id);
+    pci_set_word(dev->config + PCI_SUBSYSTEM_ID, s->chip->subsystem_id);
     if (s->aperture < 16 * MiB || s->aperture > 1 * GiB || !is_power_of_2(s->aperture)) {
         error_setg(errp, "rdna4: vram aperture must be a power of two, 16 MiB..1 GiB");
         return;
@@ -7582,6 +8038,9 @@ static void rdna4_exit(PCIDevice *dev)
     g_free(s->regs);
     g_free(s->resv);
     g_free(s->discovery);
+    for (unsigned i = 0; i < s->nfw; i++) {
+        g_free(s->fw_data[i]);
+    }
 }
 
 static bool rdna4_get_gfxoff_force(Object *obj, Error **errp)
@@ -7608,6 +8067,8 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_SIZE("vram", RDNA4State, aperture, 256 * MiB),
     DEFINE_PROP_STRING("state", RDNA4State, state_file),
     DEFINE_PROP_STRING("flash", RDNA4State, flash_file),
+    DEFINE_PROP_STRING("chip", RDNA4State, chip_name),
+    DEFINE_PROP_STRING("fwdir", RDNA4State, fw_dir),
     DEFINE_PROP_STRING("edid", RDNA4State, edid_file),
     DEFINE_PROP_UINT32("edid-line", RDNA4State, edid_line, 2),
     DEFINE_PROP_BOOL("trace", RDNA4State, trace, false),
@@ -7654,7 +8115,7 @@ static void rdna4_class_init(ObjectClass *klass, void *data)
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
     k->vendor_id = 0x1002;               /* AMD */
-    k->device_id = 0x7550;               /* Navi 48: RX 9070 / 9070 XT */
+    k->device_id = 0x7550;               /* Navi 48: RX 9070 / 9070 XT; chip=navi44 changes it in realize */
     k->revision = 0xc0;
     k->class_id = PCI_CLASS_DISPLAY_VGA;
     k->subsystem_vendor_id = 0x1da2;     /* Sapphire, from the card's ATOM header */
@@ -7664,7 +8125,7 @@ static void rdna4_class_init(ObjectClass *klass, void *data)
     k->config_write = rdna4_config_write;
     device_class_set_legacy_reset(dc, rdna4_reset);
     device_class_set_props(dc, rdna4_properties);
-    dc->desc = "AMD Radeon RX 9070 XT display-engine model (AMDRadeonRDNA4 development)";
+    dc->desc = "AMD Radeon RX 9070 XT / RX 9060 XT display-engine model (AMDRadeonRDNA4 development)";
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }
 

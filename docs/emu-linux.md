@@ -13,6 +13,42 @@ bash tools/vm/emu-linux.sh 3 --diag                                     # boot 3
 
 (The scripts are not executable in git: run them with `bash`.)
 
+## An RX 9060 XT (Navi 44) instead
+
+The emulated card becomes an RX 9060 XT with the device option `chip=navi44`: PCI id 1002:7590, and the PSP and the SMU
+report psp_14_0_2's and smu_14_0_2's versions. Register bases, VRAM size and `GB_ADDR_CONFIG` are the same on both chips
+(read on an RX 9060 XT under amdgpu), so nothing else changes. It needs that card's own VBIOS and IP discovery table,
+which amdgpu hands out under Linux (root, read-only):
+
+```sh
+D=/sys/kernel/debug/dri/0000:03:00.0                       # the card's PCI address
+sudo cat $D/amdgpu_vbios > vbios.bin; sudo cat $D/amdgpu_discovery > discovery.bin
+cat vbios.bin discovery.bin > vbios+discovery.bin          # also what `make test ROM=` takes
+
+ATOM_ROM=vbios.bin ROM_DEVICE_ID=0x7590 bash tools/vm/emu-build.sh rom      # -> Build/emu/rdna4-7590.rom
+export ROM=$PWD/Build/emu/rdna4-7590.rom FLASH=$PWD/vbios+discovery.bin
+bash tools/vm/emu-linux.sh 3 --diag --dev "chip=navi44,fwdir=$PWD/firmware/amdgpu"
+```
+
+`fwdir=` stands in for the PSP's signature check, for either chip. No signature is verified: contents are compared. A
+bootloader component or the TOC must be one whole part of the chip's own sOS package, and a `LOAD_IP_FW` image must be
+found whole in one of the chip's firmware files; anything else is refused, and the kext stops at `stage 2 (psp) failed`.
+What both sets share is accepted from either (the key database is the same in both). Without `fwdir=` any blob is taken,
+as before. Measured 2026-11-21 with an RX 9060 XT's VBIOS (Gigabyte, `113-R906XGOI-F1`): boots 1, 3
+and 8 give the rows described below for the RX 9070 XT, with `psp: firmware set of Navi 44 (psp_14_0_2, gc_12_0_0)` in
+the log; with a `fwdir` that holds the other chip's blobs the bootloader refuses the kext's component and bring-up stops
+at stage 2.
+
+What this does not show: the register image the device starts from (`emu/qemu/gop-state.txt`) is still the RX 9070 XT's
+firmware state, with HDMI lit on DIG2, so the display take-over runs against another board's lit pipe, and the model has
+no DisplayPort sink. A 9060 XT's own display paths are only parsed here, not driven.
+
+Do not run `tools/linux/linux-capture.sh` on an RX 9060 XT: the machine froze on its register sweep (2026-11-21, `device
+lost from bus` in the kernel log; the run left no record of how far it got). The same list read one register at a time,
+with a journal written before each read, froze the machine again; the journal's last line is the read of
+`ODM_MEM_PWR_CTRL2` (DMU segment 2, dword 0x1e2f), the 145th register of that list. The 613 registers read before it gave
+no trouble, and the kext never reads that one.
+
 ## What a run produces
 
 `$EMU/runs/<time>-boot<N>/` (`$EMU` = `~/work/tools/emu`, outside the repo):
@@ -65,6 +101,10 @@ and the diagnostic table: runtime, submitib, fault, **vm**, ih, vblank, **gfx** 
 TRIANGLE IS RIGHT") PASS, **gfx-col FAIL** ("colour image, draw 0 px"), flip, anim, sensors,
 gfxcg PASS; w6/gfxoff/gfxpm/sleep SKIPPED. That is the expected outcome: the emulator models the
 NGG EXEC fix (G3 passes) and not the G4 attribute ring (gfx-col fails).
+
+Since 2026-11-21 the emulator also models the G4 attribute ring and a state-dependent SMU (the list under "How it
+works" below), so boot 3 now ends with `gfx: col: THE COLOUR TRIANGLE IS RIGHT`, `gfx-col PASS` and `post-idle PASS`:
+16 PASS and no FAIL in boot 3, 19 PASS and no FAIL in boot 8 (kext of `devel/navi44`, `chip=navi44`).
 
 **Do not read more into the emulated PASS rows than they say.** The emulator models what the
 kext polls; `vm PASS` here does not mean the real card's client VM work passes (on the card it
@@ -163,8 +203,26 @@ Paths are overridable: `EMU`, `QEMU_SRC`, `OSXKVM`, `KEXT` (default `Build/AMDRa
 
 - `pmset sleepnow` is a display sleep only (`power: HDMI display blanked via DPG`, powerd stays in DarkWake); the display does not come back
   and there is no system S3. The Apple menu in Recovery has no Sleep entry. Use boot `11s` (the driver's simulated cycle) for the sleep path.
-- The SMU/sensors are synthetic (3 % / 120 W): the `post-idle` row always FAILs on the emulator.
-- G4 (the attribute-ring colour draw) is not modelled: `gfx-col`, `gfx-app-tricol` FAIL.
+- The SMU's activity and power follow the model's state, with the RX 9070 XT's figures for it (`docs/power-gfx.md` s.1):
+  100 % / 131 W without clock gating, 3 % / 19 W with it (the kext's default), 100 % / 80 W while a wave never ends, 0 % / 8 W
+  in GFXOFF. `idle-pin` and `post-idle` therefore PASS when the kext left the model gated and idle, and FAIL with
+  `rdna4-gfxcg=0`, in any boot that does not reach the clock-gating step of stage 7, and while a wave stays hung
+  (`idle-pin` passed in those before, when the figures were constant). They say what state the kext left the model in, nothing about a card's power.
+- G4 (the attribute-ring colour draw) is modelled since 2026-11-21 for what the kext's stream is: one parameter, stored by
+  `nggcol.s` with the attribute ring descriptor of `docs/g4-colour.md`, read by `pscol.s` (`ds_param_load`, `v_interp`),
+  PERSP_CENTER barycentrics alone. `gfx-col` and `gfx-app-tricol` PASS, with the centroid pixel the card gave (`0xff555654`).
+  The model was written from Mesa and that document, not from a card: `gs_attr_offset` is given as 0 (measured only for G3)
+  and PrimMask is a value of the model's own.
+  - Checked: the register state above (else the draw is refused, 0 px); the descriptor and the store's form (else the wave
+    stops, and the ring with it); that SPI reads a parameter the NGG wave stored in this draw (else a wrong colour: what an
+    earlier draw left in the ring never passes); PrimMask in `m0` (else a wrong colour); and, for every gfx wave since then, G3
+    included, that the shader stays inside the VGPRs `SPI_SHADER_PGM_RSRC1` gives it, `(VGPRS + 1) * 8` (else the wave
+    stops: the card's over-budget probe ended in a ring reset).
+  - Not checked, so a mistake there can still pass here: a missing `s_wqm` or `wait_exp` (no quads, no timing), an unwritten
+    `SPI_PS_INPUT_CNTL_0` (reads 0 unless `ctx-garbage=on`), a shader that ignores `gs_attr_offset`.
+  - Negative controls, device option `gfx-break=`: 5 (the ring registers point elsewhere) and 7 (PrimMask one SGPR later)
+    give a wrong colour image, 6 (`SPI_PS_INPUT_CNTL_0` not 0) is refused, 8 (the NGG stage's VGPRS delta lost) ends in
+    `col: did not finish (ring fence NOT signalled)`; the plain triangle stays right in all four.
 - A kext that links IOGraphicsFamily/IOAcceleratorFamily2 does not load when OpenCore injects it (those families are in
   `BaseSystemKernelExtensions.kc`, not in the boot KC), see `docs/metal-spike.md`.
 

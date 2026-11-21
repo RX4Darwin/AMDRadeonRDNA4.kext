@@ -5,6 +5,28 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.3.3 (on `next`, no number yet)
 
+**Navi 44 (RX 9060 XT), a first step: not run on a card**
+- One kext for both chips: it carries the Navi 48 firmware set and the Navi 44 one (PSP 14.0.2, SMU 14.0.2, SDMA 7.0.0, GC 12.0.0),
+  each when its files are in `firmware/amdgpu/`, and takes the set of the GC version the card's IP discovery table gives
+  (`src/fwset.hpp`), as amdgpu names its files. `tools/build/fetch-firmware.sh` fetches both.
+- The card is matched (`1002:7590`) and named, and a code object built for gfx1200 is taken as one built for gfx1201 is: LLVM 23
+  gives every kernel in `src/shaders/` the same code for both.
+- Host test (`make test`): the Navi 44 set goes through the firmware parsers (its sOS package has 9 parts, no RAS driver and no RL,
+  where Navi 48's has 11; the same 19 images for the RLC autoload). The IP versions are from an RX 9060 XT 16 GB under Linux.
+- On an RX 9060 XT under Linux (Gigabyte, 2026-11-21): `make test ROM=` passes on its VBIOS and IP discovery table (two DisplayPort
+  paths and one HDMI); the IP register bases and `GB_ADDR_CONFIG` are the RX 9070 XT's, and 36 of the 37 GC registers of
+  `src/linuxref.hpp` read the same; `tools/linux/linux-replay/run.sh` draws the kext's triangle through amdgpu, 8192 px in all
+  seven variants.
+- The emulator can be an RX 9060 XT (`chip=navi44`) and can refuse a blob that is not from the chip's firmware set (`fwdir=`),
+  `docs/emu-linux.md`. Emulated boots 1, 3 and 8 with that card's VBIOS give the RX 9070 XT's rows.
+- The emulator draws the colour triangle (the attribute-ring path: `buffer_store_b128`, `ds_param_load`, `v_interp`) and its SMU's
+  activity and power follow the model's state, so `gfx-col`, `gfx-app-tricol` and `post-idle` are no longer FAIL by construction:
+  boots 3 and 8 have no FAIL row. Written from Mesa and `docs/g4-colour.md`, not from a card (`docs/emu-linux.md`).
+- `tools/linux/linux-capture.sh` must not be run on an RX 9060 XT: the machine froze on its register sweep, and again when the
+  same list was read one register at a time, at the read of `ODM_MEM_PWR_CTRL2` (`docs/emu-linux.md`).
+- Not looked at: the display paths of a Navi 44 board driven on a card (the second display's sequences are the RX 9070 XT's), power
+  management, the paravirtual GPU on two shader engines.
+
 **Native Metal (spike, `docs/native-metal-spike.md`)**
 - Apps, not only root: `rdna4-client-policy=local` lets the logged-in user open the kext's runtime client, only in a GPU address
   space of its own and only with what a graphics client needs (no display, sensors, sleep test or quiesce). Card (Tahoe 26.6.2,

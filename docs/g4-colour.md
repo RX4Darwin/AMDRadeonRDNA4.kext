@@ -148,7 +148,7 @@ The list below was written before the first run (section 6). Status after it:
 4. **PrimMask in `s2`** via RSRC2_PS.USER_SGPR = 2 with written zeros. *Resolved:* the LDS parameter loads returned the right colours.
 5. **wave32 NGG + wave32 PS** (RADV: wave64 both). *Resolved for this configuration:* it draws correctly, including the wave32 thread-id shift.
 6. **`s_setprio 3`** and the `s_delay_alu` hints are not replicated. No visible effect (performance hints).
-7. The emulator cannot run G4 (no `ds_param_load`, `v_interp`, buffer stores). *Open, not in scope so far.*
+7. The emulator could not run G4 (no `ds_param_load`, `v_interp`, buffer stores). *Modelled since 2026-11-21* (`docs/emu-linux.md`): written from this document and Mesa, so its PASS is not a card result.
 8. **New, open: the attribute ring memory did not change as the CPU sees it** (section 6): where the data lives, and whether the same stream works on the kext's macOS path
    (bare RB0, VMID0, UC memory), are untested.
 
@@ -250,3 +250,7 @@ and in the kext log, after the G3 `THE TRIANGLE IS RIGHT`: `gfx: col: 492-dword 
 `col: wrong colour image in N us: 0 pixels (want 8192), bounds x 255..0 y 255..0; max channel error 0.00 ...`, `col: target still empty: after 2 ms 0 px; after a full ACQUIRE_MEM GL2 write-back (fence ok) 0 px`;
 results: `gfx-col FAIL colour image, draw 0 px, max channel error 0.00, centroid 0x00000000`, feature summary row `gfx-col FAIL`, `Compute,GFXColPixels` 0. **That FAIL is expected on the emulator** (and G3's `gfx PASS` is
 unaffected); it is not a regression. The emulator needs a real model of `ds_param_load`, `v_interp_p10/p2` and buffer stores before `gfx-col` can pass there.
+
+**Update 2026-11-21:** the emulator has that model now, so this section describes what it did before: boot 3 ends with
+`gfx: col: THE COLOUR TRIANGLE IS RIGHT` and `gfx-col PASS` there. What the model checks and what it cannot see is in
+`docs/emu-linux.md` ("How it works"); its PASS is not a card result.
