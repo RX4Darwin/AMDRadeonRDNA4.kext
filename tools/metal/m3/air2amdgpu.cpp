@@ -497,6 +497,15 @@ static std::string legalize(Function &k) {
 
 		if (Type *to = globalType(i.getType(), globalTypes); to != i.getType())
 			i.mutateType(to);
+		// The types a GEP steps through and an alloca holds as well: AMDGPU's address space 2 has 32-bit pointers, so a struct of AIR's
+		// constant pointers kept its layout's offsets halved (MoltenVK's argument buffers: a vertex shader read its UBO's address from
+		// offset 4 of spvDescriptorSetBuffer2 instead of 8 and hung the gfx ring, vkQuake 2026-11-21).
+		if (auto *gep = dyn_cast<GetElementPtrInst>(&i)) {
+			gep->setSourceElementType(globalType(gep->getSourceElementType(), globalTypes));
+			gep->setResultElementType(globalType(gep->getResultElementType(), globalTypes));
+		} else if (auto *a = dyn_cast<AllocaInst>(&i)) {
+			a->setAllocatedType(globalType(a->getAllocatedType(), globalTypes));
+		}
 	}
 	for (Instruction &i : instructions(k))
 		if (auto *c = dyn_cast<AddrSpaceCastInst>(&i); c && c->getSrcAddressSpace() == c->getDestAddressSpace()) {
@@ -1369,7 +1378,9 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			from[index] = 6;
 		else if (!vertex && kind == "air.render_target" && !unused && mdInt(a, 2) == 0)
 			from[index] = 4;   // colour attachment 0 as it is (programmable blending): read at the pixel from the host's staged target
-		else if (kind == "air.buffer" && !unused) {
+		// An argument buffer (air.indirect_buffer; MoltenVK's descriptor sets) is a buffer of 8-byte handles: a buffer's address, a texture's or
+		// sampler's gpuResourceID = the address of its T# or S# (RDNA4MTLDevice), which the shader loads and passes on as handles.
+		else if ((kind == "air.buffer" || kind == "air.indirect_buffer") && !unused) {
 			int location = -1;
 			bool writes = false;
 			for (unsigned k = 2; k < a->getNumOperands(); k++) {
@@ -2058,7 +2069,7 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 		if (kind == "air.buffer" && index < air->arg_size() && air->getArg(index)->getType() == PointerType::get(ctx, 3)) {
 			roles[index] = {GroupBuffer, -1};   // threadgroup memory the app sizes at dispatch (setThreadgroupMemoryLength): LDS below
 			groupBuffers++;
-		} else if (kind == "air.buffer" || kind == "air.primitive_acceleration_structure") {   // the latter: its address, as a buffer's
+		} else if (kind == "air.buffer" || kind == "air.indirect_buffer" || kind == "air.primitive_acceleration_structure") {   // the latter: its address, as a buffer's
 			int location = -1;
 			bool writes = false;
 			for (unsigned k = 2; k < a->getNumOperands(); k++) {

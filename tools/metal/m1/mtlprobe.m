@@ -2892,6 +2892,70 @@ int main(int argc, char **argv) {
 			spin(d, [d newCommandQueue], argc > 2 ? atof(argv[2]) : 10);
 			return 0;
 		}
+		if (!strcmp(mode, "nativeargbuf")) {   // argument buffers on our own device: mtlprobe nativeargbuf <probe.metallib> (probe.metal's argbuf)
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			NSError *err = nil;
+			id<MTLLibrary> lib = d && argc > 2 ? [d newLibraryWithURL:[NSURL fileURLWithPath:@(argv[2])] error:&err] : nil;
+			id<MTLComputePipelineState> k = lib ? [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"argbuf"] error:&err] : nil;
+			if (!k) {
+				OUT("nativeargbuf: FAIL: %s", !d ? "no RDNA4MTLDevice" : err.localizedDescription.UTF8String ?: "usage: mtlprobe nativeargbuf <probe.metallib>");
+				return 1;
+			}
+			OUT("nativeargbuf: tier %d, Metal3 %d", (int)d.argumentBuffersSupport, [d supportsFamily:MTLGPUFamilyMetal3]);
+			MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:4 height:1 mipmapped:NO];
+			id<MTLTexture> tex = [d newTextureWithDescriptor:td];
+			float texels[16];
+			for (int i = 0; i < 16; i++)
+				texels[i] = (float)(i + 1);
+			[tex replaceRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0 withBytes:texels bytesPerRow:64];
+			MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+			sd.supportArgumentBuffers = YES;   // nearest, clamped
+			id<MTLSamplerState> smp = [d newSamplerStateWithDescriptor:sd];
+			id<MTLBuffer> out = [d newBufferWithLength:8 * 16 options:MTLResourceStorageModeShared];
+			id<MTLBuffer> args = [d newBufferWithLength:24 options:MTLResourceStorageModeShared];
+			uint64_t *a = args.contents;
+			if (argc > 3 && !strcmp(argv[3], "encoder")) {   // through an argument encoder (MoltenVK's way whatever the tier)
+				NSMutableArray *ds = [NSMutableArray array];
+				const MTLDataType types[3] = {MTLDataTypeTexture, MTLDataTypeSampler, MTLDataTypePointer};
+				for (int i = 0; i < 3; i++) {
+					MTLArgumentDescriptor *ad = [MTLArgumentDescriptor argumentDescriptor];
+					ad.dataType = types[i];
+					ad.index = (NSUInteger)i;
+					[ds addObject:ad];
+				}
+				id<MTLArgumentEncoder> enc = [d newArgumentEncoderWithArguments:ds];
+				OUT("nativeargbuf: encoder %s, %lu bytes", enc ? "made" : "NOT made", (unsigned long)enc.encodedLength);
+				[enc setArgumentBuffer:args offset:0];
+				[enc setTexture:tex atIndex:0];
+				[enc setSamplerState:smp atIndex:1];
+				[enc setBuffer:out offset:0 atIndex:2];
+			} else {
+				a[0] = tex.gpuResourceID._impl;
+				a[1] = smp.gpuResourceID._impl;
+				a[2] = out.gpuAddress;
+			}
+			OUT("nativeargbuf: handles 0x%llx 0x%llx 0x%llx", a[0], a[1], a[2]);
+			id<MTLCommandBuffer> cb = [[d newCommandQueue] commandBuffer];
+			id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+			[e setComputePipelineState:k];
+			[e setBuffer:args offset:0 atIndex:0];
+			[e useResource:tex usage:MTLResourceUsageRead];
+			[e useResource:out usage:MTLResourceUsageWrite];
+			[e dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
+			[e endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			const float *o = out.contents;
+			int bad = 0;
+			for (int i = 0; i < 32; i++)
+				bad += o[i] != texels[i % 16];
+			OUT("nativeargbuf: read %g %g %g %g .. %g, sampled %g %g %g %g .. %g: %s", o[0], o[1], o[2], o[3], o[15], o[16], o[17], o[18], o[19], o[31],
+			    cb.error ? cb.error.localizedDescription.UTF8String : bad ? "FAIL" : "PASS");
+			return bad || cb.error ? 1 : 0;
+		}
 		if (!strcmp(mode, "nativewin")) {   // the native-Metal spike's gate 9: a CAMetalLayer on our own device, on the screen
 			id<MTLDevice> d = nil;
 			for (id<MTLDevice> dev in MTLCopyAllDevices())

@@ -221,6 +221,11 @@ static void missingCall(id obj, NSInvocation *inv)
 - (instancetype)initNativeWithAcceleratorPort:(io_service_t)service;   // whatever the environment (the router's choice)
 - (rdna4_t *)gpu;   // nil until the kext's runtime client is open
 - (NSError *)drainGfx;   // waits for the draws submitted so far (the work queue)
+// A resource's gpuResourceID (argument buffers, MoltenVK's descriptor sets): the address of a 32-byte slot holding its T# or S#, which the
+// translated shader loads as it loads a bound one's (air2amdgpu.cpp). handle 0: a new slot (0 back: none left); `words` written into it.
+- (uint64_t)handle:(uint64_t)handle words:(const uint32_t *)words count:(unsigned)count;
+- (void)freeHandle:(uint64_t)handle;
+- (void)spareImage:(uint32_t[8])t;   // the T# of an unbound texture slot: one texel of the zeroed spare buffer
 @end
 
 static NSError *rdna4Error(NSString *what, kern_return_t kr)
@@ -637,6 +642,7 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 	BOOL _shadowSeeded;
 	RDNA4MTLTexture *_parent;   // a view's
 	RDNA4Held *_held;
+	uint64_t _handle;       // (gpuResourceID) its T#'s slot
 	rdna4_buffer_t _vram;   // a depth or multisampled texture's
 	uint64_t _depthBytes, _stencilBytes;
 	uint32_t _samples;
@@ -988,7 +994,17 @@ static char gCopyKey;
 - (void)waitUntilComplete { deviceIdle(_device); }
 - (MTLTextureCompressionType)compressionType { return MTLTextureCompressionTypeLossless; }
 - (BOOL)allowGPUOptimizedContents { return NO; }
-- (MTLResourceID)gpuResourceID { return (MTLResourceID){ ._impl = self.gpuBase }; }
+// ponytail: the T# as it is when asked (MoltenVK: when it writes the descriptor), not refreshed if the texture's memory moves later.
+- (MTLResourceID)gpuResourceID
+{
+	uint32_t t[8];
+	if (self.isDepth || !self.gpuBase)   // as an unbound slot (the draw's and dispatch's tables): a depth T# or one at 0 could stall the unit
+		[_device spareImage:t];
+	else
+		[self descriptor:t];
+	_handle = [_device handle:_handle words:t count:8];
+	return (MTLResourceID){ ._impl = _handle };
+}
 
 - (instancetype)initWithBuffer:(RDNA4MTLBuffer *)buffer descriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr
 {
@@ -1129,6 +1145,7 @@ static char gCopyKey;
 - (void)dealloc
 {
 	gTexturesLive--;
+	[_device freeHandle:_handle];
 	if (_vram.handle)
 		rdna4_free(_device.gpu, &_vram);
 }
@@ -1864,7 +1881,6 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 - (NSError *)drainGfx;
 - (NSError *)flushBatch;   // the draws and barriers written so far onto the gfx ring (one submit)
 - (dispatch_queue_t)work;
-- (void)spareImage:(uint32_t[8])t;   // the T# of an unbound texture slot: one texel of the zeroed spare buffer
 - (const rdna4_program_t *)resolveKernel:(BOOL)srgb;   // rdna4_resolve or rdna4_resolve_srgb, loaded on first use (NULL: not loaded)
 - (uint64_t)spareBuffer;             // what an unbound buffer slot points at: the zeroed spare buffer
 - (BOOL)drawnInFlight:(RDNA4MTLTexture *)t;   // a draw not yet waited for draws into it
@@ -2262,6 +2278,7 @@ RDNA4_ANSWER_MISSING
 @implementation RDNA4MTLSamplerState {
 	RDNA4MTLDevice *_device;
 	uint32_t _s[4];
+	uint64_t _handle;   // (gpuResourceID) its S#'s slot
 }
 @synthesize label;
 
@@ -2282,6 +2299,109 @@ RDNA4_ANSWER_MISSING
 
 - (const uint32_t *)words { return _s; }
 - (id<MTLDevice>)device { return _device; }
+- (MTLResourceID)gpuResourceID
+{
+	@synchronized(self) {
+		if (!_handle)
+			_handle = [_device handle:0 words:_s count:4];
+	}
+	return (MTLResourceID){ ._impl = _handle };
+}
+- (void)dealloc { [_device freeHandle:_handle]; }
+
+RDNA4_ANSWER_MISSING
+@end
+
+// An argument buffer's encoder (MoltenVK's descriptor sets: it makes them whatever tier we answer). Its layout is the shader's struct as Apple's
+// compiler lays it out: the arguments in index order, a buffer, texture or sampler an 8-byte handle (gpuAddress, gpuResourceID: air2amdgpu reads
+// them as such), constant data at its own size and alignment, arrays element after element.
+@interface RDNA4MTLArgumentEncoder : NSObject <MTLArgumentEncoder>
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device arguments:(NSArray<MTLArgumentDescriptor *> *)arguments;
+@end
+
+@implementation RDNA4MTLArgumentEncoder {
+	RDNA4MTLDevice *_device;
+	std::vector<std::array<NSUInteger, 4>> _slots;   // index, count, offset, element size
+	NSUInteger _length, _alignment;
+	uint8_t *_at;   // the argument buffer's bytes at the encoded offset; nil: none set
+}
+@synthesize label;
+
+static NSUInteger argumentSize(MTLDataType t)
+{
+	switch (t) {
+	case MTLDataTypeChar: case MTLDataTypeUChar: case MTLDataTypeBool: return 1;
+	case MTLDataTypeShort: case MTLDataTypeUShort: case MTLDataTypeHalf: case MTLDataTypeChar2: case MTLDataTypeUChar2: return 2;
+	case MTLDataTypeFloat: case MTLDataTypeInt: case MTLDataTypeUInt: case MTLDataTypeShort2: case MTLDataTypeUShort2: case MTLDataTypeHalf2:
+	case MTLDataTypeChar4: case MTLDataTypeUChar4: return 4;
+	case MTLDataTypeFloat2: case MTLDataTypeInt2: case MTLDataTypeUInt2: case MTLDataTypeShort4: case MTLDataTypeUShort4: case MTLDataTypeHalf4: return 8;
+	case MTLDataTypeFloat3: case MTLDataTypeFloat4: case MTLDataTypeInt3: case MTLDataTypeInt4: case MTLDataTypeUInt3: case MTLDataTypeUInt4: return 16;
+	default: return 8;   // a buffer, texture, sampler or other object: its handle
+	}
+}
+
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device arguments:(NSArray<MTLArgumentDescriptor *> *)arguments
+{
+	if (!(self = [super init]))
+		return nil;
+	_device = device;
+	_alignment = 8;
+	NSArray *sorted = [arguments sortedArrayUsingComparator:^NSComparisonResult(MTLArgumentDescriptor *a, MTLArgumentDescriptor *b) {
+		return [@(a.index) compare:@(b.index)];
+	}];
+	for (MTLArgumentDescriptor *a in sorted) {
+		const NSUInteger size = argumentSize(a.dataType), align = MAX(size, a.constantBlockAlignment ?: 1), count = MAX(a.arrayLength, (NSUInteger)1);
+		_length = (_length + align - 1) / align * align;
+		_slots.push_back({ a.index, count, _length, size });
+		_length += size * count;
+		_alignment = MAX(_alignment, align);
+	}
+	_length = (_length + _alignment - 1) / _alignment * _alignment;
+	return self;
+}
+
+- (id<MTLDevice>)device { return _device; }
+- (NSUInteger)encodedLength { return _length; }
+- (NSUInteger)alignment { return _alignment; }
+- (void)setArgumentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset { _at = buffer ? (uint8_t *)buffer.contents + offset : nil; }
+- (void)setArgumentBuffer:(id<MTLBuffer>)buffer startOffset:(NSUInteger)start arrayElement:(NSUInteger)element
+{
+	[self setArgumentBuffer:buffer offset:start + element * _length];
+}
+
+// Where argument `index` is in the buffer (an array's element by its own index), or nil.
+- (uint8_t *)at:(NSUInteger)index
+{
+	for (const auto &s : _slots)
+		if (_at && index >= s[0] && index < s[0] + s[1])
+			return _at + s[2] + (index - s[0]) * s[3];
+	return nil;
+}
+- (void)put:(uint64_t)handle at:(NSUInteger)index
+{
+	if (uint8_t *p = [self at:index])
+		memcpy(p, &handle, 8);
+}
+- (void *)constantDataAtIndex:(NSUInteger)index { return [self at:index]; }
+- (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index { [self put:buffer ? buffer.gpuAddress + offset : 0 at:index]; }
+- (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained[])buffers offsets:(const NSUInteger[])offsets withRange:(NSRange)range
+{
+	for (NSUInteger i = 0; i < range.length; i++)
+		[self setBuffer:buffers[i] offset:offsets[i] atIndex:range.location + i];
+}
+- (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index { [self put:texture ? texture.gpuResourceID._impl : 0 at:index]; }
+- (void)setTextures:(const id<MTLTexture> __unsafe_unretained[])textures withRange:(NSRange)range
+{
+	for (NSUInteger i = 0; i < range.length; i++)
+		[self setTexture:textures[i] atIndex:range.location + i];
+}
+- (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index { [self put:sampler ? sampler.gpuResourceID._impl : 0 at:index]; }
+- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained[])samplers withRange:(NSRange)range
+{
+	for (NSUInteger i = 0; i < range.length; i++)
+		[self setSamplerState:samplers[i] atIndex:range.location + i];
+}
+- (id<MTLArgumentEncoder>)newArgumentEncoderForBufferAtIndex:(NSUInteger)index { return nil; }   // nested argument buffers: none so far
 
 RDNA4_ANSWER_MISSING
 @end
@@ -2378,8 +2498,25 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 	id<MTLBuffer> _bound[kMaxBufferIndex];
 	id<MTLTexture> _textures[16];
 	id<MTLSamplerState> _samplers[16];
+	NSMutableArray<RDNA4MTLTexture *> *_used;   // textures in argument buffers (useResource:usage:): kept and written back as bound ones
 }
 @synthesize label;
+
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)usage
+{
+	if (![(id)r isKindOfClass:[RDNA4MTLTexture class]] || ((RDNA4MTLTexture *)r).isDepth || [_used containsObject:(RDNA4MTLTexture *)r])
+		return;
+	if (!_used)
+		_used = [NSMutableArray array];
+	[_used addObject:(RDNA4MTLTexture *)r];
+}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained[])r count:(NSUInteger)count usage:(MTLResourceUsage)usage
+{
+	for (NSUInteger i = 0; i < count; i++)
+		[self useResource:r[i] usage:usage];
+}
+- (void)useHeap:(id<MTLHeap>)heap { }   // (its buffers are memory of the process, as any)
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained[])heaps count:(NSUInteger)count { }
 
 - (void)setTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < 16) _textures[i] = t; }
 - (void)setSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < 16) _samplers[i] = s; }
@@ -2489,6 +2626,14 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 			anyTexture = YES;
 		}
 	}
+	for (RDNA4MTLTexture *t in _used) {
+		if ([kernelTextures containsObject:t])
+			continue;
+		[held addObject:t];
+		[kernelTextures addObject:t];
+		if (t.shadowed)
+			[shadowed addObject:t];
+	}
 	{   // always: a kernel's texture read through a table at 0 faulted
 		(void)anyTexture;
 		uint32_t spare[8];
@@ -2580,6 +2725,13 @@ RDNA4_ANSWER_MISSING
 	float _blendColour[4];
 }
 @synthesize label;
+
+// Resources in argument buffers: memory of the process, as any, and kept alive by their owner (MoltenVK's descriptor sets).
+// ponytail: a texture a draw writes through one is not written back to a shadowed IOSurface (the compute encoder's are).
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages { }
+- (void)useResources:(const id<MTLResource> __unsafe_unretained[])r count:(NSUInteger)count usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages { }
+- (void)useHeap:(id<MTLHeap>)heap stages:(MTLRenderStages)stages { }
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained[])heaps count:(NSUInteger)count stages:(MTLRenderStages)stages { }
 
 - (instancetype)initWithCommandBuffer:(RDNA4MTLCommandBuffer *)commandBuffer pass:(MTLRenderPassDescriptor *)pass
 {
@@ -3924,6 +4076,8 @@ RDNA4_ANSWER_MISSING
 @end
 
 @implementation RDNA4MTLDevice {
+	id<MTLBuffer> _handles;           // (handle:words:count:) the slots, the spare T# in each free one: an explicit-LOD sample reads past its
+	NSMutableIndexSet *_freeHandles;  // handle's slot (RDNA4_MTLC_LEVEL_FIRST), and an all-zero T# can stall the texture unit
 	io_service_t _service;
 	uint64_t _registryID;
 	__weak id _accelService;   // Metal's MTLIOAccelService for our service
@@ -4212,6 +4366,42 @@ static void abortStack(int sig)
 		}
 	}
 	linearImage(t, _spare.gpu, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 1, 1, 64);
+}
+
+// ponytail: 32768 slots (1 MiB) for the process, its textures and samplers that were asked their gpuResourceID; a second slab if that runs out.
+- (uint64_t)handle:(uint64_t)handle words:(const uint32_t *)words count:(unsigned)count
+{
+	static const NSUInteger kHandles = 32768;
+	@synchronized(self) {
+		if (!_handles) {
+			uint32_t spare[8];
+			[self spareImage:spare];
+			_handles = [self newBufferWithLength:kHandles * 32 options:MTLResourceStorageModeShared];
+			for (NSUInteger i = 0; _handles && i < kHandles; i++)
+				memcpy((uint8_t *)_handles.contents + 32 * i, spare, 32);
+			_freeHandles = [NSMutableIndexSet indexSetWithIndexesInRange:NSMakeRange(0, kHandles)];
+		}
+		if (!handle && _handles && _freeHandles.count) {
+			const NSUInteger i = _freeHandles.firstIndex;
+			[_freeHandles removeIndex:i];
+			handle = _handles.gpuAddress + 32 * i;
+		}
+		if (handle)
+			memcpy((uint8_t *)_handles.contents + (handle - _handles.gpuAddress), words, 4 * count);
+		return handle;
+	}
+}
+
+- (void)freeHandle:(uint64_t)handle
+{
+	if (!handle)
+		return;
+	uint32_t spare[8];
+	[self spareImage:spare];
+	@synchronized(self) {
+		memcpy((uint8_t *)_handles.contents + (handle - _handles.gpuAddress), spare, 32);
+		[_freeHandles addIndex:(NSUInteger)(handle - _handles.gpuAddress) / 32];
+	}
 }
 
 - (uint64_t)spareBuffer
@@ -4544,7 +4734,9 @@ static void abortStack(int sig)
 // (Apple family 1, programmable blending, memoryless targets, ...), and Core Animation chose techniques of those for our device that
 // the paravirtual one never sees (an empty mask shader hung WindowServer). The same draws and the same translator serve both, so the same
 // answers; ray tracing and the buffer size limit are our own.
-- (BOOL)supportsFamily:(MTLGPUFamily)family { return family == 2001 || family == 3001 || family == 3002; }   // Mac1, Common1, Common2: Apple's device's
+// Tier 2 and Metal3: MoltenVK then writes its descriptor sets' argument buffers itself (gpuAddress, gpuResourceID), no encoder (which we lack)
+- (MTLArgumentBuffersTier)argumentBuffersSupport { return MTLArgumentBuffersTier2; }
+- (BOOL)supportsFamily:(MTLGPUFamily)family { return family == 2001 || family == 3001 || family == 3002 || family == MTLGPUFamilyMetal3; }   // Mac1, Common1, Common2: Apple's device's
 - (uint64_t)dedicatedMemorySize { return 1073741824ull; }
 - (uint64_t)deviceLinearReadOnlyTextureAlignmentBytes { return 256ull; }
 - (uint64_t)deviceLinearTextureAlignmentBytes { return 256ull; }
@@ -4792,6 +4984,11 @@ static void abortStack(int sig)
 }
 
 - (id<MTLFence>)newFence { return [[RDNA4MTLFence alloc] initWithDevice:self]; }
+
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithArguments:(NSArray<MTLArgumentDescriptor *> *)arguments
+{
+	return [[RDNA4MTLArgumentEncoder alloc] initWithDevice:self arguments:arguments];
+}
 
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)descriptor
 {

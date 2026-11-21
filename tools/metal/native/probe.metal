@@ -37,3 +37,16 @@ kernel void rays(raytracing::primitive_acceleration_structure accel [[buffer(0)]
 	out[i] = hit.type == raytracing::intersection_type::triangle ? float4(hit.distance, hit.triangle_barycentric_coord, float(hit.primitive_id))
 	                                                              : float4(-1);
 }
+
+// mtlprobe nativeargbuf: a texture, a sampler and the output buffer reached through a tier-2 argument buffer (MoltenVK's descriptor sets),
+// which the app fills with their gpuResourceID / gpuAddress: out[i] = texel i of the 4x1 texture, read and sampled.
+struct ArgProbe {
+	texture2d<float> tex [[id(0)]];
+	sampler smp [[id(1)]];
+	device float4 *out [[id(2)]];
+};
+
+kernel void argbuf(constant ArgProbe &a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+	a.out[i] = a.tex.read(uint2(i, 0));
+	a.out[i + 4] = a.tex.sample(a.smp, float2((i + 0.5f) / 4.0f, 0.5f), level(0));
+}
