@@ -787,6 +787,7 @@ private:
 	friend struct N48nBackend;
 	struct N48nState;
 	N48nState *n48n { nullptr };
+	void n48nReleaseVmid();
 	void     n48nDiscard();        // the card lost its memory under the client (sleep): forget it, write nothing
 	struct N48nView;
 	N48nView *n48nViews { nullptr };   // what processes map of the pool heap's buffers (n48nMemory), kept for the boot

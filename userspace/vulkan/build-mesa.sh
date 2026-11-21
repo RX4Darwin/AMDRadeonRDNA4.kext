@@ -6,9 +6,10 @@
 #
 # Fetches Mesa at the commit the patches are made for (about 150 MB), applies the patches, makes a private
 # Python environment with meson, and builds the AMD Vulkan driver alone: x86_64 (the card's machines; an
-# Apple-silicon Mac cross-builds it and runs it under Rosetta), for macOS 11 and later, without Mesa's window-system
-# layer, which would bring in Apple's Metal and two macOS 12 symbols. The result links IOKit, libSystem, libz and
-# libc++ only: <work>/build/src/amd/vulkan/libvulkan_radeon.dylib. vkprobe.c says how to try it.
+# Apple-silicon Mac cross-builds it and runs it under Rosetta), for macOS 11 and later, with Mesa's Metal window-system
+# layer (VK_EXT_metal_surface: windows through CAMetalLayer, mesa-patches/0009). The result links IOKit, Metal,
+# QuartzCore, libSystem, libz and libc++: <work>/build/src/amd/vulkan/libvulkan_radeon.dylib. vkprobe.c says how to try
+# it, winprobe.m how to try a window.
 #
 # Needs clang, ninja, bison, flex, pkg-config and glslangValidator. Mesa's own tests stay off: with them two AMD
 # tests fail to link (the patches make libamd_common need IOKit and those tests do not ask for it).
@@ -34,7 +35,7 @@ done
 export PATH=$W/venv/bin:$PATH MACOSX_DEPLOYMENT_TARGET=11.0
 # Homebrew's libraries on an Apple-silicon Mac are arm64 only: keep pkg-config away from them.
 [ -d build ] || PKG_CONFIG_LIBDIR=/nonexistent meson setup build mesa --cross-file mesa/cross-x86_64.ini \
-	-Dvulkan-drivers=amd -Dgallium-drivers= -Dplatforms= -Dglx=disabled -Degl=disabled -Dopengl=false \
+	-Dvulkan-drivers=amd -Dgallium-drivers= -Dplatforms=macos -Dglx=disabled -Degl=disabled -Dopengl=false \
 	-Dgles1=disabled -Dgles2=disabled -Dllvm=disabled -Dvideo-codecs= -Dzstd=disabled -Dexpat=disabled \
 	-Dxmlconfig=disabled -Dbuild-tests=false -Dbuildtype=debugoptimized
 ninja -C build

@@ -35,6 +35,9 @@ public:
 	                       IOService *whatDevice) APPLE_KEXT_OVERRIDE;
 };
 
+// rdna4-client-policy: the console user may open the runtime's clients (the default), not root alone (userclient.cpp)
+bool localClientsAllowed();
+
 // The published service (the runtime's), for clients made through the paravirtual accelerator (rdna4AcceleratorClient).
 extern RDNA4ComputeService *gComputeService;
 // A compute client for `task`, attached to the IOAccelerator `accel` it opened with type RDNA4_NATIVE_UC_TYPE (pvhooks.cpp).

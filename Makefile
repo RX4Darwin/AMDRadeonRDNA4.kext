@@ -220,7 +220,7 @@ mesa:
 	@$(MAKE) vulkan-products
 	@otool -l $(RADV_LIB) | grep -A4 LC_BUILD_VERSION | grep -q 'minos $(DEPLOY)' || \
 		{ echo "$(RADV_LIB) is not built for macOS $(DEPLOY)" >&2; exit 1; }
-	@echo "Built $(RADV_LIB), $(BIN)/vkprobe and $(BIN)/swapprobe for $(ARCH) (min macOS $(DEPLOY))"
+	@echo "Built $(RADV_LIB), $(BIN)/vkprobe, $(BIN)/swapprobe and $(BIN)/winprobe for $(ARCH) (min macOS $(DEPLOY))"
 
 vulkan-products:
 	@[ -f $(RADV_BUILT) ] || exit 0; \
@@ -231,7 +231,12 @@ vulkan-products:
 			echo "$(CXX) -x c ... $(VULKAN)/$$p.c -o $(BIN)/$$p"; \
 			$(CXX) -x c $(USER_FLAGS) -I$(RADV_DIR)/mesa/include -I$(VULKAN) $(VULKAN)/$$p.c -o $(BIN)/$$p || exit 1; \
 		fi; \
-	done
+	done; \
+	if [ ! -f $(BIN)/winprobe ] || [ $(VULKAN)/winprobe.m -nt $(BIN)/winprobe ]; then \
+		echo "$(CXX) -x objective-c ... $(VULKAN)/winprobe.m -o $(BIN)/winprobe"; \
+		$(CXX) -x objective-c $(USER_FLAGS) -fno-objc-arc -I$(RADV_DIR)/mesa/include -I$(VULKAN) $(VULKAN)/winprobe.m -o $(BIN)/winprobe \
+			-framework Cocoa -framework QuartzCore || exit 1; \
+	fi
 
 # The Metal kernel translator's run-time helper for the rig (M3, docs/m1-stream.md s.5b); builds LLVM for x86_64 the first time.
 metal-helper:

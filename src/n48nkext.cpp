@@ -484,6 +484,16 @@ void RDNA4Compute::n48nKeep() {
 	}
 }
 
+// The session's address space back: to the pool it was pinned from (rdna4-vmshared=2), else free for the runtime's clients. With rtLock.
+void RDNA4Compute::n48nReleaseVmid() {
+	if (vmShared == 2) {
+		uint32_t first = 0;
+		vmPool.forget(reinterpret_cast<uintptr_t>(n48n), true, first);
+	} else {
+		vmidUsed[n48n->vmid] = false;
+	}
+}
+
 IOReturn RDNA4Compute::n48nOpen(const void *owner) {
 	if (!rtLock)
 		return kIOReturnNotReady;
@@ -500,23 +510,30 @@ IOReturn RDNA4Compute::n48nOpen(const void *owner) {
 		bzero(n48nViews, kViews * sizeof(N48nView));
 	}
 	n48nSweep();
-	// ponytail: with rdna4-vmshared=2 the runtime hands address spaces out per job from a pool of its own (vmPool), which this does not
-	// know; the interface stays shut there. Take one from that pool when both are wanted.
-	if (vmShared == 2) {
-		VLOG("not with rdna4-vmshared=2: its address spaces are handed out per job");
-		return kIOReturnNotReady;
-	}
-	// An address space no client of the runtime holds, picked as rtOpenShared picks: 8 when none is open.
-	uint32_t vmid = 8;
-	for (; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
-	if (vmid > 15) {
-		VLOG("open failed: all of the address spaces 8 to 15 are taken");
-		return kIOReturnNoResources;
-	}
 	auto *s = static_cast<N48nState *>(IOMalloc(sizeof(N48nState)));
 	if (!s)
 		return kIOReturnNoMemory;
 	bzero(s, sizeof(*s));
+	uint32_t vmid = 8;
+	if (vmShared == 2) {
+		// The runtime hands address spaces out per job from its pool (vmPool, the default): one pinned for the session, never stolen,
+		// given back at close (n48nReleaseVmid). Refused before, which left Vulkan shut on the accelerated desktop (2026-11-21).
+		Vmid::Grant grant;
+		if (vmPool.pin(reinterpret_cast<uintptr_t>(s), reinterpret_cast<uintptr_t>(s), 0, grant) != Vmid::Result::Ok) {
+			IOFree(s, sizeof(*s));
+			VLOG("open failed: no address space of the pool is free to pin");
+			return kIOReturnNoResources;
+		}
+		vmid = grant.vmid;
+	} else {
+		// An address space no client of the runtime holds, picked as rtOpenShared picks: 8 when none is open.
+		for (; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
+		if (vmid > 15) {
+			IOFree(s, sizeof(*s));
+			VLOG("open failed: all of the address spaces 8 to 15 are taken");
+			return kIOReturnNoResources;
+		}
+	}
 	s->owner = owner;
 	s->vmid = vmid;
 	n48n = s;                          // the backend reads the address space from it while the client opens
@@ -529,13 +546,15 @@ IOReturn RDNA4Compute::n48nOpen(const void *owner) {
 		s->client.close();
 		if (s->fencePage)
 			heap.free(s->fencePage);
+		n48nReleaseVmid();
 		IOFree(s, sizeof(*s));
 		n48n = nullptr;
 		return kIOReturnNoMemory;
 	}
 	N48nBackend::zero(*this, s->fencePage, kPage);
 	N48nBackend::flush(this);
-	vmidUsed[vmid] = true;
+	if (vmShared != 2)
+		vmidUsed[vmid] = true;
 	VLOG("client open: address space %u, table root at physical 0x%llx; %llu MiB of VRAM behind the BAR, %llu MiB past it",
 	     vmid, s->client.root(), heap.size() >> 20, devHeap.size() >> 20);
 	return kIOReturnSuccess;
@@ -554,7 +573,7 @@ void RDNA4Compute::n48nClose(const void *owner) {
 	if (!n48n->client.quiesce())       // its work first: that still needs the address space
 		VLOG("client closes with work on the graphics queue that did not finish");
 	wr(IpDiscovery::HwGc, Reg { 0, static_cast<uint16_t>(GcCtx1Cntl.dword + n48n->vmid - 1) }, 0);   // the context goes off before its table does
-	vmidUsed[n48n->vmid] = false;
+	n48nReleaseVmid();
 	if (((rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == n48n->vmid)
 		gcFaultClear();                // a fault of this client's left in the hub would hide the next client's (vmJobFaulted)
 	if (n48n->copyTestPage)
@@ -577,7 +596,7 @@ void RDNA4Compute::n48nDiscard() {
 		if (b && b->memory.system)
 			N48nBackend::free(this, b->memory, b->bytes);
 	}
-	vmidUsed[n48n->vmid] = false;
+	n48nReleaseVmid();
 	IOFree(n48n, sizeof(N48nState));
 	n48n = nullptr;
 	VLOG("client dropped: the card lost its memory; its calls answer \"not ready\" from here on");
@@ -703,6 +722,7 @@ class RDNA4VulkanClient : public IOUserClient {
 public:
 	RDNA4Compute *compute;
 	IOReturn      opened;        // what the open came to, for newUserClient to hand to the caller
+	bool          privileged;    // root: every call; else the console user (rdna4-client-policy): kLocalCalls only
 
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	IOReturn clientClose() APPLE_KEXT_OVERRIDE;
@@ -735,8 +755,17 @@ IOReturn RDNA4VulkanClient::clientClose() {
 }
 
 // No dispatch table: the engine checks each call's counts and sizes itself, exactly, as the interface states them.
+// What the console user's client may call: its memory, its contexts and submissions in its own address space, GB_ADDR_CONFIG (all
+// READREGS reads, n48n.cpp); not the display (scanout, mode trials) or the Metal nub, which stay root's.
+static constexpr uint32_t kLocalCalls = 1u << N48N_SEL_HELLO | 1u << N48N_SEL_QUERYINFO | 1u << N48N_SEL_READREGS | 1u << N48N_SEL_BOCREATE |
+                                        1u << N48N_SEL_BOFREE |
+                                        1u << N48N_SEL_GEMVA | 1u << N48N_SEL_CTX | 1u << N48N_SEL_SUBMIT | 1u << N48N_SEL_WAITSEQ |
+                                        1u << N48N_SEL_BO_IMPORT_HOST;
+
 IOReturn RDNA4VulkanClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                                            IOExternalMethodDispatch *, OSObject *, void *) {
+	if (!privileged && (selector >= 32 || !(kLocalCalls >> selector & 1)))
+		return kIOReturnNotPrivileged;
 	return compute ? compute->n48nCall(this, selector, args) : kIOReturnNotReady;
 }
 
@@ -752,12 +781,15 @@ IOReturn RDNA4ComputeService::newUserClient(task_t owningTask, void *securityID,
 #endif
 	if (type != N48N_UC_TYPE)
 		return IOService::newUserClient(owningTask, securityID, type, properties, handler);
-	// Root only until there is a policy for who may have the GPU (docs/vulkan-port.md, "What a client may reach").
-	if (IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+	// Root, or the console user as the runtime's clients (rdna4-client-policy; then only kLocalCalls, in an address space of its own):
+	// Vulkan applications in windows on the accelerated desktop (docs/vulkan-port.md, "What a client may reach").
+	const bool privileged = IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
+	if (!privileged && !(localClientsAllowed() && IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeLocalUser) == kIOReturnSuccess))
 		return kIOReturnNotPrivileged;
 	auto *client = OSTypeAlloc(RDNA4VulkanClient);
 	if (!client)
 		return kIOReturnNoMemory;
+	client->privileged = privileged;
 	if (!client->initWithTask(owningTask, securityID, type, properties) || !client->attach(this)) {
 		client->release();
 		return kIOReturnNoResources;
