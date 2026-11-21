@@ -376,6 +376,8 @@ class RDNA4PvHost : public OSObject {
 	OSDeclareDefaultStructors(RDNA4PvHost)
 public:
 	static RDNA4PvHost *start(RDNA4PvNub *nub, uint32_t level);
+	// pvPresent: on a host without a guest (startDisplay), made the first time; its tick opens the runtime and shows finished copies.
+	static bool display(uint32_t port, uint32_t sid);
 	void tick();
 	int dumpTexture(uint32_t task, uint32_t id, struct sysctl_req *req);
 
@@ -729,6 +731,12 @@ private:
 	ScanoutMap mScanout[kScanoutPorts] {};
 	GfxBuffers mPresentIb {};
 	bool presentOnCard(uint32_t port, uint32_t sid);
+	bool presentFrame(uint32_t port, uint32_t surface, uint32_t task);   // by the card (presentOnCard), else by the CPU
+	bool startTicks(uint32_t ms);
+	static RDNA4PvHost *startDisplay();
+	uint32_t mDisplayMisses { 0 };
+	static IOReturn presentAction(OSObject *owner, void *port, void *sid, void *ok, void *);
+	void displayTick();
 	uint64_t presentSource(uint32_t sid, uint64_t bytes);   // surface sid's frame in VRAM (pvPresentSource): its GPU address of ours, else 0
 	// A frame of macOS's scaled modes, larger than any mode of the head ("looks like 2560x1440" draws 5120x2880 on a 3840x2160
 	// monitor): scale.cl puts it into the scanout, dispatched in the frame's IB. Its kernargs a slot per port.
@@ -1121,6 +1129,7 @@ OSDefineMetaClassAndStructors(RDNA4PvHost, OSObject)
 
 namespace {
 RDNA4PvHost *gHost { nullptr };
+RDNA4PvHost *gDisplayHost { nullptr };   // our own accelerator's (RDNA4PvHost::display): no guest
 
 // Frames the native device keeps in VRAM (pvPresentSource): surface sid presented from the client's buffer, mapped into the host's GPU
 // address space when it is first presented (on the host's thread), the mapping dropped there too once the source is (dead).
@@ -1177,11 +1186,25 @@ static int frameSysctl SYSCTL_HANDLER_ARGS
 	if (!rdna4Root())
 		return EPERM;
 
-	return gHost ? gHost->grabFrame(static_cast<uint32_t>(gFramePort), req) : ENOENT;
+	RDNA4PvHost *h = gHost ? gHost : gDisplayHost;
+
+	return h ? h->grabFrame(static_cast<uint32_t>(gFramePort), req) : ENOENT;
 }
 
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_pvframe, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, frameSysctl, "S",
 	    "AMDRadeonRDNA4: the next presented frame at half size");
+
+// Once: by the nub's publish and by the display host (startDisplay), whichever comes first.
+static void registerFrameSysctls()
+{
+	static bool done;
+
+	if (__atomic_exchange_n(&done, true, __ATOMIC_ACQ_REL))
+		return;
+
+	sysctl_register_oid(&sysctl__debug_rdna4_pvframeport);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvframe);
+}
 
 // debug.rdna4_pvnotrun: the draws the host could not run since the boot, by reason, the most first: "count reason (first function)".
 static int notRunSysctl SYSCTL_HANDLER_ARGS
@@ -1252,16 +1275,10 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	}
 	pvlog("host: display side: online event %s, VBL events %s, mode %ux%u", h->mDisp & kDispOnline ? "on" : "off", h->mDisp & kDispVbl ? "on" : "off",
 	      h->mDispInfo.modes[0].width, h->mDispInfo.modes[0].height);
-	h->mLoop = IOWorkLoop::workLoop();
-	h->mTimer = h->mLoop ? IOTimerEventSource::timerEventSource(h, hostTick) : nullptr;
-	if (!h->mTimer || h->mLoop->addEventSource(h->mTimer) != kIOReturnSuccess) {
-		pvlog("host: no work loop / timer");
-		OSSafeReleaseNULL(h->mTimer);
-		OSSafeReleaseNULL(h->mLoop);
+	if (!h->startTicks(500)) {   // first tick after the nub had time to register and match
 		h->release();
 		return nullptr;
 	}
-	h->mTimer->setTimeoutMS(500);   // first tick after the nub had time to register and match
 	if (gCompute)
 		gCompute->setSleepHook(sleepHook, h);
 
@@ -1276,6 +1293,79 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	}
 
 	return h;
+}
+
+// The host's work loop and its tick, the first after `ms`.
+bool RDNA4PvHost::startTicks(uint32_t ms) {
+	mLoop = IOWorkLoop::workLoop();
+	mTimer = mLoop ? IOTimerEventSource::timerEventSource(this, hostTick) : nullptr;
+	if (!mTimer || mLoop->addEventSource(mTimer) != kIOReturnSuccess) {
+		pvlog("host: no work loop / timer");
+		OSSafeReleaseNULL(mTimer);
+		OSSafeReleaseNULL(mLoop);
+		return false;
+	}
+	mTimer->setTimeoutMS(ms);
+	return true;
+}
+
+RDNA4PvHost *RDNA4PvHost::startDisplay() {
+	auto *h = OSTypeAlloc(RDNA4PvHost);
+	if (!h || !h->init()) {
+		OSSafeReleaseNULL(h);
+		return nullptr;
+	}
+	if (!h->startTicks(1)) {   // the first tick opens the runtime
+		h->release();
+		return nullptr;
+	}
+	if (gCompute)
+		gCompute->setSleepHook(sleepHook, h);   // ponytail: the one hook; our pipes run without the paravirtual host
+	registerFrameSysctls();
+	pvlog("host: display host made for our accelerator's display pipes");
+	return h;
+}
+
+// The display host's tick: the runtime opened (here, on the tick's shallow stack, as tick() does), the frames whose copies are done
+// flipped to; again soon while one is queued.
+void RDNA4PvHost::displayTick() {
+	if (gCompute && !mRtOpen)
+		(void)openRuntime();
+	flipDone();
+	for (const ScanoutMap &sm : mScanout)
+		if (sm.queued) {
+			mTimer->setTimeoutUS(250);
+			break;
+		}
+}
+
+bool RDNA4PvHost::display(uint32_t port, uint32_t sid) {
+	bool ok = false;
+
+	if (!gDisplayHost)   // (made on the display machine's one pipe work loop: no race)
+		gDisplayHost = startDisplay();
+
+	if (!gDisplayHost)
+		return PvScanout::present(port, sid, 0);
+
+	gDisplayHost->mLoop->runAction(presentAction, gDisplayHost, &port, &sid, &ok);
+	return ok;
+}
+
+IOReturn RDNA4PvHost::presentAction(OSObject *owner, void *port, void *sid, void *ok, void *) {
+	auto *h = static_cast<RDNA4PvHost *>(owner);
+	const uint32_t p = *static_cast<uint32_t *>(port);
+
+	*static_cast<bool *>(ok) = h->presentFrame(p, *static_cast<uint32_t *>(sid), 0);
+
+	// The copy done before the transaction is (our pipe's isTransactionComplete: at once), else WindowServer draws the next frame into
+	// the surface while the card still reads it. ponytail: waited here; the fence in isTransactionComplete if the wait shows.
+	if (p < kScanoutPorts && h->mScanout[p].fence)
+		h->waitFor(h->mScanout[p].fence);
+
+	h->flipDone();   // shown at the next vblank
+	h->mTimer->setTimeoutUS(250);   // the runtime opened
+	return kIOReturnSuccess;
 }
 
 void RDNA4PvHost::sleepHook(void *ctx) {
@@ -1404,6 +1494,10 @@ void RDNA4PvHost::dropIrqBits() {
 }
 
 void RDNA4PvHost::tick() {
+	if (!mNub) {   // the display host (startDisplay)
+		displayTick();
+		return;
+	}
 	if (mTicks++ < 3)
 		pvlog("host: tick %llu", mTicks);
 	if (mTicks == 1)
@@ -8052,20 +8146,7 @@ void RDNA4PvHost::presentTransaction(const pvstream::FifoCommand &c, const uint8
 	memcpy(f, pl, sizeof(f));
 
 	const uint32_t port = f[0], surface = c.id == 0x07 ? f[2] : f[1], task = c.id == 0x07 ? f[1] : f[2];
-	bool ok = gPresentOnCard && presentOnCard(port, surface);
-
-	if (!ok) {   // copied by the CPU from the guest's memory
-		void *s = retainSurface(surface);
-
-		if (port < kScanoutPorts && mScanout[port].flips)   // into the head's own surface, which the HUBP must read then
-			pauseFlips(mScanout[port]);
-
-		cardToMemory(s);
-		if (s)
-			static_cast<OSObject *>(s)->release();
-
-		ok = PvScanout::present(port, surface, task);
-	}
+	const bool ok = presentFrame(port, surface, task);
 
 	mPresents += ok;
 
@@ -8074,6 +8155,27 @@ void RDNA4PvHost::presentTransaction(const pvstream::FifoCommand &c, const uint8
 
 	if (gTalk)
 		pvlog("host: present: port %u, IOSurface %u (task %u): %s", port, surface, task, ok ? "copied" : "NOT copied");
+}
+
+bool RDNA4PvHost::presentFrame(uint32_t port, uint32_t surface, uint32_t task) {
+	if (gPresentOnCard && presentOnCard(port, surface))
+		return true;
+
+	if (!mNub && mDisplayMisses++ < 4)   // the display host's frames by the CPU: why
+		pvlog("host: display host: port %u: IOSurface %u by the CPU (runtime %s, present IB %s)", port, surface, mRtOpen ? "open" : "not open",
+		      mPresentIb.cpu ? "made" : "not made");
+
+	// copied by the CPU from the surface's memory
+	void *s = retainSurface(surface);
+
+	if (port < kScanoutPorts && mScanout[port].flips)   // into the head's own surface, which the HUBP must read then
+		pauseFlips(mScanout[port]);
+
+	cardToMemory(s);
+	if (s)
+		static_cast<OSObject *>(s)->release();
+
+	return PvScanout::present(port, surface, task);
 }
 
 // PKT3 DMA_DATA {header, control, src lo, hi, dst lo, hi, command} as Mesa's si_cp_dma for gfx9 on: source and destination through the L2,
@@ -8227,8 +8329,8 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 		ok = false;
 	}
 
-	if (ok && !inVram)
-		keepOnCard(s);   // its next frame drawn on the card
+	if (ok && !inVram && mNub)
+		keepOnCard(s);   // its next frame drawn on the card (the guest's draws: none for the display host)
 
 	if (s)
 		static_cast<OSObject *>(s)->release();
@@ -9010,6 +9112,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 }
 
 void RDNA4PvHost::pollDisplay() {
+	if (!mNub)   // the display host (startDisplay): no guest display to serve (its waits called this: panic, 2026-11-21)
+		return;
 	volatile uint32_t *c = mNub->ctrl();
 	if (!c)
 		return;
@@ -9848,8 +9952,7 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 	sysctl_register_oid(&sysctl__debug_rdna4_pvprofile);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtexid);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtex);
-	sysctl_register_oid(&sysctl__debug_rdna4_pvframeport);
-	sysctl_register_oid(&sysctl__debug_rdna4_pvframe);
+	registerFrameSysctls();
 	sysctl_register_oid(&sysctl__debug_rdna4_pvnotrun);
 	// publish() is reached from two threads (the GPU path in attach() and RDNA4PvLate's work loop): claim the single slot atomically before building
 	// anything, give it back on the paths that can be retried.
@@ -10390,6 +10493,11 @@ IOReturn RDNA4PvNub::disableInterrupt(int source) {
 IOReturn RDNA4PvNub::causeInterrupt(int source) { PVCALL("causeInterrupt"); return raiseInterrupt(source) ? kIOReturnSuccess : kIOReturnNotReady; }
 
 void pvgpu::routeGlPages(KernelPatcher &patcher) { routeGlPagesNow(patcher); }
+
+bool pvPresent(uint32_t port, uint32_t sid)
+{
+	return RDNA4PvHost::display(port, sid);
+}
 
 IOReturn pvPresentSource(const void *client, uint32_t sid, uint64_t handle)
 {

@@ -384,8 +384,8 @@ public:
 		note("validateTransaction", t);
 		return super::validateTransaction(t);
 	}
-	// A transaction's first plane onto the pipe's head: its IOSurface copied into the head's scanout (PvScanout::present, the copy
-	// the paravirtual displays use). ponytail: a CPU copy of each frame, plane 0 only, no rects; the display engine's own flip later.
+	// A transaction's first plane onto the pipe's head as the paravirtual displays' frames go (pvPresent: copied by the card into a
+	// buffer the head flips to at vblank, else by the CPU). ponytail: plane 0 only, no rects.
 	uintptr_t performTransaction(IOAccelDisplayPipeTransaction2 *t) APPLE_KEXT_OVERRIDE
 	{
 		const uintptr_t r = super::performTransaction(t);
@@ -400,7 +400,7 @@ public:
 				fb->release();
 			}
 		}
-		const bool shown = sid && port >= 0 && PvScanout::present(static_cast<uint32_t>(port), sid, 0);
+		const bool shown = sid && port >= 0 && pvPresent(static_cast<uint32_t>(port), sid);
 		static uint32_t presentLogged;   // (its own budget: the other hooks use up `logged`)
 		if (presentLogged < 32 && (presented < 4 || !shown)) {
 			presentLogged++;

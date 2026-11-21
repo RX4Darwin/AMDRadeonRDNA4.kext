@@ -1216,7 +1216,7 @@ void attach(FbEntry &e) {
 		RDNA4PvNub::publish(pci, pvGpu);
 	if (pvGpu && dev.isAmd && pvDelay)
 		RDNA4PvNub::setLateParent(pci);
-	if (pvGpu && dev.isAmd)
+	if (dev.isAmd)   // (the host's; without rdna4-pvgpu our accelerator's display host, pvPresent)
 		RDNA4PvNub::setCompute(&st->compute);
 #endif
 

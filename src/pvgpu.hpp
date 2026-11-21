@@ -204,6 +204,9 @@ void pvFramesInMemory(bool on);
 // The native device keeps WindowServer's frames in VRAM: surface `sid`'s frames are presented from runtime client `client`'s VRAM buffer
 // `handle` (0: from the surface's memory again). pvPresentSourcesOf: a client gone, its sources dropped.
 IOReturn pvPresentSource(const void *client, uint32_t sid, uint64_t handle);
+// Our own accelerator's display pipes (rdna4accel.cpp): surface `sid` onto head `port` as the host presents the guest's frames (by the
+// card: from the native device's VRAM, flipped at vblank; else copied by the CPU), on a host without a guest made the first time.
+bool pvPresent(uint32_t port, uint32_t sid);
 void pvPresentSourcesOf(const void *client);
 
 #endif /* RDNA4PvGpu_hpp */
