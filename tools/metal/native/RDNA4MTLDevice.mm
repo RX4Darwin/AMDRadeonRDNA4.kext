@@ -62,6 +62,7 @@
 - (id)newSerializedDescriptor;   // MTLVertexDescriptorInternal's (Metal.framework)
 @end
 #include <malloc/malloc.h>
+#include <CommonCrypto/CommonDigest.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <dlfcn.h>
@@ -975,6 +976,7 @@ static char gCopyKey;
 	return _swizzle ?: MTLTextureSwizzleRed | MTLTextureSwizzleGreen << 8 | MTLTextureSwizzleBlue << 16 | (uint32_t)MTLTextureSwizzleAlpha << 24;
 }
 - (BOOL)isWriteComplete { deviceIdle(_device); return YES; }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }   // (as buffers: never purged)
 - (void)waitUntilComplete { deviceIdle(_device); }
 - (MTLTextureCompressionType)compressionType { return MTLTextureCompressionTypeLossless; }
 - (BOOL)allowGPUOptimizedContents { return NO; }
@@ -1600,13 +1602,52 @@ static BOOL appendLinkEntry(NSMutableData *box, NSString *name, NSData *data)
 
 // `linked`: the functions `function` calls (a render stage's private linked functions, X.MTL_VISIBLE_FN_REF: RenderBox's custom shaders),
 // sent with it in one container that the translator links before translating
+static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFunction>> *linked, NSData **blob, uint32_t *buffers);
+
+// A function's translation, once a process for the same AIR: VideoToolbox makes its transfer pipeline anew for each frame (System Settings'
+// Displays pane started the translator 14 times a second, 2026-11-21). ponytail: kept for the process's life, unbounded; by the library's
+// path or the bitcode's SHA-256 and the name (linked functions: not kept).
 static NSError *translateFunction(id<MTLFunction> function, NSArray<id<MTLFunction>> *linked, NSData **blob, uint32_t *buffers)
+{
+	static NSMutableDictionary<NSString *, NSArray *> *done;
+	NSString *key = nil;
+	if (!linked.count) {
+		if ([(id)function isKindOfClass:[RDNA4MTLFunction class]]) {
+			key = [NSString stringWithFormat:@"%@\n%@", ((RDNA4MTLFunction *)function).library.path, function.name];
+		} else if (NSData *air = functionAir(function)) {
+			uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+			CC_SHA256(air.bytes, (CC_LONG)air.length, digest);
+			key = [NSString stringWithFormat:@"%@\n%@", [[NSData dataWithBytes:digest length:sizeof digest] base64EncodedStringWithOptions:0],
+			                                function.name];
+		}
+	}
+	@synchronized([RDNA4MTLFunction class]) {
+		if (NSArray *hit = key ? done[key] : nil) {
+			*blob = hit[0];
+			*buffers = [hit[1] unsignedIntValue];
+			return nil;
+		}
+	}
+	NSError *why = translateFunctionNow(function, linked, blob, buffers);
+	if (!why && key && *blob)
+		@synchronized([RDNA4MTLFunction class]) {
+			done = done ?: [NSMutableDictionary dictionary];
+			done[key] = @[ *blob, @(*buffers) ];
+		}
+	return why;
+}
+
+static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFunction>> *linked, NSData **blob, uint32_t *buffers)
 {
 	// the bundle's own (build.sh: the translator these functions need, ray queries say), else the paravirtual GPU's helper
 	NSString *own = [[NSBundle bundleForClass:[RDNA4MTLFunction class]] pathForResource:@"air2amdgpu" ofType:nil];
 	NSString *tool = NSProcessInfo.processInfo.environment[@"RDNA4_AIR2AMDGPU"] ?: own ?: @"/usr/local/libexec/rdna4-air2amdgpu";
 	// (a short stand-in for long names in file names: Core Image's stitched kernels' run to hundreds of characters, past a file name's 255)
-	NSString *fileName = function.name.length < 100 ? function.name : [NSString stringWithFormat:@"h%lx", (unsigned long)function.name.hash];
+	NSString *stem = function.name.length < 100 ? function.name : [NSString stringWithFormat:@"h%lx", (unsigned long)function.name.hash];
+	// numbered: threads translating the same function at once removed each other's files (VideoToolbox's transfer kernel in System
+	// Settings' Displays pane: "could not translate" each frame, 2026-11-21)
+	static std::atomic<unsigned> calls;
+	NSString *fileName = [NSString stringWithFormat:@"%@-%u", stem, calls++];
 	NSString *out = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"rdna4mtl-%d-%@.bin", getpid(), fileName]];
 	// The input: our library's metallib, or the AIR bitcode of a function Metal's own compiler made (newLibraryWithSource: and the other
 	// library calls _MTLDevice answers: an _MTLFunctionInternal, its -bitcodeData)
@@ -2458,6 +2499,10 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 		for (RDNA4MTLTexture *t in kernelTextures) {   // what the kernel may have written
 			[t wroteAll];
 			[t heldRows:0 to:(uint32_t)t.height width:(uint32_t)t.width];
+			// a shadowed IOSurface it may write: its copy into the surface at the end, as a draw's (VideoToolbox's 420v -> BGRA into
+			// System Settings' display thumbnails, 2752 bytes a row: written in the copy only, they stayed black, 2026-11-21)
+			if (t.usage & MTLTextureUsageShaderWrite)
+				[cb drewInto:t];
 		}
 		statAdd(kStatDispatches, 1);
 		statAdd(kStatDispatchUs, nowUs() - t0);
@@ -2630,6 +2675,7 @@ RDNA4_ANSWER_MISSING
 }
 - (void)setDepthStoreAction:(MTLStoreAction)action {}   // ponytail: depth is kept on the card for the texture's life either way
 - (void)setStencilStoreAction:(MTLStoreAction)action {}   // (and stencil)
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before { }   // draws in order
 - (void)setLineWidth:(float)width {}                    // ponytail: lines are one pixel wide
 
 - (id<MTLDevice>)device { return _commandBuffer.device; }
@@ -4363,6 +4409,8 @@ static void abortStack(int sig)
 - (BOOL)isLowPower { return NO; }
 - (BOOL)isRemovable { return NO; }
 - (BOOL)isHeadless { return NO; }
+- (MTLDeviceLocation)location { return MTLDeviceLocationSlot; }   // a PCIe card (System Settings' Displays pane asks)
+- (NSUInteger)locationNumber { return 0; }
 
 - (NSString *)name { return @"AMD Radeon RDNA4 (native Metal, spike)"; }
 // Apple's GL-on-Metal renderer takes its renderer string and its per-vendor limits from this ("AMD" or "ATI" for AMD's)
