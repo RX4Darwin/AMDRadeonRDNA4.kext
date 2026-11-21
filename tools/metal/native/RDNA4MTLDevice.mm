@@ -1725,14 +1725,18 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 }
 @end
 
-// rdna4-nativeheld: on unless the boot arguments say rdna4-nativeheld=0 (the driver's default since 2026-11-21, src/trial.cpp)
+// rdna4-nativeheld: on unless the boot arguments say rdna4-nativeheld=0 (the driver's default since 2026-11-21, src/trial.cpp), and in
+// WindowServer only: the kext presents its frames from VRAM, while an app's drawables are read by WindowServer from the surfaces'
+// memory. Held in iTerm2, its frames reached the surface only at the idle or once-a-second write-back: the end of the text vanished
+// and came back as it typed (2026-11-21).
 static BOOL heldOn(void)
 {
 	static int on = -1;
 	if (on < 0) {
 		char args[1024] = {};
 		size_t n = sizeof args - 1;
-		on = sysctlbyname("kern.bootargs", args, &n, NULL, 0) || strstr(args, "rdna4-nativeheld=0") == NULL;
+		on = !strcmp(getprogname(), "WindowServer") &&
+		     (sysctlbyname("kern.bootargs", args, &n, NULL, 0) || strstr(args, "rdna4-nativeheld=0") == NULL);
 	}
 	return on;
 }
@@ -3182,22 +3186,32 @@ static void eventWait(id event, uint64_t value)
 		// once its draws were done, WindowServer's main thread waited for the card in 23 % of a window drag (spindump, 2026-11-20).
 		NSError *flushed = [device flushBatch];   // (the last batch of draws onto the ring first)
 		why = why ?: flushed;
-		self->_status = MTLCommandBufferStatusScheduled;
-		dispatch_group_leave(self->_scheduledGroup);
-		NSArray<MTLCommandBufferHandler> *scheduled = [self->_scheduled copy];
-		// given up once run, as the completed ones: a handler holding its command buffer (iTerm2's) kept it, its set*Bytes buffers and its
-		// ops alive for good, 52 small buffers a frame, until the client's buffer quota ran out and iTerm2 crashed (2026-11-21)
-		[self->_scheduled removeAllObjects];
-		if (scheduled.count)
-			dispatch_async(handlers, ^{
-				for (MTLCommandBufferHandler h in scheduled)
-					h(self);
-			});
+		void (^scheduledNow)(void) = ^{
+			self->_status = MTLCommandBufferStatusScheduled;
+			dispatch_group_leave(self->_scheduledGroup);
+			NSArray<MTLCommandBufferHandler> *scheduled = [self->_scheduled copy];
+			// given up once run, as the completed ones: a handler holding its command buffer (iTerm2's) kept it, its set*Bytes buffers and
+			// its ops alive for good, 52 small buffers a frame, until the client's buffer quota ran out and iTerm2 crashed (2026-11-21)
+			[self->_scheduled removeAllObjects];
+			if (scheduled.count)
+				dispatch_async(handlers, ^{
+					for (MTLCommandBufferHandler h in scheduled)
+						h(self);
+				});
+		};
+		// A buffer that drew into shadows (surfaces the card cannot draw in place) is scheduled only once their pixels are back in the
+		// surfaces: iTerm2 presents its drawable when waitUntilScheduled returns (presentsWithTransaction), and WindowServer composed the
+		// surface as the frame before left it: the end of the text vanished now and then and came back (2026-11-21).
+		const BOOL shadowsDrawn = self->_drawnShadows.count > 0;
+		if (!shadowsDrawn)
+			scheduledNow();
 		NSError *drained = [device drainGfx];
 		self->_error = why ?: drained;
 		for (RDNA4MTLTexture *t in self->_drawnShadows)   // the draws done: their pixels into the surfaces
 			[t writeBack];
 		[self->_drawnShadows removeAllObjects];
+		if (shadowsDrawn)
+			scheduledNow();
 		const uint64_t done = nowUs();
 		statAdd(kStatRunUs, done - started);
 		uint64_t vblNs = 0;   // the kext's last VBL event on display 0 (the same clock): where in the frame this one was made, committed, done
