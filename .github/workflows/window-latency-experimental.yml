@@ -1,0 +1,70 @@
+name: Build experimental window-latency PVGPU driver
+
+on:
+  push:
+    tags:
+      - "tahoe-exp-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-experimental:
+    runs-on: macos-26-intel
+    timeout-minutes: 60
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Record build environment
+        run: |
+          sw_vers
+          uname -a
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          test "$(uname -m)" = "x86_64"
+
+      - name: Run host-side regression tests
+        run: make test
+
+      - name: Fetch firmware blobs
+        run: tools/build/fetch-firmware.sh
+
+      - name: Build experimental PVGPU kext
+        run: |
+          make VERSION=0.3.3 PVGPU=1 kext
+          KEXT="Build/AMDRadeonRDNA4-0.3.3-RELEASE/AMDRadeonRDNA4.kext"
+          test -d "$KEXT"
+          ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$KEXT/Contents/Info.plist")
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$KEXT/Contents/Info.plist")
+          test "$ID" = "com.hackintosh.AMDRadeonRDNA4"
+          test "$VERSION" = "0.3.3"
+          file "$KEXT/Contents/MacOS/AMDRadeonRDNA4"
+          lipo -archs "$KEXT/Contents/MacOS/AMDRadeonRDNA4" | grep -qw x86_64
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$KEXT" "dist/AMDRadeonRDNA4-${GITHUB_REF_NAME}-PVGPU-EXPERIMENTAL.zip"
+          shasum -a 256 "dist/AMDRadeonRDNA4-${GITHUB_REF_NAME}-PVGPU-EXPERIMENTAL.zip" > "dist/AMDRadeonRDNA4-${GITHUB_REF_NAME}-PVGPU-EXPERIMENTAL.zip.sha256"
+
+      - name: Publish experimental prerelease
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "AMDRadeonRDNA4 ${{ github.ref_name }} (PVGPU experimental)"
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            **Experimental PVGPU build for macOS Tahoe window/compositor latency investigation.**
+
+            This is separate from the regular PVGPU=0 release. It includes additional
+            per-present timing counters; it does not yet change synchronization policy
+            or claim to fix window animation stalls.
+
+            CI compilation and host-side tests do not establish hardware compatibility.
+            This build has not been certified on macOS Tahoe 26.7.3 or an RX 9070 XT.
+            Keep a known-good boot entry and do not treat this as a production driver.
+          files: |
+            dist/AMDRadeonRDNA4-${{ github.ref_name }}-PVGPU-EXPERIMENTAL.zip
+            dist/AMDRadeonRDNA4-${{ github.ref_name }}-PVGPU-EXPERIMENTAL.zip.sha256
