@@ -2774,6 +2774,10 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 	b.hostDma = dma;
 	b.hostMap = map;
 	b.hostUser = map->getAddress();
+	/* Charge pinned memory before the GPU mapping can become unsafe. A failed
+	 * rollback quarantines this backing, so its quota charge must survive too. */
+	c->hostBytes += rounded;
+	hostBytesTotal += rounded;
 	if (!b.hostUser || !b.va ||
 	    b.va + rounded < b.va || b.va + rounded > GpuVm::kVaEnd ||
 	    !vmMapHost(*c, b.va, pageBuses, rounded,
@@ -2788,6 +2792,10 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 		if (b.va)
 			vaGive(*c, b.va, rounded);
 		releaseHost(b);
+		if (c->hostBytes >= rounded)
+			c->hostBytes -= rounded;
+		if (hostBytesTotal >= rounded)
+			hostBytesTotal -= rounded;
 		b.owner = nullptr;
 		return kIOReturnNoMemory;
 	}
@@ -2801,11 +2809,13 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 		}
 		vaGive(*c, b.va, rounded);
 		releaseHost(b);
+		if (c->hostBytes >= rounded)
+			c->hostBytes -= rounded;
+		if (hostBytesTotal >= rounded)
+			hostBytesTotal -= rounded;
 		b.owner = nullptr;
 		return kIOReturnNotResponding;
 	}
-	c->hostBytes += rounded;
-	hostBytesTotal += rounded;
 	handle = makeHandle(slot, b.gen);
 	gpu = b.va;
 	user = b.hostUser;
