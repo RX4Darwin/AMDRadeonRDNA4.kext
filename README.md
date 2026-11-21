@@ -193,6 +193,7 @@ default).
 | `rdna4-boot4k=0` | An HDMI boot display behind a passive DP++ adapter stays at what the firmware lit. |
 | `rdna4-dpdual-khz=<kHz>` | The TMDS clock a passive DP++ adapter is taken to carry. |
 | `rdna4-accel=0` | WindowServer not on the driver's own accelerator (default 4; after a boot where it did not survive, the next boot leaves it out). |
+| `rdna4-accelgl=0` | OpenGL in software on the driver's own accelerator (default 1: Apple's GL-on-Metal renderer on the driver's Metal device; `sysctl debug.rdna4_accelgl` switches it for apps started afterwards). |
 | `rdna4-compute=<0-7>` | The compute bring-up stage (default 7, with the runtime; 3: the power-management firmware and the display clocks only; `0` off). |
 | `rdna4-gfx=0`, `rdna4-vm=0` | No graphics ring; no address space per client (both needed for Metal). |
 | `rdna4-pvgpu=1` | The paravirtual GPU on the card (`make PVGPU=1` builds): Metal, OpenGL, Vulkan through MoltenVK (with `rdna4-accel=0`). |
