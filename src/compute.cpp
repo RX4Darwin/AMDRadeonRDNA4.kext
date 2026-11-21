@@ -592,9 +592,8 @@ void RDNA4Compute::resumeMain(void *arg, wait_result_t) {
 		return;
 	}
 	const bool stopped = !self->bringupStepAllowed("resume reset");
-	if (!stopped)
-	self->resetRuntimeForResume();
-	if (!stopped)
+	const bool reset = !stopped && self->resetRuntimeForResume();
+	if (reset)
 		self->runStages();
 	self->endBringup();
 	if (self->rtLock) {
