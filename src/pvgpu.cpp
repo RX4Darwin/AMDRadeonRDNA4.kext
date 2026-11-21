@@ -887,6 +887,7 @@ private:
 	uint64_t mPresentCapacityNs { 0 }, mPresentCapacityMaxNs { 0 }, mPresentCapacityCalls { 0 };
 	// Experimental low-latency policy: skip a present rather than block the host work loop.
 	uint64_t mPresentBusyDrops { 0 }, mPresentCapacityDrops { 0 };
+	uint64_t mPresentBusyDropsByPort[kScanoutPorts] {}, mPresentCapacityDropsByPort[kScanoutPorts] {};
 	// Time spent inside rtSubmitGfxIb itself, separate from explicit retry delays.
 	uint64_t mSubmitRuntimeNs { 0 }, mSubmitRuntimeMaxNs { 0 }, mSubmitRuntimeCalls { 0 };
 	uint64_t mSubmitRuntimeOver250us { 0 }, mSubmitRuntimeOver1ms { 0 };
@@ -8307,6 +8308,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	// present will retry after the previous copy completes. No in-flight resource is reused.
 	if (sm.fence && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(sm.fence))) {
 		mPresentBusyDrops++;
+		mPresentBusyDropsByPort[port]++;
 		return true;
 	}
 
@@ -8425,6 +8427,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 		// present another frame. Preserve all existing fences and retry next frame.
 		if (mPending >= kInFlight) {
 			mPresentCapacityDrops++;
+			mPresentCapacityDropsByPort[port]++;
 			return true;
 		}
 	}
@@ -9024,9 +9027,14 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	if (mPresentCapacityCalls)
 		pvstat("host: present:   in-flight capacity checks %llu, average %llu us, max %llu us",
 		       mPresentCapacityCalls, mPresentCapacityNs / mPresentCapacityCalls / 1000, mPresentCapacityMaxNs / 1000);
-	if (mPresentBusyDrops || mPresentCapacityDrops)
+	if (mPresentBusyDrops || mPresentCapacityDrops) {
 		pvstat("host: present:   nonblocking frame drops: head busy %llu, queue full %llu",
 		       mPresentBusyDrops, mPresentCapacityDrops);
+		for (uint32_t port = 0; port < kScanoutPorts; port++)
+			if (mPresentBusyDropsByPort[port] || mPresentCapacityDropsByPort[port])
+				pvstat("host: present:     port %u: head busy %llu, queue full %llu", port,
+				       mPresentBusyDropsByPort[port], mPresentCapacityDropsByPort[port]);
+	}
 	if (mSubmitBusyExhausted || mSubmitNotReadyExhausted || mSubmitFailed)
 		pvstat("host: render:   GPU submit failures: busy timeout %u, ring not-ready timeout %u, other errors %u",
 		       mSubmitBusyExhausted, mSubmitNotReadyExhausted, mSubmitFailed);
@@ -9201,6 +9209,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mPresentFenceWaitNs = mPresentFenceWaitMaxNs = mPresentFenceWaitCalls = 0;
 	mPresentCapacityNs = mPresentCapacityMaxNs = mPresentCapacityCalls = 0;
 	mPresentBusyDrops = mPresentCapacityDrops = 0;
+	memset(mPresentBusyDropsByPort, 0, sizeof(mPresentBusyDropsByPort));
+	memset(mPresentCapacityDropsByPort, 0, sizeof(mPresentCapacityDropsByPort));
 	mSubmitBusyMaxRetries = mSubmitNotReadyMaxMs = 0;
 	mSubmitBusyExhausted = mSubmitNotReadyExhausted = mSubmitFailed = 0;
 	mTickNs = mTickMaxNs = mTickCalls = mTickOver250us = mTickOver1ms = 0;
