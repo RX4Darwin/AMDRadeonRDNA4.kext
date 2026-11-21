@@ -299,25 +299,30 @@ uint32_t RDNA4Compute::vmAcquire(RtClient &c) {
 }
 
 // The client closes: every VMID it owns goes back to the pool with its context switched off, its IH LUT entry cleared and its TLB flushed.
-void RDNA4Compute::vmReleaseVmids(RtClient &c, bool releasePool) {
+bool RDNA4Compute::vmReleaseVmids(RtClient &c, bool releasePool) {
 	const uintptr_t owner = reinterpret_cast<uintptr_t>(&c);
-	for (uint32_t v = Vmid::kFirst; v <= Vmid::kLast; v++) {
-		if (vmPool.ownerOf(v) != owner)
-			continue;
-		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + v - 1 }, 0);
-		wr(IpDiscovery::HwOsssys, Reg { 0, v }, 0);
-		if (!vmInvalidate(v, "vmpool release")) {
-			/* A stale translation may still name memory the client is about to free.
-			 * Keep this hardware VMID unavailable until a GPU reset clears its TLB. */
-			SLOG("VMID %u: release invalidation failed; quarantining until GPU reset", v);
-			vmPool.quarantine(owner, v);
+	if (!releasePool) {
+		/* Disable and flush every VMID, but keep pool ownership until its page tables are
+		 * cleared. If even one flush fails, the caller must retain those tables. */
+		bool ok = true;
+		for (uint32_t v = Vmid::kFirst; v <= Vmid::kLast; v++) {
+			if (vmPool.ownerOf(v) != owner)
+				continue;
+			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + v - 1 }, 0);
+			wr(IpDiscovery::HwOsssys, Reg { 0, v }, 0);
+			if (!vmInvalidate(v, "vmpool quiesce")) {
+				SLOG("VMID %u: quiesce invalidation failed; quarantining until GPU reset", v);
+				vmPool.quarantine(owner, v);
+				ok = false;
+			}
 		}
+		return ok;
 	}
-	if (!releasePool)
-		return;                         // contexts are off and flushed, but keep the VMIDs owned until table teardown completes
+	/* The caller has already quiesced and flushed these contexts, then cleared their tables. */
 	uint32_t first = 0;
 	vmPool.forget(owner, true, first);
 	c.vmid = 0;
+	return true;
 }
 
 int RDNA4Compute::vmClientSlotByPasid(uint32_t pasid) const {
