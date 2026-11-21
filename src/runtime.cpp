@@ -4414,7 +4414,10 @@ void RDNA4Compute::powerWillSleep() {
 		recovery.recoveryWpoll = c.wpollVa;
 		recovery.recoveryProofAddress = c.fenceVa;
 		recovery.recoveryProofCpu = c.fenceCpu;
-		(void)drainQueue(c.pipe, c.queue, c.vmid, &recovery);
+		if (!drainQueue(c.pipe, c.queue, c.vmid, &recovery)) {
+			c.privateQueueDrainFailed = true;
+			RLOG("power: VMID %u queue drain unconfirmed; its allocations must survive resume", c.vmid);
+		}
 	}
 	if (ihActive)
 		ihStop();
@@ -4438,6 +4441,12 @@ bool RDNA4Compute::resetRuntimeForResume() {
 		 * still reference and leave the runtime unavailable until a real reset. */
 		RLOG("power: resume blocked: SDMA queue is still wedged; retaining runtime allocations and DMA buffers");
 		return false;
+	}
+	for (const RtClient &c : clients) {
+		if (c.active && c.privateQueueDrainFailed) {
+			RLOG("power: resume blocked: VMID %u private HQD never confirmed inactive; retaining its allocations", c.vmid);
+			return false;
+		}
 	}
 	for (RtBuffer &b : buffers) {
 		if (!b.owner)
