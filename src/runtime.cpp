@@ -2028,6 +2028,14 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 		uint32_t fill[Sdma::kFillDwords];
 		Sdma::constFill(fill, poolMc(table), 0, kVmTableBytes);
 		const bool zeroed = sdmaRun(fill, Sdma::kFillDwords, 2000);
+		if (!zeroed && sdmaWedged) {
+			/* The timed-out fill may still be writing this table allocation. Do not
+			 * race it with CPU fallback writes or return the destination to the heap. */
+			vmidUsed[vmid] = true;
+			quarantineLocked(owner, *c);
+			RLOG("vmid %u: initial page-table fill timed out; retaining table allocation until device reset", vmid);
+			return kIOReturnNotResponding;
+		}
 
 		memcpy(poolWc + table, c->tableShadow, zeroed ? 0x3000 : kVmTableBytes);
 		__builtin_ia32_sfence();
