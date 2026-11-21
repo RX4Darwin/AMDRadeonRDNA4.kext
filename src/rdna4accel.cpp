@@ -1241,7 +1241,7 @@ bool RDNA4Accel::showsFramebuffer(IORegistryEntry *fb)
 void RDNA4Accel::waitForWindowServer()
 {
 	uint32_t want = 0;
-	if (!PE_parse_boot_argn("rdna4-accel", &want, sizeof(want)) || want != 4)
+	if (!Trial::bootArg("rdna4-accel", want) || want != 4)
 		return;
 	rdna4Log("AMDRadeonRDNA4: accel: WindowServer opens the GPU wrangler: held until the accelerator is registered\n");
 	for (int ms = 0; ms < 60000 && !gBootDone; ms += 50)

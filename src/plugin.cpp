@@ -1751,7 +1751,7 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 #ifdef AMDRadeonRDNA4_PVGPU
 	{   // (pass-through unless our accelerator serves WindowServer)
 		uint32_t accel = 0;
-		gAccelCursor = PE_parse_boot_argn("rdna4-accel", &accel, sizeof(accel)) && accel == 4;
+		gAccelCursor = Trial::bootArg("rdna4-accel", accel) && accel == 4;
 		KernelPatcher::RouteRequest cursor[] {
 			{ "__ZN17IONDRVFramebuffer14setCursorImageEPv", wrapSetCursorImage, orgSetCursorImage },
 			{ "__ZN17IONDRVFramebuffer14setCursorStateEiib", wrapSetCursorState, orgSetCursorState },
@@ -1898,7 +1898,7 @@ void pluginStart() {
 		pvGpu = 0;
 	// A VM without the emulated RDNA4 device never reaches attach(). rdna4-pvgpu-delay: on the rig the default 25 s falls into the system volume's snapshot
 	// remount (~26 s), where freeze-watch.sh cannot write; a later publish comes after login, where a live kernel log over ssh sees what follows.
-	PE_parse_boot_argn("rdna4-pvgpu-delay", &pvDelay, sizeof(pvDelay));
+	(void)Trial::bootArg("rdna4-pvgpu-delay", pvDelay);
 	if (pvGpu)
 		RDNA4PvNub::publishLater(pvGpu, pvDelay ? pvDelay * 1000 : 25000);
 #endif

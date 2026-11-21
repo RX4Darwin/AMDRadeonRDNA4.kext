@@ -1561,7 +1561,7 @@ void RDNA4Device::dmubTrace(const char *tag) {
 	static int on = -1;
 	if (on < 0) {
 		uint32_t v = 0;
-		on = PE_parse_boot_argn("rdna4-dmubload", &v, sizeof(v)) && v;
+		on = Trial::bootArg("rdna4-dmubload", v) && v;
 	}
 	const uint32_t cw5 = 5 - 3;   // window 5's index in the CW3..6 register runs
 	const uint64_t mc = regReadDmu(2, kDmcubCw3Offset + 2 * cw5) |

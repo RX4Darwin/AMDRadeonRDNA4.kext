@@ -315,7 +315,7 @@ void routeGlPagesNow(KernelPatcher &patcher) {
 // On the rig AppleGPUWrangler took the nub with 0x030000 and with 0xff0000 alike (it follows the accelerator, not the class).
 uint32_t pvClass() {
 	uint32_t c = 0x030000;
-	PE_parse_boot_argn("rdna4-pvgpu-class", &c, sizeof(c));
+	(void)Trial::bootArg("rdna4-pvgpu-class", c);
 	return c & 0xffffff;
 }
 

@@ -56,9 +56,10 @@ bool RDNA4ComputeService::registerPowerManagement(IOService *provider) {
 // console (the native Metal device's apps, docs/native-metal-spike.md), only in a GPU address space of its own (start: rtClientIsolated) and
 // only with the selectors a graphics client needs (kLocalSelectors): without the VM a kernel runs in VMID0 and reaches all of VRAM. So is
 // WindowServer (_windowserver, uid 88: not the console user), for the native desktop.
+// The default since 2026-11-21 (the accelerated desktop's apps need it); rdna4-client-policy=root: root only.
 static bool localClientsAllowed() {
 	char policy[8] = {};
-	return PE_parse_boot_argn("rdna4-client-policy", policy, sizeof(policy)) && !strncmp(policy, "local", sizeof(policy));
+	return !PE_parse_boot_argn("rdna4-client-policy", policy, sizeof(policy)) || !strncmp(policy, "local", sizeof(policy));
 }
 
 bool RDNA4ComputeClient::initWithTask(task_t owningTask, void *securityToken, UInt32 type,

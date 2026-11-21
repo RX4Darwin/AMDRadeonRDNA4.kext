@@ -126,6 +126,35 @@ bool Trial::loaded()
 	return gLoaded;
 }
 
+/*
+ * The driver's defaults (2026-11-21): what the rig's accelerated desktop boots with, so an install needs no boot-args for them; the debug
+ * ones (rdna4-trace, the rdna4-gfxclient self-test) stay off. A boot-arg or a test's value wins (=0 turns one off). Also defaulted outside
+ * this table: rdna4-client-policy=local (userclient.cpp), rdna4-nativeheld=1 (the Metal bundle), rdna4-accel=4 for rdna4-iop. A VM test
+ * build has no card: none.
+ */
+static bool builtIn(const char *key, uint32_t &value)
+{
+	static const struct { const char *key; uint32_t value; } kDefaults[] = {
+#ifndef AMDRadeonRDNA4_VM_TEST
+		{"rdna4-compute", 7}, {"rdna4-gfx", 2}, {"rdna4-vm", 1}, {"rdna4-vmshared", 2}, {"rdna4-accel", 4},
+		{"rdna4-dmubload", 1}, {"rdna4-dcninit", 1}, {"rdna4-head2dp", 1},
+		{"rdna4-pvgpu-disp", 7}, {"rdna4-pvgpu-class", 0xff0000}, {"rdna4-pvgpu-delay", 5}, {"rdna4-pvfast", 1}, {"rdna4-nativews", 3},
+#endif
+		{nullptr, 0},
+	};
+	for (const auto &d : kDefaults)
+		if (d.key && !strcmp(d.key, key)) {
+			value = d.value;
+			return true;
+		}
+	return false;
+}
+
+bool Trial::bootArg(const char *key, uint32_t &value)
+{
+	return PE_parse_boot_argn(key, &value, sizeof(value)) || builtIn(key, value);
+}
+
 bool Trial::option(const char *key, uint32_t &value)
 {
 	if (PE_parse_boot_argn(key, &value, sizeof(value)))
@@ -133,5 +162,5 @@ bool Trial::option(const char *key, uint32_t &value)
 
 	load();
 
-	return gArmed && find(gText, key, value);
+	return (gArmed && find(gText, key, value)) || builtIn(key, value);
 }

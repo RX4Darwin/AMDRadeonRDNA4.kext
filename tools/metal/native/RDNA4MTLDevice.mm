@@ -1725,14 +1725,14 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 }
 @end
 
-// rdna4-nativeheld=1 in the boot arguments
+// rdna4-nativeheld: on unless the boot arguments say rdna4-nativeheld=0 (the driver's default since 2026-11-21, src/trial.cpp)
 static BOOL heldOn(void)
 {
 	static int on = -1;
 	if (on < 0) {
 		char args[1024] = {};
 		size_t n = sizeof args - 1;
-		on = !sysctlbyname("kern.bootargs", args, &n, NULL, 0) && strstr(args, "rdna4-nativeheld=1") != NULL;
+		on = sysctlbyname("kern.bootargs", args, &n, NULL, 0) || strstr(args, "rdna4-nativeheld=0") == NULL;
 	}
 	return on;
 }

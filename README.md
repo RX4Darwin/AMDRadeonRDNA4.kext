@@ -171,17 +171,13 @@ sudo userspace/rdna4-logd/install.sh                               # optional: e
 userspace/moltenvk/install.sh                                      # as yourself, for Vulkan apps through MoltenVK
 ```
 
-Boot-args (in OpenCore's `boot-args`):
-
-```
-rdna4-compute=7 rdna4-gfx=2 rdna4-vm=1 rdna4-pvgpu=1 rdna4-pvgpu-disp=7 rdna4-pvgpu-delay=5
-```
-
-Without these boot-args (or with a `make PVGPU=0` build, which leaves the paravirtual code out) the driver runs the displays and macOS draws in software.
+No boot-args are needed: the driver's defaults (`src/trial.cpp`) are the accelerated desktop, WindowServer and Metal on the driver's
+own accelerator. For Apple's paravirtual GPU on the card instead (the desktop before 0.4.0), set `rdna4-accel=0 rdna4-pvgpu=1`.
 
 ## Boot arguments
 
-All without a leading dash (`name=1`). The features above are on by default; these turn them off or change them.
+All without a leading dash (`name=1`). The features above are on by default; these turn them off or change them (`=0` turns off any
+default).
 
 | Boot-arg | Effect |
 |----------|--------|
@@ -189,27 +185,29 @@ All without a leading dash (`name=1`). The features above are on by default; the
 | `rdna4-modeset=0` | Only the boot mode; no mode switching. |
 | `rdna4-head2=0` | No displays beside the boot display. |
 | `rdna4-heads=<n>` | How many displays beside the boot display (1-3; default one per connector). |
-| `rdna4-head2dp=1` | Also displays on DisplayPort beside the boot display (off by default: one plugged in after boot gets no paravirtual display). |
+| `rdna4-head2dp=0` | No displays on DisplayPort beside the boot display (one plugged in after boot gets no paravirtual display). |
 | `rdna4-hotplug=0` | No hot-plug of the second display (`1`: only log its pin). |
 | `rdna4-syssleep=0` | macOS refuses system sleep (as for any unsupported card). |
 | `rdna4-nosleep=1` | Display sleep does nothing (the screen stays on). |
 | `rdna4-noedid=1` | No EDID read (for a monitor that misbehaves on DDC). |
 | `rdna4-boot4k=0` | An HDMI boot display behind a passive DP++ adapter stays at what the firmware lit. |
 | `rdna4-dpdual-khz=<kHz>` | The TMDS clock a passive DP++ adapter is taken to carry. |
-| `rdna4-compute=<0-7>` | The compute bring-up stage (default 3: the power-management firmware and the display clocks; `7` with the runtime; `0` off). |
-| `rdna4-gfx=2`, `rdna4-vm=1` | The graphics ring, and an address space per client: needed for Metal. |
-| `rdna4-pvgpu=1` | The paravirtual GPU on the card (`make PVGPU=1` builds): Metal, OpenGL, Vulkan through MoltenVK. |
-| `rdna4-pvgpu-disp=7` | The displays are the paravirtual GPU's (WindowServer composites on the card). |
-| `rdna4-pvgpu-delay=<s>` | Publish the paravirtual GPU this many seconds after the plugin starts (default 25). |
+| `rdna4-accel=0` | WindowServer not on the driver's own accelerator (default 4; after a boot where it did not survive, the next boot leaves it out). |
+| `rdna4-compute=<0-7>` | The compute bring-up stage (default 7, with the runtime; 3: the power-management firmware and the display clocks only; `0` off). |
+| `rdna4-gfx=0`, `rdna4-vm=0` | No graphics ring; no address space per client (both needed for Metal). |
+| `rdna4-pvgpu=1` | The paravirtual GPU on the card (`make PVGPU=1` builds): Metal, OpenGL, Vulkan through MoltenVK (with `rdna4-accel=0`). |
+| `rdna4-pvgpu-disp=<0-7>` | Which of the displays are the paravirtual GPU's (default 7: all; WindowServer composites on the card). |
+| `rdna4-pvgpu-delay=<s>` | Publish the paravirtual GPU this many seconds after the plugin starts (default 5). |
 | `rdna4-pvcursor=0` | No hardware cursor (WindowServer draws the pointer into each frame). |
 | `rdna4-pvgl=0` | OpenGL in software. |
 | `rdna4-pvmac2=1` | The paravirtual device reports Mac GPU family 2: WebGL in Safari (Chrome's does not run yet). |
 | `rdna4-pvscaled=0` | No scaled modes larger than the monitor. |
-| `rdna4-pvfast=1` | Each size at its fastest refresh, not the one nearest 60 Hz. |
-| `rdna4-dmubload=1`, `rdna4-dcninit=1`, `rdna4-coldboot=1` | The display firmware of the kext's own; the display engine started from nothing; a real cold start from a reset card. |
+| `rdna4-pvfast=0` | Each size at the refresh nearest 60 Hz, not its fastest. |
+| `rdna4-dmubload=0`, `rdna4-dcninit=0`, `rdna4-coldboot=1` | The firmware's display firmware, not the kext's own; the display engine as the firmware left it, not started from nothing; a real cold start from a reset card. |
 | `rdna4-dispclk=<MHz>`, `rdna4-dcfclk=<MHz>`, `rdna4-uclk=<MHz>`, `rdna4-fclk=<MHz>` | The clock minimums asked of the power-management firmware (`rdna4-dispclk=0`: clocks left alone, no 4K). |
-| `rdna4-vmshared=<0-2>`, `rdna4-hang=0` | Where compute jobs run (1, the default: two shared kernel queues); recovery from a hung job off. |
-| `rdna4-client-policy=local` | The compute runtime's client for the logged-in user too, not only root (the native Metal device's apps): only in a GPU address space of its own (`rdna4-vm=1`) and without the display, sensor and power calls. |
+| `rdna4-vmshared=<0-2>`, `rdna4-hang=0` | Where compute jobs run (2, the default: address spaces from a pool, one per app; 1: two shared kernel queues and eight address spaces); recovery from a hung job off. |
+| `rdna4-client-policy=root` | The compute runtime's client for root only. By default also for the logged-in user and WindowServer (the native Metal device's apps): only in a GPU address space of its own (`rdna4-vm=1`) and without the display, sensor and power calls. |
+| `rdna4-nativews=0`, `rdna4-nativeheld=0` | With the paravirtual GPU: Apple's Metal plug-in for WindowServer (default 3: the driver's own); WindowServer's targets not held in VRAM. |
 | `rdna4-cursor=1` | A hardware cursor without the paravirtual GPU (through Apple's framebuffer driver). |
 | `rdna4-trace=1` | Log every request Apple's framebuffer driver makes of ours. |
 | `-rdna4dbg` | Lilu's debug logging for the plugin (Lilu DEBUG builds). |

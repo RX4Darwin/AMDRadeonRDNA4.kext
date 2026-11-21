@@ -46,7 +46,7 @@ static int pvHeads(void)
 	return 0;
 }
 
-/* Whether this boot's WindowServer is to run on our own accelerator (the boot-arg rdna4-accel=4, src/rdna4accel.cpp): its displays
+/* Whether this boot's WindowServer is to run on our own accelerator (rdna4-accel=4, the driver's default: src/trial.cpp): its displays
  * present through our display pipes, which only IOPresentment drives too. Without it CoreDisplay took the framebuffers' legacy path
  * and composited the login window's display in software, where Core Animation's flatten path asserted (2026-11-21). */
 static int ownAccelerator(void)
@@ -54,7 +54,9 @@ static int ownAccelerator(void)
 	char args[1024] = "";
 	size_t len = sizeof(args) - 1;
 
-	return !sysctlbyname("kern.bootargs", args, &len, NULL, 0) && strstr(args, "rdna4-accel=4") != NULL;
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0))
+		return 0;
+	return !strstr(args, "rdna4-accel=") || strstr(args, "rdna4-accel=4");
 }
 
 /* useIOP now: 1 true, 0 false, -1 not set. */

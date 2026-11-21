@@ -22,6 +22,7 @@
 #include <libkern/c++/OSCollectionIterator.h>
 #include <sys/errno.h>
 #include <sys/sysctl.h>
+#include "trial.hpp"
 
 extern "C" {
 int proc_selfpid(void);
@@ -311,9 +312,9 @@ void RDNA4AccelCensus::setProvider(IOService *gpu)
 	PE_parse_boot_argn("rdna4-nativeapps", gNativeApps, sizeof(gNativeApps));
 	// rdna4-nativews=2 or 3: route from the boot on (debug.rdna4_nativemtl's values), at the paravirtual accelerator's first publication:
 	// before WindowServer makes its device. Our own service stays unpublished (the router needs none).
-	int route = 0;
-	if (PE_parse_boot_argn("rdna4-nativews", &route, sizeof(route)) && (route == 2 || route == 3)) {
-		gRoute = route;
+	uint32_t route = 0;
+	if (Trial::bootArg("rdna4-nativews", route) && (route == 2 || route == 3)) {
+		gRoute = static_cast<int>(route);
 		OSDictionary *match = IOService::serviceMatching("AppleParavirtAccelerator");
 		gPvNotifier = match ? IOService::addMatchingNotification(gIOFirstPublishNotification, match, pvPublished, nullptr) : nullptr;
 		OSSafeReleaseNULL(match);

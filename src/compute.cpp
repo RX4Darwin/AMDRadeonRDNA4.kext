@@ -128,7 +128,7 @@ uint32_t RDNA4Compute::requestedStage() {
 // (docs/vulkan-port.md sections 8 and 9).
 uint32_t RDNA4Compute::requestedVmShared() {
 	uint32_t mode = 1;
-	(void)PE_parse_boot_argn("rdna4-vmshared", &mode, sizeof(mode));
+	(void)Trial::bootArg("rdna4-vmshared", mode);
 	return mode > 2 ? 2 : mode;
 }
 
@@ -2083,7 +2083,7 @@ void RDNA4Compute::dmubWrite(void *ctx, uint32_t reg, uint32_t value) {
 // which dmubRing finds from the window registers.
 void RDNA4Compute::stageDmub() {
 	uint32_t on = 0;
-	if (!PE_parse_boot_argn("rdna4-dmubload", &on, sizeof(on)) || !on)
+	if (!Trial::bootArg("rdna4-dmubload", on) || !on)
 		return;
 #ifdef AMDRadeonRDNA4_NO_FIRMWARE
 	CLOG("dmub: this build carries no firmware");
