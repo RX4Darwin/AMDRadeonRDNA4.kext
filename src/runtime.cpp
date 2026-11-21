@@ -4356,10 +4356,17 @@ void RDNA4Compute::powerWillSleep() {
 	RLOG("power: quiesce complete; compute engines halted");
 }
 
-void RDNA4Compute::resetRuntimeForResume() {
+bool RDNA4Compute::resetRuntimeForResume() {
 	if (!rtLock)
-		return;
+		return false;
 	Locked g(rtLock);
+	if (sdmaWedged) {
+		/* A sleep/wake cycle is not proof that SDMA stopped. The queue can
+		 * retain its ring state across wake, so keep every allocation it may
+		 * still reference and leave the runtime unavailable until a real reset. */
+		RLOG("power: resume blocked: SDMA queue is still wedged; retaining runtime allocations and DMA buffers");
+		return false;
+	}
 	for (RtBuffer &b : buffers) {
 		if (!b.owner)
 			continue;
@@ -4417,21 +4424,10 @@ void RDNA4Compute::resetRuntimeForResume() {
 	presentActive = false;
 	presentOwner = nullptr;
 	rtWedged = false;
-	/* The device has reset: any old DMA can no longer touch the quarantined
-	 * bounce buffer or shared staging page, so release the retained mapping. */
-	if (bounceDma) {
-		bounceDma->clearMemoryDescriptor();
-		bounceDma->release();
-		bounceDma = nullptr;
-	}
-	OSSafeReleaseNULL(bounce);
-	bounceVa = nullptr;
-	bounceBus = 0;
-	sdmaWedged = false;
-	sdmaFence = 0;
 	rtReady = false;
 	rtGeneration++;
 	RLOG("power: old runtime buffers, heaps and VM contexts discarded; client objects retained as aborted");
+	return true;
 }
 
 // ---------------------------------------------------------------------------
