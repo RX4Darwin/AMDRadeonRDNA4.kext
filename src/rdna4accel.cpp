@@ -25,6 +25,7 @@
 #include "accelcensus.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
+#include "pvhooks.hpp"
 #include "translator.hpp"
 #include "iosurface.hpp"
 #include "pvscanout.hpp"
@@ -1260,14 +1261,22 @@ void RDNA4Accel::waitForWindowServer()
 		OSSafeReleaseNULL(svc);
 		OSSafeReleaseNULL(match);
 	}
-	// and each lit framebuffer's IODisplayConnect (its monitor as IOFramebuffer knows it): they came over 10 s late in some boots, and a
-	// framebuffer WindowServer opened without one got mode 0 and no display (the Samsung, run19 of 2026-11-21)
+	// and each lit framebuffer's IODisplayConnect (its monitor as IOFramebuffer knows it): IOFramebuffer::open makes them. One that
+	// WindowServer opened first got mode 0 and no display for half a minute (the Samsung, runs 19 and 29 of 2026-11-21: the boot
+	// framebuffer opened ahead, pvhooks.cpp, is the oldest IONDRV one, there a monitorless display nub's): opened here first.
 	uint32_t connectMs = 0, missing = 0;
 	for (; gFamilyClients && connectMs <= 15000; connectMs += 100) {
 		missing = 0;
 		eachFramebuffer([&](IORegistryEntry *e) {
 			auto *fb = OSDynamicCast(IOService, e);
-			missing += fb && isLit(fb) && !hasDisplayConnect(e);
+			if (fb && isLit(fb) && !hasDisplayConnect(e)) {
+				missing++;
+#ifdef AMDRadeonRDNA4_PVGPU
+				if (!connectMs)
+					rdna4Log("AMDRadeonRDNA4: accel: framebuffer %s 0x%llx: lit, no IODisplayConnect yet: opened (0x%x)\n", e->getName(),
+					         e->getRegistryEntryID(), PvHooks::openFramebuffer(fb));
+#endif
+			}
 			return true;
 		});
 		if (!missing)

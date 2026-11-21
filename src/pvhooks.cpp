@@ -149,7 +149,7 @@ void waitForParavirtDisplay()
 IOReturn wrapNewUserClient(void *fb, void *task, void *security, uint32_t type, void **handler)
 {
 	if (isClass(fb, kNdrvFramebuffer) && !PvScanout::known() && fbOpen) {
-		const IOReturn r = reinterpret_cast<IOReturn (*)(void *)>(fbOpen)(fb);
+		const IOReturn r = PvHooks::openFramebuffer(fb);
 
 		PLOG("opened framebuffer %p ahead of its first client (0x%x): the heads %s", fb, r,
 		     !PvScanout::known() ? "still undecided" : PvScanout::enabled() ? "are the paravirtual displays" : "are macOS's displays");
@@ -306,7 +306,7 @@ int wrapServiceOpen(void *service, void *task, uint32_t type, uint64_t ndr, void
 			// this. Opened ahead here as wrapNewUserClient does for an undecided one, or the wait below would wait for itself.
 			if (!PvScanout::known() && fbOpen)
 				if (IOService *boot = oldestNdrvFramebuffer()) {
-					const IOReturn r = reinterpret_cast<IOReturn (*)(void *)>(fbOpen)(boot);
+					const IOReturn r = PvHooks::openFramebuffer(boot);
 					PLOG("opened the boot framebuffer %p ahead of WindowServer's GPU wrangler (0x%x)", boot, r);
 					boot->release();
 				}
@@ -527,6 +527,11 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index,
 }
 
 } /* namespace */
+
+int PvHooks::openFramebuffer(void *fb)
+{
+	return fbOpen && fb ? reinterpret_cast<IOReturn (*)(void *)>(fbOpen)(fb) : kIOReturnNotReady;
+}
 
 void PvHooks::hideFramebuffers(void *fb)
 {
