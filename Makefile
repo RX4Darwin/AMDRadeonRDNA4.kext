@@ -247,7 +247,7 @@ metal-helper:
 # into $(BUILD)/vk-app the first time; needs cmake). docs/todo-vulkantest.md has the commands.
 vkcube: mesa
 	$(VULKAN)/build-app.sh $(BUILD)/vk-app $(RADV_BUILT) $(BIN)
-	@echo "Built $(BIN)/vkcube with libvulkan.dylib and vulkan/icd.d/radeon_icd.json beside it"
+	@echo "Built $(BIN)/vkcube with libvulkan.dylib and vulkan/icd.d/radeon_icd.json beside it, and $(BIN)/vkcube.app"
 
 # E1 trigger (docs/metal-spike.md): Objective-C, runs in Recovery next to rdna4-run.
 $(BIN)/rdna4-census: $(CENSUS)/census.m
