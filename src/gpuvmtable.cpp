@@ -187,9 +187,9 @@ bool treeMapVram(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, ui
 	uint64_t *pt = nullptr;
 	uint32_t ptId = 0;
 	uint64_t ptKey = ~0ull;
+	/* The complete VA interval was checked above, before treePath can allocate
+	 * directories. Keep the mapping loop free of late range failures. */
 	for (uint64_t at = va, phys = physical; at < end; at += GpuVm::kPageBytes, phys += GpuVm::kPageBytes) {
-		if (at < GpuVm::kVaStart || at >= GpuVm::kVaEnd)
-			return false;
 		if ((at >> 21) != ptKey) {
 			if (!treePath(t, at, true, pt, ptId)) {
 				/* A quota/allocation failure must not leave the prefix mapped.
