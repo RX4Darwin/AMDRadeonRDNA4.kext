@@ -41,6 +41,8 @@ jobs:
         run: tools/build/fetch-firmware.sh
 
       - name: Build experimental PVGPU kext
+        env:
+          SAFE_LABEL: ${{ steps.ref-label.outputs.safe }}
         run: |
           make VERSION=0.3.4 PVGPU=1 kext
           KEXT="Build/AMDRadeonRDNA4-0.3.4-RELEASE/AMDRadeonRDNA4.kext"
@@ -52,7 +54,7 @@ jobs:
           file "$KEXT/Contents/MacOS/AMDRadeonRDNA4"
           lipo -archs "$KEXT/Contents/MacOS/AMDRadeonRDNA4" | grep -qw x86_64
           mkdir -p dist
-          LABEL="${{ steps.ref-label.outputs.safe }}"
+          LABEL="$SAFE_LABEL"
           ditto -c -k --sequesterRsrc --keepParent "$KEXT" "dist/AMDRadeonRDNA4-${LABEL}-PVGPU-EXPERIMENTAL.zip"
           shasum -a 256 "dist/AMDRadeonRDNA4-${LABEL}-PVGPU-EXPERIMENTAL.zip" > "dist/AMDRadeonRDNA4-${LABEL}-PVGPU-EXPERIMENTAL.zip.sha256"
 
