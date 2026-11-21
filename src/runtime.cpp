@@ -4245,8 +4245,11 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			 * the client's fence, and recover the queue (kill this VMID's waves) if they do not. */
 			vmOpTrace("release (shared)", c->vmid, c->pipe, c->queue);   // its jobs were waited for before its buffers went
 			rdna4Step("rtRelease: shared client, VM context off");
-			if (vmShared == 2)
-				vmReleaseVmids(*c, false); // context off, IH LUT cleared and flushed; keep ownership until page-table teardown succeeds
+			if (vmShared == 2 && !vmReleaseVmids(*c, false)) {
+				RLOG("vmid %u: pooled VMID quiesce failed; retaining page tables", c->vmid);
+				quarantineLocked(owner, *c);
+				return;
+			} // context off and flushed; keep ownership until page-table teardown succeeds
 			else
 				wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + c->vmid - 1 }, 0);   // the context goes off before its tables do
 		} else {
