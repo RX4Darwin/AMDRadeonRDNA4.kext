@@ -3950,6 +3950,10 @@ static void abortStack(int sig)
 
 - (BOOL)supportsRaytracing { return YES; }
 - (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count == 1; }
+// 1, 2 and 4 samples (2x/4x MSAA textures and resolves). Apple's GL-on-Metal renderer asks the private supportsSampleCount: (answered NO
+// as a missing selector, it made no context: "invalid memory allocation", 2026-11-21).
+- (BOOL)supportsTextureSampleCount:(NSUInteger)count { return count == 1 || count == 2 || count == 4; }
+- (BOOL)supportsSampleCount:(NSUInteger)count { return [self supportsTextureSampleCount:count]; }
 
 // A texture over the caller's memory (Core Animation's tiled textures), as a buffer of it and a linear texture over that.
 - (id<MTLTexture>)newTiledTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d
@@ -4240,6 +4244,11 @@ static void abortStack(int sig)
 }
 
 - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count
+{
+	return [self newCommandQueue];
+}
+// (Apple's GL-on-Metal renderer makes its queue so: _MTLDevice's answer was nil and the GL context failed, 2026-11-21)
+- (id<MTLCommandQueue>)newCommandQueueWithDescriptor:(id)descriptor   // (MTLCommandQueueDescriptor: macOS 15)
 {
 	return [self newCommandQueue];
 }
