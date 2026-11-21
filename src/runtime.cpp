@@ -507,9 +507,12 @@ RDNA4Compute::RtClient *RDNA4Compute::vmClientFor(const void *owner) {
 IOReturn RDNA4Compute::ownerStateLocked(const void *owner) const {
 	if (!rtReady)
 		return kIOReturnNotReady;
-	for (const RtClient &c : clients)
+	for (const RtClient &c : clients) {
+		if (c.quarantinedOwner == owner)
+			return kIOReturnNotResponding;
 		if (c.owner == owner && c.active)
 			return c.aborted ? kIOReturnAborted : kIOReturnSuccess;
+	}
 	return kIOReturnSuccess;
 }
 
@@ -4218,6 +4221,7 @@ void RDNA4Compute::quarantineLocked(const void *owner, RtClient &c) {
 		}
 	}
 
+	c.quarantinedOwner = owner;
 	c.owner = &kQuarantined;
 	RLOG("vmid %u: client quarantined: %u buffer(s), %u program(s), its page tables and VMID kept, not reused", c.vmid, nb, np);
 }
