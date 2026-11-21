@@ -92,7 +92,8 @@ constexpr uint32_t kMaxLogLines = 30000;   // M1 reads the protocol from this lo
 constexpr uint32_t kTargetId = 0xffffff;
 // A draw's state page (mGfxMisc): the stages' tables in its first 0x1000 bytes, then its textures' levels (RDNA4_MTLC_LEVEL_FIRST)
 constexpr uint32_t kLevelsAt = 0x1000, kMiscPage = 0x5000;
-static_assert(kLevelsAt + RDNA4_MTLC_LEVEL_STRIDE * (RDNA4_MTLC_LEVELS - 2) + 0x400 + 32 * 16 <= kMiscPage, "the levels fit the state page");
+static_assert(kLevelsAt + RDNA4_MTLC_LEVEL_STRIDE * (RDNA4_MTLC_LEVELS - 2) + 0x400 + 32 * 16 <= 0x400 + RDNA4_MTLC_TABLE_TEXTURES_HIGH, "the levels end before textures 16-30");
+static_assert(0x800 + RDNA4_MTLC_TEXTURE_AT(RDNA4_MTLC_TEXTURES) <= kMiscPage, "textures 16-30 fit the state page");
 static_assert(0x400 + RDNA4_MTLC_TABLE_TEXTURES + RDNA4_MTLC_LEVEL_FIRST == kLevelsAt, "level 1 of the vertex stage's texture 0");
 // GpuCoreCount: the compute units of the card, 64 on the RX 9070 XT, 56 on
 // the RX 9070 and 48 on the RX 9070 GRE (sku.hpp). From the product
@@ -443,7 +444,7 @@ public:
 	uint32_t runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
 	uint32_t clearAttachment(uint32_t task, const uint8_t *p);
 	uint32_t viewParent(uint32_t task, uint32_t id);
-	struct Bindings { uint32_t buffer[RDNA4_MTLC_MAX_BUFFERS]; uint64_t offset[RDNA4_MTLC_MAX_BUFFERS]; uint32_t texture[16], sampler[16]; };   // by Metal index (0 = none)
+	struct Bindings { uint32_t buffer[RDNA4_MTLC_MAX_BUFFERS]; uint64_t offset[RDNA4_MTLC_MAX_BUFFERS]; uint32_t texture[RDNA4_MTLC_TEXTURES], sampler[16]; };   // by Metal index (0 = none)
 	// A draw: Metal's primitive type, first vertex, vertices (indices), instances, base instance, and for an indexed draw the index buffer's
 	// resource id, offset and index size (bytes; 0: not indexed).
 	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes, blendColor[4]; uint64_t viewport[6]; bool viewportSet;
@@ -478,9 +479,9 @@ public:
 	bool textureSource(uint32_t task, uint32_t id, TextureSource &out, uint32_t level = 0);
 	bool readTextureRow(uint32_t task, const TextureSource &src, uint32_t y, uint8_t *dst, uint32_t bytes);
 	int inkedBytes(uint32_t task, const TextureSource &src, uint32_t bpp);
-	bool stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName,
-	                   bool writes, uint32_t texturesWritten = 0);
-	bool releaseTextures(uint32_t task, StagedTexture (&staged)[16], bool copyBack);
+	bool stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[RDNA4_MTLC_TEXTURES], bool talk, const char *stageName,
+	                   bool writes, uint32_t texturesWritten = 0, unsigned textures = RDNA4_MTLC_TEXTURES);
+	bool releaseTextures(uint32_t task, StagedTexture (&staged)[RDNA4_MTLC_TEXTURES], bool copyBack);
 	void levelImages(uint32_t task, const Bindings &bound, const uint32_t *table, uint32_t *levels);
 	bool mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t &handle, uint64_t &gpu, bool write = false);
 	bool mapGuestPages(uint32_t task, uint64_t first, uint64_t count, bool write, uint64_t &handle, uint64_t &gpu);
@@ -3280,8 +3281,9 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		memcpy(&count, payload + 4, 4);
 		const bool compute = id == 0x0ce || id == 0x0cc;
 		RDNA4PvHost::Bindings &g = compute ? t->compute : t->stage[id == 0x072 || id == 0x070];
-		uint32_t *to = id == 0x072 || id == 0x081 || id == 0x0ce ? g.texture : g.sampler;
-		for (uint32_t k = 0; k < count && first + k < 16 && 8 + 4 * (k + 1) <= bytes; k++)
+		const bool textures = id == 0x072 || id == 0x081 || id == 0x0ce;
+		uint32_t *to = textures ? g.texture : g.sampler;
+		for (uint32_t k = 0; k < count && first + k < (textures ? RDNA4_MTLC_TEXTURES : 16) && 8 + 4 * (k + 1) <= bytes; k++)
 			memcpy(&to[first + k], payload + 8 + 4 * k, 4);
 	} else if ((id == 0x0cf || id == 0x07e || id == 0x06f) && bytes >= 12) {   // the set...BufferOffset of each: {u32 index, u64 offset}
 		RDNA4PvHost::Bindings &g = id == 0x0cf ? t->compute : t->stage[id == 0x06f];
@@ -4545,7 +4547,7 @@ bool RDNA4PvHost::levelRange(uint32_t task, uint32_t id, uint32_t level, uint64_
 void RDNA4PvHost::levelImages(uint32_t task, const Bindings &bound, const uint32_t *table, uint32_t *levels)
 {
 	for (uint32_t k = 0; k < 16; k++) {
-		const uint32_t *before = table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4;
+		const uint32_t *before = table + RDNA4_MTLC_TEXTURE_AT(k) / 4;
 		const uint32_t id = bound.texture[k];
 
 		for (uint32_t level = 1; level < RDNA4_MTLC_LEVELS; level++) {
@@ -4701,20 +4703,20 @@ int RDNA4PvHost::inkedBytes(uint32_t task, const TextureSource &src, uint32_t bp
 
 // `writes`: the shader may write its textures (a kernel, or a fragment shader without a colour output); those with
 // MTLTextureUsageShaderWrite are then copied back after it. CoreAnimation makes its textures with that usage and draws only read them.
-bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName,
-                                bool writes, uint32_t texturesWritten) {
+bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[RDNA4_MTLC_TEXTURES], bool talk, const char *stageName,
+                                bool writes, uint32_t texturesWritten, unsigned textures) {
 	bool ok = true;
-	for (unsigned k = 0; k < 16 && ok; k++) {
+	for (unsigned k = 0; k < textures && ok; k++) {   // textures: the table's (a kernel's has 0-15)
 		const uint32_t id = bound.texture[k];
 		TextureSource src;
 		if (!id) {   // a 1x1 texel of the spare buffer: an image instruction on an all-zero T# can stall the texture unit
-			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, mGfxSpare.gpu, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 1, 1, 64);
+			linearImage(table + RDNA4_MTLC_TEXTURE_AT(k) / 4, mGfxSpare.gpu, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 1, 1, 64);
 			continue;
 		}
 		bool earlier = false;   // the same texture in an earlier slot: its T#
 		for (unsigned j = 0; j < k && !earlier; j++)
 			if ((earlier = bound.texture[j] == id))
-				memcpy(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * j) / 4, 32);
+				memcpy(table + RDNA4_MTLC_TEXTURE_AT(k) / 4, table + RDNA4_MTLC_TEXTURE_AT(j) / 4, 32);
 		if (earlier)
 			continue;
 
@@ -4731,7 +4733,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		// Not a texture at all: a binding left from an earlier encoder whose id was used again (Xgc's slot 3 named a function), which the
 		// shader does not sample. The spare texel as for no binding; refused, it took the whole draw with it.
 		if (!ok && src.type != 2 && src.type != 3 && src.type != 5) {
-			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, mGfxSpare.gpu, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 1, 1, 64);
+			linearImage(table + RDNA4_MTLC_TEXTURE_AT(k) / 4, mGfxSpare.gpu, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 1, 1, 64);
 			ok = true;
 			continue;
 		}
@@ -4773,7 +4775,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		if (zb) {
 			ok = true;
 			waitDraws();
-			msaaImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, zb->gpu, 22, 4 | 1u << 9, w, h, static_cast<uint32_t>(__builtin_ctz(zb->samples)));
+			msaaImage(table + RDNA4_MTLC_TEXTURE_AT(k) / 4, zb->gpu, 22, 4 | 1u << 9, w, h, static_cast<uint32_t>(__builtin_ctz(zb->samples)));
 			continue;
 		}
 		if (talk)
@@ -4833,14 +4835,14 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		                                   : mapGuest(task, src.va, used, out[k].handle, gpu, shaderWrites))) {
 			out[k].va = 0;   // nothing to copy back: the card writes the guest's memory itself
 			out[k].writable = false;
-			image(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, h == 1 ? w : rowBytes / fm->bpp);
+			image(table + RDNA4_MTLC_TEXTURE_AT(k) / 4, gpu, h == 1 ? w : rowBytes / fm->bpp);
 			mInPlace++;
 			continue;
 		}
 
 		// Through a shadow; not one the shader writes (copied back after the draw as before).
 		if (shadowed || (!shaderWrites && !surfaceWrites && !(gInPlace & 16) && !large && shadowTexture(task, id, src, fm->bpp, gpu, shadowPitch))) {
-			uint32_t *t = table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4;
+			uint32_t *t = table + RDNA4_MTLC_TEXTURE_AT(k) / 4;
 
 			if (array1d)
 				linearArray1d(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, depth);
@@ -4930,13 +4932,13 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			out[k].writable = false;
 		}
 		if (array1d)
-			linearArray1d(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, depth);
+			linearArray1d(table + RDNA4_MTLC_TEXTURE_AT(k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, depth);
 		else if (array2d)
-			linearArray2d(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
+			linearArray2d(table + RDNA4_MTLC_TEXTURE_AT(k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 		else if (depth > 1)
-			linearVolume(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
+			linearVolume(table + RDNA4_MTLC_TEXTURE_AT(k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 		else
-			image(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, pitchPx);
+			image(table + RDNA4_MTLC_TEXTURE_AT(k) / 4, gpu, pitchPx);
 	}
 	for (unsigned k = 0; k < 16 && ok; k++) {
 		const uint32_t id = bound.sampler[k];
@@ -5898,7 +5900,7 @@ void RDNA4PvHost::keyMapping(Mapping *m, IOMemoryDescriptor *memory, uint32_t ta
 
 // The textures stageTextures put in the runtime freed; with copyBack, the writable ones (MTLTextureUsageShaderWrite) first copied back into the
 // guest's texture, row by row. False if a copy back failed.
-bool RDNA4PvHost::releaseTextures(uint32_t task, StagedTexture (&staged)[16], bool copyBack) {
+bool RDNA4PvHost::releaseTextures(uint32_t task, StagedTexture (&staged)[RDNA4_MTLC_TEXTURES], bool copyBack) {
 	bool all = true;
 	for (StagedTexture &st : staged) {
 		if (!st.handle && !st.cpu)
@@ -6107,7 +6109,7 @@ uint32_t RDNA4PvHost::codeSlot(const uint8_t *vs, const uint8_t *ps, bool &fresh
 }
 
 // Whether a draw's staging leaves the CPU work after the card: a texture to copy back, or memory of its own to free.
-static bool ownsMemory(const RDNA4PvHost::StagedTexture (&staged)[2][16], const uint64_t (&handle)[2][RDNA4_MTLC_MAX_BUFFERS])
+static bool ownsMemory(const RDNA4PvHost::StagedTexture (&staged)[2][RDNA4_MTLC_TEXTURES], const uint64_t (&handle)[2][RDNA4_MTLC_MAX_BUFFERS])
 {
 	for (unsigned st = 0; st < 2; st++) {
 		for (const auto &t : staged[st])
@@ -6739,9 +6741,12 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// The stages' buffers, in place (each mapped once a draw, whole), and their tables at +0x400 (vertex) and +0x800 (fragment) of the misc page
 	// (the fence at +0).
 	static constexpr uint64_t kMaxBuffer = 64ull << 20;
-	static uint64_t misc[RDNA4_TRIRUN_PAGE / 8];   // a page: too large for the kernel stack
+	// The whole state page (too large for the kernel stack): its first page each draw, textures 16-30's T#s (RDNA4_MTLC_TABLE_TEXTURES_HIGH)
+	// when a shader samples one; the levels' T#s are a buffer of their own. Sized a page, the T#s of textures 16-30 were written past it
+	// into whatever followed: every paravirtual boot froze as WindowServer started drawing (2026-11-21).
+	static uint64_t misc[kMiscPage / 8];
 	uint64_t handle[2][RDNA4_MTLC_MAX_BUFFERS] = {}, base[2][RDNA4_MTLC_MAX_BUFFERS] = {};
-	memset(misc, 0, sizeof(misc));
+	memset(misc, 0, RDNA4_TRIRUN_PAGE);
 	for (unsigned st = 0; st < 2 && ok; st++)
 		for (unsigned k = 0; k < RDNA4_MTLC_MAX_BUFFERS && ok; k++) {
 			const uint32_t id = bound[st].buffer[k];
@@ -6771,7 +6776,17 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		}
 	memcpy(&misc[(0x400 + RDNA4_MTLC_TABLE_ATTRIBUTES) / 8], attributes, sizeof(attributes));
 	mPhaseNs[5] += nowNs() - targetAt;
-	StagedTexture stagedTextures[2][16] = {};
+	// Off the stack, as misc and levels: at [2][31] runDraw's frame came to 7.9 KB and a log line under it ran off the kernel stack (double
+	// fault, 2026-11-21). ponytail: one host, its work loop only.
+	static StagedTexture stagedTextures[2][RDNA4_MTLC_TEXTURES];
+	memset(stagedTextures, 0, sizeof(stagedTextures));
+	// a shader sampling a texture 16-30: its blob's "TXRD" record (after the values) has a bit 16-30 set
+	auto readsHigh = [](const Jit *j) {
+		const auto *h = reinterpret_cast<const uint32_t *>(j->gfx);
+		const uint64_t at = 8 + h[2] / 4 + 2ull * (h[7] & 0xffff);
+		return at + 2 <= j->gfxLen / 4 && h[at] == 0x44525854u /* "TXRD" */ && (h[at + 1] >> 16);
+	};
+	const bool highTextures = ok && (readsHigh(shader[1]) || readsHigh(shader[2]));
 	const uint64_t texturesFrom = nowNs();
 	mDrawTarget = target;
 	mReadsBatched = false;
@@ -7117,7 +7132,11 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		if (r == kIOReturnSuccess) {
 			step = "state in";
-			r = upload(mGfxMisc, misc, sizeof(misc), miscAt);
+			r = upload(mGfxMisc, misc, RDNA4_TRIRUN_PAGE, miscAt);
+
+		if (r == kIOReturnSuccess && highTextures)   // the vertex stage's T#s of textures 16-30 to the fragment stage's
+			r = upload(mGfxMisc, &misc[(0x400 + RDNA4_MTLC_TABLE_TEXTURES_HIGH) / 8], 0x400 + 32 * (RDNA4_MTLC_TEXTURES - 16),
+			           miscAt + 0x400 + RDNA4_MTLC_TABLE_TEXTURES_HIGH);
 
 		if (r == kIOReturnSuccess && levelStages)   // the levels' T#s, for a shader that reads them
 			r = upload(mGfxMisc, levels, sizeof(levels), miscAt + kLevelsAt);
@@ -8006,7 +8025,8 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		bytes[b] = len - offset[b];
 	}
 	// The kernel's textures and samplers in a table of their own (air2amdgpu.cpp: its address follows the dimensions in the kernargs).
-	StagedTexture staged[16] = {};
+	static StagedTexture staged[RDNA4_MTLC_TEXTURES];   // (off the stack, as runDraw's; dispatches run one at a time on the work loop)
+	memset(staged, 0, sizeof(staged));
 	uint64_t tableHandle = 0, tableGpu = 0;
 	bool textures = false;
 	for (unsigned k = 0; k < 16; k++)
@@ -8016,7 +8036,7 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		memset(table, 0, sizeof(table));
 		waitDraws();   // dispatches run alone
 		readyDraws();
-		ok = stageTextures(task, bound, table, staged, true, "kernel", true, texturesWritten) && gCompute->rtAlloc(this, sizeof(table), tableHandle, tableGpu) == kIOReturnSuccess &&
+		ok = stageTextures(task, bound, table, staged, true, "kernel", true, texturesWritten, 16) && gCompute->rtAlloc(this, sizeof(table), tableHandle, tableGpu) == kIOReturnSuccess &&
 		     gCompute->rtCopy(this, tableHandle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(table), sizeof(table), true) == kIOReturnSuccess;
 
 		// The shadows the staging filled are filled by the card in the graphics ring (put together with draws, not even submitted yet);

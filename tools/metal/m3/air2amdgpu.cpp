@@ -1355,10 +1355,12 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 					location = static_cast<int>(mdInt(a, k + 1));
 					count = k + 2 < a->getNumOperands() ? static_cast<int>(mdInt(a, k + 2)) : 1;
 				}
-			if (location < 0 || count < 1 || location + count > 16)
-				return kind + " argument " + std::to_string(index) + ": only indices 0-15 so far";
-			from[index] = (kind == "air.texture" ? 200 : 300) + location;
-			texturesRead |= kind == "air.texture" ? ((1u << count) - 1) << location : 0;
+			const bool texture = kind == "air.texture";   // textures 0-30 (an array within 0-15 or 16-30: include/rdna4mtlc.h), samplers 0-15
+			if (location < 0 || count < 1 || location + count > (texture ? static_cast<int>(RDNA4_MTLC_TEXTURES) : 16) ||
+			    (location < 16 && location + count > 16))
+				return kind + " argument " + std::to_string(index) + ": only indices 0-" + (texture ? "30" : "15") + " so far";
+			from[index] = (texture ? 200 : 300) + location;
+			texturesRead |= texture ? ((1u << count) - 1) << location : 0;
 		}
 		else if (unused)
 			from[index] = -1;
@@ -1700,7 +1702,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			               : from[k] == 5 ? b.CreateZExtOrTrunc(b.CreateFCmpOGT(f->getArg(kFrontFace), ConstantFP::get(f32, 0.0)), air->getArg(k)->getType())
 			               : from[k] == 6 ? Constant::getNullValue(air->getArg(k)->getType())
 			               : from[k] >= 300 ? resource(k, RDNA4_MTLC_TABLE_SAMPLERS + 16 * static_cast<unsigned>(from[k] - 300), 16)
-			               : from[k] >= 200 ? resource(k, RDNA4_MTLC_TABLE_TEXTURES + 32 * static_cast<unsigned>(from[k] - 200), 32)
+			               : from[k] >= 200 ? resource(k, RDNA4_MTLC_TEXTURE_AT(static_cast<unsigned>(from[k] - 200)), 32)
 			               : from[k] >= 100 ? buffer(static_cast<unsigned>(from[k] - 100), air->getArg(k)->getType())
 			                              : PoisonValue::get(air->getArg(k)->getType()));
 		return b.CreateCall(air, args);
@@ -1876,6 +1878,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		return "no code or no register values in the shader object";
 	if (localArrays && scratch)
 		return "the shader needs " + std::to_string(scratch) + " bytes of scratch memory (a local array not kept in registers)";
+	if (f->hasFnAttribute("rdna4-levels") && texturesRead >> 16)
+		return "explicit LODs with textures 16-30: their levels have no T#s yet";
 	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3],
 	                          static_cast<uint32_t>(vars.size()) | writes << 20 | (attachment > 0 ? static_cast<uint32_t>(attachment) << 28 : 0) |
 	                          (noColour ? 1u << 31 : 0) | (f->hasFnAttribute("rdna4-levels") ? 1u << 16 : 0) | (dualMember >= 0 ? 1u << 18 : 0)};

@@ -28,6 +28,12 @@ enum { kMtlcNext = 0, kMtlcDeliver = 1 };
  * +0 (indices 0-7), texture n's T# (8 dwords) at RDNA4_MTLC_TABLE_TEXTURES + 32 n, sampler n's S# (4 dwords) at RDNA4_MTLC_TABLE_SAMPLERS
  * + 16 n (n 0-15). */
 #define RDNA4_MTLC_TABLE_TEXTURES 64u
+/* Textures 16-30 (Metalterm's fragment shader samples 17): their T#s at RDNA4_MTLC_TABLE_TEXTURES_HIGH + 32 (n - 16) of the stage's table,
+ * past the levels' T#s (level 0 only: a shader sampling at explicit LODs uses textures 0-15 alone). An array of textures is within one of
+ * the two ranges. */
+#define RDNA4_MTLC_TABLE_TEXTURES_HIGH 0x4200u
+#define RDNA4_MTLC_TEXTURES 31u
+#define RDNA4_MTLC_TEXTURE_AT(n) ((n) < 16 ? RDNA4_MTLC_TABLE_TEXTURES + 32u * (n) : RDNA4_MTLC_TABLE_TEXTURES_HIGH + 32u * ((n) - 16))
 #define RDNA4_MTLC_TABLE_SAMPLERS 576u
 /* The fragment stage's colour attachment 0 as the draw found it, for shaders that read it (Metal's [[color(0)]] input): a T# of the host's
  * staged RGBA8 copy of the target. */

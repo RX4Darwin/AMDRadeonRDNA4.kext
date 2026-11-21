@@ -1594,11 +1594,12 @@ enum { kRgfxMagic = 0x58464752u, kHead = 8, kTxrd = 0x44525854u, kPosm = 0x4d534
 @end
 
 // One draw as recorded: everything the device needs to run it.
-enum { kStageTextures = 16 };   // a stage's table holds textures and samplers 0-15 (include/rdna4mtlc.h)
+enum { kStageTextures = 16 };   // a stage's table holds samplers 0-15 and the textures that have levels (include/rdna4mtlc.h)
+enum { kTextures = RDNA4_MTLC_TEXTURES };   // and textures 0-30
 
 typedef struct {
 	uint64_t table[2][kTableBuffers];   // per stage, its buffers' GPU addresses by index (0: unbound)
-	uint32_t textures[2][kStageTextures][8], samplers[2][kStageTextures][4];   // per stage, T#s and S#s (0: unbound)
+	uint32_t textures[2][kTextures][8], samplers[2][kStageTextures][4];   // per stage, T#s and S#s (0: unbound)
 	uint32_t type, start, count, instances, baseInstance;
 	float viewport[4];                  // x, y, width, height in pixels
 	uint32_t scissor[4];                // x, y, width, height in pixels (the whole target when none was set)
@@ -2282,7 +2283,7 @@ RDNA4_ANSWER_MISSING
 	RDNA4MTLRenderPipeline *_pipeline;
 	uint64_t _addresses[2][kTableBuffers];
 	id<MTLBuffer> _bound[2][kTableBuffers];
-	id<MTLTexture> _textures[2][kStageTextures];
+	id<MTLTexture> _textures[2][kTextures];
 	id<MTLSamplerState> _samplers[2][kStageTextures];
 	RDNA4MTLTexture *_depth, *_stencil;   // the pass's depth and stencil attachments of this device (the same texture for Depth32Float_Stencil8)
 	RDNA4MTLDepthStencilState *_depthState;
@@ -2387,8 +2388,8 @@ RDNA4_ANSWER_MISSING
 	_depthState = [(id)state isKindOfClass:[RDNA4MTLDepthStencilState class]] ? (RDNA4MTLDepthStencilState *)state : nil;
 }
 
-- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < kStageTextures) _textures[0][i] = t; }
-- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < kStageTextures) _textures[1][i] = t; }
+- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < kTextures) _textures[0][i] = t; }
+- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < kTextures) _textures[1][i] = t; }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < kStageTextures) _samplers[0][i] = s; }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < kStageTextures) _samplers[1][i] = s; }
 
@@ -2542,18 +2543,18 @@ RDNA4_ANSWER_MISSING
 		// the textures its shaders use only: one left bound by an earlier draw is not read, made current, waited for or copied (Core
 		// Animation's target, left bound, was a copy of it for every draw of Vfx / Xc, 2026-11-20)
 		const uint32_t uses = _pipeline ? [_pipeline texturesOf:st] : 0xffff;
-		for (int i = 0; i < kStageTextures; i++) {
+		for (int i = 0; i < kTextures; i++) {
 			if ((uses >> i & 1) && [(id)_textures[st][i] isKindOfClass:[RDNA4MTLTexture class]] && !((RDNA4MTLTexture *)_textures[st][i]).isDepth) {
 				RDNA4MTLTexture *t = (RDNA4MTLTexture *)_textures[st][i];
 				[t descriptor:d.textures[st][i]];
-				for (NSUInteger l = 1; levelT && l < 8; l++)
+				for (NSUInteger l = 1; levelT && i < kStageTextures && l < 8; l++)   // (the helper refuses levels of textures 16-30)
 					[t descriptor:(uint32_t *)((uint8_t *)levelT.mutableBytes + ((st * 7 + (l - 1)) * 16 + i) * 32) level:l];
 				if (t.shadowed)
 					[shadowed addObject:t];
 				[held addObject:t];
 				[reads addObject:@[ @(st), @(i), t ]];
 			}
-			if ([(id)_samplers[st][i] isKindOfClass:[RDNA4MTLSamplerState class]])
+			if (i < kStageTextures && [(id)_samplers[st][i] isKindOfClass:[RDNA4MTLSamplerState class]])
 				memcpy(d.samplers[st][i], ((RDNA4MTLSamplerState *)_samplers[st][i]).words, 16);
 		}
 	}
@@ -3771,16 +3772,14 @@ static void abortStack(int sig)
 	uint32_t spare[8];
 	[self spareImage:spare];
 	static const uint32_t none[8] = {};
-	for (unsigned st = 0; st < 2; st++)   // the T#s at +64 + 32 n, the S#s at +576 + 16 n of the stage's table (include/rdna4mtlc.h)
-		for (unsigned k = 0; k < kStageTextures; k++) {
-			if (!memcmp(d->textures[st][k], none, 32)) {   // unbound: the spare texel (here and at every level)
-				memcpy((uint8_t *)misc + 0x400 + 0x400 * st + RDNA4_MTLC_TABLE_TEXTURES + 32 * k, spare, 32);
-				memcpy((uint8_t *)misc + 0x400 + 0x400 * st + RDNA4_MTLC_TABLE_SAMPLERS + 16 * k, d->samplers[st][k], 16);
-				continue;
-			}
-			memcpy((uint8_t *)misc + 0x400 + 0x400 * st + RDNA4_MTLC_TABLE_TEXTURES + 32 * k, d->textures[st][k], 32);
-			memcpy((uint8_t *)misc + 0x400 + 0x400 * st + RDNA4_MTLC_TABLE_SAMPLERS + 16 * k, d->samplers[st][k], 16);
-		}
+	static_assert(0x800 + RDNA4_MTLC_TEXTURE_AT(kTextures) <= kMiscBytes, "textures 16-30 fit the state page");
+	for (unsigned st = 0; st < 2; st++) {   // the T#s at RDNA4_MTLC_TEXTURE_AT(n), the S#s at +576 + 16 n of the stage's table (include/rdna4mtlc.h)
+		uint8_t *table = (uint8_t *)misc + 0x400 + 0x400 * st;
+		for (unsigned k = 0; k < kTextures; k++)   // unbound: the spare texel (here and at every level)
+			memcpy(table + RDNA4_MTLC_TEXTURE_AT(k), memcmp(d->textures[st][k], none, 32) ? d->textures[st][k] : spare, 32);
+		for (unsigned k = 0; k < kStageTextures; k++)
+			memcpy(table + RDNA4_MTLC_TABLE_SAMPLERS + 16 * k, d->samplers[st][k], 16);
+	}
 	// The draw in place of the template's DRAW_INDEX_AUTO: blend colour, the fragment inputs, the stages' tables (USER_DATA_GS_0/1, _PS_0/1),
 	// the first vertex and base instance (USER_DATA_GS_2/3), NUM_INSTANCES, DRAW_INDEX_AUTO.
 	uint32_t seq[256], m = 0;
@@ -3860,7 +3859,7 @@ static void abortStack(int sig)
 	for (unsigned st = 0; levels && st < 2; st++)   // each level's own image (a texture of fewer levels: its last), unbound ones the spare texel
 		for (uint32_t level = 1; level < RDNA4_MTLC_LEVELS; level++) {
 			uint8_t *at = (uint8_t *)misc + kMiscTables + RDNA4_MTLC_LEVEL_STRIDE * (level - 1) + 0x400 * st;
-			memcpy(at, d->levelT ? (const void *)(d->levelT + (st * 7 + (level - 1)) * 16 * 32) : (const void *)d->textures[st], sizeof d->textures[st]);
+			memcpy(at, d->levelT ? (const void *)(d->levelT + (st * 7 + (level - 1)) * 16 * 32) : (const void *)d->textures[st], 32 * kStageTextures);
 			for (unsigned k = 0; k < kStageTextures; k++)
 				if (!memcmp(at + 32 * k, none, 32))
 					memcpy(at + 32 * k, spare, 32);
