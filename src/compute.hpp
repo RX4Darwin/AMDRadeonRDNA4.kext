@@ -261,7 +261,7 @@ private:
 	bool beginBringup();
 	void endBringup();
 	bool bringupStepAllowed(const char *step);
-	void resetRuntimeForResume();
+	bool resetRuntimeForResume();
 
 	// The pre-Metal features past the compute stages (W1-W5) name their
 	// trail steps "<feature>: ..." (gfx, ih, vm, flip). If the previous
