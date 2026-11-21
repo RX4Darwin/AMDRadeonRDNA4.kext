@@ -26,9 +26,9 @@
 //                             the client's buffers with the runtime's flip
 //                             and given back at the release or the close
 //
-//  One client at a time, root only. Its address space is the lowest of 8 to
-//  15 that no client of the runtime holds (rdna4-vm), so both can be open in
-//  one boot; not with rdna4-vmshared=2. What shows that the address space
+//  Up to kN48nSessions clients, each in an address space of its own: the
+//  lowest of 8 to 15 that no client of the runtime holds (rdna4-vm), or one
+//  pinned from the runtime's pool (rdna4-vmshared=2). What shows that the address space
 //  works before anything is drawn in it is the copy test at the end
 //  (include/rdna4vulkan.h).
 //
@@ -131,20 +131,22 @@ struct RDNA4Compute::N48nView {
 constexpr uint32_t kViews = N48N_MAX_BOS;
 
 struct RDNA4Compute::N48nState {
+	RDNA4Compute *compute;
 	const void  *owner;
 	uint32_t     vmid;           // its address space: the lowest of 8 to 15 no client of the runtime holds (vmidUsed)
 	uint64_t     copyTestPage;   // pool offset of the copy test's command page; 0 until the first test
 	uint64_t     fencePage;      // pool offset of the dword the graphics queue reports finished work in
-	uint32_t     ringDwords;     // what this client has put on the graphics ring since the ring last ran dry
+	uint32_t     ringDwords;     // what this client has on the graphics ring (part of n48nRingDwords) since its work last all finished
 	uint32_t     ringSequence;   // the last sequence it put there
 	bool         scanTaken;      // the client has the display's plane; scanSurface is what it showed before
 	Flip::Surface scanSurface;
 	N48N::Client client;         // a few hundred KiB
 };
 
-// N48N::Backend over the runtime. Every function runs under rtLock, from a call of the client.
+// N48N::Backend over the runtime, for one session (the context). Every function runs under rtLock, from a call of the client.
 struct N48nBackend {
-	static RDNA4Compute &of(void *context) { return *static_cast<RDNA4Compute *>(context); }
+	static RDNA4Compute::N48nState &me(void *context) { return *static_cast<RDNA4Compute::N48nState *>(context); }
+	static RDNA4Compute &of(void *context) { return *me(context).compute; }
 
 	// A pool offset as the GPU-physical address a table entry holds, and back.
 	static uint64_t poolPhysical(const RDNA4Compute &c, uint64_t offset) {
@@ -237,7 +239,7 @@ struct N48nBackend {
 	static void flush(void *context) {
 		RDNA4Compute &c = of(context);
 		c.flushHdp();
-		(void)c.vmInvalidate(c.n48n->vmid, "vulkan client");
+		(void)c.vmInvalidate(me(context).vmid, "vulkan client");
 	}
 
 	static bool readRegs(void *context, uint32_t dword, uint32_t count, uint32_t *out) {
@@ -259,16 +261,19 @@ struct N48nBackend {
 	// command-buffer packet names the client's, and a last packet reports the sequence to the fence dword.
 	static uint32_t submit(void *context, const N48N::Ib *ibs, uint32_t count, uint32_t sequence) {
 		RDNA4Compute &c = of(context);
-		RDNA4Compute::N48nState &s = *c.n48n;
+		RDNA4Compute::N48nState &s = me(context);
 		const IOReturn ready = c.gfxClientReady();
 		if (ready != kIOReturnSuccess)   // no graphics ring this boot (rdna4-gfx=2), not up yet, or halted after lost work
 			return ready == kIOReturnNotResponding ? N48N::kAborted : static_cast<uint32_t>(ready);
-		// ponytail: room on the ring is only counted back when all of this client's work has finished; per
-		// submission if a client ever keeps half the ring busy.
-		if (*c.poolDw(static_cast<uint32_t>(s.fencePage)) == s.ringSequence)
+		// ponytail: room on the ring is only counted back when all of a client's work has finished; per
+		// submission if a client ever keeps the Vulkan share busy. The share is what the runtime's own
+		// clients leave (kMaxGfxOutstanding submissions of at most 22 dwords).
+		if (*c.poolDw(static_cast<uint32_t>(s.fencePage)) == s.ringSequence) {
+			c.n48nRingDwords -= s.ringDwords;
 			s.ringDwords = 0;
+		}
 		const uint32_t need = 3 + 4 * count + 8;
-		if (s.ringDwords + need > c.gfxRing.sizeDwords() / 2)
+		if (c.n48nRingDwords + need > c.gfxRing.sizeDwords() - RDNA4Compute::kMaxGfxOutstanding * 22)
 			return N48N::kBusy;
 		c.grbmSelect(0, 0, 0, s.vmid);     // the address space's shader memory setup, as gfx_v12_0_init_compute_vmid has it
 		c.wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
@@ -287,12 +292,12 @@ struct N48nBackend {
 		c.flushHdp();                      // what the CPU wrote through the BAR, command buffers included
 		c.gfxKick(c.gfxRing.wptr());
 		s.ringDwords += need;
+		c.n48nRingDwords += need;
 		s.ringSequence = sequence;
 		return N48N::kSuccess;
 	}
 	static uint32_t finished(void *context) {
-		const RDNA4Compute &c = of(context);
-		return *c.poolDw(static_cast<uint32_t>(c.n48n->fencePage));
+		return *of(context).poolDw(static_cast<uint32_t>(me(context).fencePage));
 	}
 	/* The client's work made no progress for ten seconds. The client is finished (n48n.cpp); the ring is kept for
 	 * everybody else if its hung waves can be removed (gfxRingRelease, runtime.cpp: verified with this client).
@@ -302,7 +307,7 @@ struct N48nBackend {
 	 * Noticing sooner needs the stray entry gone or the hub's fault interrupt. */
 	static void lost(void *context) {
 		RDNA4Compute &c = of(context);
-		RDNA4Compute::N48nState &s = *c.n48n;
+		RDNA4Compute::N48nState &s = me(context);
 		if (!c.gfxRingRelease(s.vmid, c.poolDw(static_cast<uint32_t>(s.fencePage)), s.ringSequence, "vulkan client"))
 			c.gfxClientWedge("vulkan client");
 	}
@@ -349,16 +354,24 @@ struct N48nBackend {
 		q.otg = s.otg;
 		q.flags = N48N_SCANQ_LIT | N48N_SCANQ_GEOM_OK;    // the refresh rate is left 0: not derived here
 		q.frame_count = otgReg(c, s, Pipe::Reg::kOtgFrameCount) & 0xffffff;
-		q.console_mc = c.n48n && c.n48n->scanTaken ? c.n48n->scanSurface.desktop : s.desktop;
+		const RDNA4Compute::N48nState *taker = holder(c);
+		q.console_mc = taker ? taker->scanSurface.desktop : s.desktop;
 		q.plane_mc = q.earliest_mc = s.desktop;           // a flip is waited for, so the two are the same between calls
 		q.plane_w = s.width;
 		q.plane_h = s.height;
 		return true;
 	}
+	// The session that has the display's plane, if one has.
+	static const RDNA4Compute::N48nState *holder(const RDNA4Compute &c) {
+		for (const RDNA4Compute::N48nState *n : c.n48n)
+			if (n && n->scanTaken)
+				return n;
+		return nullptr;
+	}
 	static uint32_t scanAcquire(void *context) {
 		RDNA4Compute &c = of(context);
-		RDNA4Compute::N48nState &n = *c.n48n;
-		if (c.presentActive)                              // the runtime's own Present has the plane
+		RDNA4Compute::N48nState &n = me(context);
+		if (c.presentActive || (holder(c) && holder(c) != &n))   // the runtime's own Present, or another client, has the plane
 			return N48N::kBusy;
 		if (!Flip::findPipe(c, n.scanSurface))
 			return N48N::kNotReady;
@@ -370,7 +383,7 @@ struct N48nBackend {
 	static uint32_t scanShow(void *context, uint64_t address, uint32_t width, uint32_t height, uint32_t pitchBytes,
 	                         uint64_t &frame) {
 		RDNA4Compute &c = of(context);
-		const RDNA4Compute::N48nState &n = *c.n48n;
+		const RDNA4Compute::N48nState &n = me(context);
 		Flip::Surface s {};
 		// The plane has to be what it was when the client took it: macOS may have changed the mode since.
 		if (!n.scanTaken || !Flip::findPipe(c, s, false) || s.otg != n.scanSurface.otg || s.hubp != n.scanSurface.hubp ||
@@ -383,7 +396,7 @@ struct N48nBackend {
 	}
 	static bool scanRelease(void *context) {
 		RDNA4Compute &c = of(context);
-		RDNA4Compute::N48nState &n = *c.n48n;
+		RDNA4Compute::N48nState &n = me(context);
 		if (!n.scanTaken)
 			return true;
 		n.scanTaken = false;
@@ -406,7 +419,7 @@ struct N48nBackend {
 		return back;
 	}
 
-	static N48N::Backend make(RDNA4Compute *c) {
+	static N48N::Backend make(RDNA4Compute::N48nState *c) {
 		N48N::Backend b {};
 		b.context = c;
 		b.allocVram = allocVram;
@@ -485,13 +498,20 @@ void RDNA4Compute::n48nKeep() {
 }
 
 // The session's address space back: to the pool it was pinned from (rdna4-vmshared=2), else free for the runtime's clients. With rtLock.
-void RDNA4Compute::n48nReleaseVmid() {
+void RDNA4Compute::n48nReleaseVmid(N48nState *s) {
 	if (vmShared == 2) {
 		uint32_t first = 0;
-		vmPool.forget(reinterpret_cast<uintptr_t>(n48n), true, first);
+		vmPool.forget(reinterpret_cast<uintptr_t>(s), true, first);
 	} else {
-		vmidUsed[n48n->vmid] = false;
+		vmidUsed[s->vmid] = false;
 	}
+}
+
+RDNA4Compute::N48nState *RDNA4Compute::n48nOf(const void *owner) const {
+	for (N48nState *s : n48n)
+		if (s && s->owner == owner)
+			return s;
+	return nullptr;
 }
 
 IOReturn RDNA4Compute::n48nOpen(const void *owner) {
@@ -501,7 +521,9 @@ IOReturn RDNA4Compute::n48nOpen(const void *owner) {
 	// System memory needs the card to reach host pages, which the DMA setup established.
 	if (!rtReady || powerSleeping || rtWedged || !poolCpu || !heap.size() || !dmaReady || !busMasterSet)
 		return kIOReturnNotReady;
-	if (n48n)
+	uint32_t slot = 0;
+	for (; slot < kN48nSessions && n48n[slot]; slot++) {}
+	if (slot == kN48nSessions)
 		return kIOReturnExclusiveAccess;
 	if (!n48nViews) {
 		n48nViews = static_cast<N48nView *>(IOMalloc(kViews * sizeof(N48nView)));
@@ -534,29 +556,29 @@ IOReturn RDNA4Compute::n48nOpen(const void *owner) {
 			return kIOReturnNoResources;
 		}
 	}
+	s->compute = this;
 	s->owner = owner;
 	s->vmid = vmid;
-	n48n = s;                          // the backend reads the address space from it while the client opens
 	RtClient context {};
 	context.vmid = vmid;
 	const uint32_t gc = (static_cast<uint32_t>(sv.gcMajor) << 16) | (static_cast<uint32_t>(sv.gcMinor) << 8) | sv.gcRev;
-	if (!heap.alloc(kPage, s->fencePage) || !s->client.open(N48nBackend::make(this), vmid, kBuild, gc) ||
+	if (!heap.alloc(kPage, s->fencePage) || !s->client.open(N48nBackend::make(s), vmid, kBuild, gc) ||
 	    !(context.rootPhys = s->client.root()) || !vmContextInit(context)) {
 		VLOG("open failed: %s", s->client.root() ? "the address space's registers did not take" : "no page for the table");
 		s->client.close();
 		if (s->fencePage)
 			heap.free(s->fencePage);
-		n48nReleaseVmid();
+		n48nReleaseVmid(s);
 		IOFree(s, sizeof(*s));
-		n48n = nullptr;
 		return kIOReturnNoMemory;
 	}
 	N48nBackend::zero(*this, s->fencePage, kPage);
-	N48nBackend::flush(this);
+	N48nBackend::flush(s);
+	n48n[slot] = s;
 	if (vmShared != 2)
 		vmidUsed[vmid] = true;
-	VLOG("client open: address space %u, table root at physical 0x%llx; %llu MiB of VRAM behind the BAR, %llu MiB past it",
-	     vmid, s->client.root(), heap.size() >> 20, devHeap.size() >> 20);
+	VLOG("client %u open: address space %u, table root at physical 0x%llx; %llu MiB of VRAM behind the BAR, %llu MiB past it",
+	     slot, vmid, s->client.root(), heap.size() >> 20, devHeap.size() >> 20);
 	return kIOReturnSuccess;
 }
 
@@ -564,24 +586,28 @@ void RDNA4Compute::n48nClose(const void *owner) {
 	if (!rtLock)
 		return;
 	Locked g(rtLock);
-	if (!n48n || n48n->owner != owner)
+	N48nState *s = n48nOf(owner);
+	if (!s)
 		return;
+	for (N48nState *&slot : n48n)
+		if (slot == s)
+			slot = nullptr;
 	if (powerSleeping) {
-		n48nDiscard();     // the card is off: nothing to write to
+		n48nDrop(s);       // the card is off: nothing to write to
 		return;
 	}
-	if (!n48n->client.quiesce())       // its work first: that still needs the address space
+	if (!s->client.quiesce())          // its work first: that still needs the address space
 		VLOG("client closes with work on the graphics queue that did not finish");
-	wr(IpDiscovery::HwGc, Reg { 0, static_cast<uint16_t>(GcCtx1Cntl.dword + n48n->vmid - 1) }, 0);   // the context goes off before its table does
-	n48nReleaseVmid();
-	if (((rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == n48n->vmid)
+	n48nRingDwords -= s->ringDwords;
+	wr(IpDiscovery::HwGc, Reg { 0, static_cast<uint16_t>(GcCtx1Cntl.dword + s->vmid - 1) }, 0);   // the context goes off before its table does
+	n48nReleaseVmid(s);
+	if (((rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == s->vmid)
 		gcFaultClear();                // a fault of this client's left in the hub would hide the next client's (vmJobFaulted)
-	if (n48n->copyTestPage)
-		heap.free(n48n->copyTestPage);
-	n48n->client.close();
-	heap.free(n48n->fencePage);
-	IOFree(n48n, sizeof(N48nState));
-	n48n = nullptr;
+	if (s->copyTestPage)
+		heap.free(s->copyTestPage);
+	s->client.close();
+	heap.free(s->fencePage);
+	IOFree(s, sizeof(N48nState));
 	n48nSweep();
 	VLOG("client closed: %llu MiB free behind the BAR, %llu MiB past it", heap.freeBytes() >> 20, devHeap.freeBytes() >> 20);
 }
@@ -589,34 +615,42 @@ void RDNA4Compute::n48nClose(const void *owner) {
 // Called with rtLock held, by the wake's cleanup before it makes the heaps anew: the VRAM and the table went with
 // the card's power. Only the system memory is still someone's.
 void RDNA4Compute::n48nDiscard() {
-	if (!n48n)
-		return;
-	for (uint32_t h = 1; h < N48N_MAX_BOS; h++) {
-		const N48N::Buffer *b = n48n->client.buffer(h);
-		if (b && b->memory.system)
-			N48nBackend::free(this, b->memory, b->bytes);
+	for (N48nState *&s : n48n) {
+		if (s)
+			n48nDrop(s);
+		s = nullptr;
 	}
-	n48nReleaseVmid();
-	IOFree(n48n, sizeof(N48nState));
-	n48n = nullptr;
+}
+
+// A session forgotten without writing to the card: its system memory freed, its address space given back.
+void RDNA4Compute::n48nDrop(N48nState *s) {
+	for (uint32_t h = 1; h < N48N_MAX_BOS; h++) {
+		const N48N::Buffer *b = s->client.buffer(h);
+		if (b && b->memory.system)
+			N48nBackend::free(s, b->memory, b->bytes);
+	}
+	n48nRingDwords -= s->ringDwords;
+	n48nReleaseVmid(s);
+	IOFree(s, sizeof(N48nState));
 	VLOG("client dropped: the card lost its memory; its calls answer \"not ready\" from here on");
 }
 
 IOReturn RDNA4Compute::n48nCall(const void *owner, uint32_t selector, IOExternalMethodArguments *a) {
 	Locked g(rtLock);
 	IOReturn r;
-	if (!n48n || n48n->owner != owner || !rtReady || powerSleeping) {
+	N48nState *s = n48nOf(owner);
+	if (!s || !rtReady || powerSleeping) {
 		r = kIOReturnNotReady;
 	} else if (a->structureInputDescriptor || a->structureOutputDescriptor) {
 		r = kIOReturnBadArgument;          // nothing of this interface is large enough to arrive that way
 	} else if (selector == RDNA4_VULKAN_SEL_COPY_TEST) {
 		r = a->scalarInputCount == 3 && !a->scalarOutputCount && !a->structureInputSize && !a->structureOutputSize
-			? n48nCopyTest(a->scalarInput[0], a->scalarInput[1], a->scalarInput[2]) : kIOReturnBadArgument;
+			? n48nCopyTest(*s, a->scalarInput[0], a->scalarInput[1], a->scalarInput[2]) : kIOReturnBadArgument;
 	} else {
 		uint32_t scalars = a->scalarOutputCount;
 		size_t bytes = a->structureOutputSize;
-		r = static_cast<IOReturn>(n48n->client.call(selector, a->scalarInput, a->scalarInputCount, a->structureInput, a->structureInputSize,
-		                                            a->scalarOutput, &scalars, a->structureOutput, &bytes));
+		r = static_cast<IOReturn>(s->client.call(selector, a->scalarInput, a->scalarInputCount, a->structureInput, a->structureInputSize,
+		                                         a->scalarOutput, &scalars, a->structureOutput, &bytes));
 		n48nSweep();
 	}
 	if (r != kIOReturnSuccess)
@@ -629,9 +663,10 @@ IOReturn RDNA4Compute::n48nCall(const void *owner, uint32_t selector, IOExternal
 // mapping holds it. System memory stays wired while a mapping holds its descriptor, and the card no longer reaches it.
 IOReturn RDNA4Compute::n48nMemory(const void *owner, uint32_t handle, IOMemoryDescriptor **memory) {
 	Locked g(rtLock);
-	if (!n48n || n48n->owner != owner || !rtReady || powerSleeping)
+	const N48nState *s = n48nOf(owner);
+	if (!s || !rtReady || powerSleeping)
 		return kIOReturnNotReady;
-	const N48N::Buffer *b = n48n->client.buffer(handle);
+	const N48N::Buffer *b = s->client.buffer(handle);
 	if (!b)
 		return kIOReturnNotFound;
 	if (!b->memory.cpuVisible)
@@ -673,20 +708,20 @@ IOReturn RDNA4Compute::n48nMemory(const void *owner, uint32_t handle, IOMemoryDe
 // RDNA4_VULKAN_SEL_COPY_TEST. The kernel's copy queue stays in address space 0; the packet that starts a command
 // buffer names the address space the buffer and its addresses are read in, which is how Linux runs a process's
 // copy work (sdma_v7_0_ring_emit_ib). The command page is the kext's, mapped below the client's range.
-IOReturn RDNA4Compute::n48nCopyTest(uint64_t source, uint64_t destination, uint64_t bytes) {
+IOReturn RDNA4Compute::n48nCopyTest(N48nState &s, uint64_t source, uint64_t destination, uint64_t bytes) {
 	if (!bytes || bytes > RDNA4_VULKAN_COPY_TEST_MAX || ((source | destination | bytes) & (kPage - 1)))
 		return kIOReturnBadArgument;
 	// An address that is not mapped would stop the copy engine for the rest of the boot: look first.
-	const uint64_t root = n48n->client.root(), low48 = (1ull << N48N::kVaBits) - 1;
+	const uint64_t root = s.client.root(), low48 = (1ull << N48N::kVaBits) - 1;
 	for (uint64_t at = 0; at < bytes; at += kPage) {
 		uint64_t physical = 0, from = 0, to = 0;
-		if (!GpuVm::walk(root, (source + at) & low48, N48nBackend::readEntry, this, physical, from) ||
-		    !GpuVm::walk(root, (destination + at) & low48, N48nBackend::readEntry, this, physical, to) ||
+		if (!GpuVm::walk(root, (source + at) & low48, N48nBackend::readEntry, &s, physical, from) ||
+		    !GpuVm::walk(root, (destination + at) & low48, N48nBackend::readEntry, &s, physical, to) ||
 		    !(from & GpuVm::kReadable) || !(to & GpuVm::kWritable))
 			return kIOReturnBadArgument;
 	}
-	const N48N::Backend be = N48nBackend::make(this);
-	if (!n48n->copyTestPage) {
+	const N48N::Backend be = N48nBackend::make(&s);
+	if (!s.copyTestPage) {
 		uint64_t offset = 0;
 		if (!heap.alloc(kPage, offset))
 			return kIOReturnNoMemory;
@@ -695,23 +730,23 @@ IOReturn RDNA4Compute::n48nCopyTest(uint64_t source, uint64_t destination, uint6
 			heap.free(offset);
 			return kIOReturnNoMemory;
 		}
-		n48n->copyTestPage = offset;
+		s.copyTestPage = offset;
 	}
 	uint32_t copy[Sdma::kCopyDwords];
 	Sdma::copyLinear(copy, source, destination, static_cast<uint32_t>(bytes));
 	for (uint32_t i = 0; i < Sdma::kCopyDwords; i++)
-		*poolDw(static_cast<uint32_t>(n48n->copyTestPage) + 4 * i) = copy[i];
-	N48nBackend::flush(this);
+		*poolDw(static_cast<uint32_t>(s.copyTestPage) + 4 * i) = copy[i];
+	N48nBackend::flush(&s);
 
 	uint32_t ring[7 + Sdma::kIndirectDwords] {};
 	uint32_t n = Sdma::indirectPad(sdmaRing.wptr());
-	n += Sdma::indirect(ring + n, kCopyTestVa, Sdma::kCopyDwords, n48n->vmid);
+	n += Sdma::indirect(ring + n, kCopyTestVa, Sdma::kCopyDwords, s.vmid);
 	if (!sdmaRun(ring, n, 2000)) {
 		VLOG("copy test: the copy engine did not finish 0x%llx -> 0x%llx (%llu bytes) in address space %u", source,
-		     destination, bytes, n48n->vmid);
+		     destination, bytes, s.vmid);
 		return kIOReturnNotResponding;
 	}
-	VLOG("copy test: 0x%llx -> 0x%llx, %llu bytes, in address space %u", source, destination, bytes, n48n->vmid);
+	VLOG("copy test: 0x%llx -> 0x%llx, %llu bytes, in address space %u", source, destination, bytes, s.vmid);
 	return kIOReturnSuccess;
 }
 

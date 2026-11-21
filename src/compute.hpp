@@ -776,8 +776,8 @@ public:
 	IOReturn rtRestore(const void *owner);
 	void     rtRelease(const void *owner);
 
-	// The Vulkan interface (src/n48nkext.cpp, docs/vulkan-port.md): one client at a time, in an address space of
-	// its own. `owner` is its user client.
+	// The Vulkan interface (src/n48nkext.cpp, docs/vulkan-port.md): up to kN48nSessions clients, each in an address
+	// space of its own. `owner` is its user client.
 	IOReturn n48nOpen(const void *owner);
 	void     n48nClose(const void *owner);
 	IOReturn n48nCall(const void *owner, uint32_t selector, IOExternalMethodArguments *args);
@@ -786,15 +786,20 @@ public:
 private:
 	friend struct N48nBackend;
 	struct N48nState;
-	N48nState *n48n { nullptr };
-	void n48nReleaseVmid();
-	void     n48nDiscard();        // the card lost its memory under the client (sleep): forget it, write nothing
+	// ponytail: 3, as each pins an address space of the 8 the desktop's clients share (rdna4-vmshared=2); more if that proves roomy.
+	static constexpr uint32_t kN48nSessions = 3;
+	N48nState *n48n[kN48nSessions] {};
+	uint32_t   n48nRingDwords { 0 };   // what all of them have on the graphics ring (N48nBackend::submit)
+	N48nState *n48nOf(const void *owner) const;
+	void n48nReleaseVmid(N48nState *s);
+	void     n48nDiscard();        // the card lost its memory under the clients (sleep): forget them, write nothing
+	void     n48nDrop(N48nState *s);
 	struct N48nView;
 	N48nView *n48nViews { nullptr };   // what processes map of the pool heap's buffers (n48nMemory), kept for the boot
 	bool     n48nRetire(uint64_t offset);   // a freed buffer's memory waits for its mappings: true if it has a view
 	void     n48nSweep();          // memory whose mappings are all gone back to the heap
 	void     n48nKeep();           // a heap made anew: memory still mapped is taken out of it again
-	IOReturn n48nCopyTest(uint64_t source, uint64_t destination, uint64_t bytes);
+	IOReturn n48nCopyTest(N48nState &s, uint64_t source, uint64_t destination, uint64_t bytes);
 	// The pool past kHeapOffset is the CPU-visible heap (code, and buffers
 	// when there is no DMA). With DMA, buffers come from the device heap:
 	// VRAM past the BAR, which the CPU never touches.
