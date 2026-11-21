@@ -73,6 +73,10 @@ bool RDNA4Compute::sharedStart(uint32_t k) {
 // Called under rtLock when the first shared client opens (and again after a resume): SH_MEM_CONFIG/BASES for every VMID, once, like
 // gfx_v12_0_constants_init, then both queues.
 bool RDNA4Compute::vmSharedEnsure() {
+	if (sharedQueueDrainFailed) {
+		SLOG("shared queues: refusing restart after an unconfirmed HQD drain; a GPU reset is required");
+		return false;
+	}
 	if (sharedInit)
 		return true;
 	rdna4Step("vmSharedEnsure: GC awake (gcEnsureAwake)");
@@ -102,7 +106,8 @@ bool RDNA4Compute::vmSharedEnsure() {
 	return true;
 }
 
-void RDNA4Compute::sharedStopAll(const char *why) {
+bool RDNA4Compute::sharedStopAll(const char *why) {
+	bool allStopped = true;
 	for (uint32_t k = 0; k < kSharedQueues; k++) {
 		SharedQueue &s = sharedQ[k];
 		if (!s.up)
@@ -116,13 +121,23 @@ void RDNA4Compute::sharedStopAll(const char *why) {
 				IODelay(10);
 		}
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
-		if (!idle)
-			SLOG("shared queue %u (%s): dequeue timeout (ACTIVE 0x%08x)", k, why, rdGc(CpHqdActive));
+		if (!idle) {
+			SLOG("shared queue %u (%s): dequeue timeout (ACTIVE 0x%08x); retaining ring and queue reservation",
+			     k, why, rdGc(CpHqdActive));
+			allStopped = false;
+		} else {
+			s.up = false;
+			queueUsed[s.pipe][s.queue] = false;
+		}
 		grbmSelect(0, 0, 0, 0);
-		s.up = false;
-		queueUsed[s.pipe][s.queue] = false;
+	}
+	if (!allStopped) {
+		sharedQueueDrainFailed = true;
+		sharedInit = true; // prevent callers from treating a partially live queue set as stopped
+		return false;
 	}
 	sharedInit = false;
+	return true;
 }
 
 // A shared queue after a job that did not finish, as amdgpu resets a compute queue over MMIO on this chip (mes_v12_0_reset_queue_mmio, its
