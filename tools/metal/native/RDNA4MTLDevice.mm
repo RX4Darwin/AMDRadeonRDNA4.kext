@@ -62,6 +62,13 @@
 - (id)newSerializedDescriptor;   // MTLVertexDescriptorInternal's (Metal.framework)
 @end
 #include <malloc/malloc.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
+#include <dlfcn.h>
+#include <unordered_map>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <crt_externs.h>
 #include <execinfo.h>
 #import <os/log.h>
 #include <atomic>
@@ -1597,28 +1604,48 @@ static NSError *translateFunction(id<MTLFunction> function, NSArray<id<MTLFuncti
 			return rdna4Error([NSString stringWithFormat:@"%@: a linked function (%@) without AIR", function.name, [linked valueForKey:@"name"]], 0);
 		input = scratch = path;
 	}
-	NSTask *task = [NSTask new];
-	NSPipe *pipe = [NSPipe pipe];
-	task.executableURL = [NSURL fileURLWithPath:tool];
-	task.arguments = @[ input, function.name, out ];
-	task.standardOutput = pipe;
-	task.standardError = pipe;
-	NSError *runError = nil;
-	if (![task launchAndReturnError:&runError]) {   // not allowed to (a sandbox): through the kext
-		NSError *why = translateByKext(((RDNA4MTLDevice *)function.device).gpu, input, function.name, blob, buffers);
+	// posix_spawn and waitpid, not NSTask: -waitUntilExit runs the calling thread's run loop while it waits, and on an app's main thread
+	// that ran the app's own sources, which came back into OpenGL under the context's lock (kitty hung for good, 2026-11-21)
+	int fds[2];
+	pid_t pid = 0;
+	posix_spawn_file_actions_t actions;
+	const char *argv[] = { tool.fileSystemRepresentation, input.fileSystemRepresentation, function.name.UTF8String, out.fileSystemRepresentation, NULL };
+	bool started = !pipe(fds);
+	if (started) {
+		posix_spawn_file_actions_init(&actions);
+		posix_spawn_file_actions_adddup2(&actions, fds[1], 1);
+		posix_spawn_file_actions_adddup2(&actions, fds[1], 2);
+		posix_spawn_file_actions_addclose(&actions, fds[0]);
+		started = !posix_spawn(&pid, argv[0], &actions, NULL, (char *const *)argv, *_NSGetEnviron());
+		posix_spawn_file_actions_destroy(&actions);
+		close(fds[1]);
+		if (!started)
+			close(fds[0]);
+	}
+	if (!started) {   // not allowed to (a sandbox): through the kext
+		NSError *why = translateByKext(((RDNA4MTLDevice *)(function.device ?: gGlDevice)).gpu, input, function.name, blob, buffers);
 		if (scratch)
 			[NSFileManager.defaultManager removeItemAtPath:scratch error:nil];
 		return why;
 	}
-	NSData *said = [pipe.fileHandleForReading readDataToEndOfFile];
-	[task waitUntilExit];
-	if (scratch)
+	NSMutableData *said = [NSMutableData data];
+	char chunk[4096];
+	for (ssize_t got; (got = read(fds[0], chunk, sizeof chunk)) > 0 || (got < 0 && errno == EINTR);)
+		if (got > 0)
+			[said appendBytes:chunk length:(NSUInteger)got];
+	close(fds[0]);
+	int status = 0;
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+	static std::atomic<int> kept;
+	if (scratch && getenv("RDNA4_KEEP_AIR"))   // (diagnostic: the AIR translated, kept in the app's temporary directory, numbered)
+		[NSFileManager.defaultManager moveItemAtPath:scratch toPath:[scratch stringByAppendingFormat:@".%d", kept++] error:nil];
+	else if (scratch)
 		[NSFileManager.defaultManager removeItemAtPath:scratch error:nil];
 	NSString *text = [[NSString alloc] initWithData:said encoding:NSUTF8StringEncoding];
 	NSArray *words = [text componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];   // "<name> <buffers> <written>"
 	*blob = [NSData dataWithContentsOfFile:out];
 	[NSFileManager.defaultManager removeItemAtPath:out error:nil];
-	if (task.terminationStatus || words.count < 2 || !*blob)
+	if (!WIFEXITED(status) || WEXITSTATUS(status) || words.count < 2 || !*blob)
 		return rdna4Error([NSString stringWithFormat:@"%@ could not translate %@: %@", tool, function.name, text], 0);
 	*buffers = (uint32_t)[words[1] intValue];
 	return nil;
@@ -1973,7 +2000,9 @@ static void heldIdle(RDNA4MTLDevice *device)
 		return rdna4Error(@"no gfx IBs: the kext's runtime client is not open (root only), or the boot has no client gfx IBs (rdna4-gfx=2)", 0);
 	id<MTLFunction> fn[2] = { desc.vertexFunction, desc.fragmentFunction };
 	if (!fn[0] || !fn[1] || fn[0].device != _device || fn[1].device != _device)
-		return rdna4Error(@"a render pipeline needs a vertex and a fragment function of this device so far", 0);
+		return rdna4Error([NSString stringWithFormat:@"a render pipeline needs a vertex and a fragment function of this device so far: %@ (%@, device %@) / %@ (%@, "
+		                                             @"device %@)", fn[0].name, [(id)fn[0] class], [(id)fn[0].device class], fn[1].name,
+		                                             [(id)fn[1] class], [(id)fn[1].device class]], 0);
 	MTLRenderPipelineColorAttachmentDescriptor *a = desc.colorAttachments[0];
 	_format = a.pixelFormat;
 	const MTLPixelFormat zf = desc.depthAttachmentPixelFormat, sf = desc.stencilAttachmentPixelFormat;
@@ -2007,7 +2036,10 @@ static void heldIdle(RDNA4MTLDevice *device)
 			continue;
 		}
 		MTLVertexBufferLayoutDescriptor *l = vd.layouts[buffer];
-		const uint32_t step = l.stepFunction ? (uint32_t)l.stepFunction : 1, rate = l.stepRate ? (uint32_t)l.stepRate : 1;
+		// as Metal has them: step function constant (0: every vertex reads the first element; GL-on-Metal's constant attributes, a
+		// colour of one float4 that was read per vertex past its end and shaded kitty's window to black in one corner, 2026-11-21),
+		// per vertex (1, the default) or per instance (2, rate 0: always the first)
+		const uint32_t step = (uint32_t)l.stepFunction, rate = (uint32_t)l.stepRate;
 		const uint32_t rec[4] = { (uint32_t)at.offset, (uint32_t)l.stride, buffer | (f & 15) << 8 | (f >> 4 & 7) << 12 | (f >> 7 & 1) << 15 | step << 16, rate };
 		memcpy(_attributeRecords[i], rec, sizeof rec);
 	}
@@ -3517,6 +3549,205 @@ enum { kSlots = 128, kBatchSlots = 32 };   // a batch is submitted at kBatchSlot
 - (id<MTLDevice>)device { return _device; }
 @end
 
+// GL windows without the kernel's accelerator surfaces (2026-11-21). On Tahoe a GL window's surface lives in the app's own SkyLight
+// (CAWindowContent): SLSBindSurface makes an accelerator surface for it (IOAccelCreateSurface, client type 0 on our accelerator), sets its
+// shape, and each flush asks it for the buffer to show (IOAccelSurfaceControl -> an IOSurface's mach port), which becomes the window's
+// content; Apple's GL drawable (client type 9, never run on our accelerator) fills those buffers in the kernel. Here, in a process with
+// Apple's GL-on-Metal renderer only: SkyLight's surface calls are redirected (its import pointers) to surfaces of this file, and our
+// drawable gives GL their IOSurfaces. Other surfaces (another accelerator's) go to the real calls.
+struct GLSurface {
+	uint32_t id, options, width = 0, height = 0;
+	IOSurfaceRef buffers[2] = {};
+};
+static std::mutex gGLSurfacesLock;
+static std::unordered_map<uint64_t, GLSurface> gGLSurfaces;   // by our connect (kGLConnect + n)
+static constexpr uint64_t kGLConnect = 0x7d000000;
+static kern_return_t (*gRealCreateSurface)(io_service_t, uint32_t, uint32_t, uint64_t *);
+static kern_return_t (*gRealDestroySurface)(uint64_t);
+static kern_return_t (*gRealSurfaceControl)(uint64_t, uint32_t, uint32_t, uint32_t *);
+static kern_return_t (*gRealSetShape)(uint64_t, const void *, uint32_t, uint32_t);
+static kern_return_t (*gRealSetScale)(uint64_t, uint32_t, const void *);
+static kern_return_t (*gRealWaitForSurface)(uint64_t);
+static bool glConnect(uint64_t c) { return (c & ~0xffffffull) == kGLConnect; }
+// (the caller holds gGLSurfacesLock) the surface with SkyLight's id, or null
+static GLSurface *glSurfaceWithId(uint32_t sid)
+{
+	for (auto &g : gGLSurfaces)
+		if (g.second.id == sid)
+			return &g.second;
+	return nullptr;
+}
+
+// (the caller holds gGLSurfacesLock) the surface's buffers at its size, BGRA8
+static void glSurfaceBuffers(GLSurface &g)
+{
+	for (IOSurfaceRef &b : g.buffers) {
+		if (b && IOSurfaceGetWidth(b) == g.width && IOSurfaceGetHeight(b) == g.height)
+			continue;
+		if (b)
+			CFRelease(b);
+		b = g.width && g.height ? IOSurfaceCreate((__bridge CFDictionaryRef)@{ (id)kIOSurfaceWidth : @(g.width), (id)kIOSurfaceHeight : @(g.height),
+		                                                                         (id)kIOSurfaceBytesPerElement : @4, (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA') })
+		                        : nullptr;
+	}
+}
+
+static kern_return_t glCreateSurface(io_service_t accel, uint32_t sid, uint32_t options, uint64_t *out)
+{
+	io_name_t cls = "";
+	IOObjectGetClass(accel, cls);
+	if (strcmp(cls, "RDNA4Accelerator"))
+		return gRealCreateSurface(accel, sid, options, out);
+	static uint32_t next;
+	std::lock_guard<std::mutex> hold(gGLSurfacesLock);
+	*out = kGLConnect + (++next & 0xffffff);
+	gGLSurfaces[*out] = GLSurface{ sid, options };
+	RTRACE(40, @"GL surface 0x%x (options 0x%x): connect 0x%llx", sid, options, *out);
+	return KERN_SUCCESS;
+}
+static kern_return_t glDestroySurface(uint64_t c)
+{
+	if (!glConnect(c))
+		return gRealDestroySurface(c);
+	std::lock_guard<std::mutex> hold(gGLSurfacesLock);
+	auto it = gGLSurfaces.find(c);
+	if (it != gGLSurfaces.end()) {
+		for (IOSurfaceRef b : it->second.buffers)
+			if (b)
+				CFRelease(b);
+		gGLSurfaces.erase(it);
+	}
+	return KERN_SUCCESS;
+}
+// IOAccelDeviceRegion {u32 rects, IOAccelBounds bounds, IOAccelBounds rect[]}, IOAccelBounds {s16 x, y, w, h}: the bounds' size
+static kern_return_t glSetShape(uint64_t c, const void *region, uint32_t options, uint32_t index)
+{
+	if (!glConnect(c))
+		return gRealSetShape(c, region, options, index);
+	const int16_t *bounds = (const int16_t *)((const uint8_t *)region + 4);
+	std::lock_guard<std::mutex> hold(gGLSurfacesLock);
+	auto it = gGLSurfaces.find(c);
+	if (it != gGLSurfaces.end() && region && bounds[2] > 0 && bounds[3] > 0) {
+		it->second.width = (uint32_t)bounds[2], it->second.height = (uint32_t)bounds[3];
+		RTRACE(40, @"GL surface 0x%x: shape %d,%d %dx%d (options 0x%x, index %u)", it->second.id, bounds[0], bounds[1], bounds[2], bounds[3], options, index);
+	}
+	return KERN_SUCCESS;
+}
+static kern_return_t glSurfaceControl(uint64_t c, uint32_t cmd, uint32_t arg, uint32_t *out)
+{
+	if (!glConnect(c))
+		return gRealSurfaceControl(c, cmd, arg, out);
+	if (out)
+		*out = 0;
+	if (cmd == 0x14) {   // the buffer to show (SLSFlushSurfaceWithOptionsAndIndex): a send right for its IOSurface, which SkyLight gives up
+		std::lock_guard<std::mutex> hold(gGLSurfacesLock);
+		auto it = gGLSurfaces.find(c);
+		IOSurfaceRef b = it != gGLSurfaces.end() && arg < 2 ? it->second.buffers[arg] : nullptr;
+		if (b && out)
+			*out = IOSurfaceCreateMachPort(b);
+		RTRACE(40, @"GL surface 0x%x: buffer %u shown (%@)", it != gGLSurfaces.end() ? it->second.id : 0, arg, b ? @"ours" : @"none");
+		return KERN_SUCCESS;
+	}
+	RTRACE(80, @"GL surface control 0x%llx: command 0x%x, argument 0x%x", c, cmd, arg);
+	return KERN_SUCCESS;
+}
+static kern_return_t glSetScale(uint64_t c, uint32_t options, const void *scale)
+{
+	return glConnect(c) ? KERN_SUCCESS : gRealSetScale(c, options, scale);
+}
+static kern_return_t glWaitForSurface(uint64_t c) { return glConnect(c) ? KERN_SUCCESS : gRealWaitForSurface(c); }
+
+// `image`'s import of `name` (its stub's pointer: jmpq *slot(%rip)) to `to`, the real one into *real. ponytail: x86_64 stubs only.
+static bool rebindImport(const struct mach_header_64 *image, const char *name, void *to, void **real)
+{
+	void *target = dlsym(RTLD_DEFAULT, name);
+	unsigned long size = 0;
+	uint8_t *stubs = getsectiondata(image, "__TEXT", "__stubs", &size);
+	bool done = false;
+	for (unsigned long i = 0; target && stubs && i + 6 <= size; i += 6) {
+		if (stubs[i] != 0xff || stubs[i + 1] != 0x25)
+			continue;
+		int32_t disp;
+		memcpy(&disp, stubs + i + 2, 4);
+		void **slot = (void **)(stubs + i + 6 + disp);
+		if (*slot != target)
+			continue;
+		const vm_address_t page = (vm_address_t)slot & ~(vm_address_t)(vm_page_size - 1);
+		if (vm_protect(mach_task_self(), page, vm_page_size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS)
+			continue;
+		*real = target;
+		*slot = to;
+		vm_protect(mach_task_self(), page, vm_page_size, false, VM_PROT_READ);
+		done = true;
+	}
+	return done;
+}
+
+// SkyLight's surface calls to ours, once, in a GL process (never WindowServer)
+static void glSurfacesInstall(void)
+{
+	static std::mutex lock;
+	static bool tried;   // set once the renderer was there to decide (the device is made before it is loaded)
+	std::lock_guard<std::mutex> hold(lock);
+	if (tried || !strcmp(getprogname(), "WindowServer"))
+		return;
+	const struct mach_header_64 *sky = nullptr, *gl = nullptr;
+	for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+		const char *n = _dyld_get_image_name(i);
+		if (strstr(n, "/SkyLight.framework/"))
+			sky = (const struct mach_header_64 *)_dyld_get_image_header(i);
+		// a GL process: its renderer, or OpenGL.framework (our device is made while its GL context is, before a window's surface is
+		// bound, and the renderer may not be loaded yet then)
+		if (strstr(n, "AppleMetalOpenGLRenderer") || strstr(n, "/OpenGL.framework/Versions/A/OpenGL"))
+			gl = (const struct mach_header_64 *)_dyld_get_image_header(i);
+	}
+	if (!sky || !gl)   // not a GL process (again at the next GL drawable)
+		return;
+	tried = true;
+	const bool ok = rebindImport(sky, "IOAccelCreateSurface", (void *)glCreateSurface, (void **)&gRealCreateSurface) &&
+	                rebindImport(sky, "IOAccelDestroySurface", (void *)glDestroySurface, (void **)&gRealDestroySurface) &&
+	                rebindImport(sky, "IOAccelSurfaceControl", (void *)glSurfaceControl, (void **)&gRealSurfaceControl) &&
+	                rebindImport(sky, "IOAccelSetSurfaceFramebufferShape", (void *)glSetShape, (void **)&gRealSetShape) &&
+	                rebindImport(sky, "IOAccelSetSurfaceScale", (void *)glSetScale, (void **)&gRealSetScale) &&
+	                rebindImport(sky, "IOAccelWaitForSurface", (void *)glWaitForSurface, (void **)&gRealWaitForSurface);
+	RLOG(@"RDNA4MTL: GL window surfaces in this process: %@", ok ? @"ours" : @"NOT redirected (SkyLight's imports not found)");
+}
+
+// A GL window's drawable: the IOSurfaces of the surface with its id (setDrawableSurface)
+@interface RDNA4GLDrawable : NSObject
+@end
+@implementation RDNA4GLDrawable {
+	uint32_t _sid;
+}
+- (GLSurface *)surface { return glSurfaceWithId(_sid); }   // (the caller holds gGLSurfacesLock)
+- (int)setDrawableSurface:(unsigned)surface mode:(unsigned long long)mode colorDepthMode:(unsigned)depth face:(unsigned)face level:(unsigned)level
+                 volatile:(unsigned)vol fixedSource:(unsigned)fixed scaleOptions:(unsigned)scale scaledWidth:(unsigned)w scaledHeight:(unsigned)h
+{
+	_sid = surface;
+	RTRACE(40, @"GL drawable: surface 0x%x mode 0x%llx depth %u scale 0x%x %ux%u", surface, mode, depth, scale, w, h);
+	return 0;
+}
+- (id)lookupIOSurfaceAtIndex:(unsigned long long)i
+{
+	std::lock_guard<std::mutex> hold(gGLSurfacesLock);
+	GLSurface *g = [self surface];
+	if (!g || i >= 2)
+		return nil;
+	glSurfaceBuffers(*g);
+	return (__bridge id)g->buffers[i];
+}
+- (unsigned)width { std::lock_guard<std::mutex> hold(gGLSurfacesLock); GLSurface *g = [self surface]; return g ? g->width : 0; }
+- (unsigned)height { std::lock_guard<std::mutex> hold(gGLSurfacesLock); GLSurface *g = [self surface]; return g ? g->height : 0; }
+- (unsigned)surfaceWidth { return [self width]; }
+- (unsigned)surfaceHeight { return [self height]; }
+- (int)clearDrawable { _sid = 0; return 0; }
+- (int)setSwapInterval:(int)interval limit:(int)limit { return 0; }
+- (int)setSwapRectX:(unsigned)x y:(unsigned)y w:(unsigned)w h:(unsigned)h { return 0; }
+- (unsigned long long)windowMode { return 0; }
+- (int)signalSharedEvent:(id)e value:(unsigned long long)v operation:(unsigned long long)op { return 0; }
+RDNA4_ANSWER_MISSING
+@end
+
 @implementation RDNA4MTLDevice {
 	io_service_t _service;
 	uint64_t _registryID;
@@ -3594,6 +3825,7 @@ static void abortStack(int sig)
 	if (!self)
 		return nil;
 	gGlDevice = self;
+	glSurfacesInstall();   // (a GL process: before SkyLight binds its window surfaces)
 	IOObjectRetain(service);
 	_service = service;
 	IORegistryEntryGetRegistryEntryID(service, &_registryID);
@@ -3733,6 +3965,10 @@ static void abortStack(int sig)
 // was most of WindowServer's frame time.
 - (NSError *)gpuBarrier:(const RDNA4Copy *)copies count:(uint32_t)count
 {
+	// the gfx buffers made first, as a draw does (a pass whose first work is a clear, GL's into its window's buffer, reached them unmade:
+	// a null IB page, 2026-11-21)
+	if (!self.gfx)
+		return rdna4Error(@"a copy or fill on the card without the device's gfx buffers", 0);
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];
 	uint32_t n = 0;
 	if (_lastFence || _batchCount) {
@@ -4076,6 +4312,8 @@ static void abortStack(int sig)
 - (BOOL)isHeadless { return NO; }
 
 - (NSString *)name { return @"AMD Radeon RDNA4 (native Metal, spike)"; }
+// Apple's GL-on-Metal renderer takes its renderer string and its per-vendor limits from this ("AMD" or "ATI" for AMD's)
+- (NSString *)vendorName { return @"AMD"; }
 - (uint64_t)registryID { return _registryID; }
 - (BOOL)hasUnifiedMemory { return NO; }
 // (0 by the catch-all before: Core Image's icon kernels asked) 256 bytes, the sampler's linear and buffer texture base alignment
@@ -4163,6 +4401,9 @@ static void abortStack(int sig)
 - (BOOL)supportsArrayOfSamplers { return YES; }
 - (BOOL)supportsArrayOfTextures { return YES; }
 - (BOOL)supportsBaseVertexInstanceDrawing { return YES; }
+// Attributes at any byte offset and stride: the translator reads each component from its dword (SH_MEM_CONFIG allows unaligned loads).
+// Without it Apple's GL-on-Metal renderer refuses kitty's cell arrays and draws each of its ~3000 instances alone (2026-11-21).
+- (BOOL)supportsUnalignedVertexFetch { return YES; }
 - (BOOL)supportsBlackOrWhiteSamplerBorderColors { return YES; }
 - (BOOL)supportsBufferPrefetchStatistics { return NO; }
 - (BOOL)supportsBufferWithIOSurface { return NO; }
@@ -4403,6 +4644,18 @@ static void abortStack(int sig)
 			RLOG(@"RDNA4MTL: pipeline %@ / %@: no reflection from its GL programs' data", descriptor.vertexFunction.name, descriptor.fragmentFunction.name);
 	}
 	return state;
+}
+
+// GL windows: our own drawable, and their surfaces' sizes (GLSurface above)
+- (id)newGLDrawable { glSurfacesInstall(); return [RDNA4GLDrawable new]; }
+- (int)getSurfaceMode:(unsigned long long *)mode width:(unsigned *)width height:(unsigned *)height forId:(unsigned)sid
+{
+	std::lock_guard<std::mutex> hold(gGLSurfacesLock);
+	const GLSurface *g = glSurfaceWithId(sid);
+	if (!g)
+		return -1;
+	*mode = g->options, *width = g->width, *height = g->height;
+	return 0;
 }
 
 - (id<MTLCommandQueue>)newCommandQueue
