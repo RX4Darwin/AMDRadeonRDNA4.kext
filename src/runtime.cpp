@@ -685,10 +685,8 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	auto rollback = [&]() {
 		if (vmUnmap(c, va, mapped))
 			return true;
-		if (c.active)
-			c.mappingUnsafe = true;
-		RLOG("vmid %u: VRAM-map rollback could not be confirmed%s", c.vmid,
-		     c.active ? "; client marked unsafe" : "; client context not active");
+		c.mappingUnsafe = true;
+		RLOG("vmid %u: VRAM-map rollback could not be confirmed; client marked unsafe", c.vmid);
 		return false;
 	};
 	if (c.sp) {
@@ -1932,6 +1930,12 @@ IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 	    !vmMap(*c, c->fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
 	    !vmMap(*c, c->kernargVa, poolMc(qoff + kVmKernarg), 0x1000, false) ||
 	    !c->pm4.init(poolDw(qoff + kVmPq), qva, kPqSize) || !vmContextInit(*c)) {
+		if (c->mappingUnsafe) {
+			vmidUsed[vmid] = true;
+			queueUsed[pipe][queue] = true;
+			quarantineLocked(owner, *c);
+			return kIOReturnNotResponding;
+		}
 		IOFree(c->tableShadow, kVmTableBytes); devHeap.free(table); *c = RtClient {};
 		return kIOReturnNoMemory;
 	}
@@ -2034,6 +2038,11 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 	if (!vmMap(*c, c->fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
 	    !vmMap(*c, c->kernargVa, poolMc(qoff + kVmKernarg), 0x1000, false) ||
 	    !vmMap(*c, c->ibVa, poolMc(qoff + kVmIb), 0x1000, true) || (rdna4Step("rtOpenShared: VM context"), !vmContextInit(*c))) {
+		if (c->mappingUnsafe) {
+			vmidUsed[vmid] = true;
+			quarantineLocked(owner, *c);
+			return kIOReturnNotResponding;
+		}
 		IOFree(c->tableShadow, kVmTableBytes); freeTable(); *c = RtClient {};
 		return kIOReturnNoMemory;
 	}
