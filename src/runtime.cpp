@@ -586,6 +586,10 @@ void RDNA4Compute::treeDirtyThunk(void *ctx, uint32_t id) {
 bool RDNA4Compute::sparseSync(RtClient &c) {
 	if (!c.sp || !poolCpu || !devHeap.size())
 		return false;
+	/* Once a kicked SDMA copy times out, it may still be reading this one
+	 * staging page. Never overwrite it until a real power reset is observed. */
+	if (sdmaWedged)
+		return false;
 	uint32_t id = 0;
 	uint64_t *shadow = nullptr, heapOffset = 0;
 	while (c.sp->s.nextDirty(id, shadow, heapOffset)) {
@@ -619,7 +623,7 @@ bool RDNA4Compute::sparseOpen(RtClient &c, uint32_t quotaPages) {
 	c.rootMc = vramMc(heapOffset);
 	c.rootPhys = root.phys;
 	if (!sparseSync(c)) {
-		sparseTeardown(c, true);
+		(void)sparseTeardown(c, true);  // on a wedged queue this deliberately retains the sparse table
 		return false;
 	}
 	return true;
@@ -627,9 +631,9 @@ bool RDNA4Compute::sparseOpen(RtClient &c, uint32_t quotaPages) {
 
 /* Give a sparse client's table memory back. With clearVram the VRAM pages are first overwritten with zeros (a stale PTE page must not be
  * readable through a reused chunk); after a resume the VRAM is gone and only the host memory is freed. */
-void RDNA4Compute::sparseTeardown(RtClient &c, bool clearVram) {
+bool RDNA4Compute::sparseTeardown(RtClient &c, bool clearVram) {
 	if (!c.sp)
-		return;
+		return true;
 	if (clearVram) {
 		for (uint32_t id = 0; id < c.sp->s.idCount(); id++) {
 			uint64_t *shadow = nullptr, heapOffset = 0;
@@ -638,12 +642,17 @@ void RDNA4Compute::sparseTeardown(RtClient &c, bool clearVram) {
 			bzero(shadow, 0x1000);
 			c.sp->s.markDirty(id);
 		}
-		(void)sparseSync(c);
+		/* Do not return chunks while a timed-out SDMA may still write them. */
+		if (!sparseSync(c)) {
+			RLOG("vmid %u: sparse page-table teardown sync failed; retaining chunks and shadow pages", c.vmid);
+			return false;
+		}
 	}
 	c.sp->s.releaseAll(sparseHost(), clearVram);
 	IOFree(c.sp, sizeof(SparseTables));
 	c.sp = nullptr;
 	c.rootMc = c.rootPhys = 0;
+	return true;
 }
 
 uint64_t *RDNA4Compute::ptEntryThunk(void *ctx, uint64_t off) {
@@ -867,6 +876,8 @@ bool RDNA4Compute::vmTableSync(RtClient &c, uint32_t offset, uint32_t bytes) {
 		flushHdp();
 		return true;
 	}
+	if (sdmaWedged)
+		return false;              // do not overwrite a staging page still referenced by a timed-out copy
 	/* Through the staging area 2 MiB at a time: it is 4 MiB, the table larger (the client's queue pages follow it). */
 	for (uint32_t at = offset; at < offset + bytes;) {
 		const uint32_t n = offset + bytes - at < (2u << 20) ? offset + bytes - at : 2u << 20;
@@ -1137,6 +1148,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 	const uint32_t nMir = sizeof(mir) / sizeof(mir[0]);
 	auto dumpWindows = [&](const char *tag) { vmDumpHubWindows(tag); };
 	auto dumpTables = [&](const char *tag) {
+		if (sdmaWedged)
+			return;                 // the readback uses the same staging page as table uploads
 		const uint32_t bytes = 0x4000;
 		for (uint32_t i = 0; i < bytes / 4; i++)
 			*poolDw(kVmTableStage + i * 4) = 0xdeadbeef;
@@ -2058,6 +2071,11 @@ IOReturn RDNA4Compute::rtOpenPooled(const void *owner, uint32_t slot, RtClient *
 	c->pasid = slot + 1;
 	c->poolOff = area - kVmFence;       // poolOff + kVmFence / kVmKernarg / kVmIb are the three pages of the area
 	if (!sparseOpen(*c, PtPages::kMaxPages)) {
+		if (c->sp) {
+			/* Initial root sync failed and its VRAM clear could not be confirmed. */
+			quarantineLocked(owner, *c);
+			return kIOReturnNotResponding;
+		}
 		*c = RtClient {};
 		return kIOReturnNoMemory;
 	}
@@ -2077,7 +2095,10 @@ IOReturn RDNA4Compute::rtOpenPooled(const void *owner, uint32_t slot, RtClient *
 	if (!vmMap(*c, c->fenceVa, poolMc(c->poolOff + kVmFence), 0x1000, false) ||
 	    !vmMap(*c, c->kernargVa, poolMc(c->poolOff + kVmKernarg), 0x1000, false) ||
 	    !vmMap(*c, c->ibVa, poolMc(c->poolOff + kVmIb), 0x1000, true)) {
-		sparseTeardown(*c, true);
+		if (!sparseTeardown(*c, true)) {
+			quarantineLocked(owner, *c);
+			return kIOReturnNotResponding;
+		}
 		*c = RtClient {};
 		return kIOReturnNoMemory;
 	}
@@ -4198,8 +4219,12 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		vmOpTrace(inactive ? "release after dequeue" : "release after dequeue TIMEOUT", c->vmid, c->pipe, c->queue);
 		}
 		if (c->sp) {
-			/* Sparse tables: zero every backed page in VRAM, then give the chunks and the wired shadow pages back. */
-			sparseTeardown(*c, true);
+			/* Sparse tables: zero every backed page in VRAM before returning chunks. */
+			if (!sparseTeardown(*c, true)) {
+				RLOG("vmid %u: sparse teardown could not be confirmed; retaining client and page tables", c->vmid);
+				quarantineLocked(owner, *c);
+				return;
+			}
 			RLOG("client slot %d (PASID %u) closed: page tables freed (%u shadow pages still wired in all)",
 			     static_cast<int>(c - clients), c->pasid, sparseShadowPages);
 			*c = RtClient {};
@@ -4256,6 +4281,7 @@ void RDNA4Compute::quarantineLocked(const void *owner, RtClient &c) {
 
 	c.quarantinedOwner = owner;
 	c.owner = &kQuarantined;
+	c.active = true;                 // a quarantined slot must never be selected as free
 	RLOG("vmid %u: client quarantined: %u buffer(s), %u program(s), its page tables and VMID kept, not reused", c.vmid, nb, np);
 }
 
@@ -4391,6 +4417,8 @@ void RDNA4Compute::resetRuntimeForResume() {
 	presentActive = false;
 	presentOwner = nullptr;
 	rtWedged = false;
+	sdmaWedged = false;            // power has reset the engine; staging and DMA buffers are safe to reuse
+	sdmaFence = 0;
 	rtReady = false;
 	rtGeneration++;
 	RLOG("power: old runtime buffers, heaps and VM contexts discarded; client objects retained as aborted");
@@ -4402,6 +4430,8 @@ void RDNA4Compute::resetRuntimeForResume() {
 
 // One packet on SDMA0 queue 0 with a FENCE after it; waits for the fence.
 bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeoutMs) {
+	if (sdmaWedged)
+		return false;
 	uint32_t fence[Sdma::kFenceDwords];
 	uint32_t trap[Sdma::kTrapDwords];
 	const uint32_t value = ++sdmaFence;
@@ -4414,8 +4444,10 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 	if (ihActive) {
 		uint64_t ns = 0;
 		const bool done = ihWaitFence(poolDw(kSdmaFenceOffset), value, timeoutMs, false, "dma", ns);
-		if (!done)
+		if (!done) {
+			sdmaWedged = true;
 			RLOG("dma: SDMA queue remains wedged; this gfx12 path has no source-backed no-MES queue reset");
+		}
 		return done;
 	}
 	uint64_t t0 = mach_absolute_time(), span = 0;
@@ -4434,6 +4466,7 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 	// The current gfx12 amdgpu source exposes SDMA reset through MES. There is
 	// no source-backed no-MES queue reset sequence for this bring-up path, so a
 	// timed-out SDMA queue remains wedged rather than risking the display.
+	sdmaWedged = true;
 	RLOG("dma: SDMA queue remains wedged; no source-backed no-MES queue reset");
 	logGcFault("dma");
 	return false;
