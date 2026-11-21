@@ -761,27 +761,43 @@ bool RDNA4Compute::initRuntimeHeap() {
 	return heap.size() != 0;
 }
 
-void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
-	if (!poolCpu || !hasTables(c) || !bytes || va & (GpuVm::kPageBytes - 1))
-		return;
+bool RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
+	if (!poolCpu || !hasTables(c) || !bytes || (va & (GpuVm::kPageBytes - 1)))
+		return false;
+	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	const uint64_t end = va + rounded;
+	if (rounded < bytes || end < va || end > GpuVm::kVaEnd)
+		return false;
 	c.tlbSeq++;      /* a removed PTE: the next job on any VMID this client owns flushes first (amdgpu's tlb_seq) */
-	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
 	if (c.sp) {
-		TreeCtx tc { this, &c };   // treeUnmap never backs a page just to clear a PTE in it
+		TreeCtx tc { this, &c };
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
 		GpuVmTable::treeUnmap(tree, va, end);
-		if (!sparseSync(c))
+		if (!sparseSync(c)) {
 			RLOG("vmid %u: page-table unmap sync failed", c.vmid);
-		return;
+			return false;
+		}
+		return true;
 	}
 	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
 	GpuVmTable::unmap(access, kVmTableBytes, va, end, span);
-	if (span.firstPt != ~0ull && c.tableCpu)
-		(void)vmSyncCpu(c, va, end);
-	else if (span.firstPt != ~0ull && !vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000)))
-		RLOG("vmid %u: page-table unmap sync failed", c.vmid);   // one SDMA job for the span, as vmMapHost
+	if (span.firstPt == ~0ull)
+		return true;
+	if (c.tableCpu) {
+		if (!vmSyncCpu(c, va, end)) {
+			RLOG("vmid %u: CPU page-table unmap sync failed", c.vmid);
+			return false;
+		}
+		return true;
+	}
+	if (!vmTableSync(c, static_cast<uint32_t>(span.firstPt),
+	                 static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000))) {
+		RLOG("vmid %u: page-table unmap sync failed", c.vmid);
+		return false;
+	}
+	return true;
 }
 
 /* Tables in the pool (rtPreferCpuTables): only the entries of [va, end) copied through the BAR, its PDB0 entries and its PTEs (the dense
@@ -2774,18 +2790,18 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	if (c && c->gfxOutstanding && owner != idleFreeOwner)
 		gfxClientDrain(*c, "buffer free");   // W12k: an outstanding gfx IB may still use it
 	const bool host = b->host;
-	if (c && b->va)
-		vmUnmap(*c, b->va, b->bytes);
-	/* Every unmap is followed by an invalidation before the memory goes back to its heap
-	 * (amdgpu sets tlb_seq on a cleared PTE and flushes before the VMID's next job,
-	 * amdgpu_vm.c:1272). Device buffers used to skip it: a cached translation could then
-	 * still reach VRAM that the heap hands to another client. Inferred from the code, not
-	 * measured on the card. When the invalidation times out the memory is never reused: the
-	 * GPU may still reach it, and host pages handed back to the kernel would take its writes. */
-	const bool forgotten = !c || !(b->va || host) || vmInvalidateOwned(*c, host ? "host unmap" : "device unmap");
-
-	if (!forgotten)
-		RLOG("vmid %u: %s buffer unmap invalidation timed out: its memory is kept, not reused", c->vmid, host ? "host" : "device");
+	/* A failed page-table writeback is just as unsafe as a failed TLB invalidate:
+	 * either can leave the GPU reaching memory that is about to be returned. Keep
+	 * the entire client intact rather than freeing one resource and continuing. */
+	const bool unmapped = !c || !b->va || vmUnmap(*c, b->va, b->bytes);
+	const bool forgotten = unmapped &&
+	                      (!c || !(b->va || host) || vmInvalidateOwned(*c, host ? "host unmap" : "device unmap"));
+	if (!forgotten) {
+		RLOG("vmid %u: buffer cleanup could not be confirmed; quarantining client resources", c ? c->vmid : 0);
+		if (c)
+			quarantineLocked(owner, *c);
+		return kIOReturnNotResponding;
+	}
 
 	if (c && b->va && forgotten)
 		vaGive(*c, b->va, b->bytes);   // after the invalidation: nothing cached reaches the range when it is mapped again
@@ -3020,12 +3036,13 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 	if (!p)
 		return kIOReturnBadArgument;
 	if (RtClient *c = vmClientFor(owner)) {
-		vmUnmap(*c, p->va, heap.lengthOf(p->offset));
-		/* As rtFree: invalidate before the code pages return to the heap. */
-		if (!vmInvalidateOwned(*c, "program unmap"))
-			RLOG("vmid %u: program unmap invalidation timed out", c->vmid);
-
-		vaGive(*c, p->va, p->vaBytes);   // after the invalidation, as rtFree
+		if (!vmUnmap(*c, p->va, heap.lengthOf(p->offset)) ||
+		    !vmInvalidateOwned(*c, "program unmap")) {
+			RLOG("vmid %u: program cleanup could not be confirmed; quarantining client resources", c->vmid);
+			quarantineLocked(owner, *c);
+			return kIOReturnNotResponding;
+		}
+		vaGive(*c, p->va, p->vaBytes);
 	}
 	heap.free(p->offset);
 	p->owner = nullptr;
@@ -4043,14 +4060,41 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		return;
 	}
 
+	/* Unmap every owned range first, then invalidate once before releasing ANY backing.
+	 * If one page-table writeback or the invalidate fails, preserve all resources and
+	 * the VMID. Partial cleanup followed by reuse would be unsafe. */
+	bool mappingsCleared = true;
+	bool hadMappings = false;
+	if (c) {
+		for (RtBuffer &b : buffers) {
+			if (b.owner == owner && b.va) {
+				hadMappings = true;
+				if (!vmUnmap(*c, b.va, b.bytes))
+					mappingsCleared = false;
+			}
+		}
+		for (RtProgram &p : programs) {
+			if (p.owner == owner && p.va) {
+				hadMappings = true;
+				if (!vmUnmap(*c, p.va, heap.lengthOf(p.offset)))
+					mappingsCleared = false;
+			}
+		}
+		if (mappingsCleared && hadMappings)
+			mappingsCleared = vmInvalidateOwned(*c, "client close");
+	}
+	if (!mappingsCleared) {
+		RLOG("vmid %u: client cleanup could not be confirmed; retaining all resources and VMID", c ? c->vmid : 0);
+		if (c)
+			quarantineLocked(owner, *c);
+		return;
+	}
+
 	uint32_t nb = 0, np = 0;
-	bool hostUnmapped = false;
 	for (RtBuffer &b : buffers) {
 		if (b.owner == owner) {
-			if (c)
-				vmUnmap(*c, b.va, b.bytes);
 			if (b.host) {
-				hostUnmapped = true;
+				/* Released below after all page-table and TLB cleanup succeeded. */
 			} else {
 				(b.device ? devHeap : heap).free(b.offset);
 				b.owner = nullptr;
@@ -4060,18 +4104,11 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	}
 	for (RtProgram &p : programs) {
 		if (p.owner == owner) {
-			if (c)
-				vmUnmap(*c, p.va, heap.lengthOf(p.offset));
 			heap.free(p.offset);
 			p.owner = nullptr;
 			np++;
 		}
 	}
-	const bool hostForgotten = !c || !hostUnmapped || vmInvalidateOwned(*c, "host unmap");
-
-	if (!hostForgotten)
-		RLOG("vmid %u: host buffer cleanup invalidation timed out: their pages are kept, not reused", c->vmid);
-
 	for (RtBuffer &b : buffers) {
 		if (b.owner == owner && b.host) {
 			const uint64_t rounded = b.mapped ? 0 : (b.bytes + GpuVm::kPageBytes - 1) &
@@ -4081,10 +4118,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			if (hostBytesTotal >= rounded)
 				hostBytesTotal -= rounded;
 			RLOG("vmid %u: host buffer unmapped during client close", c ? c->vmid : 0);
-			if (hostForgotten)
-				releaseHost(b);
-			else
-				leakHost(b);
+			releaseHost(b);
 			b.owner = nullptr;
 		}
 	}
