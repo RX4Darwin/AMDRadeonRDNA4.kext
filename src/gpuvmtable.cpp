@@ -166,8 +166,13 @@ bool treeMapVram(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, ui
 		if (at < GpuVm::kVaStart || at >= GpuVm::kVaEnd)
 			return false;
 		if ((at >> 21) != ptKey) {
-			if (!treePath(t, at, true, pt, ptId))
+			if (!treePath(t, at, true, pt, ptId)) {
+				/* A quota/allocation failure must not leave the prefix mapped.
+				 * Keep empty directory pages: they are harmless and remain owned
+				 * by the client, while a later map can retry safely. */
+				treeUnmap(t, va, at);
 				return false;
+			}
 			ptKey = at >> 21;
 		}
 		pt[GpuVm::index(at, 3)] = vramLeaf(pol, va, end, at, phys, executable);
@@ -187,8 +192,13 @@ bool treeMapHost(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, co
 		if (at < GpuVm::kVaStart || at >= GpuVm::kVaEnd)
 			return false;
 		if ((at >> 21) != ptKey) {
-			if (!treePath(t, at, true, pt, ptId))
+			if (!treePath(t, at, true, pt, ptId)) {
+				/* A quota/allocation failure must not leave the prefix mapped.
+				 * Keep empty directory pages: they are harmless and remain owned
+				 * by the client, while a later map can retry safely. */
+				treeUnmap(t, va, at);
 				return false;
+			}
 			ptKey = at >> 21;
 		}
 		pt[GpuVm::index(at, 3)] = hostLeaf(pol, pageBuses[page], executable, readOnly);
