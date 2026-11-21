@@ -57,6 +57,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#include <execinfo.h>
 #import <os/log.h>
 #include <atomic>
 #include <mutex>
@@ -2862,6 +2863,9 @@ static NSError *colourOnly(id<MTLTexture> t)
 RDNA4_ANSWER_MISSING
 @end
 
+static bool gAbortStack;   // WindowServer on our accelerator: kept as SIGABRT's handler (commit puts it back over WindowServer's own)
+static void abortStack(int sig);
+
 // An event's value: a shared event's own (signaledValue), else one kept with the event (a plain MTLEvent has none it shows).
 static const void *const kEventValue = &kEventValue;
 static void eventSignal(id event, uint64_t value)
@@ -3076,6 +3080,9 @@ static void eventWait(id event, uint64_t value)
 {
 	if (_status >= MTLCommandBufferStatusCommitted)
 		return;
+	struct sigaction now;
+	if (gAbortStack && !sigaction(SIGABRT, NULL, &now) && now.sa_handler != abortStack)
+		signal(SIGABRT, abortStack);
 	[self enqueue];
 	_committedUs = nowUs();
 	statAdd(kStatEncodeUs, _committedUs - _createdUs);
@@ -3319,8 +3326,23 @@ static NSString *serviceString(io_service_t service, CFStringRef key);
 		class_addProtocol(self, spi);
 }
 
+// WindowServer on our own accelerator: an abort's stack into the unified log (ReportCrash writes few reports for a process that keeps
+// crashing). ponytail: backtrace_symbols and os_log are not async-signal-safe; this process is dying anyway.
+static void abortStack(int sig)
+{
+	void *frames[64];
+	const int n = backtrace(frames, 64);
+	char **names = backtrace_symbols(frames, n);
+	for (int i = 0; names && i < n; i++)
+		os_log(OS_LOG_DEFAULT, "RDNA4MTL abort: %{public}s", names[i]);
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
 - (instancetype)initWithAcceleratorPort:(io_service_t)service
 {
+	if (serviceString(service, CFSTR("RDNA4Accelerator")) && !strcmp(getprogname(), "WindowServer"))
+		gAbortStack = true;
 	// always on our own accelerator (rdna4accel.cpp: no other device there), else only with RDNA4_NATIVE_MTL
 	if (!getenv("RDNA4_NATIVE_MTL") && !serviceString(service, CFSTR("RDNA4Accelerator"))) {
 		self = [super init];   // before the nil return: _MTLDevice's dealloc expects its init to have run

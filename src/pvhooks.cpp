@@ -182,6 +182,13 @@ IOReturn wrapNewUserClient(void *fb, void *task, void *security, uint32_t type, 
  */
 bool wrapMatchInternal(void *service, OSDictionary *table, uint32_t options, uint32_t *done)
 {
+	if (RDNA4Accel::hidesBareFramebuffers() && current_task() != kernel_task && isClass(service, kNdrvFramebuffer) &&
+	    !RDNA4Accel::hasDisplay(static_cast<IORegistryEntry *>(service))) {
+		if (hidden++ < 8)
+			PLOG("framebuffer %p left out of a user-space match: no display on it (our accelerator serves WindowServer)", service);
+
+		return false;
+	}
 	if (ndrvVtable && *static_cast<void **>(service) == ndrvVtable && current_task() != kernel_task && PvScanout::enabled()) {
 		if (hidden++ < 4)
 			PLOG("framebuffer %p left out of a user-space match: the heads are the paravirtual displays", service);

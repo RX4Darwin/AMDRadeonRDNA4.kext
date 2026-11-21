@@ -317,14 +317,14 @@ class RDNA4DeviceControl : public AppleGraphicsDeviceControl {
 		}
 	}
 
-	// the GPU's framebuffers (IOFramebuffers anywhere under its provider), retained, at most cap
+	// the GPU's framebuffers with a display (IOFramebuffers anywhere under its provider), retained, at most cap: those WindowServer sees
 	uint32_t framebuffers(IORegistryEntry **out, uint32_t cap)
 	{
 		uint32_t n = 0;
 		IORegistryIterator *it = getProvider() ? IORegistryIterator::iterateOver(getProvider(), gIOServicePlane, kIORegistryIterateRecursively)
 		                                        : nullptr;
 		while (IORegistryEntry *e = it ? it->getNextObject() : nullptr)
-			if (n < cap && e->metaCast("IOFramebuffer")) {
+			if (n < cap && e->metaCast("IOFramebuffer") && RDNA4Accel::hasDisplay(e)) {
 				e->retain();
 				out[n++] = e;
 			}
@@ -758,6 +758,20 @@ SYSCTL_PROC(_debug, OID_AUTO, rdna4_accel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LO
 // WindowServer's first open of the GPU wrangler (pvhooks.cpp wrapServiceOpen): with rdna4-accel=4 as a boot-arg, held until the boot
 // thread has made and registered the accelerator (or given up), at most 60 s: WindowServer's wrangler lists each GPU's accelerator
 // when it opens, and it opened before ours existed ("accel 0x0", 2026-11-20). (A test boot's option is not known this early.)
+bool RDNA4Accel::hidesBareFramebuffers() { return gFamilyClients; }
+
+// Of our six IONDRV framebuffers two have a display; with all six visible WindowServer made displays of four, two without a monitor
+// (display IDs 0x003f004x), composited in software (2026-11-20)
+bool RDNA4Accel::hasDisplay(IORegistryEntry *fb)
+{
+	bool found = false;
+	OSIterator *it = fb->getChildIterator(gIOServicePlane);
+	while (auto *c = it && !found ? OSDynamicCast(IORegistryEntry, it->getNextObject()) : nullptr)
+		found = c->metaCast("IODisplayConnect");
+	OSSafeReleaseNULL(it);
+	return found;
+}
+
 void RDNA4Accel::waitForWindowServer()
 {
 	uint32_t want = 0;
