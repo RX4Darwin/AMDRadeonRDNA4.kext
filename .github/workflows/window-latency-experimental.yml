@@ -67,9 +67,12 @@ jobs:
           body: |
             **Experimental PVGPU build for macOS Tahoe window/compositor latency investigation.**
 
-            This is separate from the regular PVGPU=0 release. It includes additional
-            per-present timing counters; it does not yet change synchronization policy
-            or claim to fix window animation stalls.
+            This is separate from the regular PVGPU=0 release. It includes per-present
+            timing diagnostics and a nonblocking frame policy: a present is skipped when
+            its scanout head or the global in-flight queue is still busy, rather than
+            waiting synchronously for GPU completion. Drop counts are reported globally
+            and per display port. This trades possible judder/frame drops for reduced
+            host-work-loop blocking; it is not a proven fix for window animation stalls.
 
             CI compilation and host-side tests do not establish hardware compatibility.
             This build has not been certified on macOS Tahoe 26.7.3 or an RX 9070 XT.
