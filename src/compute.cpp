@@ -2903,6 +2903,32 @@ bool RDNA4Compute::hqdInitFor(bool asKiq, uint32_t pipe, uint32_t queue, uint32_
 		CLOG("hqd: pipe %u queue %u does not exist (2 pipes x 4 queues); refused", pipe, queue);
 		return false;
 	}
+	/* Do not overwrite either the MQD backing or its registers until the old HQD
+	 * is confirmed inactive. The CP may still be fetching ring state on timeout. */
+	grbmSelect(1, pipe, queue, vmid);
+	if (rdGc(CpHqdActive) & 1) {
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
+		bool inactive = false;
+		for (uint32_t us = 0; us < 100000; us += 10) {
+			if (!(rdGc(CpHqdActive) & 1)) {
+				inactive = true;
+				break;
+			}
+			IODelay(10);
+		}
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+		if (!inactive) {
+			const uint32_t active = rdGc(CpHqdActive);
+			CLOG("mec: refusing to reconfigure active ME1/pipe%u/queue%u VMID%u after dequeue timeout (ACTIVE 0x%08x)",
+			     pipe, queue, vmid, active);
+			grbmSelect(0, 0, 0, 0);
+			return false;
+		}
+		wr(IpDiscovery::HwGc, CpHqdPqRptr, 0);
+		wr(IpDiscovery::HwGc, CpHqdPqWptrLo, 0);
+		wr(IpDiscovery::HwGc, CpHqdPqWptrHi, 0);
+	}
+	grbmSelect(0, 0, 0, 0);
 	const uint32_t mqdOff = static_cast<uint32_t>(mqd - pool.mcAddress);
 	const bool rptrCpu = rptr >= pool.mcAddress && rptr < pool.mcAddress + pool.size;
 	const uint32_t rptrOff = rptrCpu ? static_cast<uint32_t>(rptr - pool.mcAddress) : 0;
@@ -2965,28 +2991,6 @@ bool RDNA4Compute::hqdInitFor(bool asKiq, uint32_t pipe, uint32_t queue, uint32_
 	}
 
 	grbmSelect(1, pipe, queue, vmid);
-	if (rdGc(CpHqdActive) & 1) {                // a queue left behind: drain it before touching its configuration
-		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
-		bool inactive = false;
-		for (uint32_t us = 0; us < 100000; us += 10) {
-			if (!(rdGc(CpHqdActive) & 1)) {
-				inactive = true;
-				break;
-			}
-			IODelay(10);
-		}
-		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
-		if (!inactive) {
-			const uint32_t active = rdGc(CpHqdActive);
-			CLOG("mec: refusing to reconfigure active ME1/pipe%u/queue%u VMID%u after dequeue timeout (ACTIVE 0x%08x)",
-			     pipe, queue, vmid, active);
-			grbmSelect(0, 0, 0, 0);
-			return false;                  // preserve the old queue's registers and backing memory
-		}
-		wr(IpDiscovery::HwGc, CpHqdPqRptr, 0);
-		wr(IpDiscovery::HwGc, CpHqdPqWptrLo, 0);
-		wr(IpDiscovery::HwGc, CpHqdPqWptrHi, 0);
-	}
 	wr(IpDiscovery::HwGc, CpPqWptrPollCntl, rdGc(CpPqWptrPollCntl) & ~kPqWptrPollEn);
 	wr(IpDiscovery::HwGc, CpHqdEopBase, static_cast<uint32_t>(eop));
 	wr(IpDiscovery::HwGc, CpHqdEopBaseHi, static_cast<uint32_t>(eop >> 32));
