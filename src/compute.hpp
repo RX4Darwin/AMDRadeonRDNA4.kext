@@ -362,6 +362,7 @@ private:
 	bool mecStart();
 	bool doorbellInit();
 	bool hqdInit(bool asKiq);
+	bool hqdQuiesce(uint32_t pipe, uint32_t queue, uint32_t vmid, const char *tag);
 	bool hqdInitFor(bool asKiq, uint32_t pipe, uint32_t queue, uint32_t vmid,
 	                uint64_t mqd, uint64_t eop, uint64_t pq, uint64_t rptr,
 	                uint64_t wpoll, uint32_t doorbell);
