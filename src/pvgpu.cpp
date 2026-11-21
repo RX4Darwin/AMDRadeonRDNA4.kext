@@ -4857,7 +4857,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		};
 		ok = ok && fm && w && h && (w <= 16384 || (wideRow && w <= 16384u * 16384u)) && h <= 16384 &&
 		     static_cast<uint64_t>(rowBytes) >= static_cast<uint64_t>(w) * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= src.length;
-		ok = ok && (depth == 1 || (depth <= 2048 && src.imageBytes >= static_cast<uint64_t>(rowBytes) * h && src.imageBytes * depth <= src.length));
+		ok = ok && (depth == 1 || (depth > 1 && depth <= 2048 && src.imageBytes >= static_cast<uint64_t>(rowBytes) * h && src.imageBytes <= src.length / depth));
 		if (!ok) {
 			if (talk || mTexLines++ < 2)   // per stats period
 				pvstat("host: render: %s texture %u (resource %u, type %u): format %u, %ux%ux%u, %u bytes per row: not supported yet", stageName, k,
@@ -8431,7 +8431,7 @@ RDNA4PvHost::PresentResult RDNA4PvHost::presentOnCard(uint32_t port, uint32_t si
 		mPresentCapacityMaxNs = elapsed > mPresentCapacityMaxNs ? elapsed : mPresentCapacityMaxNs;
 
 		// Experimental: don't wait for the global queue's oldest fence just to
-		// present another frame. Preserve all existing fences and retry next frame.
+		// present another frame. This frame is dropped; only a later guest present is new work.
 		if (mPending >= kInFlight) {
 			mPresentCapacityDrops++;
 			mPresentCapacityDropsByPort[port]++;
