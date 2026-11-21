@@ -139,6 +139,7 @@ static bool builtIn(const char *key, uint32_t &value)
 		{"rdna4-compute", 7}, {"rdna4-gfx", 2}, {"rdna4-vm", 1}, {"rdna4-vmshared", 2}, {"rdna4-accel", 4},
 		{"rdna4-dmubload", 1}, {"rdna4-dcninit", 1}, {"rdna4-head2dp", 1},
 		{"rdna4-pvgpu-disp", 7}, {"rdna4-pvgpu-class", 0xff0000}, {"rdna4-pvgpu-delay", 5}, {"rdna4-pvfast", 1}, {"rdna4-nativews", 3},
+		{"rdna4-accelgl", 1},
 #endif
 		{nullptr, 0},
 	};
