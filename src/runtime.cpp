@@ -1069,8 +1069,14 @@ bool RDNA4Compute::vmBootSelfTest() {
 		RLOG("vm: boot page-table setup q=%d eop=%d r=%d w=%d data=%d fence=%d pm4=%d",
 		     qMap, eMap, rMap, wMap, dMap, fMap, qInit);
 		RLOG("vm: boot page-table or queue setup failed");
+		if (c.mappingUnsafe || sdmaWedged) {
+			vmidUsed[vmid] = true;
+			queueUsed[pipe][queue] = true;
+			RLOG("vm: retaining boot page-table allocation and VMID %u because SDMA cleanup is unconfirmed", vmid);
+		} else {
+			devHeap.free(table);
+		}
 		IOFree(c.tableShadow, kVmTableBytes);
-		devHeap.free(table);
 		return false;
 	}
 	/* gfx_v12_0_init_compute_vmid: every KFD VMID (8-15) gets SH_MEM_CONFIG
@@ -1192,6 +1198,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 	const uint64_t ibVa = qva + 0x6000;      /* E4's IB page (VMID 8 VA) */
 	const uint32_t ibOff = dataOff;           /* same physical page as the data word, IB at +0x100 */
 	auto buildTables = [&]() -> bool {
+		if (c.mappingUnsafe || sdmaWedged)
+			return false;
 		bzero(c.tableShadow, kVmTableBytes);
 		GpuVmTable::denseRoot(c.tableShadow, c.rootPhys);
 		return vmMap(c, qva, poolMc(qoff + kVmPq), kPqSize, true) &&
@@ -1220,6 +1228,10 @@ bool RDNA4Compute::vmBootSelfTest() {
 	 * the context.  Returns whether fence, data and a clean fault status all
 	 * came out right (fence/data/clean are left set for the caller). */
 	auto attempt = [&](const char *tag, bool first) -> bool {
+		if (c.mappingUnsafe || sdmaWedged) {
+			RLOG("vm: %s: skipped because page-table or SDMA state is unsafe", tag);
+			return false;
+		}
 		/* A fault latched before this test (an earlier boot, another
 		 * engine) would be blamed on the queue below: show it, then clear
 		 * it the way amdgpu does. */
@@ -1488,7 +1500,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 			uint32_t slot = 0;
 			for (uint32_t oi = 0; oi < kTests; oi++) {
 				const uint32_t v = order[oi];
-				if (abandon || (v == kControl ? !diag : !(diag & bitOf[v])))
+				if (abandon || c.mappingUnsafe || sdmaWedged || (v == kControl ? !diag : !(diag & bitOf[v])))
 					continue;
 				const char *tag = nameOf[v];
 				RLOG("vm: variant:%s", tag);
@@ -1709,7 +1721,13 @@ bool RDNA4Compute::vmBootSelfTest() {
 		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + vmid - 1 }, 0);
 	}
 	IOFree(c.tableShadow, kVmTableBytes);
-	devHeap.free(table);
+	if (c.mappingUnsafe || sdmaWedged) {
+		vmidUsed[vmid] = true;
+		queueUsed[pipe][queue] = true;
+		RLOG("vm: retaining boot page-table allocation and VMID %u because SDMA may still reference it", vmid);
+	} else {
+		devHeap.free(table);
+	}
 	if (context && !clean) {
 		gcFaultClear();
 		scrubFaultPage();   // D15: a faulting write may have left data there
