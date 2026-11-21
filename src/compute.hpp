@@ -342,6 +342,7 @@ private:
 	bool sdmaDoorbell { false };        // kick SDMA0 through its doorbell (amdgpu's way)
 	Sdma::Ring sdmaRing;                // SDMA0 queue 0: stage 4, then the runtime's DMA
 	uint32_t   sdmaFence { 0 };         // last FENCE value written by SDMA
+	bool       sdmaWedged { false };    // a timed-out copy may still read the shared staging page
 	bool doorbellMapBar();
 	bool stageSdma();
 
@@ -1026,7 +1027,7 @@ private:
 	bool ptPhys(RtClient &c, uint64_t off, uint64_t &phys);
 	bool hasTables(const RtClient &c) const { return c.tableShadow || c.sp; }
 	bool sparseOpen(RtClient &c, uint32_t quotaPages);
-	void sparseTeardown(RtClient &c, bool clearVram);
+	bool sparseTeardown(RtClient &c, bool clearVram);
 	// W13 S7-lite (docs/w13-vmid.md): with rdna4-vmshared=1 clients own no HQD. Two kernel-owned MEC queues (VMID 0, PRIV_STATE|KMD_QUEUE,
 	// one per MEC pipe) run every client job as INDIRECT_BUFFER(vmid = the client's) followed by a ring-level fence, as amdgpu's kernel
 	// compute rings do. Clients keep a static VMID 8-15. Default off; the per-client-HQD path is unchanged when off.
