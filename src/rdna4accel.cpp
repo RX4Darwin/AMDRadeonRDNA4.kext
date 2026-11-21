@@ -1084,19 +1084,21 @@ void accelAtBoot(void *, wait_result_t)
 }
 
 // (diagnostic) each display pipe's state as transactionEnd tests it, one line a pipe: index, transactions begun (+0x288), active
-// (+0x298), terminated (+0x280), WSAA defer (+0x282), +0x299, the queue (+0x238 head, +0x23c tail), live (+0x248)
+// (+0x298), terminated (+0x280), WSAA defer (+0x282), +0x299, the queue (+0x238 head, +0x23c tail), live (+0x248), and its VBLs:
+// the framebuffer interrupt it registered (+0xd8, displayModeDidChange), VBL interrupt on (+0x2a0), enableVBLInterrupt count (+0x2a8)
 int accelPipesSysctl SYSCTL_HANDLER_ARGS
 {
-	char text[1024];   // (8 lines of at most ~110 characters)
+	char text[1536];   // (8 lines of at most ~170 characters)
 	size_t at = 0;
 	text[0] = 0;
 	for (uint32_t i = 0; i < 8 && at < sizeof(text); i++)
 		if (const uint8_t *b = gPipes[i]) {
 			auto u32 = [b](uint32_t off) { return *reinterpret_cast<const uint32_t *>(b + off); };
 			at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at,
-			                                   "pipe %u %p: begun %u active %u term %u defer %u 299 %u queue %d..%d live %p\n", i, b, u32(0x288),
-			                                   b[0x298], b[0x280], b[0x282], b[0x299], static_cast<int32_t>(u32(0x238)),
-			                                   static_cast<int32_t>(u32(0x23c)), *reinterpret_cast<void *const *>(b + 0x248)));
+			                                   "pipe %u %p: begun %u active %u term %u defer %u 299 %u queue %d..%d live %p vbl ref %p on %u enables %u\n", i, b,
+			                                   u32(0x288), b[0x298], b[0x280], b[0x282], b[0x299], static_cast<int32_t>(u32(0x238)),
+			                                   static_cast<int32_t>(u32(0x23c)), *reinterpret_cast<void *const *>(b + 0x248),
+			                                   *reinterpret_cast<void *const *>(b + 0xd8), u32(0x2a0), u32(0x2a8)));
 		}
 	return SYSCTL_OUT(req, text, strlen(text) + 1);
 }
@@ -1184,6 +1186,20 @@ bool wranglerHasUs()
 }
 }   // namespace
 
+namespace {
+// An IODisplayConnect under framebuffer `fb`: IOFramebuffer's display, made when it found a monitor
+bool hasDisplayConnect(IORegistryEntry *fb)
+{
+	bool has = false;
+	if (OSIterator *it = fb->getChildIterator(gIOServicePlane)) {
+		while (OSObject *o = it->getNextObject())
+			has |= OSDynamicCast(IORegistryEntry, o) && static_cast<IORegistryEntry *>(o)->metaCast("IODisplayConnect");
+		it->release();
+	}
+	return has;
+}
+}   // namespace
+
 bool RDNA4Accel::framebuffersDecided() { return __atomic_load_n(&gBareKnown, __ATOMIC_ACQUIRE); }
 
 bool RDNA4Accel::isBareFramebuffer(IORegistryEntry *fb)
@@ -1242,6 +1258,23 @@ void RDNA4Accel::waitForWindowServer()
 		OSSafeReleaseNULL(svc);
 		OSSafeReleaseNULL(match);
 	}
+	// and each lit framebuffer's IODisplayConnect (its monitor as IOFramebuffer knows it): they came over 10 s late in some boots, and a
+	// framebuffer WindowServer opened without one got mode 0 and no display (the Samsung, run19 of 2026-11-21)
+	uint32_t connectMs = 0, missing = 0;
+	for (; gFamilyClients && connectMs <= 15000; connectMs += 100) {
+		missing = 0;
+		eachFramebuffer([&](IORegistryEntry *e) {
+			auto *fb = OSDynamicCast(IOService, e);
+			missing += fb && isLit(fb) && !hasDisplayConnect(e);
+			return true;
+		});
+		if (!missing)
+			break;
+		IOSleep(100);
+	}
+	if (gFamilyClients)
+		rdna4Log("AMDRadeonRDNA4: accel: the lit framebuffers' IODisplayConnects: %s after %u ms\n", missing ? "NOT all there" : "all there",
+		         connectMs);
 	uint32_t lit = 0;
 	if (gFamilyClients) {
 		eachFramebuffer([&](IORegistryEntry *e) {
