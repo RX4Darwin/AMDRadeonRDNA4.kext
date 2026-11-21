@@ -458,6 +458,7 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 {
 	switch (f) {
 	case 70: case 71: case 80: case 81: case 115: case 110: case 65: case 10: case 25: case 90: case 94: case 103: case 104: case 63: case 53:
+	case 55: case 105: case 125: case 92: case 30:
 		return YES;
 	default: return NO;
 	}
@@ -524,6 +525,7 @@ enum { kWrittenRanges = 8 };   // ranges kept apart (more: the two nearest merge
 @property (readonly) uint64_t gpuBase;    // the first row's GPU address (page aligned)
 @property (readonly) NSUInteger rowBytes; // a multiple of 256
 @property (readonly) uint32_t bpp;        // bytes a pixel
+@property (readonly) uint32_t gfxFormat;  // the image format of its T#s
 @property (readonly) uint8_t *bytes;      // a colour texture's first pixel (the CPU's view)
 @property (readonly) RDNA4MTLBuffer *memory;   // a colour texture's pixels
 @end
@@ -611,6 +613,8 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 }
 
 @implementation RDNA4MTLTexture {
+	id<MTLBuffer> _overBuffer;   // made over a buffer (newTextureWithDescriptor:offset:bytesPerRow:): it, the offset and the row pitch given
+	NSUInteger _overOffset, _overRowBytes;
 	uint32_t _swizzle;   // a view's MTLTextureSwizzleChannels, red .. alpha a byte each; 0: none (pvdraw.hpp viewSel)
 	uint64_t _written[kWrittenRanges][2];   // (gCopied) identity addresses [lo, hi), sorted, apart
 	uint32_t _writtenCount;
@@ -965,6 +969,7 @@ static char gCopyKey;
 - (IOSurfaceRef)iosurface { return _surface; }
 - (NSUInteger)iosurfacePlane { return _plane; }
 - (uint32_t)bpp { return _fm ? _fm->bpp : 4; }
+- (uint32_t)gfxFormat { return _fm ? _fm->gfx : 0; }   // the image format of its T#s
 - (MTLTextureSwizzleChannels)swizzle
 {
 	return _swizzle ? MTLTextureSwizzleChannelsMake((MTLTextureSwizzle)(_swizzle & 0xff), (MTLTextureSwizzle)(_swizzle >> 8 & 0xff),
@@ -977,6 +982,9 @@ static char gCopyKey;
 }
 - (BOOL)isWriteComplete { deviceIdle(_device); return YES; }
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }   // (as buffers: never purged)
+- (id<MTLBuffer>)buffer { return _overBuffer; }   // (MoltenVK asks)
+- (NSUInteger)bufferOffset { return _overOffset; }
+- (NSUInteger)bufferBytesPerRow { return _overRowBytes; }
 - (void)waitUntilComplete { deviceIdle(_device); }
 - (MTLTextureCompressionType)compressionType { return MTLTextureCompressionTypeLossless; }
 - (BOOL)allowGPUOptimizedContents { return NO; }
@@ -999,6 +1007,7 @@ static char gCopyKey;
 		return nil;
 	}
 	_type = MTLTextureType2D;
+	_overBuffer = buffer, _overOffset = offset, _overRowBytes = bpr;
 	if ((offset & 255) || (bpr & 127) || bpr % _fm->bpp) {   // where the hardware cannot read it in place (Core Animation's at offset 32): a copy
 		_surfaceRows = (const uint8_t *)buffer.contents + offset;
 		_surfaceRowBytes = bpr;
@@ -1037,9 +1046,10 @@ static char gCopyKey;
 		slices = 6 * MAX(d.arrayLength, (NSUInteger)1);
 	else if (d.mipmapLevelCount == 1 && d.textureType == MTLTextureType2DArray)
 		slices = d.arrayLength;
-	// 2x and 4x (Maps' 600x600 BGRA8 sRGB, 2026-11-20), 4 or 8 bytes a pixel: the samples in the card's memory, as the PV host's msaaSurface
+	// 2x and 4x (Maps' 600x600 BGRA8 sRGB, 2026-11-20), 1, 2, 4 or 8 bytes a pixel (vkQuake's R8 through MoltenVK, 2026-11-21): the samples
+	// in the card's memory, as the PV host's msaaSurface
 	const BOOL msaa = d.textureType == MTLTextureType2DMultisample && (d.sampleCount == 2 || d.sampleCount == 4) && d.mipmapLevelCount == 1 &&
-	                  _fm && (_fm->bpp == 4 || _fm->bpp == 8) && device.gpu;
+	                  _fm && (_fm->bpp == 1 || _fm->bpp == 2 || _fm->bpp == 4 || _fm->bpp == 8) && device.gpu;
 	if ((!twoD && !threeD && !msaa && !(oneD && d.mipmapLevelCount == 1) && !(slices && slices <= 2048)) || (d.sampleCount != 1 && !msaa) || !_fm || !d.width || !d.height ||
 	    d.width > 16384 || d.height > 16384) {
 		rdna4Error([NSString stringWithFormat:@"a texture of type %lu, format %lu, %lux%lu, %lu layers, %lu levels, %lu samples: only 2D and 1D of "
@@ -1070,7 +1080,9 @@ static char gCopyKey;
 	if (msaa) {   // 64KB_2D in whole 128x128 blocks (msaaSurface's), the colour block's pitch its width; drawn, cleared and resolved on the card
 		_samples = (uint32_t)d.sampleCount;
 		_rowBytes = d.width * _fm->bpp;
-		if (rdna4_alloc(device.gpu, (uint64_t)((d.width + 127) & ~(NSUInteger)127) * ((d.height + 127) & ~(NSUInteger)127) * _fm->bpp * _samples, &_vram))
+		// (fragments of under 4 bytes: a 64 KiB block is wider than 128 pixels, up to 256)
+		const NSUInteger align = _fm->bpp * _samples < 4 ? 255 : 127;
+		if (rdna4_alloc(device.gpu, (uint64_t)((d.width + align) & ~align) * ((d.height + align) & ~align) * _fm->bpp * _samples, &_vram))
 			return nil;
 	} else if (!(_memory = [[RDNA4MTLBuffer alloc] initWithDevice:device length:bytes options:MTLResourceStorageModeShared]))
 		return nil;
@@ -1221,7 +1233,9 @@ static char gCopyKey;
 {
 	const uint32_t bpp = self.bpp;
 	const uint64_t px = [self pixelFor:c];
-	if ((_type != MTLTextureType2D && _samples < 2) || !_fm || (bpp != 4 && bpp != 8) || (uint32_t)px != (uint32_t)(px >> 32) || (self.gpuBase & 3))
+	// (1- and 2-byte pixels: clearPattern repeats the pixel through the 32 bits)
+	if ((_type != MTLTextureType2D && _samples < 2) || !_fm || (bpp != 1 && bpp != 2 && bpp != 4 && bpp != 8) || (uint32_t)px != (uint32_t)(px >> 32) ||
+	    (self.gpuBase & 3))
 		return NO;
 	*pattern = (uint32_t)px;
 	*bytes = _samples > 1 ? _vram.bytes : (_rowBytes * (_height - 1) + _width * bpp + 3) & ~3ull;   // the rows and what lies between them (row padding)
@@ -1790,7 +1804,7 @@ RDNA4_ANSWER_MISSING
 
 // ---- render pipelines
 
-enum { kMaxBufferIndex = 31, kTableBuffers = 28 };   // a stage's table holds buffers 0-27 (RDNA4_MTLC_HIGH_BUFFERS, 28-30, not yet)
+enum { kMaxBufferIndex = 31, kTableBuffers = 31 };   // a stage's table holds buffers 0-30 (28-30 at RDNA4_MTLC_HIGH_BUFFERS)
 
 // The RGFX header (air2amdgpu.cpp): {"RGFX", stage, code bytes, RSRC1, RSRC2, SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR, attributes}, the code,
 // then per value between the stages {u32 name hash, u32 flags: bit 0 flat, bit 1 the point's coordinate}, then {"TXRD", u32 bit n: texture n
@@ -2079,11 +2093,24 @@ static void heldIdle(RDNA4MTLDevice *device)
 	return why ? nil : self;
 }
 
+// The bundle's rdna4_no_fragment (rdna4.metal), once a process.
+static id<MTLFunction> noFragmentFunction(RDNA4MTLDevice *device)
+{
+	static id<MTLFunction> function;
+	static std::once_flag once;
+	std::call_once(once, ^{
+		NSString *path = [[NSBundle bundleForClass:[RDNA4MTLFunction class]] pathForResource:@"rdna4" ofType:@"metallib"];
+		function = path ? [[device newLibraryWithURL:[NSURL fileURLWithPath:path] error:nil] newFunctionWithName:@"rdna4_no_fragment"] : nil;
+	});
+	return function;
+}
+
 - (NSError *)build:(MTLRenderPipelineDescriptor *)desc
 {
 	if (!_device.gfx)
 		return rdna4Error(@"no gfx IBs: the kext's runtime client is not open (root only), or the boot has no client gfx IBs (rdna4-gfx=2)", 0);
-	id<MTLFunction> fn[2] = { desc.vertexFunction, desc.fragmentFunction };
+	// no fragment function (a depth-only pass; MoltenVK's in vkQuake, refused before: the game stopped): one that writes nothing
+	id<MTLFunction> fn[2] = { desc.vertexFunction, desc.fragmentFunction ?: noFragmentFunction(_device) };
 	if (!fn[0] || !fn[1] || fn[0].device != _device || fn[1].device != _device)
 		return rdna4Error([NSString stringWithFormat:@"a render pipeline needs a vertex and a fragment function of this device so far: %@ (%@, device %@) / %@ (%@, "
 		                                             @"device %@)", fn[0].name, [(id)fn[0] class], [(id)fn[0].device class], fn[1].name,
@@ -2539,6 +2566,8 @@ RDNA4_ANSWER_MISSING
 	RDNA4MTLRenderPipeline *_pipeline;
 	uint64_t _addresses[2][kTableBuffers];
 	id<MTLBuffer> _bound[2][kTableBuffers];
+	id<MTLBuffer> _indirect;   // (record:, while an indirect draw is recorded) where its arguments are, at _indirectOffset
+	NSUInteger _indirectOffset;
 	id<MTLTexture> _textures[2][kTextures];
 	id<MTLSamplerState> _samplers[2][kStageTextures];
 	RDNA4MTLTexture *_depth, *_stencil;   // the pass's depth and stencil attachments of this device (the same texture for Depth32Float_Stencil8)
@@ -2694,6 +2723,20 @@ RDNA4_ANSWER_MISSING
 	[self record:type start:(NSUInteger)(uint32_t)baseVertex count:count instances:instances baseInstance:baseInstance indices:indexBuffer
 	      offset:offset type:indexType];
 }
+// Indirect: the arguments read when the draw runs (record:'s block)
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexType:(MTLIndexType)indexType indexBuffer:(id<MTLBuffer>)indexBuffer
+            indexBufferOffset:(NSUInteger)offset indirectBuffer:(id<MTLBuffer>)indirect indirectBufferOffset:(NSUInteger)indirectOffset
+{
+	_indirect = indirect, _indirectOffset = indirectOffset;
+	[self record:type start:0 count:0 instances:1 baseInstance:0 indices:indexBuffer offset:offset type:indexType];
+	_indirect = nil;
+}
+- (void)drawPrimitives:(MTLPrimitiveType)type indirectBuffer:(id<MTLBuffer>)indirect indirectBufferOffset:(NSUInteger)indirectOffset
+{
+	_indirect = indirect, _indirectOffset = indirectOffset;
+	[self record:type start:0 count:0 instances:1 baseInstance:0 indices:nil offset:0 type:MTLIndexTypeUInt16];
+	_indirect = nil;
+}
 - (void)setDepthStoreAction:(MTLStoreAction)action {}   // ponytail: depth is kept on the card for the texture's life either way
 - (void)setStencilStoreAction:(MTLStoreAction)action {}   // (and stencil)
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before { }   // draws in order
@@ -2820,6 +2863,8 @@ RDNA4_ANSWER_MISSING
     baseInstance:(NSUInteger)baseInstance indices:(id<MTLBuffer>)indexBuffer offset:(NSUInteger)indexOffset type:(MTLIndexType)indexType
 {
 	const StatTime timed { kStatRecordUs };
+	id<MTLBuffer> indirect = _indirect;   // an indirect draw's arguments: read when it runs (written on the card by then, below)
+	const NSUInteger indirectOffset = _indirectOffset;
 	RDNA4Draw d = { .type = (uint32_t)type, .start = (uint32_t)start, .count = (uint32_t)count, .instances = (uint32_t)instances,
 		            .baseInstance = (uint32_t)baseInstance,
 		            .viewport = { (float)_viewport.originX, (float)_viewport.originY, (float)_viewport.width, (float)_viewport.height },
@@ -2932,6 +2977,22 @@ RDNA4_ANSWER_MISSING
 		// draw's own target, read as a texture (Core Animation's backdrops), is read from a copy the card makes (the PV host's staged copy);
 		// read in place while drawn, WindowServer's first native frames hung the gfx ring (2026-11-20).
 		RDNA4Draw dd = d;
+		// An indirect draw's arguments, as the PV host's: what wrote them (MoltenVK's culling kernels in vkQuake) ran before this step,
+		// dispatches being waited for. MTLDraw(Indexed)PrimitivesIndirectArguments.
+		if (indirect) {
+			const uint32_t *a = (const uint32_t *)((const uint8_t *)indirect.contents + indirectOffset);
+			if (!indirect.contents || indirectOffset + 20 > indirect.length)
+				return rdna4Error(@"an indirect draw's arguments outside its buffer", 0);
+			dd.count = a[0], dd.instances = a[1];
+			if (dd.indexGpu) {
+				dd.indexGpu += (uint64_t)a[2] * dd.indexBytes;
+				dd.start = a[3], dd.baseInstance = a[4];   // (the base vertex as the first vertex, as drawIndexed...baseVertex:)
+			} else {
+				dd.start = a[2], dd.baseInstance = a[3];
+			}
+			if (!dd.count || !dd.instances)
+				return nil;
+		}
 		NSError *why = [target.held sync];
 		for (NSUInteger i = 0; i < reads.count && !why; i++)
 			why = [((RDNA4MTLTexture *)reads[i][2]).held sync];
@@ -3014,7 +3075,7 @@ RDNA4_ANSWER_MISSING
 		}
 		const MTLPixelFormat f = ms.pixelFormat;
 		const BOOL srgb = f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatBGRA8Unorm_sRGB;
-		const uint32_t raw = f == MTLPixelFormatRGB10A2Unorm || f == MTLPixelFormatBGR10A2Unorm ? 36 : ms.bpp == 8 ? 57 : 42;
+		const uint32_t raw = ms.bpp < 4 ? ms.gfxFormat : f == MTLPixelFormatRGB10A2Unorm || f == MTLPixelFormatBGR10A2Unorm ? 36 : ms.bpp == 8 ? 57 : 42;
 		const uint32_t sel = 4 | 5 << 3 | 6 << 6 | 7 << 9, w = (uint32_t)ms.width, h = (uint32_t)ms.height;
 		[cb record:^NSError * {
 			const rdna4_program_t *prog = [device resolveKernel:srgb];
@@ -4283,7 +4344,10 @@ static void abortStack(int sig)
 	memset(misc, 0, miscBytes);
 	for (unsigned st = 0; st < 2; st++)
 		for (unsigned k = 0; k < kTableBuffers; k++) {
-			const uint32_t at = 0x400 + 0x400 * st + (k < 8 ? 8 * k : RDNA4_MTLC_TABLE_MORE_BUFFERS + 8 * (k - 8));
+			// 28-30 past both tables, as the PV host's (MoltenVK binds vertex buffers from 30 down: left at 0, vkQuake's world draws
+			// read address 0 and hung the gfx ring, 2026-11-21)
+			const uint32_t at = k >= 28 ? RDNA4_MTLC_HIGH_BUFFERS + 0x20 * st + 8 * (k - 28)
+			                            : 0x400 + 0x400 * st + (k < 8 ? 8 * k : RDNA4_MTLC_TABLE_MORE_BUFFERS + 8 * (k - 8));
 			misc[at / 8] = d->table[st][k] ?: _spare.gpu;
 		}
 	memcpy((uint8_t *)misc + 0x400 + RDNA4_MTLC_TABLE_ATTRIBUTES, p.attributes, 16 * 16);   // the vertex descriptor
@@ -4432,6 +4496,9 @@ static void abortStack(int sig)
 - (BOOL)isHeadless { return NO; }
 - (MTLDeviceLocation)location { return MTLDeviceLocationSlot; }   // a PCIe card (System Settings' Displays pane asks)
 - (NSUInteger)locationNumber { return 0; }
+- (uint64_t)peerGroupID { return 0; }   // not in a peer group (MoltenVK asks)
+- (uint32_t)peerIndex { return 0; }
+- (uint32_t)peerCount { return 0; }
 
 - (NSString *)name { return @"AMD Radeon RDNA4 (native Metal, spike)"; }
 // Apple's GL-on-Metal renderer takes its renderer string and its per-vendor limits from this ("AMD" or "ATI" for AMD's)
@@ -4739,6 +4806,52 @@ static void abortStack(int sig)
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor error:(NSError **)error
 {
 	return [[RDNA4MTLRenderPipeline alloc] initWithDevice:self descriptor:descriptor error:error];
+}
+
+// The asynchronous forms: made as the synchronous ones, the handler called on another thread as Metal's (MoltenVK waits for it holding a
+// lock the handler takes). Answered by _MTLDevice's own before, the handler never came and vkQuake waited for good (2026-11-21).
+static dispatch_queue_t pipelineQueue(void) { return dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0); }
+- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
+                           completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler
+{
+	dispatch_async(pipelineQueue(), ^{
+		NSError *error = nil;
+		id<MTLRenderPipelineState> state = [self newRenderPipelineStateWithDescriptor:descriptor error:&error];
+		handler(state, error);
+	});
+}
+- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor options:(MTLPipelineOption)options
+                           completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler
+{
+	dispatch_async(pipelineQueue(), ^{
+		NSError *error = nil;
+		MTLAutoreleasedRenderPipelineReflection reflection = nil;
+		id<MTLRenderPipelineState> state = [self newRenderPipelineStateWithDescriptor:descriptor options:options reflection:&reflection
+		                                                                         error:&error];
+		handler(state, reflection, error);
+	});
+}
+- (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler
+{
+	dispatch_async(pipelineQueue(), ^{
+		NSError *error = nil;
+		id<MTLComputePipelineState> state = [self newComputePipelineStateWithFunction:function error:&error];
+		handler(state, error);
+	});
+}
+- (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
+                          completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler
+{
+	dispatch_async(pipelineQueue(), ^{
+		NSError *error = nil;
+		id<MTLComputePipelineState> state = [self newComputePipelineStateWithFunction:function error:&error];
+		handler(state, nil, error);
+	});
+}
+- (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor options:(MTLPipelineOption)options
+                            completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler
+{
+	[self newComputePipelineStateWithFunction:descriptor.computeFunction options:options completionHandler:handler];
 }
 
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor

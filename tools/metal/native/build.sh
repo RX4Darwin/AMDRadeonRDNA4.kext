@@ -17,6 +17,9 @@ if [ -x Build/m3/x86_64/air2amdgpu ]; then
 	mkdir -p "$out/Contents/Resources"
 	cp Build/m3/x86_64/air2amdgpu "$out/Contents/Resources/air2amdgpu"
 fi
+mkdir -p "$out/Contents/Resources"   # the bundle's own functions (rdna4.metal)
+xcrun -sdk macosx metal -c tools/metal/native/rdna4.metal -o Build/native/rdna4.air
+xcrun -sdk macosx metallib Build/native/rdna4.air -o "$out/Contents/Resources/rdna4.metallib"
 codesign -s - -f "$out" >/dev/null
 xcrun -sdk macosx metal -c tools/metal/native/probe.metal -o Build/native/probe.air
 xcrun -sdk macosx metallib Build/native/probe.air -o Build/native/probe.metallib

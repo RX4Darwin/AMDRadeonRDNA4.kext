@@ -58,6 +58,11 @@ static inline uint32_t colourInfo(uint32_t format, bool swap) {
 	case 104: return 0x0003050bu;   // RG32Sint
 	case 63: return 0x00030405u;    // RG16Uint: 16_16 UINT, BLEND_BYPASS (WindowServer's brim_init_lpf at 4K, Tahoe)
 	case 53: return 0x00030404u;    // R32Uint: 32 UINT, BLEND_BYPASS (clearOnCard's fills: the bits as exported)
+	case 55: return 0x00020704u;    // R32Float: 32 float (MoltenVK's, vkQuake)
+	case 105: return 0x0002070bu;   // RG32Float: 32_32 float
+	case 125: return 0x0002070eu;   // RGBA32Float: 32_32_32_32 float
+	case 92: return 0x00020706u;    // RG11B10Float: 10_11_11 float
+	case 30: return 0x00020003u;    // RG8Unorm: 8_8 unorm
 	default: return (swap ? 0x0002880au : 0x0002800au) | (format == 71 || format == 81 ? 6u << 8 : 0u);
 	}
 }
