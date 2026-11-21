@@ -882,6 +882,11 @@ private:
 	uint64_t mSubmitBusyRetries { 0 }, mSubmitNotReadyMs { 0 };
 	uint64_t mSubmitBusyWaitNs { 0 }, mSubmitNotReadyWaitNs { 0 };
 	uint64_t mSubmitBusyWaitMaxNs { 0 }, mSubmitNotReadyWaitMaxNs { 0 };
+	// WindowServer present-path latency: card path, CPU fallback, per-head fence and capacity pressure.
+	uint64_t mPresentCardNs { 0 }, mPresentCardMaxNs { 0 }, mPresentCardCalls { 0 };
+	uint64_t mPresentFallbackNs { 0 }, mPresentFallbackMaxNs { 0 }, mPresentFallbackCalls { 0 };
+	uint64_t mPresentFenceWaitNs { 0 }, mPresentFenceWaitMaxNs { 0 }, mPresentFenceWaitCalls { 0 };
+	uint64_t mPresentCapacityNs { 0 }, mPresentCapacityMaxNs { 0 }, mPresentCapacityCalls { 0 };
 	// Time spent inside rtSubmitGfxIb itself, separate from explicit retry delays.
 	uint64_t mSubmitRuntimeNs { 0 }, mSubmitRuntimeMaxNs { 0 }, mSubmitRuntimeCalls { 0 };
 	uint64_t mSubmitRuntimeOver250us { 0 }, mSubmitRuntimeOver1ms { 0 };
@@ -8365,7 +8370,13 @@ void RDNA4PvHost::presentTransaction(const pvstream::FifoCommand &c, const uint8
 }
 
 bool RDNA4PvHost::presentFrame(uint32_t port, uint32_t surface, uint32_t task) {
-	if (gPresentOnCard && presentOnCard(port, surface))
+	const uint64_t cardAt = nowNs();
+	const bool onCard = gPresentOnCard && presentOnCard(port, surface);
+	const uint64_t cardNs = nowNs() - cardAt;
+	mPresentCardCalls++;
+	mPresentCardNs += cardNs;
+	mPresentCardMaxNs = cardNs > mPresentCardMaxNs ? cardNs : mPresentCardMaxNs;
+	if (onCard)
 		return true;
 
 	if (!mNub && mDisplayMisses++ < 4)   // the display host's frames by the CPU: why
@@ -8378,11 +8389,17 @@ bool RDNA4PvHost::presentFrame(uint32_t port, uint32_t surface, uint32_t task) {
 	if (port < kScanoutPorts && mScanout[port].flips)   // into the head's own surface, which the HUBP must read then
 		pauseFlips(mScanout[port]);
 
+	const uint64_t fallbackAt = nowNs();
 	cardToMemory(s);
 	if (s)
 		static_cast<OSObject *>(s)->release();
 
-	return PvScanout::present(port, surface, task);
+	const bool ok = PvScanout::present(port, surface, task);
+	const uint64_t fallbackNs = nowNs() - fallbackAt;
+	mPresentFallbackCalls++;
+	mPresentFallbackNs += fallbackNs;
+	mPresentFallbackMaxNs = fallbackNs > mPresentFallbackMaxNs ? fallbackNs : mPresentFallbackMaxNs;
+	return ok;
 }
 
 // PKT3 DMA_DATA {header, control, src lo, hi, dst lo, hi, command} as Mesa's si_cp_dma for gfx9 on: source and destination through the L2,
@@ -8555,15 +8572,31 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	if (!ok || !mPresentIb.cpu)
 		return false;
 
-	if (sm.fence && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(sm.fence)))
+	if (sm.fence && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(sm.fence))) {
+		const uint64_t waitAt = nowNs();
 		waitFor(sm.fence);   // the port's IB of the frame before (each port has its own: the other display's frame is not waited for)
+		const uint64_t waited = nowNs() - waitAt;
+		mPresentFenceWaitCalls++;
+		mPresentFenceWaitNs += waited;
+		mPresentFenceWaitMaxNs = waited > mPresentFenceWaitMaxNs ? waited : mPresentFenceWaitMaxNs;
+	}
 
 	flipDone();   // the frame before asked for, if its copy is done: this one goes into another buffer
 
 	if (sm.flips && port < 8 && gCompute->rtScanoutUnderflowed(sm.hubp))
 		mPortTiming[port].underflows++;
 
-	roomForDraw();
+	const bool atCapacity = mPending >= kInFlight;
+	if (atCapacity) {
+		const uint64_t capacityAt = nowNs();
+		roomForDraw();
+		const uint64_t elapsed = nowNs() - capacityAt;
+		mPresentCapacityCalls++;
+		mPresentCapacityNs += elapsed;
+		mPresentCapacityMaxNs = elapsed > mPresentCapacityMaxNs ? elapsed : mPresentCapacityMaxNs;
+	} else {
+		roomForDraw();
+	}
 
 	// the rows, or the whole frame in chunks when the surface's rows are the scanout's
 	const uint64_t ibAt = static_cast<uint64_t>(port) * kPresentIbBytes;
@@ -9191,6 +9224,18 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 		pvstat("host: render:   fence waits %llu, average %llu us, max %llu us, failures %llu (batch %llu ms, oldest %llu ms)",
 		       mFenceWaitCalls, mFenceWaitNs / mFenceWaitCalls / 1000, mFenceWaitMaxNs / 1000, mFenceWaitFailures,
 		       mFenceBatchWaitNs / 1000000, mFenceOldestWaitNs / 1000000);
+	if (mPresentCardCalls)
+		pvstat("host: present:   card path %llu calls, average %llu us, max %llu us",
+		       mPresentCardCalls, mPresentCardNs / mPresentCardCalls / 1000, mPresentCardMaxNs / 1000);
+	if (mPresentFallbackCalls)
+		pvstat("host: present:   CPU fallback %llu calls, average %llu us, max %llu us",
+		       mPresentFallbackCalls, mPresentFallbackNs / mPresentFallbackCalls / 1000, mPresentFallbackMaxNs / 1000);
+	if (mPresentFenceWaitCalls)
+		pvstat("host: present:   previous-frame fence waits %llu, average %llu us, max %llu us",
+		       mPresentFenceWaitCalls, mPresentFenceWaitNs / mPresentFenceWaitCalls / 1000, mPresentFenceWaitMaxNs / 1000);
+	if (mPresentCapacityCalls)
+		pvstat("host: present:   in-flight capacity checks %llu, average %llu us, max %llu us",
+		       mPresentCapacityCalls, mPresentCapacityNs / mPresentCapacityCalls / 1000, mPresentCapacityMaxNs / 1000);
 	if (mSubmitBusyExhausted || mSubmitNotReadyExhausted || mSubmitFailed)
 		pvstat("host: render:   GPU submit failures: busy timeout %u, ring not-ready timeout %u, other errors %u",
 		       mSubmitBusyExhausted, mSubmitNotReadyExhausted, mSubmitFailed);
@@ -9366,6 +9411,10 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mSubmitRuntimeOver250us = mSubmitRuntimeOver1ms = 0;
 	mFenceWaitNs = mFenceWaitMaxNs = mFenceWaitCalls = mFenceWaitFailures = 0;
 	mFenceBatchWaitNs = mFenceOldestWaitNs = 0;
+	mPresentCardNs = mPresentCardMaxNs = mPresentCardCalls = 0;
+	mPresentFallbackNs = mPresentFallbackMaxNs = mPresentFallbackCalls = 0;
+	mPresentFenceWaitNs = mPresentFenceWaitMaxNs = mPresentFenceWaitCalls = 0;
+	mPresentCapacityNs = mPresentCapacityMaxNs = mPresentCapacityCalls = 0;
 	mSubmitBusyMaxRetries = mSubmitNotReadyMaxMs = 0;
 	mSubmitBusyExhausted = mSubmitNotReadyExhausted = mSubmitFailed = 0;
 	mTickNs = mTickMaxNs = mTickCalls = mTickOver250us = mTickOver1ms = 0;
