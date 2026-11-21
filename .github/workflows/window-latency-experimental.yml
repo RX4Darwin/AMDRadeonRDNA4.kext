@@ -35,13 +35,13 @@ jobs:
 
       - name: Build experimental PVGPU kext
         run: |
-          make VERSION=0.3.3 PVGPU=1 kext
-          KEXT="Build/AMDRadeonRDNA4-0.3.3-RELEASE/AMDRadeonRDNA4.kext"
+          make VERSION=0.3.4 PVGPU=1 kext
+          KEXT="Build/AMDRadeonRDNA4-0.3.4-RELEASE/AMDRadeonRDNA4.kext"
           test -d "$KEXT"
           ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$KEXT/Contents/Info.plist")
           VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$KEXT/Contents/Info.plist")
           test "$ID" = "com.hackintosh.AMDRadeonRDNA4"
-          test "$VERSION" = "0.3.3"
+          test "$VERSION" = "0.3.4"
           file "$KEXT/Contents/MacOS/AMDRadeonRDNA4"
           lipo -archs "$KEXT/Contents/MacOS/AMDRadeonRDNA4" | grep -qw x86_64
           mkdir -p dist
