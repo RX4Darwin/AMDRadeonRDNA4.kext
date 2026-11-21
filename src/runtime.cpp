@@ -4154,6 +4154,27 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		return;
 	}
 
+	/* Stop a private HQD before unmapping or freeing anything it may still use. */
+	if (c && vmEnabled && !c->shared) {
+		vmOpTrace("release before dequeue", c->vmid, c->pipe, c->queue);
+		grbmSelect(1, c->pipe, c->queue, c->vmid);
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
+		bool inactive = false;
+		for (uint32_t us = 0; us < 100000; us += 10) {
+			if (!(rdGc(CpHqdActive) & 1)) { inactive = true; break; }
+			IODelay(10);
+		}
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+		grbmSelect(0, 0, 0, 0);
+		if (!inactive) {
+			RLOG("vmid %u: queue MEC1 pipe %u queue %u dequeue timed out; retaining all client resources",
+			     c->vmid, c->pipe, c->queue);
+			quarantineLocked(owner, *c);
+			return;
+		}
+		vmOpTrace("release after dequeue", c->vmid, c->pipe, c->queue);
+	}
+
 	/* Unmap every owned range first, then invalidate once before releasing ANY backing.
 	 * If one page-table writeback or the invalidate fails, preserve all resources and
 	 * the VMID. Partial cleanup followed by reuse would be unsafe. */
@@ -4229,21 +4250,8 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			else
 				wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + c->vmid - 1 }, 0);   // the context goes off before its tables do
 		} else {
-		/* Dequeue is deliberately polled: W1's interrupt path is not required. */
-		vmOpTrace("release before dequeue", c->vmid, c->pipe, c->queue);
-		grbmSelect(1, c->pipe, c->queue, c->vmid);
-		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
-		bool inactive = false;
-		for (uint32_t us = 0; us < 100000; us += 10) {
-			if (!(rdGc(CpHqdActive) & 1)) { inactive = true; break; }
-			IODelay(10);
-		}
-		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
-		if (!inactive)
-			RLOG("vmid %u: queue MEC1 pipe %u queue %u dequeue timeout (ACTIVE 0x%08x)",
-			     c->vmid, c->pipe, c->queue, rdGc(CpHqdActive));
-		grbmSelect(0, 0, 0, 0);
-		vmOpTrace(inactive ? "release after dequeue" : "release after dequeue TIMEOUT", c->vmid, c->pipe, c->queue);
+			/* The private queue was stopped before any backing memory was released. */
+			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + c->vmid - 1 }, 0);
 		}
 		if (c->sp) {
 			/* Sparse tables: zero every backed page in VRAM before returning chunks. */
@@ -4262,10 +4270,17 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		 * image before releasing the VMID or its backing VRAM. */
 		rdna4Step("rtRelease: clearing the page table in VRAM (vmTableSync)");
 		bzero(c->tableShadow, kVmTableBytes);
-		if (!vmTableSync(*c, 0, kVmTableBytes))
-			RLOG("vmid %u: page-table teardown clear failed", c->vmid);
+		if (!vmTableSync(*c, 0, kVmTableBytes)) {
+			RLOG("vmid %u: page-table teardown clear failed; retaining table allocation and VMID", c->vmid);
+			quarantineLocked(owner, *c);
+			return;
+		}
 		rdna4Step("rtRelease: TLB invalidate");
-		vmInvalidate(c->vmid, "client close");
+		if (!vmInvalidate(c->vmid, "client close")) {
+			RLOG("vmid %u: final TLB invalidation failed; retaining table allocation and VMID", c->vmid);
+			quarantineLocked(owner, *c);
+			return;
+		}
 		rdna4Step("rtRelease: done");
 		vmidUsed[c->vmid] = false;
 		if (!c->shared)
