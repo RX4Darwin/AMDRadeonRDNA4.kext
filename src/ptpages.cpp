@@ -163,7 +163,6 @@ bool Sparse::get(const Host &h, uint32_t level, uint64_t key, bool create, Page 
 		if (!table.page(fresh, h.be, heapOffset))
 			return false;
 		uint64_t *mem = h.allocShadow ? h.allocShadow(h.context) : nullptr;
-		uint64_t physical = 0;
 		if (!mem || !h.physOf || !h.physOf(h.context, heapOffset, physical) || !dir.insert(k, static_cast<uint16_t>(fresh))) {
 			if (mem && h.freeShadow)
 				h.freeShadow(h.context, mem);
