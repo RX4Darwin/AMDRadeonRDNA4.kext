@@ -4838,7 +4838,16 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		if (talk)
 			pvlog("host: render:   %s texture %u: resource %u (type %u), format %u, %ux%ux%u, %u bytes per row, %d bytes not 0", stageName, k, id,
 			      src.type, format, w, h, depth, rowBytes, ok && fm ? inkedBytes(task, src, fm->bpp) : -1);
-		ok = ok && fm && w && h && w <= 16384 && h <= 16384 && rowBytes >= w * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= src.length;
+		// A single row wider than a T# holds (16384 texels): a texture buffer, staged as rows of 16384.
+		const bool wideRow = h == 1 && depth == 1 && w > 16384 && !array1d && !array2d;
+		auto image = [&](uint32_t *t, uint64_t at, uint32_t pitchPx) {
+			if (wideRow)
+				linearImage(t, at, fm->gfx, viewSel(fm->sel, src.swizzle), 16384, (w + 16383) / 16384, 16384);
+			else
+				linearImage(t, at, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, pitchPx);
+		};
+		ok = ok && fm && w && h && (w <= 16384 || (wideRow && w <= 16384u * 16384u)) && h <= 16384 &&
+		     rowBytes >= w * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= src.length;
 		ok = ok && (depth == 1 || (depth <= 2048 && src.imageBytes >= static_cast<uint64_t>(rowBytes) * h && src.imageBytes * depth <= src.length));
 		if (!ok) {
 			if (talk || mTexLines++ < 2)   // per stats period
@@ -4881,7 +4890,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		                                   : mapGuest(task, src.va, used, out[k].handle, gpu, shaderWrites))) {
 			out[k].va = 0;   // nothing to copy back: the card writes the guest's memory itself
 			out[k].writable = false;
-			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, h == 1 ? w : rowBytes / fm->bpp);
+			image(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, h == 1 ? w : rowBytes / fm->bpp);
 			mInPlace++;
 			continue;
 		}
@@ -4897,7 +4906,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			else if (depth > 1)
 				linearVolume(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 			else
-				linearImage(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, shadowPitch / fm->bpp);
+				image(t, gpu, shadowPitch / fm->bpp);
 
 			mCopied++;
 			continue;
@@ -4984,7 +4993,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		else if (depth > 1)
 			linearVolume(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 		else
-			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, pitchPx);
+			image(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, pitchPx);
 	}
 	for (unsigned k = 0; k < 16 && ok; k++) {
 		const uint32_t id = bound.sampler[k];
