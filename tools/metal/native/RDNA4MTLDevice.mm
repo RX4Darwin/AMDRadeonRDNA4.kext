@@ -323,6 +323,7 @@ static void deviceIdle(RDNA4MTLDevice *device);   // (below: the device's work q
 	BOOL _shadow;
 }
 - (BOOL)isComplete { deviceIdle(_device); return YES; }
+- (void)waitUntilComplete { deviceIdle(_device); }   // (Sublime Text's GL)
 
 - (void)keepOwner:(void (^)(void))release { _owner = release; }
 - (void)countAsShadow
@@ -781,6 +782,10 @@ static char gCopyKey;
 		linearVolume(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), (uint32_t)_width, (uint32_t)_height, (uint32_t)_depth);
 		return;
 	}
+	if (_height == 1 && _width > 16384) {   // a texture buffer's wide row (initWithBuffer:): rows of 16384 texels
+		linearImage(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), 16384, (uint32_t)((_width + 16383) / 16384), 16384);
+		return;
+	}
 	linearImage(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), (uint32_t)_width, (uint32_t)_height, (uint32_t)(_rowBytes / _fm->bpp));
 	if (_type == MTLTextureType1D)
 		t[3] = (t[3] & 0x0fffffffu) | 8u << 28;   // TYPE 1D
@@ -945,11 +950,15 @@ static char gCopyKey;
 	if (!(self = [super init]))
 		return nil;
 	_fm = textureFormat((uint32_t)d.pixelFormat);
-	if (d.textureType != MTLTextureType2D || !_fm || !d.width || !d.height || bpr < d.width * _fm->bpp ||
-	    offset + bpr * (d.height - 1) + d.width * _fm->bpp > buffer.length) {
-		rdna4Error([NSString stringWithFormat:@"a texture of format %lu, %lux%lu over a buffer at %lu, %lu bytes a row: only 2D of pvdraw.hpp's "
-		                                      @"formats inside the buffer, so far", (unsigned long)d.pixelFormat,
-		                                      (unsigned long)d.width, (unsigned long)d.height, (unsigned long)offset, (unsigned long)bpr], 0);
+	// 2D, or a texture buffer (GL's buffer textures through Apple's GL-on-Metal renderer: Sublime Text's) as a 2D row; a row wider than a
+	// T# holds (16384 texels, Sublime's 24576 RGBA32Float) as rows of 16384, as the translator reads it (air2amdgpu read_texture_buffer_1d)
+	const BOOL row = d.textureType == MTLTextureTypeTextureBuffer && d.height == 1;
+	if ((d.textureType != MTLTextureType2D && !row) || !_fm || !d.width || !d.height || bpr < d.width * _fm->bpp ||
+	    (row && d.width > 16384u * 16384u) || offset + bpr * (d.height - 1) + d.width * _fm->bpp > buffer.length) {
+		rdna4Error([NSString stringWithFormat:@"a texture of type %lu, format %lu, %lux%lu over a buffer at %lu, %lu bytes a row: only 2D and "
+		                                      @"texture buffers of pvdraw.hpp's formats inside the buffer, so far", (unsigned long)d.textureType,
+		                                      (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)offset,
+		                                      (unsigned long)bpr], 0);
 		return nil;
 	}
 	_type = MTLTextureType2D;
@@ -2068,7 +2077,7 @@ static void heldIdle(RDNA4MTLDevice *device)
 		if (_blob[k].length < 4 * kHead || h[0] != kRgfxMagic || h[1] != (uint32_t)k + 1 || h[2] > room[k] || (h[7] & 0xffff) > 16 ||
 		    4ull * kHead + h[2] + 8ull * (h[7] & 0xffff) > _blob[k].length)
 			return rdna4Error([NSString stringWithFormat:@"%@: not a %s shader that fits its slot", fn[k].name, k ? "fragment" : "vertex"], 0);
-		if (h[7] & 0x7fff0000u & ~(k ? 0x7ff10000u : 0x00010000u))   // dual source: not yet (several attachments: the PV host's choice)
+		if (h[7] & 0x7fff0000u & ~(k ? 0x7ff50000u : 0x00010000u))   // (several attachments: the PV host's choice; bit 18 dual source)
 			return rdna4Error([NSString stringWithFormat:@"%@: attributes 0x%x not supported yet", fn[k].name, h[7]], 0);
 	}
 	for (int k = 0; k < 2; k++) {   // the records after the values (TXRD, POSM)
@@ -2585,6 +2594,7 @@ RDNA4_ANSWER_MISSING
 	      offset:offset type:indexType];
 }
 - (void)setDepthStoreAction:(MTLStoreAction)action {}   // ponytail: depth is kept on the card for the texture's life either way
+- (void)setStencilStoreAction:(MTLStoreAction)action {}   // (and stencil)
 - (void)setLineWidth:(float)width {}                    // ponytail: lines are one pixel wide
 
 - (id<MTLDevice>)device { return _commandBuffer.device; }
@@ -4103,6 +4113,10 @@ static void abortStack(int sig)
 	const uint64_t miscGpu = _misc.gpu + (uint64_t)slot * kMiscBytes, ibOffset = (uint64_t)slot * RDNA4_TRIRUN_PAGE;
 	const uint32_t *vs = p.vs, *ps = p.ps, outs = p.outs, ins = p.ins;
 	const BOOL noColour = (ps[7] >> 31) || p.exportsNothing;
+	// dual-source blending (the fragment header's bit 18: the colour and its [[color(0), index(1)]]; Sublime Text's subpixel text through
+	// Apple's GL-on-Metal renderer), as the PV host: both exports in the colour's format and in CB_SHADER_MASK, DISABLE_DUAL_QUAD, no SX
+	// blend optimisation
+	const BOOL dualSource = (ps[7] >> 18 & 1) && !noColour;
 	// Blending as the PV host's runDraw: the colour pass and, when alpha's equation differs and both are written, an alpha-only pass after it
 	// (the card ignores SEPARATE_ALPHA_BLEND). ponytail: a colour factor reading destination alpha sees the alpha from before the draw.
 	const uint32_t *blend = [p blendOf:d->attachment];
@@ -4142,9 +4156,11 @@ static void abortStack(int sig)
 		{ 0x76, 0x31, outs ? (outs - 1) | ins << 11 : 0x400u },          // SPI_SHADER_GS_OUT_CONFIG_PS
 		{ 0x69, 0x207, 0x00000244u },                                    // PA_SU_SC_MODE_CNTL: provoking vertex first, clockwise front
 		{ 0x69, 0x1e0, blend[2] ? first.control : 0 },                   // CB_BLEND0_CONTROL
-		{ 0x69, 0x1d8, blend[2] ? first.opt : 0x06000600u },             // SX_MRT0_BLEND_OPT: else BLEND_DISABLED
+		{ 0x69, 0x1d8, dualSource ? 0u : blend[2] ? first.opt : 0x06000600u },   // SX_MRT0_BLEND_OPT: else BLEND_DISABLED; NONE for dual source
+		{ 0x69, 0x216, dualSource ? 0x00cc0011u : 0x00cc0010u },         // CB_COLOR_CONTROL: ROP3 copy, MODE normal; DISABLE_DUAL_QUAD
 		{ 0x69, 0x214, noColour ? 0u : split ? mask & 7 : mask },         // CB_TARGET_MASK
-		{ 0x69, 0x195, noColour ? 0u : 9u },                             // SPI_SHADER_COL_FORMAT: 32_ABGR
+		{ 0x69, 0x195, noColour ? 0u : dualSource ? 0x99u : 9u },        // SPI_SHADER_COL_FORMAT: 32_ABGR (both sources)
+		{ 0x69, 0x215, dualSource ? 0xffu : 0xfu },                      // CB_SHADER_MASK: the exports' channels
 		{ 0x69, 0x1b, noColour ? 0x600u : 0x10u },                       // DB_SHADER_CONTROL
 		{ 0x69, 0x31b, logSamples }, { 0x69, 0x31f, 0x01000000u | (logSamples ? 3u << 15 : 0u) }, { 0x69, 0x2f8, logSamples | logSamples << 20 },
 		{ 0x69, 0x292, 0x22u | (logSamples ? 1u : 0u) }, { 0x69, 0x1e, 0x00110000u | logSamples << 8 | logSamples << 12 },
