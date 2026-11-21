@@ -2,6 +2,8 @@ name: Build experimental window-latency PVGPU driver
 
 on:
   push:
+    branches:
+      - "tahoe-26.7.3-window-latency-experimental"
     tags:
       - "tahoe-exp-v*"
   workflow_dispatch:
