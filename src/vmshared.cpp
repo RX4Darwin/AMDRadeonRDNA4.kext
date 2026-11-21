@@ -299,7 +299,7 @@ uint32_t RDNA4Compute::vmAcquire(RtClient &c) {
 }
 
 // The client closes: every VMID it owns goes back to the pool with its context switched off, its IH LUT entry cleared and its TLB flushed.
-void RDNA4Compute::vmReleaseVmids(RtClient &c) {
+void RDNA4Compute::vmReleaseVmids(RtClient &c, bool releasePool) {
 	const uintptr_t owner = reinterpret_cast<uintptr_t>(&c);
 	for (uint32_t v = Vmid::kFirst; v <= Vmid::kLast; v++) {
 		if (vmPool.ownerOf(v) != owner)
@@ -313,6 +313,8 @@ void RDNA4Compute::vmReleaseVmids(RtClient &c) {
 			vmPool.quarantine(owner, v);
 		}
 	}
+	if (!releasePool)
+		return;                         // contexts are off and flushed, but keep the VMIDs owned until table teardown completes
 	uint32_t first = 0;
 	vmPool.forget(owner, true, first);
 	c.vmid = 0;
