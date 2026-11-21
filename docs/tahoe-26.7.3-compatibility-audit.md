@@ -43,9 +43,10 @@ VM test proves physical GPU compatibility.
    Build the kext separately and inspect its architecture, bundle metadata, and linked
    symbols before any boot test.
 4. If host tests and static checks pass, prepare a separate test EFI copy and a
-   reversible boot entry. Enable the kext entry in this test EFI only; do not
-   overwrite or enable it in the known-good EFI. Confirm OpenCore actually injects
-   the bundle and verify the kernel log contains
+   reversible boot entry. Add `rdna4-off=1` to that test entry before enabling or
+   booting it. Enable the kext entry in this test EFI only; do not overwrite or
+   enable it in the known-good EFI. Confirm OpenCore actually injects the bundle
+   and verify the kernel log contains
    `AMDRadeonRDNA4: disabled by rdna4-off boot-arg`.
 5. With that test EFI, perform an injection-only boot using `rdna4-off=1` and
    verbose logging. A successful boot without the disabled log is not evidence
