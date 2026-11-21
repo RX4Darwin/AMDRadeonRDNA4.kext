@@ -885,6 +885,8 @@ private:
 	uint64_t mPresentFallbackNs { 0 }, mPresentFallbackMaxNs { 0 }, mPresentFallbackCalls { 0 };
 	uint64_t mPresentFenceWaitNs { 0 }, mPresentFenceWaitMaxNs { 0 }, mPresentFenceWaitCalls { 0 };
 	uint64_t mPresentCapacityNs { 0 }, mPresentCapacityMaxNs { 0 }, mPresentCapacityCalls { 0 };
+	// Experimental low-latency policy: skip a present rather than block the host work loop.
+	uint64_t mPresentBusyDrops { 0 }, mPresentCapacityDrops { 0 };
 	// Time spent inside rtSubmitGfxIb itself, separate from explicit retry delays.
 	uint64_t mSubmitRuntimeNs { 0 }, mSubmitRuntimeMaxNs { 0 }, mSubmitRuntimeCalls { 0 };
 	uint64_t mSubmitRuntimeOver250us { 0 }, mSubmitRuntimeOver1ms { 0 };
@@ -8299,6 +8301,15 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 		return false;
 
 	ScanoutMap &sm = mScanout[port];
+
+	// Experimental: if this head's previous present still owns the scanout destination,
+	// drop this frame instead of blocking the host work loop on its fence. The next
+	// present will retry after the previous copy completes. No in-flight resource is reused.
+	if (sm.fence && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(sm.fence))) {
+		mPresentBusyDrops++;
+		return true;
+	}
+
 	void *s = retainSurface(sid);
 	IOMemoryDescriptor *md = s ? gSurfaceFns.memory(s) : nullptr;
 
@@ -8402,17 +8413,24 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	if (sm.flips && port < 8 && gCompute->rtScanoutUnderflowed(sm.hubp))
 		mPortTiming[port].underflows++;
 
-	const bool atCapacity = mPending >= kInFlight;
-	if (atCapacity) {
+	if (mPending >= kInFlight) {
 		const uint64_t capacityAt = nowNs();
-		roomForDraw();
+		landed();
 		const uint64_t elapsed = nowNs() - capacityAt;
 		mPresentCapacityCalls++;
 		mPresentCapacityNs += elapsed;
 		mPresentCapacityMaxNs = elapsed > mPresentCapacityMaxNs ? elapsed : mPresentCapacityMaxNs;
-	} else {
-		roomForDraw();
+
+		// Experimental: don't wait for the global queue's oldest fence just to
+		// present another frame. Preserve all existing fences and retry next frame.
+		if (mPending >= kInFlight) {
+			mPresentCapacityDrops++;
+			return true;
+		}
 	}
+
+	// This is now guaranteed not to block: the pending count is below capacity.
+	roomForDraw();
 
 	// the rows, or the whole frame in chunks when the surface's rows are the scanout's
 	const uint64_t ibAt = static_cast<uint64_t>(port) * kPresentIbBytes;
@@ -9006,6 +9024,9 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	if (mPresentCapacityCalls)
 		pvstat("host: present:   in-flight capacity checks %llu, average %llu us, max %llu us",
 		       mPresentCapacityCalls, mPresentCapacityNs / mPresentCapacityCalls / 1000, mPresentCapacityMaxNs / 1000);
+	if (mPresentBusyDrops || mPresentCapacityDrops)
+		pvstat("host: present:   nonblocking frame drops: head busy %llu, queue full %llu",
+		       mPresentBusyDrops, mPresentCapacityDrops);
 	if (mSubmitBusyExhausted || mSubmitNotReadyExhausted || mSubmitFailed)
 		pvstat("host: render:   GPU submit failures: busy timeout %u, ring not-ready timeout %u, other errors %u",
 		       mSubmitBusyExhausted, mSubmitNotReadyExhausted, mSubmitFailed);
@@ -9179,6 +9200,7 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mPresentFallbackNs = mPresentFallbackMaxNs = mPresentFallbackCalls = 0;
 	mPresentFenceWaitNs = mPresentFenceWaitMaxNs = mPresentFenceWaitCalls = 0;
 	mPresentCapacityNs = mPresentCapacityMaxNs = mPresentCapacityCalls = 0;
+	mPresentBusyDrops = mPresentCapacityDrops = 0;
 	mSubmitBusyMaxRetries = mSubmitNotReadyMaxMs = 0;
 	mSubmitBusyExhausted = mSubmitNotReadyExhausted = mSubmitFailed = 0;
 	mTickNs = mTickMaxNs = mTickCalls = mTickOver250us = mTickOver1ms = 0;
