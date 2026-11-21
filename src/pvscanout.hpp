@@ -19,6 +19,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+class IOService;
+
 namespace PvScanout
 {
 
@@ -37,6 +39,10 @@ void decided(bool on);
 
 /* Whether the heads are the paravirtual displays this boot (plugin.cpp). */
 bool enabled();
+
+/* Whether framebuffer `fb` is one of ours with a monitor: the boot head's, or an extra head's that is connected (or lit once the
+ * display clocks are up). What our accelerator shows WindowServer (rdna4accel.cpp). */
+bool framebufferLit(IOService *fb);
 
 /* Whether decided() has been told yet. */
 bool known();

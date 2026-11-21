@@ -4,6 +4,7 @@
 #pragma once
 
 class IORegistryEntry;
+class OSDictionary;
 
 namespace RDNA4Accel {
 // Registers for IOAcceleratorFamily2's load (Lilu): its functions solved into the thunks (src/ioaccel_thunks.S), the vtable checked
@@ -11,10 +12,14 @@ namespace RDNA4Accel {
 void start();
 // WindowServer's first open of the GPU wrangler: with rdna4-accel=4, waits for the accelerator (rdna4accel.cpp)
 void waitForWindowServer();
-// Our accelerator serves WindowServer (rdna4-accel=4): our IONDRV framebuffers without a display are left out of user-space matching
+// Our accelerator serves WindowServer (rdna4-accel=4): one of our IONDRV framebuffers without a display, left out of user-space matching
 // (pvhooks.cpp wrapMatchInternal), or WindowServer makes displays of them that it composites in software (CompositorSW), whose
-// Core Animation flatten path asserts ("transient surface not found", 2026-11-20)
-bool hidesBareFramebuffers();
-// Whether a display is on framebuffer `fb` (an IODisplayConnect under it)
-bool hasDisplay(IORegistryEntry *fb);
+// Core Animation flatten path asserts ("transient surface not found", 2026-11-20). Decided when WindowServer is let go.
+bool isBareFramebuffer(IORegistryEntry *fb);
+bool framebuffersDecided();   // (rdna4-accel=4: the bare ones known)
+// Whether a user-space match of `table` leaves `service` out (pvhooks.cpp wrapMatchInternal): with rdna4-accel=4, our bare framebuffers
+// always, the others unless matched by registry ID
+bool hidesFromMatch(IORegistryEntry *service, OSDictionary *table);
+// Whether AGDC lists framebuffer `fb` (0x980): not a bare one once decided, before that one with a display
+bool showsFramebuffer(IORegistryEntry *fb);
 }

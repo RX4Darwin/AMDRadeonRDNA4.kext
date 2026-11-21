@@ -18,24 +18,38 @@ class IOAccelMemory;
 class IOAccelSysMemory;
 class IOAccelVidMemory;
 class IOAccelDisplayPipe;
+class IOAccelSurface;
+class IOAccelSubmitter2;
+class IOAccelContext2;
+class IOAccel2DContext2;
 class AppleGraphicsDeviceControl;
+enum eIOAccelSurfaceShapeBits : unsigned int {};
+enum eLockType : unsigned int {};
 class AGDCClientState_t;
+class IOAccel2DBlitRectStruc;
 class IOAccelAllocationInfo;
 class IOAccelChannel2;
 class IOAccelClientSharedRO;
 class IOAccelClientSharedRW;
 class IOAccelCommandDescriptor;
+class IOAccelCommandStreamInfo;
 class IOAccelConfig;
-class IOAccelContext2;
+class IOAccelContextConfig;
+class IOAccelContextGetDataBufferIn;
+class IOAccelContextGetDataBufferOut;
+class IOAccelDeviceRegion;
 class IOAccelDisplayPipeScaler;
 class IOAccelDisplayPipeTransaction2;
 class IOAccelEvent;
+class IOAccelEventFence;
 class IOAccelEventQueue;
 class IOAccelGetResourceInfoReturnData;
 class IOAccelNewResourceArgs;
 class IOAccelResourcePrivate;
 class IOAccelShared2;
-class IOAccelSurface;
+class IOAccelSidebandBufferHeader;
+class IOAccelSurfaceInformation;
+class IOAccelSurfaceScaling;
 class IOSurface;
 class vendevtBarrierRec;
 class vendevtCommandRec;
@@ -645,6 +659,200 @@ private:
 };
 static_assert(sizeof(IOAccelDisplayPipe) == 0x318, "the KDK's size");
 enum : size_t { kIOAccelDisplayPipeSize = 0x318 };
+
+class IOAccelSurface : public IOUserClient {
+public:
+	virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;   // the key function (see accelgen.py)
+	class MetaClass : public OSMetaClass { public: OSObject *alloc() const APPLE_KEXT_OVERRIDE; };
+	static MetaClass gMetaClass;   // a placeholder in our kext (ioaccel_thunks.S): our subclasses' superclass link is patched
+protected:
+	IOAccelSurface(const OSMetaClass *meta);
+	virtual ~IOAccelSurface() APPLE_KEXT_OVERRIDE;
+public:
+	// slots 300-326 its own (the KDK's order), the rest overrides; pure ones named after __ZTV30AMDRadeonX6000_AMDAccelSurface's
+	virtual void free() APPLE_KEXT_OVERRIDE; // 18
+	virtual bool requestTerminate(IOService *provider, IOOptionBits options) APPLE_KEXT_OVERRIDE; // 127
+	virtual bool didTerminate(IOService *provider, IOOptionBits options, bool *defer) APPLE_KEXT_OVERRIDE; // 129
+	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE; // 184
+	virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE; // 185
+	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE; // 266
+	virtual IOReturn clientClose() APPLE_KEXT_OVERRIDE; // 286
+	virtual IOExternalMethod *getTargetAndMethodForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE; // 296
+	virtual uintptr_t copyFromBuffer(int, int, int, int, unsigned int, unsigned int, IOAccelEvent*, IOAccelResource2*, IOAccelSysMemory*, unsigned int, unsigned long long, unsigned int) = 0; // 300
+	virtual uintptr_t copyToBuffer(int, int, int, int, unsigned int, unsigned int, IOAccelEvent*, IOAccelResource2*, IOAccelSysMemory*, unsigned int, unsigned long long, unsigned int) = 0; // 301
+	virtual uintptr_t submitSwapCopy(IOAccelEvent*, IOAccelResource2*, IOAccelResource2*) = 0; // 302
+	virtual uintptr_t surfaceStart(); // 303
+	virtual uintptr_t surfaceStop(); // 304
+	virtual uintptr_t isSurfaceSizeSupported(short, short); // 305
+	virtual uintptr_t shapeSurface(unsigned int, unsigned short, unsigned short) = 0; // 306
+	virtual uintptr_t getDirtyBufferBitsFromPrivateModeBits(unsigned long long) = 0; // 307
+	virtual uintptr_t orphanClientMappings(OSSet*); // 308
+	virtual uintptr_t _RESERVEDIOAccelSurface0(); // 309
+	virtual uintptr_t _RESERVEDIOAccelSurface1(); // 310
+	virtual uintptr_t _RESERVEDIOAccelSurface2(); // 311
+	virtual uintptr_t _RESERVEDIOAccelSurface3(); // 312
+	virtual uintptr_t _RESERVEDIOAccelSurface4(); // 313
+	virtual uintptr_t _RESERVEDIOAccelSurface5(); // 314
+	virtual uintptr_t update_shape(); // 315
+	virtual uintptr_t prune_buffers(); // 316
+	virtual uintptr_t reset_req_bits(); // 317
+	virtual uintptr_t set_scaling(unsigned int, IOAccelSurfaceScaling*); // 318
+	virtual uintptr_t add_context_to_list(IOAccelContext2*); // 319
+	virtual uintptr_t remove_context_from_list(IOAccelContext2*); // 320
+	virtual uintptr_t set_id_mode(unsigned int, unsigned int); // 321
+	virtual uintptr_t set_shape(eIOAccelSurfaceShapeBits, unsigned int, IOAccelDeviceRegion*, unsigned long long); // 322
+	virtual uintptr_t set_shape_backing_length_ext(eIOAccelSurfaceShapeBits, unsigned int, unsigned long long, unsigned int, unsigned long long, IOAccelDeviceRegion*, unsigned long long); // 323
+	virtual uintptr_t surface_lock_options(eLockType, unsigned int, IOAccelSurfaceInformation*, unsigned long long); // 324
+	virtual uintptr_t surface_unlock_options(eLockType, unsigned int); // 325
+	virtual uintptr_t surface_control_with_lock(unsigned int, unsigned int, unsigned int*); // 326
+
+private:
+	uint8_t opaque_[0x1338 - sizeof(IOUserClient)];
+};
+static_assert(sizeof(IOAccelSurface) == 0x1338, "the KDK's size");
+enum : size_t { kIOAccelSurfaceSize = 0x1338 };
+
+class IOAccelSubmitter2 : public IOUserClient {
+public:
+	virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;   // the key function (see accelgen.py)
+	class MetaClass : public OSMetaClass { public: OSObject *alloc() const APPLE_KEXT_OVERRIDE; };
+	static MetaClass gMetaClass;   // a placeholder in our kext (ioaccel_thunks.S): our subclasses' superclass link is patched
+protected:
+	IOAccelSubmitter2(const OSMetaClass *meta);
+	virtual ~IOAccelSubmitter2() APPLE_KEXT_OVERRIDE;
+public:
+	// slots 300-315 its own (the KDK's order), the rest overrides; pure ones named after __ZTV32AMDRadeonX6000_AMDAccel2DContext's
+	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE; // 184
+	virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE; // 185
+	virtual uintptr_t getOwningTask() const = 0; // 300
+	virtual uintptr_t getGPUTask() const = 0; // 301
+	virtual uintptr_t getOwningTaskPid() const = 0; // 302
+	virtual uintptr_t affectedByHardwareReset(bool, unsigned int) = 0; // 303
+	virtual uintptr_t retireCommandBuffer(IOAccelEventFence*); // 304
+	virtual uintptr_t shouldHardwareCommandNooped() = 0; // 305
+	virtual uintptr_t orphanClientMappings(OSSet*); // 306
+	virtual uintptr_t setProtectionOptions(unsigned long long); // 307
+	virtual uintptr_t setSubmissionError(unsigned int); // 308
+	virtual uintptr_t _RESERVEDIOAccelSubmitter0(); // 309
+	virtual uintptr_t _RESERVEDIOAccelSubmitter1(); // 310
+	virtual uintptr_t _RESERVEDIOAccelSubmitter2(); // 311
+	virtual uintptr_t _RESERVEDIOAccelSubmitter3(); // 312
+	virtual uintptr_t _RESERVEDIOAccelSubmitter4(); // 313
+	virtual uintptr_t _RESERVEDIOAccelSubmitter5(); // 314
+	virtual uintptr_t isOpportunisticWorkload() const; // 315
+
+private:
+	uint8_t opaque_[0x568 - sizeof(IOUserClient)];
+};
+static_assert(sizeof(IOAccelSubmitter2) == 0x568, "the KDK's size");
+enum : size_t { kIOAccelSubmitter2Size = 0x568 };
+
+class IOAccelContext2 : public IOAccelSubmitter2 {
+public:
+	virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;   // the key function (see accelgen.py)
+	class MetaClass : public OSMetaClass { public: OSObject *alloc() const APPLE_KEXT_OVERRIDE; };
+	static MetaClass gMetaClass;   // a placeholder in our kext (ioaccel_thunks.S): our subclasses' superclass link is patched
+protected:
+	IOAccelContext2(const OSMetaClass *meta);
+	virtual ~IOAccelContext2() APPLE_KEXT_OVERRIDE;
+public:
+	// slots 316-359 its own (the KDK's order), the rest overrides; pure ones named after __ZTV32AMDRadeonX6000_AMDAccel2DContext's
+	virtual void free() APPLE_KEXT_OVERRIDE; // 18
+	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE; // 184
+	virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE; // 185
+	virtual bool finalize(IOOptionBits options) APPLE_KEXT_OVERRIDE; // 193
+	virtual bool attach(IOService *provider) APPLE_KEXT_OVERRIDE; // 206
+	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE; // 266
+	virtual IOReturn clientClose() APPLE_KEXT_OVERRIDE; // 286
+	virtual IOReturn connectClient(IOUserClient *client) APPLE_KEXT_OVERRIDE; // 291
+	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE; // 292
+	virtual IOExternalMethod *getTargetAndMethodForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE; // 296
+	virtual uintptr_t getOwningTask() const APPLE_KEXT_OVERRIDE; // 300
+	virtual uintptr_t getGPUTask() const APPLE_KEXT_OVERRIDE; // 301
+	virtual uintptr_t getOwningTaskPid() const APPLE_KEXT_OVERRIDE; // 302
+	virtual uintptr_t affectedByHardwareReset(bool, unsigned int) APPLE_KEXT_OVERRIDE; // 303
+	virtual uintptr_t shouldHardwareCommandNooped() APPLE_KEXT_OVERRIDE; // 305
+	virtual uintptr_t orphanClientMappings(OSSet*) APPLE_KEXT_OVERRIDE; // 306
+	virtual uintptr_t contextStart(); // 316
+	virtual uintptr_t contextStop(); // 317
+	virtual uintptr_t getDataBufferLimits(); // 318
+	virtual uintptr_t context_finish(); // 319
+	virtual uintptr_t initSidebandBufferHeader(IOAccelSidebandBufferHeader*, unsigned long long, unsigned long long); // 320
+	virtual uintptr_t processSidebandBuffer(IOAccelCommandDescriptor*, bool); // 321
+	virtual uintptr_t processSidebandToken(IOAccelCommandStreamInfo&); // 322
+	virtual uintptr_t discardSidebandToken(IOAccelCommandStreamInfo&); // 323
+	virtual uintptr_t postTokenSanityCheck(IOAccelCommandStreamInfo&); // 324
+	virtual uintptr_t processDataBuffers(unsigned int); // 325
+	virtual uintptr_t beginCommandStream(IOAccelCommandStreamInfo&); // 326
+	virtual uintptr_t endCommandStream(IOAccelCommandStreamInfo&); // 327
+	virtual uintptr_t bindResource(IOAccelCommandStreamInfo&, IOAccelResource2*, bool, IOAccelChannel2*, unsigned int, bool); // 328
+	virtual uintptr_t unbindResource(IOAccelCommandStreamInfo&, IOAccelResource2*, IOAccelChannel2*); // 329
+	virtual uintptr_t compactCurrentVidMemory(); // 330
+	virtual uintptr_t prepareResources(IOAccelResource2**, int); // 331
+	virtual uintptr_t compactCurrentMappings(IOAccelMemoryMap*); // 332
+	virtual uintptr_t getDataBuffer(IOAccelContextGetDataBufferIn*, IOAccelContextGetDataBufferOut*, IOAccelResourcePrivate*, unsigned long long); // 333
+	virtual uintptr_t allocOneDataBuffer(bool, unsigned int); // 334
+	virtual uintptr_t getDataBufferPrivate(IOAccelResource2*, IOAccelResourcePrivate*, unsigned long long); // 335
+	virtual uintptr_t validateDataBuffer(unsigned long long, IOBufferMemoryDescriptor*, IOAccelResource2*); // 336
+	virtual uintptr_t populateContextConfig(IOAccelContextConfig*); // 337
+	virtual uintptr_t addDataBufferToChannel(IOAccelResource2*, unsigned int); // 338
+	virtual uintptr_t removeDataBufferFromChannel(IOAccelResource2*, unsigned int); // 339
+	virtual uintptr_t removeCurrentResourceFromChannel(IOAccelResource2*, unsigned int); // 340
+	virtual uintptr_t invalidate(); // 341
+	virtual uintptr_t getFrameDelimiter(); // 342
+	virtual uintptr_t canSubmitCommandBuffer(); // 343
+	virtual uintptr_t pauseSubmitCommandBuffer(); // 344
+	virtual uintptr_t getPriorityInfo(); // 345
+	virtual uintptr_t _RESERVEDIOAccelContext0(); // 346
+	virtual uintptr_t _RESERVEDIOAccelContext1(); // 347
+	virtual uintptr_t _RESERVEDIOAccelContext2(); // 348
+	virtual uintptr_t _RESERVEDIOAccelContext3(); // 349
+	virtual uintptr_t _RESERVEDIOAccelContext4(); // 350
+	virtual uintptr_t _RESERVEDIOAccelContext5(); // 351
+	virtual uintptr_t getSurfaceReqBits() const; // 352
+	virtual uintptr_t requiresBackingStore() const; // 353
+	virtual uintptr_t set_compatible_surface_mode(unsigned long long*, unsigned long long, unsigned int); // 354
+	virtual uintptr_t removeSurface(); // 355
+	virtual uintptr_t allowsExclusiveMode() const; // 356
+	virtual uintptr_t isTripleBuffered() const; // 357
+	virtual uintptr_t contextModeBits() const; // 358
+	virtual uintptr_t describeDriverAllocations(IOAccelAllocationInfo*); // 359
+
+private:
+	uint8_t opaque_[0x10a8 - sizeof(IOAccelSubmitter2)];
+};
+static_assert(sizeof(IOAccelContext2) == 0x10a8, "the KDK's size");
+enum : size_t { kIOAccelContext2Size = 0x10a8 };
+
+class IOAccel2DContext2 : public IOAccelContext2 {
+public:
+	virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;   // the key function (see accelgen.py)
+	class MetaClass : public OSMetaClass { public: OSObject *alloc() const APPLE_KEXT_OVERRIDE; };
+	static MetaClass gMetaClass;   // a placeholder in our kext (ioaccel_thunks.S): our subclasses' superclass link is patched
+protected:
+	IOAccel2DContext2(const OSMetaClass *meta);
+	virtual ~IOAccel2DContext2() APPLE_KEXT_OVERRIDE;
+public:
+	// slots 360-367 its own (the KDK's order), the rest overrides; pure ones named after __ZTV32AMDRadeonX6000_AMDAccel2DContext's
+	virtual IOExternalMethod *getTargetAndMethodForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE; // 296
+	virtual uintptr_t contextStart() APPLE_KEXT_OVERRIDE; // 316
+	virtual uintptr_t contextStop() APPLE_KEXT_OVERRIDE; // 317
+	virtual uintptr_t getSurfaceReqBits() const APPLE_KEXT_OVERRIDE; // 352
+	virtual uintptr_t allowsExclusiveMode() const APPLE_KEXT_OVERRIDE; // 356
+	virtual uintptr_t blitCopy(IOAccelEvent*, IOAccelResource2*, IOAccelResource2*, IOAccel2DBlitRectStruc*, unsigned int) = 0; // 360
+	virtual uintptr_t blitFill(IOAccelEvent*, unsigned int, IOAccelResource2*, IOAccel2DBlitRectStruc*, unsigned int) = 0; // 361
+	virtual uintptr_t _RESERVEDIOAccel2DContext0(); // 362
+	virtual uintptr_t _RESERVEDIOAccel2DContext1(); // 363
+	virtual uintptr_t _RESERVEDIOAccel2DContext2(); // 364
+	virtual uintptr_t _RESERVEDIOAccel2DContext3(); // 365
+	virtual uintptr_t _RESERVEDIOAccel2DContext4(); // 366
+	virtual uintptr_t _RESERVEDIOAccel2DContext5(); // 367
+
+private:
+	uint8_t opaque_[0x1100 - sizeof(IOAccelContext2)];
+};
+static_assert(sizeof(IOAccel2DContext2) == 0x1100, "the KDK's size");
+enum : size_t { kIOAccel2DContext2Size = 0x1100 };
 
 class AppleGraphicsDeviceControl : public IOService {
 public:

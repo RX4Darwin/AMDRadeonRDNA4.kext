@@ -43,13 +43,24 @@ OVERRIDES = {
     'requestProbe(unsigned int)': 'virtual IOReturn requestProbe(IOOptionBits options) APPLE_KEXT_OVERRIDE;',
     'message(unsigned int, IOService*, void*)': 'virtual IOReturn message(UInt32 type, IOService *provider, void *argument = 0) '
                                                 'APPLE_KEXT_OVERRIDE;',
+    'externalMethod(unsigned int, IOExternalMethodArguments*, IOExternalMethodDispatch*, OSObject*, void*)':
+        'virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch, '
+        'OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;',
+    'clientClose()': 'virtual IOReturn clientClose() APPLE_KEXT_OVERRIDE;',
+    'attach(IOService*)': 'virtual bool attach(IOService *provider) APPLE_KEXT_OVERRIDE;',
+    'connectClient(IOUserClient*)': 'virtual IOReturn connectClient(IOUserClient *client) APPLE_KEXT_OVERRIDE;',
+    'clientMemoryForType(unsigned int, unsigned int*, IOMemoryDescriptor**)':
+        'virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;',
+    'getTargetAndMethodForIndex(IOService**, unsigned int)':
+        'virtual IOExternalMethod *getTargetAndMethodForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;',
     'newUserClient(task*, void*, unsigned int, IOUserClient**)':
         'virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;',
     'newUserClient(task*, void*, unsigned int, OSDictionary*, IOUserClient**)':
         'virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) '
         'APPLE_KEXT_OVERRIDE;',
 }
-SDK_SLOTS = {'OSObject': 35, 'IOService': 266}   # the SDK's vtable sizes (checked: the same as Tahoe 26.6.2's)
+SDK_SLOTS = {'OSObject': 35, 'IOService': 266, 'IOUserClient': 300}   # the SDK's vtable sizes (checked: the same as Tahoe 26.6.2's;
+                                                                      # IOUserClient: clang's vtable layout dump and the KDK kernel's)
 
 # Return types of the family's own virtuals where they matter to us (we override or call them); the rest are declared uintptr_t (only
 # their slots and mangled names matter). One type per name, so that a base's declaration and a subclass's override agree.
@@ -87,10 +98,17 @@ CLASSES = [
     ('IOAccelSysMemory', 'IOAccelMemory', None),
     ('IOAccelVidMemory', 'IOAccelMemory', (AMD, '__ZTV32AMDRadeonX6000_AMDAccelVidMemory')),
     ('IOAccelDisplayPipe', 'IOService', None),
+    ('IOAccelSurface', 'IOUserClient', (AMD, '__ZTV30AMDRadeonX6000_AMDAccelSurface')),   # user client type 0 (newSurface)
+    ('IOAccelSubmitter2', 'IOUserClient', (AMD, '__ZTV32AMDRadeonX6000_AMDAccel2DContext')),
+    ('IOAccelContext2', 'IOAccelSubmitter2', (AMD, '__ZTV32AMDRadeonX6000_AMDAccel2DContext')),
+    ('IOAccel2DContext2', 'IOAccelContext2', (AMD, '__ZTV32AMDRadeonX6000_AMDAccel2DContext')),   # type 2 (new2DContext): the 2D plug-in's
     ('AppleGraphicsDeviceControl', 'IOService', (PARAVIRT, '__ZTV23AppleParavirtGPUControl'), 1),
 ]
 
 
+# Enums the family's virtuals take by value: declared with their underlying type (a value of an incomplete class does not compile; an
+# enum mangles by its name, as a class does)
+ENUMS = ['eIOAccelSurfaceShapeBits', 'eLockType']
 KNOWN_TYPES = {'UInt32', 'UInt64', 'IOOptionBits', 'IOReturn', 'OSObject', 'IOService', 'OSDictionary', 'OSArray', 'OSString', 'OSData',
                'OSNumber', 'OSSymbol', 'IOMemoryDescriptor', 'IOBufferMemoryDescriptor', 'IOWorkLoop', 'IOPCIDevice', 'IOUserClient',
                'IOFramebuffer', 'IOReportChannelList', 'IORangeAllocator', 'IOInterruptEventSource', 'IOTimerEventSource', 'IOCommandGate',
@@ -228,8 +246,25 @@ def main():
                 % (first, len(slots) - 1, impl[1] if impl else '-')]
         for (i, sym, pure, over), d in zip(entries, demangle([e[1] for e in entries])):
             name, params, const = params_of(d)
+            if not name and pure:   # a pure one whose namer's function is local: the name a class below it gives the slot
+                parent = {e[0]: e[1] for e in CLASSES}
+                def derives(c):   # whether class c has cls among its bases
+                    while c in parent:
+                        c = parent[c]
+                        if c == cls:
+                            return True
+                    return False
+                for other in CLASSES:
+                    if not derives(other[0]):
+                        continue
+                    osyms = binary(KEXTS[other[3] if len(other) > 3 else 0][1]).vtable('__ZTV%d%s' % (len(other[0]), other[0]))
+                    if i < len(osyms) and osyms[i].startswith('__Z'):
+                        cand = params_of(demangle([osyms[i]])[0])
+                        if cand[0]:
+                            name, params, const = cand
+                            break
             if not name:
-                sys.exit('accelgen: cannot read %s (slot %d)' % (d, i))
+                sys.exit('accelgen: %s: cannot read %s (slot %d, its first own %d, symbol %s)' % (cls, d, i, first, sym))
             key = '%s(%s)%s' % (name, params, ' const' if const else '')
             if over and i < SDK_SLOTS[sdk]:   # an SDK class's virtual: its own declaration
                 if key not in OVERRIDES:
@@ -257,7 +292,8 @@ def main():
            '#pragma once', '#include <IOKit/IOService.h>', '#include <IOKit/IOUserClient.h>', '#include <IOKit/IORangeAllocator.h>', '',
            'class IOPCIDevice;', 'class IOFramebuffer;']
     hpp += ['class %s;' % e[0] for e in CLASSES]
-    hpp += ['class %s;' % t for t in sorted(forward)]
+    hpp += ['enum %s : unsigned int {};' % t for t in ENUMS]
+    hpp += ['class %s;' % t for t in sorted(forward - set(ENUMS))]
     for cls, base, size, body, gmeta in decls:
         # getMetaClass first and defined in our kext (rdna4accel.cpp RDNA4_ACCEL_BASE): the key function, so that the compiler emits the
         # class's vtable in our kext. A subclass's Base::f() calls go through it (-fapple-kext: the base's vtable symbol, never a direct

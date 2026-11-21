@@ -199,6 +199,57 @@ public:
 };
 RDNA4_ACCEL_STRUCTORS(RDNA4VidMemory, IOAccelVidMemory)
 
+// An accelerated surface: user client type 0 (the family's newUserClient asks newSurface; null was kIOReturnNoResources). WindowServer
+// opens one for each display's surfaces: refused, its displays were composited in software (CompositorSW) and Core Animation's flatten
+// path asserted (2026-11-21). The family's surface does the rest; the copies and swaps a driver does on the GPU are refused for now.
+class RDNA4Surface : public IOAccelSurface {
+	OSDeclareDefaultStructors(RDNA4Surface)
+public:
+	uintptr_t copyFromBuffer(int, int, int, int, unsigned int, unsigned int, IOAccelEvent *, IOAccelResource2 *, IOAccelSysMemory *, unsigned int,
+	                         unsigned long long, unsigned int) APPLE_KEXT_OVERRIDE { return note("copyFromBuffer"); }
+	uintptr_t copyToBuffer(int, int, int, int, unsigned int, unsigned int, IOAccelEvent *, IOAccelResource2 *, IOAccelSysMemory *, unsigned int,
+	                       unsigned long long, unsigned int) APPLE_KEXT_OVERRIDE { return note("copyToBuffer"); }
+	uintptr_t submitSwapCopy(IOAccelEvent *, IOAccelResource2 *, IOAccelResource2 *) APPLE_KEXT_OVERRIDE { return note("submitSwapCopy"); }
+	uintptr_t shapeSurface(unsigned int, unsigned short, unsigned short) APPLE_KEXT_OVERRIDE { return note("shapeSurface"); }
+	uintptr_t getDirtyBufferBitsFromPrivateModeBits(unsigned long long) APPLE_KEXT_OVERRIDE { return 0; }
+
+private:
+	uintptr_t note(const char *what)
+	{
+		static uint32_t logged;
+		if (logged++ < 16)
+			rdna4Log("AMDRadeonRDNA4: accel: surface %p: %s (refused)\n", this, what);
+		return kIOReturnUnsupported;
+	}
+};
+RDNA4_ACCEL_STRUCTORS(RDNA4Surface, IOAccelSurface)
+
+// A 2D context: user client type 2 (new2DContext), what the IOAccelerator2D plug-in (CoreDisplay's IOPSAllocateBlitEngine, through
+// the accelerator's IOCFPlugInTypes) opens for a display's blit engine; Apple's paravirtual driver keeps two in WindowServer. The blits
+// themselves are refused for now (logged).
+class RDNA4Context2D : public IOAccel2DContext2 {
+	OSDeclareDefaultStructors(RDNA4Context2D)
+public:
+	uintptr_t blitCopy(IOAccelEvent *, IOAccelResource2 *, IOAccelResource2 *, IOAccel2DBlitRectStruc *, unsigned int n) APPLE_KEXT_OVERRIDE
+	{
+		return note("blitCopy", n);
+	}
+	uintptr_t blitFill(IOAccelEvent *, unsigned int, IOAccelResource2 *, IOAccel2DBlitRectStruc *, unsigned int n) APPLE_KEXT_OVERRIDE
+	{
+		return note("blitFill", n);
+	}
+
+private:
+	uintptr_t note(const char *what, unsigned int rects)
+	{
+		static uint32_t logged;
+		if (logged++ < 16)
+			rdna4Log("AMDRadeonRDNA4: accel: 2D context %p: %s of %u rect(s) (refused)\n", this, what, rects);
+		return kIOReturnUnsupported;
+	}
+};
+RDNA4_ACCEL_STRUCTORS(RDNA4Context2D, IOAccel2DContext2)
+
 // A display pipe (one a framebuffer). For now the family's own behaviour, each transaction hook logged (the first few): what
 // WindowServer's presents ask of a driver (AMD's pipe overrides these), before they go to the DCN.
 class RDNA4DisplayPipe : public IOAccelDisplayPipe {
@@ -324,7 +375,7 @@ class RDNA4DeviceControl : public AppleGraphicsDeviceControl {
 		IORegistryIterator *it = getProvider() ? IORegistryIterator::iterateOver(getProvider(), gIOServicePlane, kIORegistryIterateRecursively)
 		                                        : nullptr;
 		while (IORegistryEntry *e = it ? it->getNextObject() : nullptr)
-			if (n < cap && e->metaCast("IOFramebuffer") && RDNA4Accel::hasDisplay(e)) {
+			if (n < cap && e->metaCast("IOFramebuffer") && RDNA4Accel::showsFramebuffer(e)) {
 				e->retain();
 				out[n++] = e;
 			}
@@ -421,8 +472,8 @@ public:
 	RDNA4DisplayMachine *displayMachine = nullptr;   // the family keeps it (+0x378) and releases it
 	IOAccelContext2 *newGLContext() APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelContext2 *newCLContext() APPLE_KEXT_OVERRIDE { return nullptr; }
-	IOAccelSurface *newSurface() APPLE_KEXT_OVERRIDE { return nullptr; }
-	IOAccelContext2 *new2DContext() APPLE_KEXT_OVERRIDE { return nullptr; }
+	IOAccelSurface *newSurface() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4Surface); }
+	IOAccelContext2 *new2DContext() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4Context2D); }
 	IOAccelContext2 *newVideoContext() APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelSysMemory *newSysMemory() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4SysMemory); }
 	IOAccelVidMemory *newVidMemory() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4VidMemory); }
@@ -468,14 +519,15 @@ IOReturn RDNA4Accelerator::newUserClient(task_t task, void *security, UInt32 typ
 {
 	if (type == RDNA4_NATIVE_UC_TYPE)
 		return rdna4AcceleratorClient(this, task, security, handler);
+	const IOReturn r = gFamilyClients ? super::newUserClient(task, security, type, handler) : kIOReturnUnsupported;
 	static uint32_t logged;
 	if (logged++ < 64) {
 		char name[32] = "";
 		proc_selfname(name, sizeof(name));
-		rdna4Log("AMDRadeonRDNA4: accel: user client of type 0x%x for %s: %s\n", static_cast<unsigned>(type), name,
-		         gFamilyClients ? "the family's" : "refused");
+		rdna4Log("AMDRadeonRDNA4: accel: user client of type 0x%x for %s: %s: 0x%x\n", static_cast<unsigned>(type), name,
+		         gFamilyClients ? "the family's" : "refused", r);
 	}
-	return gFamilyClients ? super::newUserClient(task, security, type, handler) : kIOReturnUnsupported;
+	return r;
 }
 
 namespace {
@@ -500,6 +552,8 @@ const Derived kDerived[] = {
 	RDNA4_DERIVED(RDNA4Resource, IOAccelResource2, 16),
 	RDNA4_DERIVED(RDNA4SysMemory, IOAccelSysMemory, 16),
 	RDNA4_DERIVED(RDNA4VidMemory, IOAccelVidMemory, 16),
+	RDNA4_DERIVED(RDNA4Surface, IOAccelSurface, 14),
+	RDNA4_DERIVED(RDNA4Context2D, IOAccel2DContext2, 17),
 	RDNA4_DERIVED(RDNA4DisplayPipe, IOAccelDisplayPipe, 18),
 	RDNA4_DERIVED_IN(RDNA4DeviceControl, AppleGraphicsDeviceControl, 26, 1),
 };
@@ -508,7 +562,7 @@ constexpr size_t kDerivedCount = sizeof(kDerived) / sizeof(kDerived[0]);
 // Kext `kext`'s thunks filled, checked; our metaclasses whose base is in it given the real superclasses.
 void familyLoaded(uint32_t kext, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size)
 {
-	uint32_t missing = 0, wrongSlots = 0, thunks = 0;
+	uint32_t missing = 0, wrongSlots = 0, thunks = 0, folded = 0;
 	for (size_t i = 0; i < kThunks; i++) {
 		if (kSymbols[i].kext != kext)
 			continue;
@@ -526,8 +580,29 @@ void familyLoaded(uint32_t kext, KernelPatcher &patcher, size_t index, mach_vm_a
 		const mach_vm_address_t vt = patcher.solveSymbol(index, s.vtable, address, size);
 		patcher.clearError();
 		const uintptr_t inSlot = vt ? reinterpret_cast<const uintptr_t *>(vt + 16)[s.slot] : 0;
-		if (inSlot != rdna4AccelThunks[s.thunk] && wrongSlots++ < 4)
-			rdna4Log("AMDRadeonRDNA4: accel: slot %u of %s does not hold %s\n", s.slot, s.vtable, kSymbols[s.thunk].name);
+		// the same code at another address: the kernel collection folded identical functions (small getters; the symbol names one copy,
+		// the vtable holds another): the vtable's copy is called
+		size_t body = 32;   // the bytes compared: up to the symbol's first ret when one is that near (empty and return-0 bodies)
+		for (size_t k = 0; rdna4AccelThunks[s.thunk] && k < 32; k++)
+			if (reinterpret_cast<const uint8_t *>(rdna4AccelThunks[s.thunk])[k] == 0xc3) {
+				body = k + 1;
+				break;
+			}
+		if (inSlot && rdna4AccelThunks[s.thunk] && inSlot != rdna4AccelThunks[s.thunk] &&
+		    !memcmp(reinterpret_cast<const void *>(inSlot), reinterpret_cast<const void *>(rdna4AccelThunks[s.thunk]), body)) {
+			rdna4AccelThunks[s.thunk] = inSlot;
+			folded++;
+			continue;
+		}
+		if (inSlot != rdna4AccelThunks[s.thunk] && wrongSlots++ < 12) {
+			int found = -1;   // where the function is instead (a few slots either way: this macOS's layout moved)
+			for (int d = -8; vt && d <= 8 && found < 0; d++)
+				if (reinterpret_cast<const uintptr_t *>(vt + 16)[static_cast<int>(s.slot) + d] == rdna4AccelThunks[s.thunk])
+					found = static_cast<int>(s.slot) + d;
+			const uint8_t *b = reinterpret_cast<const uint8_t *>(inSlot);   // what it holds instead
+			rdna4Log("AMDRadeonRDNA4: accel: slot %u of %s does not hold %s (it is in slot %d; the slot's code %02x %02x %02x %02x)\n", s.slot,
+			         s.vtable, kSymbols[s.thunk].name, found, b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0);
+		}
 	}
 	// each of our classes: its metaclass's superclass link and size where OSMetaClass keeps them, then the real base's metaclass
 	// (the base's size is checked when one is made: here the family's static constructors have not run yet, its metaclass reads 0)
@@ -556,8 +631,8 @@ void familyLoaded(uint32_t kext, KernelPatcher &patcher, size_t index, mach_vm_a
 		gFailed |= 1u << kext;
 	}
 	gReady = gSolved == (1u << kKextCount) - 1 && !gFailed;
-	rdna4Log("AMDRadeonRDNA4: accel: %s: %u thunks, %u not found, %u slots not the KDK's, %u classes not as expected: %s\n",
-	         kKexts[kext].bundle, thunks, missing, wrongSlots, bad,
+	rdna4Log("AMDRadeonRDNA4: accel: %s: %u thunks, %u not found, %u slots not the KDK's (%u folded copies), %u classes not as expected: %s\n",
+	         kKexts[kext].bundle, thunks, missing, wrongSlots, folded, bad,
 	         gReady ? "ready (debug.rdna4_accel=1 makes one, 2 starts it, 3 its displays)" : gFailed ? "NOT usable" : "solved");
 }
 
@@ -626,6 +701,18 @@ int accelTo(int value)
 		// as Apple's paravirtual accelerator (its AcceleratorProperties): CoreDisplay presents through display pipe transactions when
 		// these say so; without them it took the older surface path
 		gAccel->setProperty("IOMatchCategory", "IOAccelerator");
+		// the paravirtual accelerator's personality: CoreDisplay makes each display's 2D blit engine through the plug-in these name
+		// (IOPSAllocateBlitEngine: IOCreatePlugInInterfaceForService on the accelerator); without one a display stayed unaccelerated
+		if (OSDictionary *plugins = OSDictionary::withCapacity(1)) {
+			if (OSString *plugin = OSString::withCString("IOAccelerator2D.plugin")) {
+				plugins->setObject("ACCF0000-0000-0000-0000-000a2789904e", plugin);
+				plugin->release();
+			}
+			gAccel->setProperty("IOCFPlugInTypes", plugins);
+			plugins->release();
+		}
+		gAccel->setProperty("IOAccelRevision", 2ull, 32);
+		gAccel->setProperty("AccelCaps", 7ull, 32);
 		if (OSDictionary *caps = OSDictionary::withCapacity(2)) {
 			caps->setObject("DisplayPipeSupported", kOSBooleanTrue);
 			caps->setObject("TransactionsSupported", kOSBooleanTrue);
@@ -755,23 +842,113 @@ SYSCTL_PROC(_debug, OID_AUTO, rdna4_accel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LO
             "AMDRadeonRDNA4: our own IOGraphicsAccelerator2: 1 makes and attaches one, 2 runs the family's start, 3 starts the display machine (docs/native-driver-plan.md)");
 }   // namespace
 
+namespace {
+// Whether framebuffer `fb` has a monitor, as the kext knows its heads (plugin.cpp). Not an IODisplayConnect under it: those came
+// more than 10 s late in some boots (2026-11-21), all six framebuffers were then hidden and WindowServer ran without displays.
+bool isLit(IOService *fb)
+{
+#ifdef AMDRadeonRDNA4_PVGPU
+	return PvScanout::framebufferLit(fb);
+#else
+	(void)fb;
+	return true;
+#endif
+}
+
+// Our framebuffers without a monitor, by registry ID: decided once, when WindowServer is let go (waitForWindowServer).
+uint64_t gBare[8];
+uint32_t gBareCount;
+bool gBareKnown;
+
+// The IOFramebuffers under the GPU, each passed to `f` until it returns false
+template <typename F> void eachFramebuffer(F f)
+{
+	IOService *gpu = RDNA4AccelCensus::gpu();
+	IORegistryIterator *it = gpu ? IORegistryIterator::iterateOver(gpu, gIOServicePlane, kIORegistryIterateRecursively) : nullptr;
+	while (IORegistryEntry *e = it ? it->getNextObject() : nullptr)
+		if (e->metaCast("IOFramebuffer") && !f(e))
+			break;
+	OSSafeReleaseNULL(it);
+}
+}   // namespace
+
+namespace {
+// A field of a serialized AppleGPUWrangler_GPU ("<key>acc</key><integer size=\"64\">0x...</integer>"), 0 when absent
+uint64_t serializedNumber(const char *xml, const char *key)
+{
+	char want[32];
+	snprintf(want, sizeof(want), "<key>%s</key>", key);
+	const char *at = xml ? strstr(xml, want) : nullptr;
+	at = at ? strstr(at, "<integer") : nullptr;
+	at = at ? strchr(at, '>') : nullptr;
+	if (!at)
+		return 0;
+	at++;
+	const bool hex = at[0] == '0' && (at[1] == 'x' || at[1] == 'X');
+	uint64_t v = 0;
+	for (at += hex ? 2 : 0;; at++) {
+		const char c = *at;
+		const int d = c >= '0' && c <= '9' ? c - '0' : hex && c >= 'a' && c <= 'f' ? c - 'a' + 10 : hex && c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+		if (d < 0)
+			return v;
+		v = v * (hex ? 16 : 10) + static_cast<uint64_t>(d);
+	}
+}
+
+// Whether AppleGPUWrangler's GPU list (its debug-gpus: AppleGPUWrangler_GPU objects, each serialized as {"pci" = the GPU's registry ID,
+// "acc" = its accelerator's}) has our accelerator for our GPU
+bool wranglerHasUs()
+{
+	IOService *gpu = RDNA4AccelCensus::gpu();
+	OSDictionary *match = IOService::serviceMatching("AppleGPUWrangler");
+	IOService *w = match ? IOService::copyMatchingService(match) : nullptr;
+	OSSafeReleaseNULL(match);
+	bool has = false;
+	auto *gpus = w ? OSDynamicCast(OSArray, w->getProperty("debug-gpus")) : nullptr;
+	for (unsigned i = 0; gpu && gAccel && gpus && i < gpus->getCount() && !has; i++) {
+		OSSerialize *ser = OSSerialize::withCapacity(1024);
+		const OSObject *g = gpus->getObject(i);
+		if (ser && g && g->serialize(ser))
+			has = serializedNumber(ser->text(), "pci") == gpu->getRegistryEntryID() &&
+			      serializedNumber(ser->text(), "acc") == gAccel->getRegistryEntryID();
+		OSSafeReleaseNULL(ser);
+	}
+	OSSafeReleaseNULL(w);
+	return has;
+}
+}   // namespace
+
+bool RDNA4Accel::framebuffersDecided() { return __atomic_load_n(&gBareKnown, __ATOMIC_ACQUIRE); }
+
+bool RDNA4Accel::isBareFramebuffer(IORegistryEntry *fb)
+{
+	const uint64_t id = __atomic_load_n(&gBareKnown, __ATOMIC_ACQUIRE) ? fb->getRegistryEntryID() : 0;
+	for (uint32_t i = 0; id && i < gBareCount; i++)
+		if (gBare[i] == id)
+			return true;
+	return false;
+}
+
+bool RDNA4Accel::hidesFromMatch(IORegistryEntry *service, OSDictionary *table)
+{
+	if (!__atomic_load_n(&gBareKnown, __ATOMIC_ACQUIRE) || !service->metaCast("IONDRVFramebuffer"))
+		return false;
+	// A lookup by registry ID finds one with a display: the per-GPU path's, of the framebuffers AGDC lists (0x980). A match by class
+	// (CoreDisplay's mapped path, CGXMappedDisplayStart) finds none: when it found ours ("Created FB 1 of 6"), WindowServer composited
+	// in software and asserted; when it found none, it took the per-GPU path ("Created FB 1 of 2") and ran (2026-11-21).
+	return isBareFramebuffer(service) || !table || !table->getObject("IORegistryEntryID");
+}
+
+bool RDNA4Accel::showsFramebuffer(IORegistryEntry *fb)
+{
+	auto *svc = OSDynamicCast(IOService, fb);
+	return __atomic_load_n(&gBareKnown, __ATOMIC_ACQUIRE) ? !isBareFramebuffer(fb) : svc && isLit(svc);
+}
+
 // WindowServer's first open of the GPU wrangler (pvhooks.cpp wrapServiceOpen): with rdna4-accel=4 as a boot-arg, held until the boot
 // thread has made and registered the accelerator (or given up), at most 60 s: WindowServer's wrangler lists each GPU's accelerator
 // when it opens, and it opened before ours existed ("accel 0x0", 2026-11-20). (A test boot's option is not known this early.)
-bool RDNA4Accel::hidesBareFramebuffers() { return gFamilyClients; }
-
-// Of our six IONDRV framebuffers two have a display; with all six visible WindowServer made displays of four, two without a monitor
-// (display IDs 0x003f004x), composited in software (2026-11-20)
-bool RDNA4Accel::hasDisplay(IORegistryEntry *fb)
-{
-	bool found = false;
-	OSIterator *it = fb->getChildIterator(gIOServicePlane);
-	while (auto *c = it && !found ? OSDynamicCast(IORegistryEntry, it->getNextObject()) : nullptr)
-		found = c->metaCast("IODisplayConnect");
-	OSSafeReleaseNULL(it);
-	return found;
-}
-
+// Then the framebuffers without a monitor are the bare ones (hidden from WindowServer).
 void RDNA4Accel::waitForWindowServer()
 {
 	uint32_t want = 0;
@@ -780,7 +957,26 @@ void RDNA4Accel::waitForWindowServer()
 	rdna4Log("AMDRadeonRDNA4: accel: WindowServer opens the GPU wrangler: held until the accelerator is registered\n");
 	for (int ms = 0; ms < 60000 && !gBootDone; ms += 50)
 		IOSleep(50);
-	rdna4Log("AMDRadeonRDNA4: accel: WindowServer let go (%s)\n", gFamilyClients ? "registered" : "NOT registered");
+	// the GPU wrangler takes our accelerator as the GPU's asynchronously (its own work loop, on our registerService): until its
+	// debug-gpus names it, WindowServer's CoreDisplay::GPU gets accelerator 0 for each framebuffer and composites in software
+	uint32_t waited = 0;
+	for (; gFamilyClients && !wranglerHasUs() && waited < 5000; waited += 50)
+		IOSleep(50);
+	uint32_t lit = 0;
+	if (gFamilyClients) {
+		eachFramebuffer([&](IORegistryEntry *e) {
+			auto *fb = OSDynamicCast(IOService, e);
+			const bool on = fb && isLit(fb);
+			lit += on;
+			if (e->metaCast("IONDRVFramebuffer") && !on && gBareCount < 8)
+				gBare[gBareCount++] = e->getRegistryEntryID();
+			rdna4Log("AMDRadeonRDNA4: accel: framebuffer %s 0x%llx: %s\n", e->getName(), e->getRegistryEntryID(), on ? "lit" : "bare");
+			return true;
+		});
+		__atomic_store_n(&gBareKnown, true, __ATOMIC_RELEASE);
+	}
+	rdna4Log("AMDRadeonRDNA4: accel: WindowServer let go (%s): the wrangler %s us after %u ms; %u framebuffer(s) lit, %u bare hidden\n",
+	         gFamilyClients ? "registered" : "NOT registered", wranglerHasUs() ? "has" : "does NOT have", waited, lit, gBareCount);
 }
 
 void RDNA4Accel::start()

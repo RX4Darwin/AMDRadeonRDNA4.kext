@@ -1850,6 +1850,16 @@ PluginConfiguration ADDPR(config) {
 #ifdef AMDRadeonRDNA4_PVGPU
 // --- the heads as the paravirtual displays (pvscanout.hpp) ---------------------
 
+bool PvScanout::framebufferLit(IOService *fb)
+{
+	if (Head2 *h = headFor(fb))
+		return h->connected || h->waitClocks;
+	for (const auto &e : fbTable)
+		if (e.fb == fb)
+			return e.state && e.state == bootState;
+	return false;
+}
+
 bool PvScanout::enabled()
 {
 	return pvHeads;

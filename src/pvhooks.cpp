@@ -180,12 +180,33 @@ IOReturn wrapNewUserClient(void *fb, void *task, void *security, uint32_t type, 
  * every key, nor matchPassive, which a match by class alone does not call
  * (copyExistingServices: instanceMatch calls matchInternal).
  */
+// (diagnostic, rdna4-accel=4) which user-space matches reach our framebuffers: the process, the table's keys, the verdict
+void logFramebufferMatch(void *service, OSDictionary *table, bool hide)
+{
+	static uint32_t logged;
+	if (logged >= 60 || !table)
+		return;
+	logged++;
+	char name[32] = {}, keys[200] = {};
+	proc_selfname(name, sizeof(name));
+	size_t at = 0;
+	if (OSCollectionIterator *it = OSCollectionIterator::withCollection(table)) {
+		while (auto *k = OSDynamicCast(OSSymbol, it->getNextObject()))
+			at += snprintf(keys + at, at < sizeof(keys) ? sizeof(keys) - at : 0, "%s ", k->getCStringNoCopy());
+		it->release();
+	}
+	PLOG("match from %s on %s 0x%llx: keys %s-> %s", name, static_cast<IORegistryEntry *>(service)->getName(),
+	     static_cast<IORegistryEntry *>(service)->getRegistryEntryID(), keys, hide ? "hidden" : "found");
+}
+
 bool wrapMatchInternal(void *service, OSDictionary *table, uint32_t options, uint32_t *done)
 {
-	if (RDNA4Accel::hidesBareFramebuffers() && current_task() != kernel_task && isClass(service, kNdrvFramebuffer) &&
-	    !RDNA4Accel::hasDisplay(static_cast<IORegistryEntry *>(service))) {
+	const bool hide = RDNA4Accel::hidesFromMatch(static_cast<IORegistryEntry *>(service), table);   // (false at once unless rdna4-accel=4)
+	if (current_task() != kernel_task && RDNA4Accel::framebuffersDecided() && isClass(service, kNdrvFramebuffer))
+		logFramebufferMatch(service, table, hide);
+	if (hide && current_task() != kernel_task) {
 		if (hidden++ < 8)
-			PLOG("framebuffer %p left out of a user-space match: no display on it (our accelerator serves WindowServer)", service);
+			PLOG("framebuffer %p left out of a user-space match (our accelerator serves WindowServer: found by registry ID only)", service);
 
 		return false;
 	}
