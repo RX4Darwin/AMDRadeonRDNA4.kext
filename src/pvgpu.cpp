@@ -1100,7 +1100,10 @@ private:
 	// phase against the heads' vblanks (and drifted: 60.000 Hz against 59.997 and 60.001), and frames copied close to a vblank were shown
 	// one or two vblanks later in turn.
 	uint64_t mPortVblNs[8] {};
-	uint64_t mPortPeriodNs[8] {};        // measured per-head scanout period; starts at 60 Hz until two real vblanks are observed
+	uint64_t mPortPeriodNs[8] {};        // measured per-head period, sampled independently of VBL event deadlines
+	uint32_t mPortLastLine[8] {}, mPortLineCount[8] {};
+	uint64_t mPortLastWrapNs[8] {};
+	bool mPortSawWrap[8] {};
 	uint64_t mVblSoonest { 0 };          // the earliest VBL event due, shared or a port's
 	bool vblDue(uint32_t port, uint64_t now, bool tick);
 	uint64_t mLastDispIrqNs { 0 };
@@ -8956,6 +8959,9 @@ void RDNA4PvHost::dropScanout(ScanoutMap &sm)
 	if (port < 8) {
 		mPortVblNs[port] = 0;
 		mPortPeriodNs[port] = 0;
+		mPortLastLine[port] = mPortLineCount[port] = 0;
+		mPortLastWrapNs[port] = 0;
+		mPortSawWrap[port] = false;
 		mPortTiming[port] = {};
 	}
 
@@ -9529,10 +9535,43 @@ bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
 	if (!due)
 		return tick;
 
-	if (sm && sm->flips && *due && now < *due)
+	/* Sample the physical scanline on every host tick, even while the next
+	 * guest VBL event is not due. Estimating refresh only at predicted event
+	 * deadlines aliases a 120 Hz head to 60 Hz when the initial 60 Hz deadline
+	 * skips every other hardware blank. */
+	const bool scanoutValid = sm && sm->flips && sm->otg < 8 &&
+	                          gCompute->rtScanoutScan(sm->otg, line, lines, blankStart) &&
+	                          lines && line < lines && blankStart < lines;
+	if (scanoutValid) {
+		if (mPortLineCount[port] != lines) {
+			mPortLineCount[port] = lines;
+			mPortLastLine[port] = line;
+			mPortLastWrapNs[port] = 0;
+			mPortSawWrap[port] = false;
+			mPortPeriodNs[port] = 0;
+		} else {
+			if (line < mPortLastLine[port]) {
+				if (mPortSawWrap[port]) {
+					const uint64_t measured = now - mPortLastWrapNs[port];
+					if (measured >= 4000000ull && measured <= 50000000ull)
+						mPortPeriodNs[port] = mPortPeriodNs[port]
+							? (3 * mPortPeriodNs[port] + measured) / 4 : measured;
+				}
+				mPortLastWrapNs[port] = now;
+				mPortSawWrap[port] = true;
+			}
+			mPortLastLine[port] = line;
+		}
+	} else {
+		mPortLineCount[port] = 0;
+		mPortSawWrap[port] = false;
+		mPortLastWrapNs[port] = 0;
+	}
+
+	if (scanoutValid && *due && now < *due)
 		return false;
 
-	if (!sm || !sm->flips || sm->otg >= 8 || !gCompute->rtScanoutScan(sm->otg, line, lines, blankStart) || !lines) {
+	if (!scanoutValid) {
 		*due = 0;
 	} else {
 		// The paravirtual display's first estimate is 60 Hz, but the real head may be 75/120/144 Hz.
@@ -9556,12 +9595,8 @@ bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
 
 	if (fire) {
 		PortTiming &timing = mPortTiming[port];
-		if (timing.vblAt) {
-			const uint64_t measured = now - timing.vblAt;
-			// Reject scheduler stalls and implausible readings; smooth normal jitter rather than chasing it.
-			if (measured >= 4000000ull && measured <= 50000000ull)
-				mPortPeriodNs[port] = mPortPeriodNs[port] ? (3 * mPortPeriodNs[port] + measured) / 4 : measured;
-		}
+		/* Period estimation is updated from scanline wraps above, not from
+		 * these event deadlines, which may be intentionally throttled. */
 		timing.vblAt = now;
 	}
 	if (fire && !port)
