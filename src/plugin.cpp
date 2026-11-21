@@ -1088,7 +1088,9 @@ IOReturn wrapSetCursorImage(void *fb, void *image)
 	info.minorVersion = kHardwareCursorInfoMinorVersion;
 	info.hardwareCursorData = reinterpret_cast<UInt8 *>(pixels);
 	const bool ok = pixels && static_cast<IOFramebuffer *>(fb)->convertCursorImage(image, &desc, &info) &&
-	                PvScanout::cursorArgb(static_cast<uint32_t>(port), pixels, info.cursorWidth, info.cursorHeight, kCursorAnnounced,
+	                // (rows packed tightly, the image's width a row: as AppleParavirtFramebuffer's glyphs, "32 bytes a row" for 8x8; read at
+	                // the descriptor's 128 they were a block of garbage on both displays, 2026-11-21)
+	                PvScanout::cursorArgb(static_cast<uint32_t>(port), pixels, info.cursorWidth, info.cursorHeight, info.cursorWidth,
 	                                      info.cursorHotSpotX, info.cursorHotSpotY);
 	if (ok && port < 8) {
 		gCursorHot[port][0] = info.cursorHotSpotX;
