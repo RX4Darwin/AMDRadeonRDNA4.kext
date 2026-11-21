@@ -1894,6 +1894,21 @@ uint32_t PvScanout::count()
 	return 1 + pvPortCount;
 }
 
+int PvScanout::portOf(IOService *fb)
+{
+	(void)PvScanout::count();   // (numbers the ports)
+	if (Head2 *h = headFor(fb)) {
+		for (uint32_t i = 0; i < pvPortCount; i++)
+			if (pvPorts[i] == h)
+				return static_cast<int>(i) + 1;
+		return -1;
+	}
+	for (const auto &e : fbTable)
+		if (e.fb == fb)
+			return e.state && e.state == bootState ? 0 : -1;
+	return -1;
+}
+
 bool PvScanout::mode(uint32_t port, uint32_t &width, uint32_t &height)
 {
 	Head head;

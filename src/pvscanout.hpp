@@ -44,6 +44,9 @@ bool enabled();
  * display clocks are up). What our accelerator shows WindowServer (rdna4accel.cpp). */
 bool framebufferLit(IOService *fb);
 
+/* The port of framebuffer `fb` (0 the boot head's, 1.. the extra heads' as count() numbers them), -1 when it is no head's. */
+int portOf(IOService *fb);
+
 /* Whether decided() has been told yet. */
 bool known();
 

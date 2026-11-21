@@ -26,6 +26,7 @@
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
 #include "translator.hpp"
+#include "iosurface.hpp"
 #include "pvscanout.hpp"
 #endif
 #include "rdna4compute.h"
@@ -128,6 +129,23 @@ public:
 	}
 	static constexpr size_t kStampBytes = 64 * 1024;
 
+	// Every event complete: no GPU work goes through the family's command path (WindowServer's Metal work runs on the card's runtime,
+	// RDNA4MTLDevice), so no stamp is ever written and a display pipe transaction's barrier event never completed: the family queued
+	// WindowServer's transactions and never performed them (event_interrupt_gated, 2026-11-21). The first 24 are logged, complete by
+	// their stamps or not (8 x {stamp index, -1 none; value}). ponytail: real stamps once the family's command path carries work.
+	uintptr_t testEventUnlocked(IOAccelEvent *event) APPLE_KEXT_OVERRIDE
+	{
+		static uint32_t logged;
+		const bool done = super::testEventUnlocked(event);
+		if (logged < 24) {
+			logged++;
+			const auto *e = reinterpret_cast<const int32_t *>(event);
+			rdna4Log("AMDRadeonRDNA4: accel: event %p %s by its stamps: %d:%u %d:%u %d:%u %d:%u (taken as complete)\n", event,
+			         done ? "complete" : "not complete", e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
+		}
+		return true;
+	}
+
 	uintptr_t writeStamp(int, vendevtCommandRec *, unsigned int) APPLE_KEXT_OVERRIDE { return 0; }
 	uintptr_t prepareBarrier(vendevtBarrierRec *) APPLE_KEXT_OVERRIDE { return 0; }
 	uintptr_t completeBarrier(vendevtBarrierRec *) APPLE_KEXT_OVERRIDE { return 0; }
@@ -160,6 +178,26 @@ public:
 		}
 		return super::initFramebufferResource(a, b, fb, r);
 	}
+	// The framebuffers with a monitor first: each framebuffer found gets the next pipe index (its IOAccelIndex), and IOPresentment takes
+	// a GPU's pipes as contiguous: with the lit ones at 0 and 3 it presented the second display on pipe 1, a bare framebuffer's, never
+	// active (kIOReturnNotReady, 2026-11-21). Bare ones still get a pipe after them: with none, the boot display's framebuffer never got
+	// a mode or its display (two test boots). (The family skips a framebuffer that already has a pipe.)
+	uintptr_t found_framebuffer(IOFramebuffer *fb) APPLE_KEXT_OVERRIDE
+	{
+		if (!litFirst) {
+			litFirst = true;
+			IOService *gpu = RDNA4AccelCensus::gpu();
+			IORegistryIterator *it = gpu ? IORegistryIterator::iterateOver(gpu, gIOServicePlane, kIORegistryIterateRecursively) : nullptr;
+			while (IORegistryEntry *e = it ? it->getNextObject() : nullptr)
+				if (e->metaCast("IOFramebuffer") && RDNA4Accel::showsFramebuffer(e)) {
+					rdna4Log("AMDRadeonRDNA4: accel: display machine: framebuffer %s 0x%llx (lit) first\n", e->getName(), e->getRegistryEntryID());
+					super::found_framebuffer(static_cast<IOFramebuffer *>(e));
+				}
+			OSSafeReleaseNULL(it);
+		}
+		return super::found_framebuffer(fb);
+	}
+	bool litFirst = false;
 	using super = IOAccelDisplayMachine;
 };
 RDNA4_ACCEL_STRUCTORS(RDNA4DisplayMachine, IOAccelDisplayMachine)
@@ -184,7 +222,27 @@ RDNA4_ACCEL_STRUCTORS(RDNA4MemoryMap, IOAccelMemoryMap)
 // paging buffer are not ours yet: nothing.
 class RDNA4Resource : public IOAccelResource2 {
 	OSDeclareDefaultStructors(RDNA4Resource)
+	using super = IOAccelResource2;
+	uint32_t unplaced = 0;   // prepares the family could not place (below), each one undone by a complete
 public:
+	// Prepared even when the family cannot place it: WindowServer's IOSurfaces are VRAM resources whose memory has no size (we report
+	// no device-cache VRAM), IOAccelTask::allocate cannot map 0 bytes ("failed to allocate GPU virtual address"), and every display pipe
+	// transaction carried 0xe00002be and was never performed (2026-11-21). Nothing reads a GPU address of ours: the pipe presents the
+	// plane by its IOSurface (performTransaction). ponytail: real VRAM placement once the family's command path draws.
+	uintptr_t prepare() APPLE_KEXT_OVERRIDE
+	{
+		if (!super::prepare())
+			unplaced++;
+		return true;
+	}
+	uintptr_t complete() APPLE_KEXT_OVERRIDE
+	{
+		if (unplaced) {
+			unplaced--;
+			return 0;
+		}
+		return super::complete();
+	}
 	uintptr_t rebuildPagingBuffer() APPLE_KEXT_OVERRIDE { return 0; }
 	uintptr_t getLevelOffset(unsigned char, unsigned char, int *offset) APPLE_KEXT_OVERRIDE { if (offset) *offset = 0; return 0; }
 	uintptr_t getBackingLevelOffset(unsigned char, unsigned char, int *offset) APPLE_KEXT_OVERRIDE { if (offset) *offset = 0; return 0; }
@@ -278,7 +336,9 @@ RDNA4_ACCEL_STRUCTORS(RDNA4Context2D, IOAccel2DContext2)
 // WindowServer's presents ask of a driver (AMD's pipe overrides these), before they go to the DCN.
 // IOAccelSysMemory::withMemoryDescriptor (static: no thunk), solved with the family (familyLoaded); our accelerator (below gAccel)
 mach_vm_address_t gWithMemoryDescriptor;
+mach_vm_address_t gPlaneIOSurface;   // IOAccelDisplayPipeTransaction2::getPlaneIOSurface(unsigned, unsigned) const (not virtual)
 IOGraphicsAccelerator2 *ourAccelerator();
+const uint8_t *gPipes[8];   // (diagnostic, debug.rdna4_accelpipes) our display pipes by framebuffer index (init)
 
 class RDNA4DisplayPipe : public IOAccelDisplayPipe {
 	OSDeclareDefaultStructors(RDNA4DisplayPipe)
@@ -311,26 +371,86 @@ class RDNA4DisplayPipe : public IOAccelDisplayPipe {
 	}
 
 public:
+	bool init(IOGraphicsAccelerator2 *accel, IOAccelDisplayMachine *machine, IOFramebuffer *fb, unsigned int index) APPLE_KEXT_OVERRIDE
+	{
+		if (!super::init(accel, machine, fb, index))
+			return false;
+		if (index < 8)
+			gPipes[index] = reinterpret_cast<const uint8_t *>(this);
+		return true;
+	}
 	uintptr_t validateTransaction(IOAccelDisplayPipeTransaction2 *t) APPLE_KEXT_OVERRIDE
 	{
 		note("validateTransaction", t);
 		return super::validateTransaction(t);
 	}
+	// A transaction's first plane onto the pipe's head: its IOSurface copied into the head's scanout (PvScanout::present, the copy
+	// the paravirtual displays use). ponytail: a CPU copy of each frame, plane 0 only, no rects; the display engine's own flip later.
 	uintptr_t performTransaction(IOAccelDisplayPipeTransaction2 *t) APPLE_KEXT_OVERRIDE
 	{
-		note("performTransaction", t);
-		return super::performTransaction(t);
+		const uintptr_t r = super::performTransaction(t);
+#ifdef AMDRadeonRDNA4_PVGPU
+		using PlaneSurface = const void *(*)(const IOAccelDisplayPipeTransaction2 *, unsigned int, unsigned int);
+		const void *surface = t && gPlaneIOSurface ? reinterpret_cast<PlaneSurface>(gPlaneIOSurface)(t, 0, 0) : nullptr;
+		const uint32_t sid = surfaceIdOf(surface);
+		if (port < 0) {   // (once: the pipe's framebuffer does not change)
+			const uint32_t index = *reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint8_t *>(this) + 0x284);
+			if (IOFramebuffer *fb = framebufferOf(index)) {
+				port = PvScanout::portOf(fb);
+				fb->release();
+			}
+		}
+		const bool shown = sid && port >= 0 && PvScanout::present(static_cast<uint32_t>(port), sid, 0);
+		static uint32_t presentLogged;   // (its own budget: the other hooks use up `logged`)
+		if (presentLogged < 32 && (presented < 4 || !shown)) {
+			presentLogged++;
+			rdna4Log("AMDRadeonRDNA4: accel: pipe %p: transaction %p: IOSurface %u onto port %d: %s\n", this, t, sid, port,
+			         shown ? "shown" : "NOT shown");
+		}
+		presented += shown;
+		if (shown)
+			return kIOReturnSuccess;   // (the family's own performTransaction is kIOReturnUnsupported: every transaction failed)
+#endif
+		return r;
 	}
-	uintptr_t isTransactionComplete(IOAccelDisplayPipeTransaction2 *t) APPLE_KEXT_OVERRIDE { return super::isTransactionComplete(t); }
+	int port = -1;          // the head this pipe's framebuffer is (PvScanout::portOf), once known
+	uint32_t presented = 0;
+	// Done once performed: the copy onto the head is (performTransaction). The family's waits for a later transaction to go live, so
+	// the last one stayed pending: its 300 ms timeout. ponytail: done before the scanout shows it; the head's vblank later.
+	uintptr_t isTransactionComplete(IOAccelDisplayPipeTransaction2 *) APPLE_KEXT_OVERRIDE { return true; }
+	// (diagnostic) what event_interrupt_gated decides on, logged the first 48 times: the transaction's status (+0x58, given before
+	// submit; pending 0xe0014042 is the only one performed), the queue (+0x238 head, +0x23c tail), the live one (+0x248: while set,
+	// nothing more is performed), event interrupt armed (+0x29c), transaction interrupt (+0x2a4), +0x280/+0x299 (refuse performing)
 	uintptr_t submitTransaction(IOAccelDisplayPipeTransaction2 *t) APPLE_KEXT_OVERRIDE
 	{
-		note("submitTransaction", t);
-		return super::submitTransaction(t);
+		const uint32_t before = t ? *reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint8_t *>(t) + 0x58) : 0;
+		const uintptr_t r = super::submitTransaction(t);
+		static uint32_t submitLogged;
+		if (submitLogged < 48) {
+			submitLogged++;
+			const auto *b = reinterpret_cast<const uint8_t *>(this);
+			rdna4Log("AMDRadeonRDNA4: accel: pipe %p: submit %p: status 0x%x -> 0x%lx; queue %d..%d live %p armed %u tint %u +0x280 %u +0x299 %u\n",
+			         this, t, before, r, *reinterpret_cast<const int32_t *>(b + 0x238), *reinterpret_cast<const int32_t *>(b + 0x23c),
+			         *reinterpret_cast<void *const *>(b + 0x248), *reinterpret_cast<const uint32_t *>(b + 0x29c),
+			         *reinterpret_cast<const uint32_t *>(b + 0x2a4), b[0x280], b[0x299]);
+		}
+		return r;
 	}
 	uintptr_t beginTransaction(IOAccelEvent *e) APPLE_KEXT_OVERRIDE
 	{
 		note("beginTransaction", e);
 		return super::beginTransaction(e);
+	}
+	// (diagnostic) the family clears the pipe's active flag after this: a pipe no longer active refuses WindowServer's transactions
+	uintptr_t destroyFramebufferResource(unsigned int i, IOAccelResource2 *r) APPLE_KEXT_OVERRIDE
+	{
+		const auto *b = reinterpret_cast<const uint8_t *>(this);
+		if (logged < 64) {
+			logged++;
+			rdna4Log("AMDRadeonRDNA4: accel: pipe %p (framebuffer %u): destroyFramebufferResource(%u, %p): was active %u\n", this,
+			         *reinterpret_cast<const uint32_t *>(b + 0x284), i, r, b[0x298]);
+		}
+		return super::destroyFramebufferResource(i, r);
 	}
 	// The memory a framebuffer resource is: the pipe's framebuffer's scanout (its system aperture), as Apple's paravirtual pipe gives its
 	// framebuffer's memory descriptor (IOAccelSysMemory::withMemoryDescriptor). The family's own returns kIOReturnUnsupported: no pipe of
@@ -672,6 +792,8 @@ void familyLoaded(uint32_t kext, KernelPatcher &patcher, size_t index, mach_vm_a
 	if (kext == 0) {
 		gEnableAccelerator = patcher.solveSymbol(index, "__ZN22IOGraphicsAccelerator217enableAcceleratorEv", address, size);
 		patcher.clearError();
+		gPlaneIOSurface = patcher.solveSymbol(index, "__ZNK30IOAccelDisplayPipeTransaction217getPlaneIOSurfaceEjj", address, size);
+		patcher.clearError();
 		gWithMemoryDescriptor = patcher.solveSymbol(index,
 		                                            "__ZN16IOAccelSysMemory20withMemoryDescriptorEP22IOGraphicsAccelerator2P16IOAccelResource2P18IOMemoryDescriptor",
 		                                            address, size);
@@ -961,6 +1083,25 @@ void accelAtBoot(void *, wait_result_t)
 	thread_terminate(current_thread());
 }
 
+// (diagnostic) each display pipe's state as transactionEnd tests it, one line a pipe: index, transactions begun (+0x288), active
+// (+0x298), terminated (+0x280), WSAA defer (+0x282), +0x299, the queue (+0x238 head, +0x23c tail), live (+0x248)
+int accelPipesSysctl SYSCTL_HANDLER_ARGS
+{
+	char text[1024];   // (8 lines of at most ~110 characters)
+	size_t at = 0;
+	text[0] = 0;
+	for (uint32_t i = 0; i < 8 && at < sizeof(text); i++)
+		if (const uint8_t *b = gPipes[i]) {
+			auto u32 = [b](uint32_t off) { return *reinterpret_cast<const uint32_t *>(b + off); };
+			at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at,
+			                                   "pipe %u %p: begun %u active %u term %u defer %u 299 %u queue %d..%d live %p\n", i, b, u32(0x288),
+			                                   b[0x298], b[0x280], b[0x282], b[0x299], static_cast<int32_t>(u32(0x238)),
+			                                   static_cast<int32_t>(u32(0x23c)), *reinterpret_cast<void *const *>(b + 0x248)));
+		}
+	return SYSCTL_OUT(req, text, strlen(text) + 1);
+}
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_accelpipes, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, accelPipesSysctl, "A",
+            "AMDRadeonRDNA4: our display pipes' states (diagnostic)");
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_accel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, accelSysctl, "I",
             "AMDRadeonRDNA4: our own IOGraphicsAccelerator2: 1 makes and attaches one, 2 runs the family's start, 3 starts the display machine (docs/native-driver-plan.md)");
 }   // namespace
@@ -1091,6 +1232,16 @@ void RDNA4Accel::waitForWindowServer()
 	uint32_t waited = 0;
 	for (; gFamilyClients && !wranglerHasUs() && waited < 5000; waited += 50)
 		IOSleep(50);
+	// and the card's runtime (RDNA4ComputeService, runtime.cpp): WindowServer's Metal device opens it at once, and when it was not up yet
+	// ("data was not found") CoreDisplay aborted and WindowServer restarted, three times in a boot of 2026-11-21 (let go at 14.8 s)
+	bool runtime = false;
+	if (gFamilyClients) {
+		OSDictionary *match = IOService::serviceMatching(RDNA4_COMPUTE_SERVICE);
+		IOService *svc = match ? IOService::waitForMatchingService(match, 30ull * kSecondScale) : nullptr;
+		runtime = svc;
+		OSSafeReleaseNULL(svc);
+		OSSafeReleaseNULL(match);
+	}
 	uint32_t lit = 0;
 	if (gFamilyClients) {
 		eachFramebuffer([&](IORegistryEntry *e) {
@@ -1104,8 +1255,9 @@ void RDNA4Accel::waitForWindowServer()
 		});
 		__atomic_store_n(&gBareKnown, true, __ATOMIC_RELEASE);
 	}
-	rdna4Log("AMDRadeonRDNA4: accel: WindowServer let go (%s): the wrangler %s us after %u ms; %u framebuffer(s) lit, %u bare hidden\n",
-	         gFamilyClients ? "registered" : "NOT registered", wranglerHasUs() ? "has" : "does NOT have", waited, lit, gBareCount);
+	rdna4Log("AMDRadeonRDNA4: accel: WindowServer let go (%s): the wrangler %s us after %u ms; %u framebuffer(s) lit, %u bare hidden; "
+	         "runtime %s\n", gFamilyClients ? "registered" : "NOT registered", wranglerHasUs() ? "has" : "does NOT have", waited, lit, gBareCount,
+	         runtime ? "up" : "NOT up after 30 s");
 }
 
 void RDNA4Accel::start()
@@ -1120,6 +1272,7 @@ void RDNA4Accel::start()
 				familyLoaded(k, patcher, index, address, size);
 	}, nullptr);
 	sysctl_register_oid(&sysctl__debug_rdna4_accel);
+	sysctl_register_oid(&sysctl__debug_rdna4_accelpipes);
 	thread_t th;   // (it waits for the GPU, then reads rdna4-accel)
 	if (kernel_thread_start(accelAtBoot, nullptr, &th) == KERN_SUCCESS)
 		thread_deallocate(th);
