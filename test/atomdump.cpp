@@ -4990,14 +4990,16 @@ static int testSparseTree() {
 		static TreeEnv retry;
 		retry = TreeEnv {};
 		retry.open(8);
+		PtPages::Page extra;
+		const bool extraCreated = retry.sp.get(retry.host, 1, 0, true, extra);
 		retry.sp.markDirty(0);
 		retry.syncCalls = 0;
-		retry.failSyncCall = 1;
-		f += check(!retry.sync(), "tree: an injected page-table sync failure is reported");
+		retry.failSyncCall = 2;
+		f += check(extraCreated && !retry.sync(), "tree: a later page-table sync failure is reported after earlier progress");
 		uint32_t dirtyId = ~0u; uint64_t *dirtyShadow = nullptr, dirtyOffset = 0;
 		const bool retained = retry.sp.nextDirty(dirtyId, dirtyShadow, dirtyOffset);
-		f += check(retained && dirtyId == 0 && dirtyShadow && dirtyOffset != 0,
-		           "tree: a page whose sync failed remains dirty for retry");
+		f += check(retained && dirtyId == extra.id && dirtyShadow == extra.entries && dirtyOffset != 0,
+		           "tree: earlier pages stay clean while the failed page remains dirty for retry");
 		retry.failSyncCall = 0;
 		retry.syncCalls = 0;
 		const bool retried = retry.sync();
