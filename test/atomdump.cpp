@@ -4981,7 +4981,9 @@ static int testSparseTree() {
 	static TreeEnv e;
 	e = TreeEnv {};
 	e.open(PtPages::kMaxPages);
-	f += check(e.sp.pages() == 1 && e.sp.chunksHeld() == 1 && e.shadowLive == 1, "tree: a fresh client is one page (the root), nothing below it");
+	f += check(e.sp.pages() == 1 && e.sp.chunksHeld() == 1 && e.shadowLive == 1 &&
+	           e.rootPhys == TreeEnv::kBase + 0x2000000ull,
+	           "tree: a fresh client has one root page with its allocated physical address");
 	uint64_t phys = 0;
 	f += check(!e.translate(V, phys), "tree: before any mapping every VA faults");
 
