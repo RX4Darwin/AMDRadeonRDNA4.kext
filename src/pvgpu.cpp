@@ -1359,12 +1359,34 @@ IOReturn RDNA4PvHost::presentAction(OSObject *owner, void *port, void *sid, void
 	auto *h = static_cast<RDNA4PvHost *>(owner);
 	const uint32_t p = *static_cast<uint32_t *>(port);
 
+	const uint64_t from = nowNs();
 	*static_cast<bool *>(ok) = h->presentFrame(p, *static_cast<uint32_t *>(sid), 0);
+	const uint64_t copied = nowNs();
 
 	// The copy done before the transaction is (our pipe's isTransactionComplete: at once), else WindowServer draws the next frame into
 	// the surface while the card still reads it. ponytail: waited here; the fence in isTransactionComplete if the wait shows.
 	if (p < kScanoutPorts && h->mScanout[p].fence)
 		h->waitFor(h->mScanout[p].fence);
+
+	// (diagnostic, typing felt slow on our accelerator) per port: presents, the time in presentFrame and in the copy's wait, a line every 10 s
+	static uint64_t windowAt;
+	static struct { uint64_t count, frameNs, waitNs, worst; } stat[kScanoutPorts];
+	const uint64_t now = nowNs();
+	if (p < kScanoutPorts) {
+		stat[p].count++;
+		stat[p].frameNs += copied - from;
+		stat[p].waitNs += now - copied;
+		stat[p].worst = now - from > stat[p].worst ? now - from : stat[p].worst;
+	}
+	if (now - windowAt >= 10000000000ull) {
+		for (uint32_t i = 0; windowAt && i < kScanoutPorts; i++)
+			if (stat[i].count)
+				pvlog("host: present: port %u: %llu in %llu s, %llu us building the copy and %llu us waiting for it on average, the longest %llu us",
+				      i, stat[i].count, (now - windowAt) / 1000000000ull, stat[i].frameNs / stat[i].count / 1000,
+				      stat[i].waitNs / stat[i].count / 1000, stat[i].worst / 1000);
+		windowAt = now;
+		memset(stat, 0, sizeof(stat));
+	}
 
 	h->flipDone();   // shown at the next vblank
 	h->mTimer->setTimeoutUS(250);   // the runtime opened
