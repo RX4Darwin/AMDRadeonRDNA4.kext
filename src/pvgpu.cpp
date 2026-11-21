@@ -369,6 +369,8 @@ IOReturn tDevWrite(RDNA4PvNub *n, UInt8 bar, UInt64 off, UInt64 data, UInt8 size
 
 } // namespace
 
+bool pvgpu::glRendererNameable() { return glWanted() && glRendererPatchable(); }
+
 // ======================================================================================================================================
 // The polling host (M0: watches and consumes, executes nothing) and the self-test, on one work loop.
 // ======================================================================================================================================
