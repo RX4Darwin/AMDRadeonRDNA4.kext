@@ -12,7 +12,7 @@ This pass changes the PVGPU present path to prefer dropping a frame over blockin
 
 - If a head's previous present still owns its scanout destination, the new present is skipped. The driver does not write to or reuse that destination until the previous fence completes.
 - If the global in-flight queue remains full after checking completed work, the new present is skipped rather than waiting synchronously for the oldest queue fence.
-- The next present event retries normally. Existing GPU fences, queue ordering, buffer ownership, and memory-safety checks are retained.
+- A skipped present is not retried or rescheduled by the driver. Only a later guest present can deliver a newer frame; if none arrives, the head may continue showing the previous frame until a subsequent update. Existing GPU fences, queue ordering, buffer ownership, and memory-safety checks are retained.
 - A skipped frame is treated as handled by the card-side path, preventing the slower CPU fallback from immediately doing another blocking copy for that same present event.
 
 This is a latency-versus-throughput experiment. It may make pointer/window movement feel less frozen under GPU back-pressure, but can increase visible frame drops or judder. It is not guaranteed to improve average frame rate, and it may make animation less smooth if the GPU is consistently overloaded.
