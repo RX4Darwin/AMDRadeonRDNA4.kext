@@ -4474,6 +4474,14 @@ bool RDNA4Compute::resetRuntimeForResume() {
 		}
 		if (c.sp)
 			sparseTeardown(c, false);   // the VRAM is gone after the sleep; only the host memory goes back
+		if (c.quarantinedOwner) {
+			/* The queues were confirmed inactive and all backing was reclaimed above.
+			 * Do not leave the sentinel slot permanently blocking its original owner. */
+			RLOG("power: reclaimed quarantined client slot %d after confirmed runtime reset",
+			     static_cast<int>(&c - clients));
+			c = RtClient {};
+			continue;
+		}
 		if (vmShared == 2)
 			c.vmid = 0;        // pooled clients hold no VMID; the other modes keep what they had
 		c.aborted = true;
