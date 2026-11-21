@@ -5,6 +5,7 @@
 
 class IORegistryEntry;
 class OSDictionary;
+class OSObject;
 
 namespace RDNA4Accel {
 // Registers for IOAcceleratorFamily2's load (Lilu): its functions solved into the thunks (src/ioaccel_thunks.S), the vtable checked
@@ -21,4 +22,6 @@ bool framebuffersDecided();   // (rdna4-accel=4: the bare ones known)
 bool hidesFromMatch(IORegistryEntry *service, OSDictionary *table);
 // Whether AGDC lists framebuffer `fb` (0x980): not a bare one once decided, before that one with a display
 bool showsFramebuffer(IORegistryEntry *fb);
+// Whether `object` is a lit framebuffer of ours that user space is to see as AMD's (pvhooks.cpp wrapObjectGetClass): rdna4-accel=4
+bool namesAsAmd(OSObject *object);
 }

@@ -1061,6 +1061,12 @@ bool RDNA4Accel::hidesFromMatch(IORegistryEntry *service, OSDictionary *)
 	return __atomic_load_n(&gBareKnown, __ATOMIC_ACQUIRE) && isBareFramebuffer(service);
 }
 
+bool RDNA4Accel::namesAsAmd(OSObject *object)
+{
+	auto *e = __atomic_load_n(&gBareKnown, __ATOMIC_ACQUIRE) ? OSDynamicCast(IORegistryEntry, object) : nullptr;
+	return e && e->metaCast("IONDRVFramebuffer") && !isBareFramebuffer(e);
+}
+
 bool RDNA4Accel::showsFramebuffer(IORegistryEntry *fb)
 {
 	auto *svc = OSDynamicCast(IOService, fb);

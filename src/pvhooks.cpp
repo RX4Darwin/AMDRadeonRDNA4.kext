@@ -55,6 +55,7 @@ mach_vm_address_t orgReadEdid;   /* IODisplay::readFramebufferEDID() */
 mach_vm_address_t fbOpen;   /* IOFramebuffer::open() */
 mach_vm_address_t orgMatchInternal;   /* IOService::matchInternal(OSDictionary *, UInt32, UInt32 *) */
 mach_vm_address_t orgServiceOpen;   /* is_io_service_open_extended */
+mach_vm_address_t orgObjectGetClass;   /* is_io_object_get_class */
 mach_vm_address_t orgPropertyBin;   /* is_io_registry_entry_get_property_bin_buf */
 void *ndrvVtable;   /* IONDRVFramebuffer's, once the heads are the paravirtual displays */
 mach_vm_address_t enable;
@@ -273,6 +274,22 @@ int wrapPropertyBin(void *entry, char *plane, char *name, uint32_t options, uint
 		entry, plane, name, options, buf, bufsize, properties, propertiesCnt);
 }
 
+/*
+ * is_io_object_get_class (IOObjectCopyClass): with our accelerator serving WindowServer, our lit IONDRV framebuffers named to user
+ * space as AMD's. CoreDisplay's GetGPUVendorForFramebufferService takes a framebuffer's vendor from its class name (AppleIntel-,
+ * AMD-, AppleParavirtFramebuffer); IONDRVFramebuffer is none of them, an "other" vendor that IOPresentment is never on for: the
+ * displays' surfaces were legacy ones, without IOSurfaces, composited in software (CompositorSW), 2026-11-21. Only the name user
+ * space reads: the objects and every kernel match stay as they are.
+ */
+int wrapObjectGetClass(void *object, char *className)
+{
+	const int r = reinterpret_cast<int (*)(void *, char *)>(orgObjectGetClass)(object, className);
+
+	if (!r && className && RDNA4Accel::namesAsAmd(static_cast<OSObject *>(object)))
+		strlcpy(className, "AMDRadeonRDNA4_AMDFramebuffer", 128);   // (io_name_t)
+	return r;
+}
+
 int wrapServiceOpen(void *service, void *task, uint32_t type, uint64_t ndr, void *properties, uint32_t propertiesCnt, int *result,
                     void *connection)
 {
@@ -478,6 +495,11 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index,
 	};
 
 	KernelPatcher::RouteRequest serviceOpen {"_is_io_service_open_extended", wrapServiceOpen, orgServiceOpen};
+	KernelPatcher::RouteRequest objectGetClass {"_is_io_object_get_class", wrapObjectGetClass, orgObjectGetClass};
+
+	if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &objectGetClass, 1))
+		PLOG("is_io_object_get_class not routed (error %d): our framebuffers keep their vendor unknown to CoreDisplay", patcher.getError());
+	patcher.clearError();
 	KernelPatcher::RouteRequest propertyBin {"_is_io_registry_entry_get_property_bin_buf", wrapPropertyBin, orgPropertyBin};
 
 	if (!patcher.routeMultiple(KernelPatcher::KernelID, &propertyBin, 1))
