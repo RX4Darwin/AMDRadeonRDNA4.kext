@@ -4915,6 +4915,17 @@ static int testDense4GiB() {
 	           "dense: a map in the last GiB translates");
 	f += check(resolves(V + 0x1000, MC, 0x3000) && resolves(V + G - 0x10000, MC + 0x100000, 0x20000), "dense: the earlier maps are undisturbed");
 	f += check(!map(V + 4 * G - 0x1000, MC, 0x2000), "dense: a map past 4 GiB is refused");
+	// Dense host mappings must reject a bad late bus page before writing even the first PTE.
+	const uint64_t hostVa = V + 2 * G + 0x400000;
+	uint64_t hostBuses[3] = { 0x104048000ull, 0x10404b000ull, 0x10404e000ull | 0x40ull };
+	GpuVmTable::Span hostSpan;
+	const bool badHostRejected = !GpuVmTable::mapHost(access, GpuVmTable::Policy {},
+		GpuVmTable::kDenseTableBytes, hostVa, hostVa + 0x3000, hostBuses, false, hostSpan);
+	f += check(badHostRejected &&
+	           words[GpuVmTable::densePde(hostVa) / 8] == 0 &&
+	           words[GpuVmTable::densePte(hostVa) / 8] == 0 &&
+	           words[GpuVmTable::densePte(hostVa + 0x2000) / 8] == 0,
+	           "dense: a misaligned late host bus page is rejected before writing any PTE");
 	f += check(GpuVmTable::denseVa(4u << 20) == G, "dense: a 4 MiB image still covers only the first GiB");
 	return f;
 }
