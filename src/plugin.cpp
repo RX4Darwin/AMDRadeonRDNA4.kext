@@ -40,6 +40,7 @@
 #include "rdna4accel.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
+#include "iosurface.hpp"
 #include "pvhooks.hpp"
 #include "pvscanout.hpp"
 #endif
@@ -1781,22 +1782,22 @@ void pluginStart() {
 	lilu.onKextLoadForce(&kextIOSurface, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 		if (index != kextIOSurface.loadIndex)
 			return;
-		// In the order of pvgpu.cpp's gSurfaceFns.
-		static const char *const names[RDNA4PvNub::kSurfaceFunctions] = {
+		// In the order of iosurface.hpp's IOSurfaceFunctions.
+		static const char *const names[kSurfaceFunctions] = {
 			"__ZN13IOSurfaceRoot13lookupSurfaceEjP4task", "__ZNK9IOSurface19getMemoryDescriptorEv", "__ZNK9IOSurface14getBytesPerRowEv",
 			"__ZNK9IOSurface8getWidthEv", "__ZNK9IOSurface9getHeightEv", "__ZNK9IOSurface14getPixelFormatEv", "__ZNK9IOSurface13getBaseOffsetEv",
 			"__ZNK9IOSurface12getSurfaceIDEv", "__ZNK9IOSurface13getPlaneCountEv", "__ZNK9IOSurface14getPlaneOffsetEj",
 			"__ZNK9IOSurface19getPlaneBytesPerRowEj", "__ZNK9IOSurface13getPlaneWidthEj", "__ZNK9IOSurface14getPlaneHeightEj",
 			"__ZNK9IOSurface11getLockSeedEv", "__ZNK9IOSurface13getUnlockSeedEv"};
-		mach_vm_address_t fn[RDNA4PvNub::kSurfaceFunctions];
+		mach_vm_address_t fn[kSurfaceFunctions];
 		unsigned found = 0;
-		for (unsigned k = 0; k < RDNA4PvNub::kSurfaceFunctions; k++)
+		for (unsigned k = 0; k < kSurfaceFunctions; k++)
 			found += (fn[k] = patcher.solveSymbol(index, names[k], address, size)) != 0;
 		patcher.clearError();
-		if (found == RDNA4PvNub::kSurfaceFunctions)
-			RDNA4PvNub::setSurfaceFunctions(fn);
-		FBLOG("pvgpu: IOSurface: %u of %u functions found%s", found, RDNA4PvNub::kSurfaceFunctions,
-		      found == RDNA4PvNub::kSurfaceFunctions ? "" : ": no IOSurface textures");
+		if (found == kSurfaceFunctions)
+			setSurfaceFunctions(fn);
+		FBLOG("pvgpu: IOSurface: %u of %u functions found%s", found, kSurfaceFunctions,
+		      found == kSurfaceFunctions ? "" : ": no IOSurface textures");
 	}, nullptr);
 	PvHooks::start();
 	PvScanout::start();

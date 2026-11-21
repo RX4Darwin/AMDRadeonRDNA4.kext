@@ -70,8 +70,6 @@ public:
 	static void setLateParent(IOService *gpu);
 	// The card's runtime, for running the guest's blits on it (M2; plugin.cpp sets it where the GPU attaches).
 	static void setCompute(RDNA4Compute *compute);
-	static constexpr unsigned kSurfaceFunctions = 15;
-	static void setSurfaceFunctions(const mach_vm_address_t fn[kSurfaceFunctions]);   // IOSurface kext functions for type-5 textures (pvgpu.cpp)
 	static void setPhysmap(uint8_t *base, uint8_t *max);               // the kernel's map of all physical memory, for the guest's pages
 
 	// Host side: the control block of BAR0 as dwords, valid while the nub lives (the nub is never released once published).
@@ -200,11 +198,6 @@ private:
 	IOLock *mLock { nullptr };
 };
 
-// The translator helper's request slot made (once): by the host and by our own accelerator (rdna4accel.cpp), whichever starts first
-void pvTranslatorInit();
-// M3: the Metal kernel translator's user client (include/rdna4mtlc.h), handed out by RDNA4ComputeService::newUserClient.
-IOReturn pvTranslatorClient(IOService *service, task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler);
-IOReturn pvTranslateForClient(const uint8_t *lib, uint32_t libLen, const char *name, uint8_t *&out, uint32_t &outLen, uint32_t &buffers);
 // WindowServer draws the displays' frames with the native device (accelcensus.cpp routePv): the host scans them out of their memory and
 // keeps none on the card (debug.rdna4_pvinplace bits 32 and 16), whose copies only Apple's driver's draws update.
 void pvFramesInMemory(bool on);

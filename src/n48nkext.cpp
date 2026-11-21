@@ -44,6 +44,7 @@
 #include "userclient.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
+#include "translator.hpp"
 #include "rdna4mtlc.h"
 #endif
 
@@ -747,7 +748,7 @@ IOReturn RDNA4ComputeService::newUserClient(task_t owningTask, void *securityID,
                                             IOUserClient **handler) {
 #ifdef AMDRadeonRDNA4_PVGPU
 	if (type == RDNA4_MTLC_TYPE)   // the Metal kernel translator (src/pvgpu.cpp)
-		return pvTranslatorClient(this, owningTask, securityID, type, properties, handler);
+		return translatorClient(this, owningTask, securityID, type, properties, handler);
 #endif
 	if (type != N48N_UC_TYPE)
 		return IOService::newUserClient(owningTask, securityID, type, properties, handler);

@@ -25,6 +25,7 @@
 #include "accelcensus.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
+#include "translator.hpp"
 #include "pvscanout.hpp"
 #endif
 #include "rdna4compute.h"
@@ -843,7 +844,7 @@ int accelTo(int value)
 		rdna4Log("AMDRadeonRDNA4: accel: AGDC service %s\n", agdcUp ? "started" : "NOT started");
 		OSSafeReleaseNULL(agdc);   // (the registry keeps a started one)
 #ifdef AMDRadeonRDNA4_PVGPU
-		pvTranslatorInit();   // the Metal device's shaders go through the translator helper (none without the paravirtual host)
+		translatorInit();   // the Metal device's shaders go through the translator helper (none without the paravirtual host)
 #endif
 		// enabled, as a driver does once its hardware is up (the accelerator's flag 0x2 at +0xc78): IOAccelDisplayPipeUserClient2's
 		// transactionEnd refused every one of WindowServer's display pipe transactions without it (kIOReturnNotReady, 229 a test boot),

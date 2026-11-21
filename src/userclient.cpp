@@ -13,6 +13,7 @@
 #include "klog.hpp"
 #include "compute.hpp"
 #include "pvgpu.hpp"
+#include "translator.hpp"
 #include "rdna4mtlc.h"
 
 #include <IOKit/IOLib.h>
@@ -352,7 +353,7 @@ IOReturn RDNA4ComputeClient::sPresentSource(OSObject *t, void *, IOExternalMetho
 #endif
 }
 
-// The caller's AIR copied in, translated by the helper (pvTranslateForClient), the result copied out to the caller's room.
+// The caller's AIR copied in, translated by the helper (translateForClient), the result copied out to the caller's room.
 IOReturn RDNA4ComputeClient::sTranslate(OSObject *, void *, IOExternalMethodArguments *a) {
 #ifdef AMDRadeonRDNA4_PVGPU
 	const uint64_t *in = a->scalarInput;
@@ -366,7 +367,7 @@ IOReturn RDNA4ComputeClient::sTranslate(OSObject *, void *, IOExternalMethodArgu
 	uint8_t *out = nullptr;
 	uint32_t outLen = 0, buffers = 0;
 	IOReturn r = copyin(static_cast<user_addr_t>(in[0]), lib, in[1]) ? kIOReturnBadArgument
-	           : pvTranslateForClient(lib, static_cast<uint32_t>(in[1]), name, out, outLen, buffers);
+	           : translateForClient(lib, static_cast<uint32_t>(in[1]), name, out, outLen, buffers);
 	IOFree(lib, in[1]);
 	if (r == kIOReturnSuccess && (outLen > in[4] || copyout(out, static_cast<user_addr_t>(in[3]), outLen)))
 		r = kIOReturnNoSpace;

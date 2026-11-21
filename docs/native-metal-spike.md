@@ -285,7 +285,7 @@ What it took to get WindowServer composing on `RDNA4MTLDevice` (each found on th
 - WindowServer's sandbox: it may open only user clients whose class starts with `IOAccel` (`com.apple.WindowServer.sb`), so the kext's
   runtime client is `IOAccelRDNA4ComputeClient` (a subclass, same code); and it may not start programs, so the device translates through
   the kext (`kRDNA4MethodTranslate`, `rdna4_translate`): the kext queues the AIR to the translator helper in the paravirtual host's request
-  slot (`pvTranslateForClient`; the host's own requests and these take turns, `waitForSlot`).
+  slot (`translateForClient`, src/translator.cpp; the host's own requests and these take turns, `waitForSlot`).
 - `rdna4-client-policy=local` admits `_windowserver` (uid 88) as it does the console user. The device returns nil without its runtime
   client (the router then makes Apple's device), and waits up to 15 s for the gfx ring (WindowServer makes its device about a second
   before the kext's gfx ring is up).

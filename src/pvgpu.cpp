@@ -28,6 +28,8 @@ static_assert(Gfx12Draw::kRingBytes == Gfx12DrawCol::kColRingBytes, "one ring bl
 #include "../userspace/rdna4-run/pm4build.h"   // the COMPUTE_* registers of a dispatch
 #include "rdna4compute.h"
 #include "rdna4mtlc.h"
+#include "translator.hpp"
+#include "iosurface.hpp"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOInterruptEventSource.h>
@@ -102,17 +104,6 @@ uint32_t gLogLines { 0 };
 RDNA4PvNub *gNub { nullptr };
 IOService *gLateParent { nullptr };   // RDNA4PvNub::setLateParent
 RDNA4Compute *gCompute { nullptr };   // RDNA4PvNub::setCompute
-// The IOSurface kext's functions (RDNA4PvNub::setSurfaceFunctions, from the plugin's Lilu callback), in this order; methods take the object first.
-struct {
-	void *(*lookup)(void *root, uint32_t id, task_t task);   // IOSurfaceRoot::lookupSurface(unsigned int, task*)
-	IOMemoryDescriptor *(*memory)(const void *surface);      // IOSurface::getMemoryDescriptor() const
-	uint32_t (*bytesPerRow)(const void *), (*width)(const void *), (*height)(const void *), (*pixelFormat)(const void *), (*baseOffset)(const void *),
-	    (*surfaceId)(const void *);
-	uint32_t (*planeCount)(const void *);   // the planes: IOSurface::getPlaneCount() const, getPlaneOffset/BytesPerRow/Width/Height(unsigned) const
-	uint64_t (*planeOffset)(const void *, uint32_t);
-	uint32_t (*planeBytesPerRow)(const void *, uint32_t), (*planeWidth)(const void *, uint32_t), (*planeHeight)(const void *, uint32_t);
-	uint32_t (*lockSeed)(const void *), (*unlockSeed)(const void *);   // IOSurface::getLockSeed() const, getUnlockSeed() const
-} gSurfaceFns;
 // The kernel's map of all physical memory (x86_64 PHYSMAP_PTOV: physmap_base + address, up to physmap_max), from the plugin's Lilu callback:
 // the guest's pages read and written in place. Each access through an IOMemoryMap of its own made and dropped four or five mappings a page
 // (every page-table level and the page), each drop a TLB shootdown on every CPU: thousands a frame, most of a draw's time.
@@ -128,22 +119,6 @@ static uint8_t *physPtr(uint64_t pa, uint64_t bytes)
 
 	return gPhysmap + pa;
 }
-
-// M3: the one request slot between the host and the translator helper (include/rdna4mtlc.h). The host posts a function (id != 0) and
-// waits on &done; the helper's kMtlcNext waits on &id, copies the metallib out and sets taken; kMtlcDeliver fills elf and sets done.
-struct Translation {
-	IOLock *lock;                 // allocated with the host or our accelerator (pvTranslatorInit)
-	bool helper;                  // a helper is connected
-	bool gaveUp;                  // the host waited for one in vain: it does not wait again until one connects
-	uint32_t helpers;             // helpers connected so far: failures cached under an older one are asked again
-	uint32_t seq, id;
-	bool taken, done;
-	const uint8_t *lib;
-	uint32_t libLen;
-	char name[64];
-	uint8_t *elf;                 // IOMalloc'd by kMtlcDeliver, freed by the host
-	uint32_t elfLen, buffers, written, texturesWritten;
-} gTr;
 
 void pvlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void pvlog(const char *fmt, ...) {
@@ -1256,7 +1231,7 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	}
 	h->mNub = nub;
 	h->mLevel = level;
-	pvTranslatorInit();
+	translatorInit();
 	uint32_t disp = 0;
 	if (Trial::option("rdna4-pvgpu-disp", disp))
 		h->mDisp = disp & 3;
@@ -7706,38 +7681,6 @@ uint32_t RDNA4PvHost::program(unsigned kernel) {
 	return mProgram[kernel];
 }
 
-// M3: the function translated at run time by the helper (include/rdna4mtlc.h) and loaded into the runtime, cached by its hash (failures too,
-// so a function that cannot be translated is asked for once). Null without a helper, or when it did not answer within kTranslateWait (not
-// cached): WindowServer's largest shader (Xgc, 440 KB of code) takes the helper 6 s.
-// Whether a translator helper is connected, waiting up to kHelperWait for one: WindowServer draws its first frames before launchd has started
-// the helper, and a draw left out is not drawn again until its region changes. Waits once until a helper connects; while the helper
-// restarts (it exits when lld cannot run again) the same.
-// With gTr.lock held: until no request is in the slot (the host's and the runtime clients' requests take turns: pvTranslateForClient).
-static void waitForSlot() {
-	while (gTr.id)
-		IOLockSleep(gTr.lock, &gTr.seq, THREAD_UNINT);
-}
-
-static bool waitForHelper() {
-	static constexpr uint32_t kHelperWait = 20;   // seconds
-	uint64_t deadline = 0;
-
-	IOLockLock(gTr.lock);
-	if (!gTr.helper && !gTr.gaveUp) {
-		pvlog("host: waiting up to %u s for the translator helper", kHelperWait);
-		clock_interval_to_deadline(kHelperWait, kSecondScale, &deadline);
-		while (!gTr.helper && IOLockSleepDeadline(gTr.lock, &gTr.helper, deadline, THREAD_UNINT) == THREAD_AWAKENED) {
-		}
-
-		gTr.gaveUp = !gTr.helper;
-	}
-
-	const bool helper = gTr.helper;
-	IOLockUnlock(gTr.lock);
-
-	return helper;
-}
-
 // The entry for a new translation: a free one, else the least recently used. Not the oldest: a draw asks for its vertex shader, then its
 // fragment shader, and the fragment shader's translation must not take the vertex shader's entry (the draw then ran freed code, which
 // read through a null address and hung the card).
@@ -7755,6 +7698,9 @@ RDNA4PvHost::Jit &RDNA4PvHost::jitSlot()
 	return mJit[lru];
 }
 
+// M3: the function translated at run time by the helper (include/rdna4mtlc.h) and loaded into the runtime, cached by its hash (failures too,
+// so a function that cannot be translated is asked for once). Null without a helper, or when it did not answer within kTranslateWait (not
+// cached): WindowServer's largest shader (Xgc, 440 KB of code) takes the helper 6 s.
 const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, const char *name, const uint8_t hash[32]) {
 	mJitClock++;
 
@@ -10033,7 +9979,6 @@ OSDefineMetaClassAndStructors(RDNA4PvLate, OSObject)
 void RDNA4PvNub::publishLater(uint32_t level, uint32_t delayMs) { RDNA4PvLate::schedule(level, delayMs); }
 void RDNA4PvNub::setLateParent(IOService *gpu) { gLateParent = gpu; }   // the GPU stays for the boot: no reference taken
 void RDNA4PvNub::setCompute(RDNA4Compute *compute) { gCompute = compute; }
-void RDNA4PvNub::setSurfaceFunctions(const mach_vm_address_t fn[kSurfaceFunctions]) { memcpy(&gSurfaceFns, fn, sizeof(gSurfaceFns)); }
 
 int RDNA4PvHost::dumpTexture(uint32_t task, uint32_t id, struct sysctl_req *req)
 {
@@ -10444,196 +10389,7 @@ IOReturn RDNA4PvNub::disableInterrupt(int source) {
 }
 IOReturn RDNA4PvNub::causeInterrupt(int source) { PVCALL("causeInterrupt"); return raiseInterrupt(source) ? kIOReturnSuccess : kIOReturnNotReady; }
 
-// ======================================================================================================================================
-// M3: the translator helper's user client (include/rdna4mtlc.h): one helper at a time, root only.
-// ======================================================================================================================================
-
-class RDNA4MtlcClient : public IOUserClient {
-	OSDeclareDefaultStructors(RDNA4MtlcClient)
-public:
-	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-	IOReturn clientClose() APPLE_KEXT_OVERRIDE;
-	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) APPLE_KEXT_OVERRIDE;
-
-private:
-	bool mHelper { false };   // this client is the helper (another was not connected)
-	IOReturn next(IOExternalMethodArguments *a);
-	IOReturn deliver(IOExternalMethodArguments *a);
-};
-
-OSDefineMetaClassAndStructors(RDNA4MtlcClient, IOUserClient)
-
-bool RDNA4MtlcClient::start(IOService *provider) {
-	if (!IOUserClient::start(provider))
-		return false;
-	IOLockLock(gTr.lock);
-	mHelper = !gTr.helper;
-	gTr.helper = true;
-	gTr.gaveUp = false;
-	gTr.helpers += mHelper;
-	IOLockWakeup(gTr.lock, &gTr.helper, false);
-	IOLockUnlock(gTr.lock);
-	pvlog("host: translator helper %s", mHelper ? "connected" : "refused: one is connected already");
-	return mHelper;
-}
-
-// Also what IOUserClient::clientDied comes to. A kMtlcNext still waiting is aborted with the process's thread.
-IOReturn RDNA4MtlcClient::clientClose() {
-	if (mHelper) {
-		IOLockLock(gTr.lock);
-		gTr.helper = false;
-		IOLockUnlock(gTr.lock);
-		mHelper = false;
-		pvlog("host: translator helper gone");
-	}
-	terminate();
-	return kIOReturnSuccess;
-}
-
-IOReturn RDNA4MtlcClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a, IOExternalMethodDispatch *, OSObject *, void *) {
-	if (!mHelper)
-		return kIOReturnNotOpen;
-	if (selector == kMtlcNext && a->scalarInputCount == 2 && a->scalarOutputCount == 2 && a->structureOutput &&
-	    a->structureOutputSize == sizeof(gTr.name))
-		return next(a);
-	if (selector == kMtlcDeliver && (a->scalarInputCount == 5 || a->scalarInputCount == 6) && a->scalarInput[2] <= RDNA4_MTLC_MAX_ELF)
-		return deliver(a);
-	return kIOReturnBadArgument;
-}
-
-IOReturn RDNA4MtlcClient::next(IOExternalMethodArguments *a) {
-	IOLockLock(gTr.lock);
-	while (!gTr.id || gTr.taken)
-		if (IOLockSleep(gTr.lock, &gTr.id, THREAD_ABORTSAFE) != THREAD_AWAKENED) {
-			IOLockUnlock(gTr.lock);
-			return kIOReturnAborted;
-		}
-	IOReturn r = kIOReturnNoSpace;
-	if (gTr.libLen <= a->scalarInput[1]) {
-		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(a->scalarInput[0], gTr.libLen, kIODirectionIn, current_task());
-		r = md ? md->prepare() : kIOReturnNoMemory;
-		if (r == kIOReturnSuccess) {
-			r = md->writeBytes(0, gTr.lib, gTr.libLen) == gTr.libLen ? kIOReturnSuccess : kIOReturnVMError;
-			md->complete();
-		}
-		OSSafeReleaseNULL(md);
-	}
-	if (r == kIOReturnSuccess) {
-		a->scalarOutput[0] = gTr.id;
-		a->scalarOutput[1] = gTr.libLen;
-		memcpy(a->structureOutput, gTr.name, sizeof(gTr.name));
-		gTr.taken = true;
-	}
-	IOLockUnlock(gTr.lock);
-	return r;
-}
-
-IOReturn RDNA4MtlcClient::deliver(IOExternalMethodArguments *a) {
-	const uint64_t *in = a->scalarInput;
-	const uint32_t len = static_cast<uint32_t>(in[2]);
-	auto *elf = len ? static_cast<uint8_t *>(IOMalloc(len)) : nullptr;
-	if (len) {
-		IOMemoryDescriptor *md = elf ? IOMemoryDescriptor::withAddressRange(in[1], len, kIODirectionOut, current_task()) : nullptr;
-		IOReturn r = md ? md->prepare() : kIOReturnNoMemory;
-		if (r == kIOReturnSuccess) {
-			r = md->readBytes(0, elf, len) == len ? kIOReturnSuccess : kIOReturnVMError;
-			md->complete();
-		}
-		OSSafeReleaseNULL(md);
-		if (r != kIOReturnSuccess) {
-			if (elf)
-				IOFree(elf, len);
-			return r;
-		}
-	}
-	IOLockLock(gTr.lock);
-	const bool current = in[0] && in[0] == gTr.id && gTr.taken && !gTr.done;
-	if (current) {
-		gTr.elf = elf;
-		gTr.elfLen = len;
-		gTr.buffers = static_cast<uint32_t>(in[3]);
-		gTr.written = static_cast<uint32_t>(in[4]);
-		gTr.texturesWritten = a->scalarInputCount > 5 ? static_cast<uint32_t>(in[5]) : 0;
-		gTr.done = true;
-		IOLockWakeup(gTr.lock, &gTr.done, false);
-	}
-	IOLockUnlock(gTr.lock);
-	if (!current && elf)
-		IOFree(elf, len);
-	return current ? kIOReturnSuccess : kIOReturnNotFound;   // NotFound: the host stopped waiting for it
-}
-
-void pvTranslatorInit() {
-	if (__atomic_load_n(&gTr.lock, __ATOMIC_ACQUIRE))
-		return;
-	IOLock *lock = IOLockAlloc(), *none = nullptr;   // ponytail: never freed, like the host
-	if (lock && !__atomic_compare_exchange_n(&gTr.lock, &none, lock, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-		IOLockFree(lock);
-}
-
-IOReturn pvTranslatorClient(IOService *service, task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) {
-	if (IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
-		return kIOReturnNotPrivileged;
-	if (!gTr.lock)
-		return kIOReturnNotReady;   // neither the host nor our accelerator has started yet (rdna4-pvgpu-delay)
-	auto *client = OSTypeAlloc(RDNA4MtlcClient);
-	if (!client)
-		return kIOReturnNoMemory;
-	if (!client->initWithTask(owningTask, securityID, type, properties) || !client->attach(service)) {
-		client->release();
-		return kIOReturnNoResources;
-	}
-	if (!client->start(service)) {
-		client->detach(service);
-		client->release();
-		return kIOReturnBusy;
-	}
-	*handler = client;
-	return kIOReturnSuccess;
-}
-
 void pvgpu::routeGlPages(KernelPatcher &patcher) { routeGlPagesNow(patcher); }
-
-#ifdef AMDRadeonRDNA4_PVGPU
-// A runtime client's function translated by the helper (kRDNA4MethodTranslate: the native Metal device in WindowServer, whose sandbox does
-// not let it start the translator itself; docs/native-metal-spike.md): `lib` (a metallib or AIR bitcode, the caller's) and `name` in the
-// request slot, after any request before it; the result IOMalloc'd into *out (the caller frees it), or an error.
-IOReturn pvTranslateForClient(const uint8_t *lib, uint32_t libLen, const char *name, uint8_t *&out, uint32_t &outLen, uint32_t &buffers)
-{
-	out = nullptr;
-	outLen = buffers = 0;
-	if (!gTr.lock || !waitForHelper()) {
-		pvlog("translator: \"%s\" for a runtime client: %s", name, gTr.lock ? "no helper (waited in vain)" : "no request slot yet");
-		return kIOReturnNotReady;
-	}
-	IOLockLock(gTr.lock);
-	waitForSlot();
-	gTr.id = ++gTr.seq ? gTr.seq : ++gTr.seq;
-	gTr.taken = gTr.done = false;
-	gTr.lib = lib;
-	gTr.libLen = libLen;
-	strlcpy(gTr.name, name, sizeof(gTr.name));
-	IOLockWakeup(gTr.lock, &gTr.id, false);
-	uint64_t deadline = 0;
-	clock_interval_to_deadline(20, kSecondScale, &deadline);   // WindowServer's largest shaders take the helper 6 s
-	while (!gTr.done && IOLockSleepDeadline(gTr.lock, &gTr.done, deadline, THREAD_UNINT) == THREAD_AWAKENED) {
-	}
-	const bool done = gTr.done;
-	out = done ? gTr.elf : nullptr;
-	outLen = done ? gTr.elfLen : 0;
-	buffers = done ? gTr.buffers : 0;
-	if (!done && gTr.elf)
-		IOFree(gTr.elf, gTr.elfLen);
-	gTr.id = 0;
-	gTr.lib = nullptr;
-	gTr.elf = nullptr;
-	IOLockWakeup(gTr.lock, &gTr.seq, false);
-	IOLockUnlock(gTr.lock);
-	if (!done)
-		return kIOReturnTimeout;
-	return out ? kIOReturnSuccess : kIOReturnUnsupported;   // delivered empty: the helper could not translate it
-}
-#endif
 
 IOReturn pvPresentSource(const void *client, uint32_t sid, uint64_t handle)
 {

@@ -132,7 +132,7 @@ is prelinked against the system collection's copies.
     place in 0x980's list; 0x10 is its mode, height before width): the "no devices" assert is gone. CoreDisplay then asserted "Failed to
     create MetalDevice for accelerator": our bundle's RDNA4MTLDevice made no device without `RDNA4_NATIVE_MTL`; it now does on our
     accelerator (the `RDNA4Accelerator` property). The translator helper's request slot was made only by the paravirtual host, so
-    every shader WindowServer's device sent was refused (not ready): our accelerator makes it too (`pvTranslatorInit`).
+    every shader WindowServer's device sent was refused (not ready): our accelerator makes it too (`translatorInit`, src/translator.cpp).
   - **Now:** WindowServer runs the Metal compositor on our device, starts loginwindow, and dies 2-8 s in:
     `CA::OGL::Context::push_surface` asserts "found != slist->end ()" after "context(2) transient surface %p not found", from
     `FlattenNode::retain_surface` (flattened layers are IOSurfaces; `MetalContext::create_surface_from_iosurface` tracks the surface it
