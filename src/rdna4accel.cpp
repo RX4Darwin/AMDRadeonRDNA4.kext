@@ -20,6 +20,8 @@
 #include <libkern/OSKextLib.h>
 #include <sys/sysctl.h>
 
+#include <IOKit/graphics/IOFramebuffer.h>
+
 #include "accelcensus.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
@@ -139,6 +141,25 @@ public:
 	// framebuffer with our pipe, twice on 2026-11-20)
 	uintptr_t displayModeWillChange() APPLE_KEXT_OVERRIDE { return true; }
 	uintptr_t displayModeDidChange() APPLE_KEXT_OVERRIDE { return true; }
+	// (diagnostic) the framebuffer's current mode and its pixel information, as the family's init_framebuffer_resource asks them:
+	// "getPixelInformation for framebuffer 1/2/5 failed" left those pipes inactive (transactionEnd: kIOReturnNotReady), 2026-11-21
+	uintptr_t initFramebufferResource(unsigned int a, unsigned int b, IOFramebuffer *fb, IOAccelResource2 *r) APPLE_KEXT_OVERRIDE
+	{
+		static uint32_t logged;
+		if (fb && logged++ < 24) {
+			IODisplayModeID mode = 0;
+			IOIndex depth = 0;
+			IOPixelInformation info {};
+			const IOReturn cur = fb->getCurrentDisplayMode(&mode, &depth);
+			const IOReturn pix = cur ? cur : fb->getPixelInformation(mode, depth, kIOFBSystemAperture, &info);
+			rdna4Log("AMDRadeonRDNA4: accel: display machine: framebuffer %u/%u %s 0x%llx: current mode 0x%x depth %d (0x%x), pixel info 0x%x:"
+			         " %ux%u, %u bpp, %u bytes a row\n", a, b, fb->getName(), fb->getRegistryEntryID(), static_cast<unsigned>(mode),
+			         static_cast<int>(depth), cur, pix, static_cast<unsigned>(info.activeWidth), static_cast<unsigned>(info.activeHeight),
+			         static_cast<unsigned>(info.bitsPerPixel), static_cast<unsigned>(info.bytesPerRow));
+		}
+		return super::initFramebufferResource(a, b, fb, r);
+	}
+	using super = IOAccelDisplayMachine;
 };
 RDNA4_ACCEL_STRUCTORS(RDNA4DisplayMachine, IOAccelDisplayMachine)
 
@@ -150,9 +171,11 @@ RDNA4_ACCEL_STRUCTORS(RDNA4Task, IOAccelTask)
 class RDNA4MemoryMap : public IOAccelMemoryMap {
 	OSDeclareDefaultStructors(RDNA4MemoryMap)
 public:
-	uintptr_t commitIntoGPUPageTable() APPLE_KEXT_OVERRIDE { return 0; }
-	uintptr_t releaseFromGPUPageTable() APPLE_KEXT_OVERRIDE { return 0; }
-	uintptr_t updateGPUPageTable() APPLE_KEXT_OVERRIDE { return 0; }
+	// bools, true when done (AMD's): nothing to put in a GPU page table yet (the display path scans out through the kext's own code);
+	// false failed every framebuffer resource's prepare
+	uintptr_t commitIntoGPUPageTable() APPLE_KEXT_OVERRIDE { return true; }
+	uintptr_t releaseFromGPUPageTable() APPLE_KEXT_OVERRIDE { return true; }
+	uintptr_t updateGPUPageTable() APPLE_KEXT_OVERRIDE { return true; }
 };
 RDNA4_ACCEL_STRUCTORS(RDNA4MemoryMap, IOAccelMemoryMap)
 
@@ -252,10 +275,31 @@ RDNA4_ACCEL_STRUCTORS(RDNA4Context2D, IOAccel2DContext2)
 
 // A display pipe (one a framebuffer). For now the family's own behaviour, each transaction hook logged (the first few): what
 // WindowServer's presents ask of a driver (AMD's pipe overrides these), before they go to the DCN.
+// IOAccelSysMemory::withMemoryDescriptor (static: no thunk), solved with the family (familyLoaded); our accelerator (below gAccel)
+mach_vm_address_t gWithMemoryDescriptor;
+IOGraphicsAccelerator2 *ourAccelerator();
+
 class RDNA4DisplayPipe : public IOAccelDisplayPipe {
 	OSDeclareDefaultStructors(RDNA4DisplayPipe)
 	using super = IOAccelDisplayPipe;
 	uint32_t logged = 0;
+	// our framebuffer with the family's index `index` (its IOAccelIndex), retained, or null
+	static IOFramebuffer *framebufferOf(uint32_t index)
+	{
+		IOService *gpu = RDNA4AccelCensus::gpu();
+		IOFramebuffer *found = nullptr;
+		IORegistryIterator *it = gpu ? IORegistryIterator::iterateOver(gpu, gIOServicePlane, kIORegistryIterateRecursively) : nullptr;
+		while (IORegistryEntry *e = it && !found ? it->getNextObject() : nullptr) {
+			auto *fb = e->metaCast("IOFramebuffer") ? static_cast<IOFramebuffer *>(e) : nullptr;   // (by name: IOGraphicsFamily is not linked)
+			auto *n = fb ? OSDynamicCast(OSNumber, fb->getProperty("IOAccelIndex")) : nullptr;
+			if (n && n->unsigned32BitValue() == index) {
+				fb->retain();
+				found = fb;
+			}
+		}
+		OSSafeReleaseNULL(it);
+		return found;
+	}
 	bool note(const char *what, const void *arg)
 	{
 		if (logged >= 64)
@@ -287,10 +331,29 @@ public:
 		note("beginTransaction", e);
 		return super::beginTransaction(e);
 	}
+	// The memory a framebuffer resource is: the pipe's framebuffer's scanout (its system aperture), as Apple's paravirtual pipe gives its
+	// framebuffer's memory descriptor (IOAccelSysMemory::withMemoryDescriptor). The family's own returns kIOReturnUnsupported: no pipe of
+	// ours was ever active, and transactionEnd refused every one of WindowServer's transactions (kIOReturnNotReady), 2026-11-21.
 	uintptr_t initFramebufferResource(unsigned int i, IOAccelResource2 *r) APPLE_KEXT_OVERRIDE
 	{
-		note("initFramebufferResource", r);
-		return super::initFramebufferResource(i, r);
+		const uint32_t index = *reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint8_t *>(this) + 0x284);   // getFramebufferIndex
+		IOFramebuffer *fb = framebufferOf(index);
+		IODeviceMemory *mem = fb ? fb->getApertureRange(kIOFBSystemAperture) : nullptr;
+		using WithMemory = uintptr_t (*)(IOGraphicsAccelerator2 *, IOAccelResource2 *, IOMemoryDescriptor *);
+		const uintptr_t ok = mem && gWithMemoryDescriptor && ourAccelerator()
+		                     ? reinterpret_cast<WithMemory>(gWithMemoryDescriptor)(ourAccelerator(), r, mem) : 0;
+		// ponytail: the aperture's descriptor is kept (one a mode change): Apple's pipe hands over one its framebuffer keeps, so
+		// whether withMemoryDescriptor retains it is not known; released here it could be freed under the resource
+		if (!ok)
+			OSSafeReleaseNULL(mem);
+		OSSafeReleaseNULL(fb);
+		const auto *b = reinterpret_cast<const uint8_t *>(this);   // (diagnostic) what transactionEnd tests: active +0x298, +0x282, +0x280
+		if (logged < 64) {
+			logged++;
+			rdna4Log("AMDRadeonRDNA4: accel: pipe %p (framebuffer %u): initFramebufferResource(%u) %s: active %u, +0x280 %u +0x282 %u +0x299 %u\n",
+			         this, *reinterpret_cast<const uint32_t *>(b + 0x284), i, ok ? "ok" : "FAILED", b[0x298], b[0x280], b[0x282], b[0x299]);
+		}
+		return ok;
 	}
 };
 RDNA4_ACCEL_STRUCTORS(RDNA4DisplayPipe, IOAccelDisplayPipe)
@@ -300,6 +363,10 @@ RDNA4_ACCEL_STRUCTORS(RDNA4DisplayPipe, IOAccelDisplayPipe)
 // it made no display pipes ("Unable to get AGDC information", "Unable to locate service dependencies"). Answered as Apple's paravirtual
 // GPU's (AppleParavirtGPUControl::vendor_doDeviceAttribute): attribute 1, vendor information (0x2c bytes), 0x921, the GPU's
 // capabilities (0xb0 bytes, its values); the rest (3: it makes its own framebuffers; 0x980; the framebuffers' own) not ours: refused.
+namespace {
+uint32_t accelFlags();   // (diagnostic) our accelerator's flags (+0xc78), 0 without one: defined below gAccel
+}
+
 class RDNA4DeviceControl : public AppleGraphicsDeviceControl {
 	OSDeclareDefaultStructors(RDNA4DeviceControl)
 
@@ -380,6 +447,16 @@ class RDNA4DeviceControl : public AppleGraphicsDeviceControl {
 				out[n++] = e;
 			}
 		OSSafeReleaseNULL(it);
+		auto key = [](IORegistryEntry *e) {   // by the family's framebuffer index (0x980's masks: the k-th listed is the k-th bit set)
+			auto *index = OSDynamicCast(OSNumber, e->getProperty("IOAccelIndex"));
+			return index ? index->unsigned32BitValue() : ~0u;
+		};
+		for (uint32_t i = 1; i < n; i++)
+			for (uint32_t j = i; j > 0 && key(out[j]) < key(out[j - 1]); j--) {
+				IORegistryEntry *t = out[j];
+				out[j] = out[j - 1];
+				out[j - 1] = t;
+			}
 		return n;
 	}
 
@@ -404,7 +481,19 @@ public:
 			IORegistryEntry *fb[20];                             // bit 1), n five times, the provider, then each framebuffer: objects,
 			const uint32_t n = framebuffers(fb, 20);              // which AppleGraphicsDeviceControl's filtered_doDeviceAttribute turns
 			                                                     // into registry IDs for user space (IDs here it took for objects: panic)
-			const uint64_t mask = static_cast<uint64_t>(~(0xffffffffu << n)) * 2;
+			// the masks: a bit for each listed framebuffer's index, the family's (IOAccelIndex, the display pipe's framebuffer index).
+			// The paravirtual GPU's framebuffers are 1..n, hence its (~(~0 << n)) * 2; ours are 0, 3, 4: with its formula IOPresentment
+			// presented on pipes 1 and 2, bare framebuffers' pipes, never active (transactionEnd: kIOReturnNotReady), 2026-11-21
+			uint64_t mask = 0;
+			for (uint32_t i = 0; i < n; i++) {
+				auto *index = OSDynamicCast(OSNumber, fb[i]->getProperty("IOAccelIndex"));
+				mask |= 1ull << (index ? index->unsigned32BitValue() & 63 : i + 1);
+				static uint32_t logged;
+				if (logged++ < 8)
+					rdna4Log("AMDRadeonRDNA4: accel: AGDC 0x980: framebuffer %u: %s 0x%llx, IOAccelIndex %d (accelerator flags 0x%x)\n", i,
+					         fb[i]->getName(), fb[i]->getRegistryEntryID(), index ? static_cast<int>(index->unsigned32BitValue()) : -1,
+					         accelFlags());
+			}
 			bzero(o, 0xdc);
 			for (int i = 0; i < 4; i++)
 				*reinterpret_cast<uint64_t *>(o + 8 * i) = mask;
@@ -488,9 +577,23 @@ RDNA4_ACCEL_STRUCTORS(RDNA4Accelerator, IOGraphicsAccelerator2)
 // then (IOAccelTask::init registers with it).
 IOAccelTask *RDNA4Accelerator::createKernelGPUTask()
 {
-	RDNA4Task *t = OSTypeAlloc(RDNA4Task);
-	if (t && !t->init(this, 0, nullptr))
+	// GPU virtual address ranges, one allocator a heap (the family takes up to 16; IOAccelTask::allocate indexes them by a map's heap):
+	// with none, the first framebuffer resource the display pipes prepared dereferenced a null allocator (panic, 2026-11-21). The
+	// addresses are bookkeeping for now: our maps' page-table updates are no-ops, the display path scans out through the kext's code.
+	// ponytail: one fixed range for every heap, 4 GiB to 512 GiB (below 4 GiB reserved: no map at 0); real GPU VM when we draw through it.
+	static constexpr uint32_t kHeaps = 16;
+	static constexpr IORangeScalar kVaStart = 1ull << 32, kVaEnd = 1ull << 39;
+	IORangeAllocator *ranges[kHeaps] = {};
+	bool rangesOk = true;
+	for (uint32_t i = 0; i < kHeaps && rangesOk; i++) {
+		ranges[i] = IORangeAllocator::withRange(kVaEnd - 1, 0x1000, 0, IORangeAllocator::kLocking);
+		rangesOk = ranges[i] && ranges[i]->allocateRange(0, kVaStart);
+	}
+	RDNA4Task *t = rangesOk ? OSTypeAlloc(RDNA4Task) : nullptr;
+	if (t && !t->init(this, kHeaps, ranges))
 		OSSafeReleaseNULL(t);
+	for (auto *r : ranges)   // (the task holds its own references)
+		OSSafeReleaseNULL(r);
 	rdna4Log("AMDRadeonRDNA4: accel: kernel task %s\n", t ? "made" : "NOT made");
 	return t;
 }
@@ -560,8 +663,19 @@ const Derived kDerived[] = {
 constexpr size_t kDerivedCount = sizeof(kDerived) / sizeof(kDerived[0]);
 
 // Kext `kext`'s thunks filled, checked; our metaclasses whose base is in it given the real superclasses.
+// IOGraphicsAccelerator2::enableAccelerator (not virtual: no thunk), solved with the family
+mach_vm_address_t gEnableAccelerator;
+
 void familyLoaded(uint32_t kext, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size)
 {
+	if (kext == 0) {
+		gEnableAccelerator = patcher.solveSymbol(index, "__ZN22IOGraphicsAccelerator217enableAcceleratorEv", address, size);
+		patcher.clearError();
+		gWithMemoryDescriptor = patcher.solveSymbol(index,
+		                                            "__ZN16IOAccelSysMemory20withMemoryDescriptorEP22IOGraphicsAccelerator2P16IOAccelResource2P18IOMemoryDescriptor",
+		                                            address, size);
+		patcher.clearError();
+	}
 	uint32_t missing = 0, wrongSlots = 0, thunks = 0, folded = 0;
 	for (size_t i = 0; i < kThunks; i++) {
 		if (kSymbols[i].kext != kext)
@@ -637,6 +751,7 @@ void familyLoaded(uint32_t kext, KernelPatcher &patcher, size_t index, mach_vm_a
 }
 
 RDNA4Accelerator *gAccel;   // made and attached (debug.rdna4_accel=1)
+uint32_t accelFlags() { return gAccel ? *reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint8_t *>(gAccel) + 0xc78) : 0; }
 bool gStarted;              // the family's start ran (debug.rdna4_accel=2)
 bool gDisplays;             // the display machine started (debug.rdna4_accel=3)
 
@@ -730,6 +845,13 @@ int accelTo(int value)
 #ifdef AMDRadeonRDNA4_PVGPU
 		pvTranslatorInit();   // the Metal device's shaders go through the translator helper (none without the paravirtual host)
 #endif
+		// enabled, as a driver does once its hardware is up (the accelerator's flag 0x2 at +0xc78): IOAccelDisplayPipeUserClient2's
+		// transactionEnd refused every one of WindowServer's display pipe transactions without it (kIOReturnNotReady, 229 a test boot),
+		// and its displays' surfaces were composited in software (CDDisplay::begin_update: CompositorSW), 2026-11-21
+		if (gEnableAccelerator)
+			reinterpret_cast<void (*)(IOGraphicsAccelerator2 *)>(gEnableAccelerator)(gAccel);
+		rdna4Log("AMDRadeonRDNA4: accel: enableAccelerator %s: flags +0xc78 0x%x\n", gEnableAccelerator ? "called" : "NOT found",
+		         *reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint8_t *>(gAccel) + 0xc78));
 		gAccel->registerService();
 		rdna4Log("AMDRadeonRDNA4: accel: registered for WindowServer: our Metal bundle, the family's user clients\n");
 	}
@@ -842,6 +964,8 @@ SYSCTL_PROC(_debug, OID_AUTO, rdna4_accel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LO
             "AMDRadeonRDNA4: our own IOGraphicsAccelerator2: 1 makes and attaches one, 2 runs the family's start, 3 starts the display machine (docs/native-driver-plan.md)");
 }   // namespace
 
+IOGraphicsAccelerator2 *ourAccelerator() { return gAccel; }
+
 namespace {
 // Whether framebuffer `fb` has a monitor, as the kext knows its heads (plugin.cpp). Not an IODisplayConnect under it: those came
 // more than 10 s late in some boots (2026-11-21), all six framebuffers were then hidden and WindowServer ran without displays.
@@ -929,14 +1053,12 @@ bool RDNA4Accel::isBareFramebuffer(IORegistryEntry *fb)
 	return false;
 }
 
-bool RDNA4Accel::hidesFromMatch(IORegistryEntry *service, OSDictionary *table)
+bool RDNA4Accel::hidesFromMatch(IORegistryEntry *service, OSDictionary *)
 {
-	if (!__atomic_load_n(&gBareKnown, __ATOMIC_ACQUIRE) || !service->metaCast("IONDRVFramebuffer"))
-		return false;
-	// A lookup by registry ID finds one with a display: the per-GPU path's, of the framebuffers AGDC lists (0x980). A match by class
-	// (CoreDisplay's mapped path, CGXMappedDisplayStart) finds none: when it found ours ("Created FB 1 of 6"), WindowServer composited
-	// in software and asserted; when it found none, it took the per-GPU path ("Created FB 1 of 2") and ran (2026-11-21).
-	return isBareFramebuffer(service) || !table || !table->getObject("IORegistryEntryID");
+	// Only the bare ones: a match by class must find the lit ones too. CoreDisplay's GetSystemGPUVendors takes the GPU vendors from
+	// the IOFramebuffers a class match finds, and turns IOPresentment off when there are none ("GetSystemGPUVendors: 0 0"): hidden from
+	// class matches, the lit ones left WindowServer on the framebuffers' legacy path, composited in software (2026-11-21).
+	return __atomic_load_n(&gBareKnown, __ATOMIC_ACQUIRE) && isBareFramebuffer(service);
 }
 
 bool RDNA4Accel::showsFramebuffer(IORegistryEntry *fb)

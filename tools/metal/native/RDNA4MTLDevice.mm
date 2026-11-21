@@ -3341,8 +3341,22 @@ static void abortStack(int sig)
 
 - (instancetype)initWithAcceleratorPort:(io_service_t)service
 {
-	if (serviceString(service, CFSTR("RDNA4Accelerator")) && !strcmp(getprogname(), "WindowServer"))
+	if (serviceString(service, CFSTR("RDNA4Accelerator")) && !strcmp(getprogname(), "WindowServer") && !gAbortStack) {
 		gAbortStack = true;
+		// kept as SIGABRT's handler over WindowServer's own from a timer too, for 2 minutes (it may abort before its first commit)
+		static dispatch_source_t keep;
+		keep = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+		__block int ticks = 0;
+		dispatch_source_set_timer(keep, DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC, 10 * NSEC_PER_MSEC);
+		dispatch_source_set_event_handler(keep, ^{
+			struct sigaction now;
+			if (!sigaction(SIGABRT, NULL, &now) && now.sa_handler != abortStack)
+				signal(SIGABRT, abortStack);
+			if (++ticks >= 2400)
+				dispatch_source_cancel(keep);
+		});
+		dispatch_resume(keep);
+	}
 	// always on our own accelerator (rdna4accel.cpp: no other device there), else only with RDNA4_NATIVE_MTL
 	if (!getenv("RDNA4_NATIVE_MTL") && !serviceString(service, CFSTR("RDNA4Accelerator"))) {
 		self = [super init];   // before the nil return: _MTLDevice's dealloc expects its init to have run

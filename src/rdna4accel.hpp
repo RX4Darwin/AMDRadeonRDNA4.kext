@@ -17,8 +17,7 @@ void waitForWindowServer();
 // Core Animation flatten path asserts ("transient surface not found", 2026-11-20). Decided when WindowServer is let go.
 bool isBareFramebuffer(IORegistryEntry *fb);
 bool framebuffersDecided();   // (rdna4-accel=4: the bare ones known)
-// Whether a user-space match of `table` leaves `service` out (pvhooks.cpp wrapMatchInternal): with rdna4-accel=4, our bare framebuffers
-// always, the others unless matched by registry ID
+// Whether a user-space match leaves `service` out (pvhooks.cpp wrapMatchInternal): with rdna4-accel=4, our bare framebuffers
 bool hidesFromMatch(IORegistryEntry *service, OSDictionary *table);
 // Whether AGDC lists framebuffer `fb` (0x980): not a bare one once decided, before that one with a display
 bool showsFramebuffer(IORegistryEntry *fb);
