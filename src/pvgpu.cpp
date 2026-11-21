@@ -6585,10 +6585,14 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// a negative height flips y).
 	// ponytail: a viewport in fractions of a pixel (vkQuake's through MoltenVK) to the nearest whole ones: up to half a pixel off
 	int64_t vx = 0, vy = 0, vw = width, vh = height;
+	int64_t qx = 0, qy = 0, qw = static_cast<int64_t>(width) << 8, qh = static_cast<int64_t>(height) << 8;
 	if (!why && draw.viewportSet &&
 	    !(roundedDouble(draw.viewport[0], vx) && roundedDouble(draw.viewport[1], vy) && roundedDouble(draw.viewport[2], vw) &&
 	      roundedDouble(draw.viewport[3], vh) && vw > 0 && vh != 0 && vw <= 32768 && vh >= -32768 && vh <= 32768 && vx > -32768 && vx < 32768 &&
 	      vy > -32768 && vy < 32768))
+		why = "a viewport too large, or empty";
+	if (!why && draw.viewportSet && !(roundedDouble(draw.viewport[0], qx, 8) && roundedDouble(draw.viewport[1], qy, 8) &&
+	                                  roundedDouble(draw.viewport[2], qw, 8) && roundedDouble(draw.viewport[3], qh, 8)))
 		why = "a viewport too large, or empty";
 	if (why) {
 		noteNotRun(why, name[2]);
@@ -6746,10 +6750,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x69, 0x82, (width - 1) | (height - 1) << 16},                    // PA_SC_WINDOW_SCISSOR_BR: inclusive on gfx12
 		{0x69, 0x94, sx | sy << 16},                                       // PA_SC_VPORT_SCISSOR_0_TL, _BR: Metal's scissor rectangle, BR inclusive
 		{0x69, 0x95, (sx2 - 1) | (sy2 - 1) << 16},
-		{0x69, 0x10f, halfAsFloat(static_cast<uint32_t>(vw), false)},     // PA_CL_VPORT_XSCALE: width / 2
-		{0x69, 0x110, halfAsFloat(2 * vx + vw)},                            // XOFFSET: originX + width / 2
-		{0x69, 0x111, halfAsFloat(-vh)},                                    // YSCALE: -height / 2 (Metal's y points up)
-		{0x69, 0x112, halfAsFloat(2 * vy + vh)},                            // YOFFSET: originY + height / 2
+		{0x69, 0x10f, fixedAsFloat(qw, 9)},                           // PA_CL_VPORT_XSCALE: width / 2 (1/256 pixel units, halved)
+		{0x69, 0x110, fixedAsFloat(2 * qx + qw, 9)},                      // XOFFSET: originX + width / 2
+		{0x69, 0x111, fixedAsFloat(-qh, 9)},                              // YSCALE: -height / 2 (Metal's y points up)
+		{0x69, 0x112, fixedAsFloat(2 * qy + qh, 9)},                      // YOFFSET: originY + height / 2
 		{0x79, 0x242, kPrimitive[draw.type][0]},                           // VGT_PRIMITIVE_TYPE
 		{0x79, 0x266, kPrimitive[draw.type][1]},                           // VGT_GS_OUT_PRIM_TYPE
 		{0x76, 0x31, outs ? (outs - 1) | ins << 11 : 0x400u},              // SPI_SHADER_GS_OUT_CONFIG_PS: VS_EXPORT_COUNT, NUM_INTERP; NO_PC_EXPORT
