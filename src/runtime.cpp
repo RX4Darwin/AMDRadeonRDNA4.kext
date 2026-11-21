@@ -2411,16 +2411,17 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	return allocLocked(owner, bytes, handle, gpu);
 }
 
-// The dense tables' VA (4 GiB from kVaStart) in 64 KiB granules, one bit each, per client slot: taken first fit, given back exactly.
-// The list of holes it replaces held 32: a range freed with them all taken was lost, and the paravirtual host's churn of mappings and
-// shadows filled the client's VA within minutes (Mission Control: every draw then failed to map). The VA below nextVa when the bitmap is
-// first used (the client's queue, fence and kernarg pages, taken by bumping nextVa) is marked taken. Sparse tables keep the list.
+// A client's VA in 64 KiB granules, one bit each, per client slot: taken first fit, given back exactly; the dense tables' 4 GiB from
+// kVaStart, the sparse ones' 16 GiB. The list of holes it replaces held 32: a range freed with them all taken was lost, and the
+// paravirtual host's churn of mappings and shadows filled the client's VA within minutes (Mission Control: every draw then failed to
+// map); the sparse tables kept the list until WindowServer's VA on our accelerator ran out the same way after 11 minutes (2026-11-21).
+// The VA below nextVa when the bitmap is first used (the client's queue, fence and kernarg pages, taken by bumping nextVa) is marked taken.
 uint64_t *RDNA4Compute::vaBitsOf(RtClient &c)
 {
 	uint64_t *&bits = vaBits[&c - clients];
 
 	if (!bits)   // kept for the slot once made (8 KiB)
-		bits = static_cast<uint64_t *>(IOMalloc(kVaGranules / 8));
+		bits = static_cast<uint64_t *>(IOMalloc(kSparseVaGranules / 8));
 
 	if (!bits)
 		return nullptr;
@@ -2428,9 +2429,9 @@ uint64_t *RDNA4Compute::vaBitsOf(RtClient &c)
 	if (!c.vaBitsReady) {
 		const uint64_t below = c.nextVa > GpuVm::kVaStart ? (c.nextVa - GpuVm::kVaStart + 0xffff) >> 16 : 0;
 
-		memset(bits, 0, kVaGranules / 8);
+		memset(bits, 0, kSparseVaGranules / 8);
 
-		for (uint64_t g = 0; g < below && g < kVaGranules; g++)
+		for (uint64_t g = 0; g < below && g < kSparseVaGranules; g++)
 			bits[g / 64] |= 1ull << (g % 64);
 
 		c.vaBitsReady = true;
@@ -2442,105 +2443,52 @@ uint64_t *RDNA4Compute::vaBitsOf(RtClient &c)
 // VA for a buffer of `bytes`, 64 KiB aligned; 0 if there is none.
 uint64_t RDNA4Compute::vaTake(RtClient &c, uint64_t bytes)
 {
-	const uint64_t size = (bytes + 0xffff) & ~0xffffull;
+	const uint64_t size = (bytes + 0xffff) & ~0xffffull, n = size >> 16, granules = c.sp ? kSparseVaGranules : kVaGranules;
+	uint64_t *bits = vaBitsOf(c);
 
-	if (!c.sp) {
-		uint64_t *bits = vaBitsOf(c);
-		const uint64_t n = size >> 16;
+	if (!bits)
+		return 0;
 
-		if (!bits)
-			return 0;
-
-		for (uint64_t g = 0; g + n <= kVaGranules;) {
-			if (!(g % 64) && bits[g / 64] == ~0ull) {   // a word all taken
-				g += 64;
-				continue;
-			}
-
-			uint64_t run = 0;
-
-			while (run < n && !(bits[(g + run) / 64] >> ((g + run) % 64) & 1))
-				run++;
-
-			if (run < n) {
-				g += run + 1;
-				continue;
-			}
-
-			for (uint64_t i = g; i < g + n; i++)
-				bits[i / 64] |= 1ull << (i % 64);
-
-			const uint64_t va = GpuVm::kVaStart + (g << 16);
-
-			c.nextVa = va + size > c.nextVa ? va + size : c.nextVa;
-
-			return va;
+	for (uint64_t g = 0; g + n <= granules;) {
+		if (!(g % 64) && bits[g / 64] == ~0ull) {   // a word all taken
+			g += 64;
+			continue;
 		}
 
-		return 0;
-	}
+		uint64_t run = 0;
 
-	for (uint32_t i = 0; i < c.vaHoleCount; i++) {
-		RtClient::VaHole &h = c.vaHoles[i];
+		while (run < n && !(bits[(g + run) / 64] >> ((g + run) % 64) & 1))
+			run++;
 
-		if (h.bytes < size)
+		if (run < n) {
+			g += run + 1;
 			continue;
+		}
 
-		const uint64_t va = h.va;
-		h.va += size;
-		h.bytes -= size;
+		for (uint64_t i = g; i < g + n; i++)
+			bits[i / 64] |= 1ull << (i % 64);
 
-		if (!h.bytes)
-			h = c.vaHoles[--c.vaHoleCount];
+		const uint64_t va = GpuVm::kVaStart + (g << 16);
+
+		c.nextVa = va + size > c.nextVa ? va + size : c.nextVa;
 
 		return va;
 	}
 
-	const uint64_t va = (c.nextVa + 0xffff) & ~0xffffull;
-	if (va + size < va)
-		return 0;
-
-	c.nextVa = va + size;
-
-	return va;
+	return 0;
 }
 
-// A freed buffer's VA back to the client. Sparse tables: the end of its VA moves down when the range is last, else it becomes a hole,
-// joined with a neighbour where it touches one; with the holes all taken, the range is lost (VA only, not memory).
+// A freed buffer's VA back to the client.
 void RDNA4Compute::vaGive(RtClient &c, uint64_t va, uint64_t bytes)
 {
 	uint64_t size = (bytes + 0xffff) & ~0xffffull;
+	uint64_t *bits = vaBitsOf(c);
 
-	if (!c.sp) {
-		uint64_t *bits = vaBitsOf(c);
-
-		if (!bits)
-			return;
-
-		for (uint64_t g = (va - GpuVm::kVaStart) >> 16; va >= GpuVm::kVaStart && g < kVaGranules && size; g++, size -= 0x10000)
-			bits[g / 64] &= ~(1ull << (g % 64));
-
+	if (!bits)
 		return;
-	}
 
-	for (uint32_t i = 0; i < c.vaHoleCount; i++) {
-		RtClient::VaHole &h = c.vaHoles[i];
-
-		if (h.va + h.bytes != va && va + size != h.va)
-			continue;
-
-		va = h.va < va ? h.va : va;
-		size += h.bytes;
-		c.vaHoles[i--] = c.vaHoles[--c.vaHoleCount];   // taken out and joined; look again for the other side
-	}
-
-	if (va + size == c.nextVa) {
-		c.nextVa = va;
-		return;
-	}
-
-	if (c.vaHoleCount < kVaHoles)
-		c.vaHoles[c.vaHoleCount++] = { va, size };
+	for (uint64_t g = (va - GpuVm::kVaStart) >> 16; va >= GpuVm::kVaStart && g < kSparseVaGranules && size; g++, size -= 0x10000)
+		bits[g / 64] &= ~(1ull << (g % 64));
 }
 
 // rtAlloc under rtLock: a buffer of the owner's, mapped into its VM.

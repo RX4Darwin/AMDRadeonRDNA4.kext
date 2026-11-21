@@ -805,9 +805,12 @@ private:
 	static constexpr uint32_t kMaxBuffers  = 16384;
 	static constexpr uint32_t kMaxPrograms = 32;
 	static constexpr uint32_t kBufferSlots  = 16384;       // rdna4-vmshared=2: array sizes; the cap is per client (accounting), not global
-	static constexpr uint32_t kProgramSlots = 256;
-	static constexpr uint32_t kClientBuffers  = 128;
-	static constexpr uint32_t kClientPrograms = 16;
+	static constexpr uint32_t kProgramSlots = 1024;
+	// Per client in mode 2: a share, not the whole table. 128 buffers and 16 programs fitted the bench, not a desktop: WindowServer on the
+	// native device keeps thousands of buffers (a texture, IOSurface or pipeline each) and loads a kernel pair per render pipeline, and
+	// with our own accelerator every app with Metal is a client (eight static VMIDs were all taken before Metalterm asked, 2026-11-21).
+	static constexpr uint32_t kClientBuffers  = 8192;
+	static constexpr uint32_t kClientPrograms = 256;
 	uint32_t bufferCap() const { return vmShared == 2 ? kBufferSlots : kMaxBuffers; }
 	// The paravirtual host's compiler service (PVGPU builds) loads a vertex and a fragment kernel for every render pipeline WindowServer
 	// makes: dozens. Its code takes heap space, which is checked on its own.
@@ -868,7 +871,6 @@ private:
 	struct SparseTables {
 		PtPages::Sparse s;
 	};
-	static constexpr uint32_t kVaHoles = 32;
 	struct RtClient {
 		const void *owner { nullptr };
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
@@ -902,10 +904,6 @@ private:
 		Pm4::Queue pm4;
 		bool active { false };
 		bool aborted { false };
-		// VA given back by freed buffers, 64 KiB granules, reused before nextVa grows: the dense tables reach only 1 GiB above
-		// kVaStart, which a buffer a draw passes through without reuse.
-		struct VaHole { uint64_t va, bytes; } vaHoles[kVaHoles] {};
-		uint32_t vaHoleCount { 0 };
 		bool vaBitsReady { false };   // vaBits[this slot] set up (vaBitsOf)
 		uint32_t ibSlot { kBufferSlots };   // rtSubmitGfxIb: the buffer that held the last IB
 	};
@@ -929,7 +927,8 @@ private:
 	bool           queueUsed[4][8] {};
 	RtClient       clients[kClientSlots] {};
 	static constexpr uint32_t kVaGranules = GpuVmTable::kDenseVaBytes >> 16;   // the dense tables' 4 GiB, 64 KiB each
-	uint64_t      *vaBits[kClientSlots] {};   // kVaGranules bits each, made on first use
+	static constexpr uint32_t kSparseVaGranules = (16ull << 30) >> 16;         // a sparse client's VA: 16 GiB from kVaStart
+	uint64_t      *vaBits[kClientSlots] {};   // kSparseVaGranules bits each (32 KiB), made on first use
 	GpuHeap::Heap  heap;
 	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
 	RtBuffer       buffers[kBufferSlots] {};
