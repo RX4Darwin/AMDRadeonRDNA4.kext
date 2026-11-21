@@ -177,7 +177,7 @@ Boot-args (in OpenCore's `boot-args`):
 rdna4-compute=7 rdna4-gfx=2 rdna4-vm=1 rdna4-pvgpu=1 rdna4-pvgpu-disp=7 rdna4-pvgpu-delay=5
 ```
 
-Without `make PVGPU=1` (or these boot-args) the driver runs the displays and macOS draws in software.
+Without these boot-args (or with a `make PVGPU=0` build, which leaves the paravirtual code out) the driver runs the displays and macOS draws in software.
 
 ## Boot arguments
 

@@ -47,10 +47,12 @@ CONFIG       ?= RELEASE
 # skipped there because the device has no BAR5.
 VMTEST       ?= 0
 
-# PVGPU=1: the fake Apple paravirtual GPU of M0 (src/pvgpu.cpp, rdna4-pvgpu; docs/m0-pvgpu.md) is built in. Left out
-# otherwise: on Tahoe, with it merely in the kext (its classes registered, no instance, even with rdna4-off=1), Restart
-# and Shut Down from the Apple menu froze the whole machine (2026-10-14, cause inside macOS unknown).
-PVGPU        ?= 0
+# PVGPU: the paravirtual GPU (src/pvgpu.cpp; docs/m0-pvgpu.md) and what the native accelerator shares with it (src/pvhooks.cpp,
+# the translator helper's slot, the heads as displays) are built in; each only runs when its boot-arg says so (rdna4-pvgpu=1,
+# rdna4-accel=4), off otherwise. PVGPU=0 leaves them out. It was the default until 2026-11-21: on Tahoe, with the paravirtual code
+# merely in the kext, Restart and Shut Down from the Apple menu once froze the machine (2026-10-14, cause inside macOS unknown);
+# every release and the rig have run PVGPU=1 builds since. To re-test with the paravirtual GPU off, then remove this flag.
+PVGPU        ?= 1
 
 ARCH         = x86_64
 DEPLOY       = 11.0
