@@ -4246,7 +4246,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			vmOpTrace("release (shared)", c->vmid, c->pipe, c->queue);   // its jobs were waited for before its buffers went
 			rdna4Step("rtRelease: shared client, VM context off");
 			if (vmShared == 2)
-				vmReleaseVmids(*c);    // every VMID the client owns: context off, IH LUT cleared, flushed, back to the pool
+				vmReleaseVmids(*c, false); // context off, IH LUT cleared and flushed; keep ownership until page-table teardown succeeds
 			else
 				wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + c->vmid - 1 }, 0);   // the context goes off before its tables do
 		} else {
@@ -4260,6 +4260,8 @@ void RDNA4Compute::rtRelease(const void *owner) {
 				quarantineLocked(owner, *c);
 				return;
 			}
+			if (c->shared && vmShared == 2)
+				vmReleaseVmids(*c, true);
 			RLOG("client slot %d (PASID %u) closed: page tables freed (%u shadow pages still wired in all)",
 			     static_cast<int>(c - clients), c->pasid, sparseShadowPages);
 			*c = RtClient {};
@@ -4276,13 +4278,18 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			return;
 		}
 		rdna4Step("rtRelease: TLB invalidate");
-		if (!vmInvalidate(c->vmid, "client close")) {
+		if (!(c->shared && vmShared == 2 ? vmInvalidateOwned(*c, "client close")
+		                                  : vmInvalidate(c->vmid, "client close"))) {
 			RLOG("vmid %u: final TLB invalidation failed; retaining table allocation and VMID", c->vmid);
 			quarantineLocked(owner, *c);
 			return;
 		}
 		rdna4Step("rtRelease: done");
-		vmidUsed[c->vmid] = false;
+		const uint32_t releasedVmid = c->vmid;
+		if (c->shared && vmShared == 2)
+			vmReleaseVmids(*c, true);
+		else
+			vmidUsed[c->vmid] = false;
 		if (!c->shared)
 			queueUsed[c->pipe][c->queue] = false;
 		IOFree(c->tableShadow, kVmTableBytes);
@@ -4291,7 +4298,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		else
 			devHeap.free(c->tableOffset);
 		if (c->shared)
-			RLOG("vmid %u: shared-queue client closed, freed its page tables", c->vmid);
+			RLOG("vmid %u: shared-queue client closed, freed its page tables", releasedVmid);
 		else
 			RLOG("vmid %u: client closed, freed MEC1 pipe %u queue %u and page tables",
 			     c->vmid, c->pipe, c->queue);
