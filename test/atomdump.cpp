@@ -4783,6 +4783,7 @@ struct TreeEnv {
 	PtPages::Sparse sp;
 	uint64_t nextChunk { 0x2000000 };
 	uint32_t chunksLive { 0 }, shadowLive { 0 }, shadowLimit { 0xffffffffu };
+	uint32_t physCalls { 0 }, failPhysCall { 0 };
 	std::map<uint64_t, std::vector<uint64_t>> vram;           // heap offset -> synced page
 	std::vector<uint64_t> dirtyLog;
 	uint64_t rootPhys { 0 };
@@ -4800,7 +4801,14 @@ struct TreeEnv {
 		return static_cast<uint64_t *>(calloc(512, 8));
 	}
 	static void freeShadow(void *c, uint64_t *p) { static_cast<TreeEnv *>(c)->shadowLive--; free(p); }
-	static bool physOf(void *, uint64_t heapOffset, uint64_t &phys) { phys = kBase + heapOffset; return true; }
+	static bool physOf(void *c, uint64_t heapOffset, uint64_t &phys) {
+		auto *e = static_cast<TreeEnv *>(c);
+		e->physCalls++;
+		if (e->failPhysCall && e->physCalls == e->failPhysCall)
+			return false;
+		phys = kBase + heapOffset;
+		return true;
+	}
 	static bool treePage(void *c, uint32_t level, uint64_t key, bool create, uint64_t *&entries, uint64_t &phys, uint32_t &id) {
 		auto *e = static_cast<TreeEnv *>(c);
 		PtPages::Page p;
@@ -4948,6 +4956,22 @@ static int testDense4GiB() {
 static int testSparseTree() {
 	int f = 0;
 	const uint64_t V = GpuVm::kVaStart, G = 1ull << 30;
+
+	// Creating a page must use the physical address already obtained during allocation.
+	// A redundant second physOf call could fail after the page had been inserted.
+	{
+		static TreeEnv lookup;
+		lookup = TreeEnv {};
+		lookup.open(8);
+		lookup.physCalls = 0;
+		lookup.failPhysCall = 2;
+		PtPages::Page page;
+		const bool created = lookup.sp.get(lookup.host, 1, 0, true, page);
+		f += check(created && lookup.physCalls == 1 && lookup.sp.pages() == 2 &&
+		           page.phys == TreeEnv::kBase + 0x2000000,
+		           "tree: creating a sparse page performs one physical-address lookup and cannot fail on a redundant second lookup");
+		lookup.sp.releaseAll(lookup.host, true);
+	}
 	const uint64_t MC = kFbMcBase + 0x1000000;
 	static TreeEnv e;
 	e = TreeEnv {};
