@@ -79,19 +79,41 @@ static inline bool wholeDouble(uint64_t bits, int64_t &out) {
 	return true;
 }
 
-// A double (its bits) rounded to the nearest whole number (halves away from zero), of magnitude below 2^30; false if larger.
-static inline bool roundedDouble(uint64_t bits, int64_t &out) {
+// A double (its bits) times 2^frac rounded to the nearest whole number (halves away from zero), of magnitude below 2^30; false if larger.
+static inline bool roundedDouble(uint64_t bits, int64_t &out, unsigned frac = 0) {
 	out = 0;
 	const uint32_t e = static_cast<uint32_t>(bits >> 52) & 0x7ff;
-	if (e < 1022)
-		return true;   // below 0.5 in magnitude (+-0 too)
-	if (e > 1023 + 29)
+	const int32_t scaled = static_cast<int32_t>(e) - 1023 + static_cast<int32_t>(frac);
+	if (!e || scaled < -1)
+		return true;
+	if (scaled > 29)
 		return false;
-	const uint32_t shift = 52 - (e - 1023);   // 53 for 0.5 <= |x| < 1
+	const uint32_t shift = static_cast<uint32_t>(52 - scaled);
 	const uint64_t m = (bits & ((1ull << 52) - 1)) | (1ull << 52);
 	const uint64_t v = (m + (1ull << (shift - 1))) >> shift;
 	out = bits >> 63 ? -static_cast<int64_t>(v) : static_cast<int64_t>(v);
 	return true;
+}
+
+// q / 2^frac as an IEEE-754 single's bits, rounded to nearest; |q| < 2^40.
+static inline uint32_t fixedAsFloat(int64_t q, unsigned frac) {
+	if (!q)
+		return 0;
+	const uint32_t sign = q < 0 ? 0x80000000u : 0;
+	uint64_t m = static_cast<uint64_t>(q < 0 ? -q : q);
+	int32_t e = 63 - __builtin_clzll(m);
+	if (e > 23) {
+		const uint32_t shift = static_cast<uint32_t>(e - 23);
+		m = (m + (1ull << (shift - 1))) >> shift;
+		if (m >> 24) {
+			m >>= 1;
+			e++;
+		}
+	} else {
+		m <<= 23 - e;
+	}
+	const int32_t exponent = e - static_cast<int32_t>(frac) + 127;
+	return sign | static_cast<uint32_t>(exponent) << 23 | (static_cast<uint32_t>(m) & 0x7fffff);
 }
 
 // An 8-bit linear value as 8-bit sRGB (round(255 * encode(i / 255))): a clear colour for an sRGB target, which Metal gives linear.
