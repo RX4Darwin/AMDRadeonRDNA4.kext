@@ -1103,7 +1103,7 @@ private:
 	bool vmSyncCpu(RtClient &client, uint64_t va, uint64_t end);
 	bool vmMapHost(RtClient &client, uint64_t va, const uint64_t *pageBuses,
 	               uint64_t bytes, bool executable);
-	void vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
+	bool vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
 	bool vmContextInit(RtClient &client);
 	bool vmInvalidate(uint32_t vmid, const char *tag);
 	bool vmInvalidateOwned(RtClient &c, const char *tag);
