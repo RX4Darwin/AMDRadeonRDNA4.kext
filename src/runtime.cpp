@@ -1242,6 +1242,10 @@ bool RDNA4Compute::vmBootSelfTest() {
 		trail(first ? "vm: context invalidate" : "vm: variant invalidate");
 		(void)vmInvalidate(curVmid, "boot context enable");
 		if (!first) {
+			/* The variant probe reuses a fixed HQD slot. Prove it idle before
+			 * clearing any of the ring/MQD pages it may still reference. */
+			if (!hqdQuiesce(curPipe, curQueue, curVmid, "vmBootSelfTest variant"))
+				return false;
 			/* A fresh queue: clear the report/poll/data/fence pages and the
 			 * ring, and start the PM4 writer over. */
 			for (uint32_t off = 0; off < 0x6000; off += 4)
@@ -1901,6 +1905,15 @@ IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 	}
 	if (pipe == 2)
 		return kIOReturnNoResources;
+	/* The slot may still be executing a queue from an earlier runtime. Do not
+	 * clear its pool backing or assign it to a new client until it is idle. */
+	if (!hqdQuiesce(pipe, queue, vmid, "rtOpenInner")) {
+		queueUsed[pipe][queue] = true;
+		rtWedged = true;
+		rtReady = false;
+		RLOG("runtime disabled: private HQD %u/%u could not be proven inactive", pipe, queue);
+		return kIOReturnNotResponding;
+	}
 	uint64_t table = 0;
 	if (!devHeap.size() || !devHeap.alloc(kVmTableBytes, table))
 		return kIOReturnNoMemory;
