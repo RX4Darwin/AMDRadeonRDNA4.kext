@@ -1103,6 +1103,26 @@ int accelPipesSysctl SYSCTL_HANDLER_ARGS
 		}
 	return SYSCTL_OUT(req, text, strlen(text) + 1);
 }
+// OpenGL on our accelerator, for processes started after it is set: AppleMetalOpenGLRenderer named in IOGLBundleName (OpenGL.framework loads
+// a hardware renderer only for an accelerator that names one), running on our Metal device. ponytail: off until set, at run time, as
+// naming it from the boot froze the rig (af85142, before the Metal bundle had its own GL drawables); a boot default once card-proven.
+int accelGlSysctl SYSCTL_HANDLER_ARGS
+{
+	int value = gAccel && gAccel->getProperty("IOGLBundleName") ? 1 : 0;
+	const int err = sysctl_handle_int(oidp, &value, 0, req);
+	if (err || !req->newptr)
+		return err;
+	if (!gAccel || !gFamilyClients)
+		return ENODEV;
+	if (value)
+		gAccel->setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer");
+	else
+		gAccel->removeProperty("IOGLBundleName");
+	rdna4Log("AMDRadeonRDNA4: accel: OpenGL renderer %s\n", value ? "named (AppleMetalOpenGLRenderer)" : "no longer named");
+	return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_accelgl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, accelGlSysctl, "I",
+            "AMDRadeonRDNA4: 1 names Apple's GL-on-Metal renderer on our accelerator (OpenGL on our Metal device), 0 not");
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_accelpipes, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, accelPipesSysctl, "A",
             "AMDRadeonRDNA4: our display pipes' states (diagnostic)");
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_accel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, accelSysctl, "I",
@@ -1317,6 +1337,7 @@ void RDNA4Accel::start()
 	}, nullptr);
 	sysctl_register_oid(&sysctl__debug_rdna4_accel);
 	sysctl_register_oid(&sysctl__debug_rdna4_accelpipes);
+	sysctl_register_oid(&sysctl__debug_rdna4_accelgl);
 	thread_t th;   // (it waits for the GPU, then reads rdna4-accel)
 	if (kernel_thread_start(accelAtBoot, nullptr, &th) == KERN_SUCCESS)
 		thread_deallocate(th);
