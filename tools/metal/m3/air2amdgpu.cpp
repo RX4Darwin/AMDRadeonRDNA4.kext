@@ -700,12 +700,15 @@ static std::string legalize(Function &k) {
 			                               {value, x, y, t, b.getInt32(0), b.getInt32(0)});
 			r = b.CreateInsertElement(PoisonValue::get(vt), old, uint64_t(0));
 		} else if (tex.starts_with("read_texture_buffer_1d.v4f")) {
-			// (texture, uint coord, i32): a texture made from a buffer (vkQuake's palette), which the host gives as one linear row
+			// A buffer texture is exposed as one linear row, or as rows of at most 16384 texels.
+			// Map the linear element index onto the 2D image descriptor's coordinates.
 			const bool half = tex.starts_with("read_texture_buffer_1d.v4f16");
 			Value *t = descriptor(c->getArgOperand(0), 8), *x = b.CreateZExtOrTrunc(c->getArgOperand(1), b.getInt32Ty());
+			Value *tx = b.CreateAnd(x, b.getInt32(16383));
+			Value *ty = b.CreateLShr(x, 14);
 			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
 			Value *texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2d, {v4f, b.getInt32Ty(), t->getType()},
-			                                 {b.getInt32(15), x, b.getInt32(0), t, b.getInt32(0), b.getInt32(0)});
+			                                 {b.getInt32(15), tx, ty, t, b.getInt32(0), b.getInt32(0)});
 			if (half)
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
