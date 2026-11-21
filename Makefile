@@ -81,15 +81,23 @@ LILU_SHIM    = $(BUILD)/liluhdr
 LILU_STAMP   = $(LILU_SHIM)/.stamp
 
 # AMD firmware for the compute bring-up (src/compute.cpp, stage 2+): the
-# linux-firmware blobs in firmware/amdgpu/ (tools/build/fetch-firmware.sh) are
-# embedded when all are present; otherwise the kext builds without them and
-# those stages report it.
+# linux-firmware blobs in firmware/amdgpu/ (tools/build/fetch-firmware.sh).
+# There is one set a chip (src/fwset.hpp), and the display microcontroller's
+# firmware, which both chips take. A set is embedded when all of it and the
+# display firmware are present; with no set the kext builds without firmware
+# and those stages report it.
 FW_DIR       = firmware/amdgpu
-FW_BLOBS     = $(FW_DIR)/psp_14_0_3_sos.bin $(FW_DIR)/smu_14_0_3.bin \
+FW_COMMON    = $(FW_DIR)/dcn_4_0_1_dmcub.bin
+FW_NAVI48    = $(FW_DIR)/psp_14_0_3_sos.bin $(FW_DIR)/smu_14_0_3.bin \
                $(FW_DIR)/sdma_7_0_1.bin $(FW_DIR)/gc_12_0_1_pfp.bin \
                $(FW_DIR)/gc_12_0_1_me.bin $(FW_DIR)/gc_12_0_1_mec.bin \
                $(FW_DIR)/gc_12_0_1_uni_mes.bin $(FW_DIR)/gc_12_0_1_imu.bin \
-               $(FW_DIR)/gc_12_0_1_rlc.bin $(FW_DIR)/dcn_4_0_1_dmcub.bin
+               $(FW_DIR)/gc_12_0_1_rlc.bin
+FW_NAVI44    = $(FW_DIR)/psp_14_0_2_sos.bin $(FW_DIR)/smu_14_0_2.bin \
+               $(FW_DIR)/sdma_7_0_0.bin $(FW_DIR)/gc_12_0_0_pfp.bin \
+               $(FW_DIR)/gc_12_0_0_me.bin $(FW_DIR)/gc_12_0_0_mec.bin \
+               $(FW_DIR)/gc_12_0_0_uni_mes.bin $(FW_DIR)/gc_12_0_0_imu.bin \
+               $(FW_DIR)/gc_12_0_0_rlc.bin
 
 # A dump of the card's ROM, which the host tests parse and the emulator's option ROM is made from. It is the card
 # vendor's and not in the repository (firmware/README.md): without it `make test` leaves the ROM checks out.
@@ -132,8 +140,11 @@ kext: check-config $(LILU_STAMP)
 	cmp -s $(OBJDIR)/buildrev.h.new $(OBJDIR)/buildrev.h || { cp $(OBJDIR)/buildrev.h.new $(OBJDIR)/buildrev.h; \
 		rm -f $(OBJDIR)/plugin.o $(OBJDIR)/device.o $(OBJDIR)/kmod_info.o; }; \
 	rm -f $(OBJDIR)/buildrev.h.new
-	@missing=; for f in $(FW_BLOBS); do [ -f $$f ] || missing=1; done; \
-	{ if [ -n "$$missing" ]; then echo "#define AMDRadeonRDNA4_NO_FIRMWARE 1"; else cksum $(FW_BLOBS) | sed 's|^|// |'; fi; \
+	@n48=1; for f in $(FW_COMMON) $(FW_NAVI48); do [ -f $$f ] || n48=; done; \
+	n44=1; for f in $(FW_COMMON) $(FW_NAVI44); do [ -f $$f ] || n44=; done; \
+	{ if [ -z "$$n48$$n44" ]; then echo "#define AMDRadeonRDNA4_NO_FIRMWARE 1"; else cksum $(FW_COMMON) | sed 's|^|// |'; fi; \
+	  if [ -n "$$n48" ]; then echo "#define AMDRadeonRDNA4_FW_NAVI48 1"; cksum $(FW_NAVI48) | sed 's|^|// |'; fi; \
+	  if [ -n "$$n44" ]; then echo "#define AMDRadeonRDNA4_FW_NAVI44 1"; cksum $(FW_NAVI44) | sed 's|^|// |'; fi; \
 	  if [ "$(PVGPU)" = 1 ]; then echo "#define AMDRadeonRDNA4_PVGPU 1"; fi; } > $(OBJDIR)/fwconfig.h.new; \
 	cmp -s $(OBJDIR)/fwconfig.h.new $(OBJDIR)/fwconfig.h || { cp $(OBJDIR)/fwconfig.h.new $(OBJDIR)/fwconfig.h; \
 		rm -f $(OBJDIR)/*.o; }; \

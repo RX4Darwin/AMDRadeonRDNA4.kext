@@ -20,6 +20,7 @@
 
 #include <Headers/plugin_start.hpp>
 #include "klog.hpp"
+#include "sku.hpp"
 #include "trial.hpp"
 #include "vrambench.hpp"
 #include <Headers/kern_api.hpp>
@@ -230,7 +231,7 @@ bool isOurDevice(IOService *provider) {
 		return false;
 	uint32_t vd = pci->configRead32(kIOPCIConfigVendorID);
 	uint16_t vendor = vd & 0xffff, device = static_cast<uint16_t>(vd >> 16);
-	if (vendor == 0x1002 && (device == 0x7550 || device == 0x7551))
+	if (vendor == 0x1002 && (device == Sku::kNavi48 || device == Sku::kNavi48Pro || device == Sku::kNavi44))
 		return true;
 #ifdef AMDRadeonRDNA4_VM_TEST
 	if (vendor == 0x15ad && device == 0x0405)

@@ -28,7 +28,7 @@ name.
 | Radeon RX 9070 | Navi 48 (gfx1201) | `1002:7550` (`0xC3`) | **Supported.** Ran the paravirtual GPU under Sequoia 15.8.2 (the measurements of PR 6). |
 | Radeon RX 9070 GRE | Navi 48 (gfx1201) | `1002:7550` (`0xC2`) | Recognised and named, its 48 compute units reported; **needs testing** (not yet run on one). |
 | Radeon AI PRO R9700 | Navi 48 (gfx1201) | `1002:7551` | Matched and named; **needs testing** (not yet run on one). |
-| Radeon RX 9060 XT, RX 9060 | Navi 44 (gfx1200) | `1002:7590` | **Not supported yet.** Another chip: its own firmware, IP versions and display paths. |
+| Radeon RX 9060 XT, RX 9060 | Navi 44 (gfx1200) | `1002:7590` | **Port started, not run on a card.** The kext matches the card, names it and carries its firmware set (PSP 14.0.2, SMU 14.0.2, SDMA 7.0.0, GC 12.0.0), chosen from the GC version the card reports. Its display paths and power management have not been looked at: expect the boot display at best. |
 
 Everything that differs between the Navi 48 cards (VRAM size, shader engines, display paths, the compute pool's
 place) is read from the card, not assumed (`src/sku.hpp` holds only the names and compute-unit counts).
@@ -130,7 +130,7 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 - Hardware video decode and encode (VCN).
 - Fan control; the power features held back so that they do not retune clocks under the lit displays (display DPM,
   memory and fabric deep sleep, GFXOFF).
-- The Navi 44 cards (RX 9060 XT, RX 9060).
+- The Navi 44 cards (RX 9060 XT, RX 9060): matched and given their firmware, nothing verified on one (see *Supported cards*).
 
 ## Installing
 
