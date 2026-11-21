@@ -5022,7 +5022,7 @@ static int testSparseTree() {
 		const bool mapped = converted && GpuVmTable::treeMapVram(
 			failedMap.tree(), GpuVmTable::Policy {}, mapVa, mapVa + 0x2000, physical, false);
 		failedMap.syncCalls = 0;
-		failedMap.failSyncCall = 4;  // PDB1, PDB0, first PT succeed; second PT transfer fails.
+		failedMap.failSyncCall = 5;  // root, PDB1, PDB0 and first PT succeed; second PT transfer fails.
 		const bool partialFailure = mapped && !failedMap.sync();
 		uint64_t firstPhysical = 0, secondPhysical = 0;
 		const bool partialVisible = failedMap.translate(mapVa, firstPhysical) &&
