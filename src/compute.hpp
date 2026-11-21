@@ -1055,7 +1055,7 @@ private:
 	bool sharedReserve(uint32_t k, uint32_t dwords);
 	void sharedCommit(uint32_t k, uint32_t seq, uint32_t dwords);
 	uint32_t vmAcquire(RtClient &c);                 // a VMID bound to the client's tables, rebound/flushed as needed; 0 = none available
-	void vmReleaseVmids(RtClient &c);                // client closes: every VMID it owns goes back, contexts off
+	void vmReleaseVmids(RtClient &c, bool releasePool = true); // turn off/flush owned VMIDs; optionally retain pool ownership until tables are gone
 	IOReturn rtOpenPooled(const void *owner, uint32_t slot, RtClient *c);
 	bool vmSharedEnsure();
 	IOReturn rtOpenShared(const void *owner, uint32_t slot, RtClient *c);
