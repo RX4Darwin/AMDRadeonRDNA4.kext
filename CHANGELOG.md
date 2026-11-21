@@ -16,7 +16,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - On an RX 9060 XT under Linux (Gigabyte, 2026-11-21): `make test ROM=` passes on its VBIOS and IP discovery table (two DisplayPort
   paths and one HDMI); the IP register bases and `GB_ADDR_CONFIG` are the RX 9070 XT's, and 36 of the 37 GC registers of
   `src/linuxref.hpp` read the same; `tools/linux/linux-replay/run.sh` draws the kext's triangle through amdgpu, 8192 px in all
-  seven variants.
+  seven variants, and the G4 colour triangle (`REPLAY_DRAW=col`) is right there too: 8192 px, every channel within 0.50 of the
+  barycentric colour, centroid `0xff555654`, the RX 9070 XT's figures.
 - The emulator can be an RX 9060 XT (`chip=navi44`) and can refuse a blob that is not from the chip's firmware set (`fwdir=`),
   `docs/emu-linux.md`. Emulated boots 1, 3 and 8 with that card's VBIOS give the RX 9070 XT's rows.
 - The emulator draws the colour triangle (the attribute-ring path: `buffer_store_b128`, `ds_param_load`, `v_interp`) and its SMU's
