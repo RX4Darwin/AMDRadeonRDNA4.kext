@@ -4900,7 +4900,13 @@ static int testSparseTree() {
 	f += check(treeMap(e, far, MC + 0x200000, 0x1000) && treeResolves(e, far, MC + 0x200000, 0x1000), "tree: a map 600 GiB up (root entry 1, its own PDB1 page) translates");
 	const uint64_t top = GpuVm::kVaEnd - 0x2000;
 	f += check(treeMap(e, top, MC + 0x300000, 0x2000) && treeResolves(e, top, MC + 0x300000, 0x2000), "tree: the last two pages of the 48-bit space translate");
-	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V - 0x1000, V + 0x1000, 0x1000, false), "tree: a map starting below kVaStart is refused");
+	const uint32_t pagesBeforeBadVa = e.sp.pages();
+	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, top, GpuVm::kVaEnd + 0x1000, 0x4000, false) &&
+	           e.sp.pages() == pagesBeforeBadVa,
+	           "tree: a range ending above kVaEnd is rejected before allocating tables");
+	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V - 0x1000, V + 0x1000, 0x1000, false) &&
+	           e.sp.pages() == pagesBeforeBadVa,
+	           "tree: a map starting below kVaStart is rejected before allocating tables");
 	const uint32_t pagesBeforeHighPhysical = e.sp.pages();
 	const uint64_t highPhysical = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
 	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x500000, V + 0x501000, highPhysical, false) &&
