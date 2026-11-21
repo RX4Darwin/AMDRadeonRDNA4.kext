@@ -4544,9 +4544,6 @@ static void abortStack(int sig)
 // (Apple family 1, programmable blending, memoryless targets, ...), and Core Animation chose techniques of those for our device that
 // the paravirtual one never sees (an empty mask shader hung WindowServer). The same draws and the same translator serve both, so the same
 // answers; ray tracing and the buffer size limit are our own.
-// The lowest tier (argument buffers are not translated yet: air.indirect_buffer): MoltenVK then keeps to plain bindings without
-// MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0 (an app restored at login started before the agent set it, 2026-11-21)
-- (MTLArgumentBuffersTier)argumentBuffersSupport { return MTLArgumentBuffersTier1; }
 - (BOOL)supportsFamily:(MTLGPUFamily)family { return family == 2001 || family == 3001 || family == 3002; }   // Mac1, Common1, Common2: Apple's device's
 - (uint64_t)dedicatedMemorySize { return 1073741824ull; }
 - (uint64_t)deviceLinearReadOnlyTextureAlignmentBytes { return 256ull; }
