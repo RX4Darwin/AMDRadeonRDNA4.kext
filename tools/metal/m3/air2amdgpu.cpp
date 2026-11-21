@@ -671,6 +671,45 @@ static std::string legalize(Function &k) {
 				texel = b.CreateIntCast(b.CreateBitCast(texel, FixedVectorType::get(b.getInt32Ty(), 4)),
 				                        cast<StructType>(c->getType())->getElementType(0), tex.starts_with("read_texture_2d.s"));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+		} else if (tex.starts_with("sample_texture_cube.v4f")) {
+			// (texture, sampler, float3 direction, i1 level, float bias or LOD, float min LOD, i32): vkQuake's sky through MoltenVK
+			// (2026-11-21). The direction as the hardware's cube coordinates, as Mesa's ac_prepare_cube_coords: the face (cubeid) and
+			// s, t = sc, tc / |ma| + 1.5 (cubema is twice the major axis).
+			auto *level = dyn_cast<ConstantInt>(c->getArgOperand(3));
+			Value *value = c->getArgOperand(4);
+			if (!level || !match(c->getArgOperand(5), m_AnyZeroFP()))
+				return f->getName().str() + " with a run-time level kind or a minimum LOD is not supported yet";
+			Value *t = descriptor(c->getArgOperand(0), 8), *dir = c->getArgOperand(2);
+			Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
+			Type *ft = b.getFloatTy(), *v4f = FixedVectorType::get(ft, 4);
+			Value *x = b.CreateExtractElement(dir, uint64_t(0)), *y = b.CreateExtractElement(dir, 1), *z = b.CreateExtractElement(dir, 2);
+			Value *ma = b.CreateIntrinsic(Intrinsic::amdgcn_cubema, {}, {x, y, z});
+			Value *invma = b.CreateFDiv(ConstantFP::get(ft, 1.0), b.CreateUnaryIntrinsic(Intrinsic::fabs, ma));
+			Value *bias15 = ConstantFP::get(ft, 1.5);
+			Value *sc = b.CreateFAdd(b.CreateFMul(b.CreateIntrinsic(Intrinsic::amdgcn_cubesc, {}, {x, y, z}), invma), bias15);
+			Value *tc = b.CreateFAdd(b.CreateFMul(b.CreateIntrinsic(Intrinsic::amdgcn_cubetc, {}, {x, y, z}), invma), bias15);
+			Value *face = b.CreateIntrinsic(Intrinsic::amdgcn_cubeid, {}, {x, y, z});
+			const bool zero = match(value, m_AnyZeroFP()), lod = level->isOne(), bias = !lod && !zero;
+			const bool quads = k.getCallingConv() == CallingConv::AMDGPU_PS;   // implicit LODs need pixel quads (as the 2D case)
+			const unsigned mode = !quads && !(lod && !zero) ? 3 : bias ? 1 : lod ? (zero ? 3 : 2) : 0;
+			static const Intrinsic::ID ids[4] = {Intrinsic::amdgcn_image_sample_cube, Intrinsic::amdgcn_image_sample_b_cube,
+			                                     Intrinsic::amdgcn_image_sample_l_cube, Intrinsic::amdgcn_image_sample_lz_cube};
+			SmallVector<Type *, 5> types = {v4f};
+			SmallVector<Value *, 10> args = {b.getInt32(15)};
+			if (mode == 1) {
+				types.push_back(ft);
+				args.push_back(value);
+			}
+			types.push_back(ft);
+			args.append({sc, tc, face});
+			if (mode == 2)
+				args.push_back(value);
+			types.append({t->getType(), sm->getType()});
+			args.append({t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+			Value *texel = b.CreateIntrinsic(ids[mode], types, args);
+			if (tex.starts_with("sample_texture_cube.v4f16"))
+				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
 		} else if (tex.starts_with("gather_texture_2d.v4f")) {
 			// (texture, sampler, float2 coord, i1, int2 offset, i32 component, i32): one component of the four texels around the coordinate
 			// (MoltenVK's shaders from vkQuake, 2026-11-17), image_gather4 at level 0 with that component's dmask; the order of the four is
@@ -1423,6 +1462,11 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			memberOf[mdInt(o, 1)] = static_cast<int>(k);
 			other = static_cast<int>(k);
 			otherIndex = static_cast<int>(mdInt(o, 1));
+		} else if (!vertex && kind == "air.depth") {
+			// ponytail: the depth a fragment shader writes is dropped (the rasterised depth is tested and written): the draw's colour
+			// rather than no draw (vkQuake's through MoltenVK, 2026-11-21); exporting it needs Z export in the draw stream
+			// (SPI_SHADER_Z_FORMAT, DB_SHADER_CONTROL.Z_EXPORT_ENABLE)
+			continue;
 		} else if (!(!vertex && kind == "air.render_target")) {
 			return std::string(vertex ? "vertex" : "fragment") + " output " + kind + " is not supported yet";
 		}
