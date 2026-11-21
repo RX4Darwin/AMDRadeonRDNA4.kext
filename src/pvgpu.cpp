@@ -737,7 +737,8 @@ private:
 	static constexpr uint32_t kPresentIbBytes = 64 * 1024;
 	ScanoutMap mScanout[kScanoutPorts] {};
 	GfxBuffers mPresentIb {};
-	bool presentOnCard(uint32_t port, uint32_t sid);
+	enum class PresentResult : uint8_t { Fallback, Submitted, Dropped };
+	PresentResult presentOnCard(uint32_t port, uint32_t sid);
 	// A frame of macOS's scaled modes, larger than any mode of the head ("looks like 2560x1440" draws 5120x2880 on a 3840x2160
 	// monitor): scale.cl puts it into the scanout, dispatched in the frame's IB. Its kernargs a slot per port.
 	struct ScaleKernel { uint64_t code, argsHandle, argsGpu; uint8_t *argsCpu; uint32_t rsrc[3]; bool wave32, tried; };
@@ -4855,7 +4856,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 				linearImage(t, at, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, pitchPx);
 		};
 		ok = ok && fm && w && h && (w <= 16384 || (wideRow && w <= 16384u * 16384u)) && h <= 16384 &&
-		     rowBytes >= w * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= src.length;
+		     static_cast<uint64_t>(rowBytes) >= static_cast<uint64_t>(w) * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= src.length;
 		ok = ok && (depth == 1 || (depth <= 2048 && src.imageBytes >= static_cast<uint64_t>(rowBytes) * h && src.imageBytes * depth <= src.length));
 		if (!ok) {
 			if (talk || mTexLines++ < 2)   // per stats period
@@ -8220,13 +8221,19 @@ void RDNA4PvHost::presentTransaction(const pvstream::FifoCommand &c, const uint8
 
 	const uint32_t port = f[0], surface = c.id == 0x07 ? f[2] : f[1], task = c.id == 0x07 ? f[1] : f[2];
 	const uint64_t cardAt = nowNs();
-	bool ok = gPresentOnCard && presentOnCard(port, surface);
+	const PresentResult cardResult = gPresentOnCard ? presentOnCard(port, surface) : PresentResult::Fallback;
+	bool ok = cardResult == PresentResult::Submitted;
 	const uint64_t cardNs = nowNs() - cardAt;
 	mPresentCardCalls++;
 	mPresentCardNs += cardNs;
 	mPresentCardMaxNs = cardNs > mPresentCardMaxNs ? cardNs : mPresentCardMaxNs;
 
-	if (!ok) {   // copied by the CPU from the guest's memory
+	if (cardResult == PresentResult::Dropped) {
+		if (gTalk)
+			pvlog("host: present: port %u, IOSurface %u (task %u): dropped by nonblocking policy", port, surface, task);
+		return;                 // do not invoke the blocking CPU fallback or count a successful present
+	}
+	if (cardResult == PresentResult::Fallback) {   // copied by the CPU from the guest's memory
 		const uint64_t fallbackAt = nowNs();
 		void *s = retainSurface(surface);
 
@@ -8293,13 +8300,13 @@ void RDNA4PvHost::timePresent(uint32_t port, PortTiming &t)
 	}
 }
 
-bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
+RDNA4PvHost::PresentResult RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 {
 	static constexpr uint32_t kChunk = 1u << 20;
 	PvScanout::Head h;
 
 	if (port >= kScanoutPorts || !mRtOpen || !PvScanout::head(port, h) || !h.pitch || !h.height)
-		return false;
+		return PresentResult::Fallback;
 
 	ScanoutMap &sm = mScanout[port];
 
@@ -8309,7 +8316,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	if (sm.fence && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(sm.fence))) {
 		mPresentBusyDrops++;
 		mPresentBusyDropsByPort[port]++;
-		return true;
+		return PresentResult::Dropped;
 	}
 
 	void *s = retainSurface(sid);
@@ -8351,7 +8358,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 			if (s)
 				static_cast<OSObject *>(s)->release();
 
-			return false;
+			return PresentResult::Fallback;
 		}
 
 		sm.phys = h.phys;
@@ -8399,7 +8406,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 		mPresentIb.cpu = reinterpret_cast<uint8_t *>(cpu);
 
 	if (!ok || !mPresentIb.cpu)
-		return false;
+		return PresentResult::Fallback;
 
 	if (sm.fence && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(sm.fence))) {
 		const uint64_t waitAt = nowNs();
@@ -8428,7 +8435,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 		if (mPending >= kInFlight) {
 			mPresentCapacityDrops++;
 			mPresentCapacityDropsByPort[port]++;
-			return true;
+			return PresentResult::Dropped;
 		}
 	}
 
@@ -8445,7 +8452,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	const bool timed = n && profiling();
 
 	if (!n)
-		return false;
+		return PresentResult::Fallback;
 
 	n += timed ? timeStamp(ib + n, false) : 0;
 
@@ -8457,7 +8464,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 		const uint32_t idle = k ? idleBarrier(ib + n + k) : 0;   // its writes in memory before the flip
 
 		if (!k || !idle)
-			return false;
+			return PresentResult::Fallback;
 
 		n += k + idle;
 	}
@@ -8471,7 +8478,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	}
 
 	if (n + 7 + 8 > maxDw)   // too many rows for the IB
-		return false;
+		return PresentResult::Fallback;
 
 	// debug.rdna4_pvframe: the frame as it is, into host memory too; a scaled one as it went into the scanout
 	const uint64_t grabFrom = scaled ? dst : src, grabPitch = scaled ? h.pitch : bpr;
@@ -8492,7 +8499,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	}
 
 	if (n + 7 + 8 > maxDw)
-		return false;
+		return PresentResult::Fallback;
 
 	n += timed ? timeStamp(ib + n, true) : 0;
 
@@ -8501,7 +8508,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	uint64_t fence = 0;
 
 	if (submitGfx(mPresentIb.gpu + ibAt, n, fence) != kIOReturnSuccess)
-		return false;
+		return PresentResult::Fallback;
 
 	flying(fence, "present");
 	sm.fence = fence;
@@ -8516,7 +8523,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 		sm.flipFence = fence;
 	}
 
-	return true;
+	return PresentResult::Submitted;
 }
 
 // scale.cl loaded into the runtime with a page for its kernargs, once: false (and not tried again) if it could not be.
