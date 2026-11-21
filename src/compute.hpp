@@ -894,6 +894,7 @@ private:
 		Pm4::Queue pm4;
 		bool active { false };
 		bool aborted { false };
+		const void *quarantinedOwner { nullptr };
 		// VA given back by freed buffers, 64 KiB granules, reused before nextVa grows: the dense tables reach only 1 GiB above
 		// kVaStart, which a buffer a draw passes through without reuse.
 		struct VaHole { uint64_t va, bytes; } vaHoles[kVaHoles] {};
