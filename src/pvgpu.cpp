@@ -10065,9 +10065,10 @@ private:
 		// stage 2 failed, all mtlprobe checks wrong).
 		const char *why = !parent ? "the GPU has not attached" : !gCompute || !gCompute->runtimeReady() ? "the compute runtime is not up" : nullptr;
 		// Not yet: looked at again every 500 ms for 2 minutes (with rdna4-pvgpu-delay=5 the GPU had not attached when the delay ran out, and
-		// the boot came up without displays, 2026-11-10)
+		// the boot came up without displays, 2026-11-10), now for 10 minutes: USB interfaces held the registry busy until IOKit's 240 s
+		// timeout, the GPU attached at 261 s and the boot stayed without a desktop (2026-11-21, a wedged XH00 after the UR22's resets)
 		if (why) {
-			static constexpr uint64_t kWaitMs = 120000;
+			static constexpr uint64_t kWaitMs = 600000;
 			const bool waiting = nowMs() < mDeadline + kWaitMs;
 			if (!mSaid || !waiting)
 				pvlog("not publishing after the delay yet: %s%s", why, waiting ? ": waiting" : ": giving up");
