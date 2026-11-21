@@ -896,6 +896,7 @@ private:
 		bool active { false };
 		bool aborted { false };
 		bool mappingUnsafe { false };
+		bool privateQueueDrainFailed { false }; // sleep could not prove this client's HQD inactive
 		const void *quarantinedOwner { nullptr };
 		// VA given back by freed buffers, 64 KiB granules, reused before nextVa grows: the dense tables reach only 1 GiB above
 		// kVaStart, which a buffer a draw passes through without reuse.
