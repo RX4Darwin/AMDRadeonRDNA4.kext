@@ -1122,8 +1122,26 @@ IOReturn wrapSetCursorState(void *fb, SInt32 x, SInt32 y, bool visible)
 	if (port < 0)
 		return FunctionCast(wrapSetCursorState, orgSetCursorState)(fb, x, y, visible);
 	const uint32_t *hot = port < 8 ? gCursorHot[port] : gCursorHot[0];
-	return PvScanout::cursorMove(static_cast<uint32_t>(port), x + static_cast<int32_t>(hot[0]), y + static_cast<int32_t>(hot[1]), visible)
-	           ? kIOReturnSuccess : kIOReturnUnsupported;
+	const uint64_t from = mach_absolute_time();
+	const bool ok = PvScanout::cursorMove(static_cast<uint32_t>(port), x + static_cast<int32_t>(hot[0]), y + static_cast<int32_t>(hot[1]),
+	                                      visible);
+	// (diagnostic, the pointer lagged) how many moves and how long each took, the lock wait included: a line every 10 s with moves
+	static uint64_t windowAt, moves, worst, total;
+	uint64_t now = mach_absolute_time(), ns = 0;
+	absolutetime_to_nanoseconds(now - from, &ns);
+	moves++;
+	total += ns;
+	worst = ns > worst ? ns : worst;
+	uint64_t sinceNs = 0;
+	absolutetime_to_nanoseconds(now - windowAt, &sinceNs);
+	if (sinceNs >= 10000000000ull) {
+		if (windowAt)
+			FBLOG("cursor: our accelerator's: %llu moves in %llu s, %llu us on average, the longest %llu us", moves, sinceNs / 1000000000ull,
+			      total / moves / 1000, worst / 1000);
+		windowAt = now;
+		moves = total = worst = 0;
+	}
+	return ok ? kIOReturnSuccess : kIOReturnUnsupported;
 }
 #endif
 

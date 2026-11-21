@@ -451,23 +451,26 @@ constexpr uint32_t kMpccStride = 0x15, kMpcOutMux = 0x02f2, kMpcOutStride = 4;
 constexpr uint32_t kMpcDppPending = 0x02bf, kMpcPendingMisc = 0x02c0;
 constexpr uint32_t kMpcLockBase = 0x02c1, kMpcLockStride = 5, kMpcCurLock = 4;
 
-// The cursor surface is one fixed 64x64 slot, the way amdgpu's DM hands the
+// The cursor surface is one fixed 128x128 slot, the way amdgpu's DM hands the
 // hardware a whole cursor buffer (attr->width/height = the buffer, the image
 // sits in its top-left corner over transparent pixels). The size, the pitch and
-// LINES_PER_CHUNK (hubp2_get_lines_per_chunk: 33..64 px wide = 8 lines) must
-// all describe that slot, not the image inside it.
-constexpr uint32_t kCursorWidth = 64;
-constexpr uint32_t kCursorHeight = 64;
-constexpr uint32_t kCursorPitch = 64;
+// LINES_PER_CHUNK (hubp2_get_lines_per_chunk: 65..128 px wide = 4 lines) must
+// all describe that slot, not the image inside it. 128, not 64: macOS's larger
+// pointers (64x128 ones at login) did not fit, IOFramebuffer then drew them in
+// software into a framebuffer the display was not showing (2026-11-21).
+constexpr uint32_t kCursorWidth = 128;
+constexpr uint32_t kCursorHeight = 128;
+constexpr uint32_t kCursorPitch = 128;
 constexpr uint32_t kCursorBytes = kCursorWidth * kCursorHeight * sizeof(uint32_t);
 constexpr uint32_t kCursorSlotsBytes = kCursorBytes * Pipe::kMaxOtg;   // one sprite a pipe: the paravirtual displays' images differ
 constexpr uint32_t kCursorModePremultipliedArgb = 2; // dc_cursor_color_format
 constexpr uint32_t kCursorFp16One = 0x3c00;
 constexpr uint32_t kCursorReqModePrefetch = 1u << 2;
 constexpr uint32_t kCursorModeShift = 8;
-constexpr uint32_t kCursorPitchShift = 16;   // CURSOR_PITCH: 0 = 64 px
+constexpr uint32_t kCursorPitchShift = 16;   // CURSOR_PITCH: 0 = 64 px, 1 = 128, 2 = 256
+constexpr uint32_t kCursorPitch128 = 1;
 constexpr uint32_t kCursorLinesPerChunkShift = 24;
-constexpr uint32_t kCursorLinesPer8 = 3;     // enum cursor_lines_per_chunk: 1,2,4,8,16 = 0..4
+constexpr uint32_t kCursorLinesPer4 = 2;     // enum cursor_lines_per_chunk: 1,2,4,8,16 = 0..4
 constexpr uint32_t kCursorCmModeShift = 4;
 constexpr uint32_t kCursorCmWorkingBits = (1u << 7) | (1u << 2);
 constexpr uint32_t kDchubGlobalTimerCntl = 0x0527;   // regDCHUBBUB_GLOBAL_TIMER_CNTL (REFDIV [3:0], ENABLE bit 12)
@@ -605,10 +608,10 @@ void RDNA4Device::cursorProgramPlane(bool enable) {
 	if (cursorPipeFixesOn) {   // W38: REG_UPDATE(DCHUBP_MALL_CONFIG, USE_MALL_FOR_CURSOR, cursor_size > 16384) (dcn32_hubp.c:133,165)
 		const uint32_t mall = regReadDmu(2, kMallConfig + hubp);
 		if (mall != 0xffffffffu && (mall & 4u))
-			regWriteDmu(2, kMallConfig + hubp, mall & ~4u);   // 64x64 ARGB is exactly 16384 bytes: not above the limit
+			regWriteDmu(2, kMallConfig + hubp, mall & ~4u);   // off: the kext does not set the MALL up (amdgpu: on above 16384 bytes)
 	}
 	cursorCtlBase = kCursorReqModePrefetch | (kCursorModePremultipliedArgb << kCursorModeShift) |
-	                (0u << kCursorPitchShift) | (kCursorLinesPer8 << kCursorLinesPerChunkShift);
+	                (kCursorPitch128 << kCursorPitchShift) | (kCursorLinesPer4 << kCursorLinesPerChunkShift);
 	regWriteDmu(2, kCursorControl + hubp, cursorCtlBase | (enable ? 1u : 0u));
 	regWriteDmu(2, kCursorCmScaleGY + dpp, kCursorFp16One);
 	regWriteDmu(2, kCursorCmScaleRB + dpp, kCursorFp16One);
@@ -1587,7 +1590,9 @@ IOReturn RDNA4Device::loadCursorStage(uint32_t w, uint32_t h, uint32_t hotX, uin
 	           cursorStage[opaqueIdx], slot[rbIdx],
 	           cursorStage[opaqueIdx] == slot[rbIdx] ? "(match)" : "(MISMATCH)");
 
-	cursorProgramPlane(hwCursorVisible);
+	// the pipe's own enable as it stands: hwCursorVisible is the last move's, whichever head that was (our accelerator's framebuffers
+	// give each head its images: one for the head without the pointer showed a stale sprite there)
+	cursorProgramPlane(cursorEnabledHw[cursorIndex()]);
 	hwCursorSet = true;
 	cursorDumpState("set");
 	return kIOReturnSuccess;

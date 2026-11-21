@@ -8259,8 +8259,9 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	const uint32_t frameW = md ? gSurfaceFns.width(s) : 0, frameH = md ? gSurfaceFns.height(s) : 0;
 	const uint32_t format = md ? gSurfaceFns.pixelFormat(s) : 0;
 
-	// The same size in another mode than macOS was told (a boot display the GOP lit at 30 Hz) as well. Once a size.
-	if (frameW && frameH && (frameW != sm.triedW || frameH != sm.triedH) &&
+	// The same size in another mode than macOS was told (a boot display the GOP lit at 30 Hz) as well. Once a size. Not for the display
+	// host (no guest): there IOFramebuffer sets the modes WindowServer asks for, and a size-chosen one undid its refresh rate.
+	if (mNub && frameW && frameH && (frameW != sm.triedW || frameH != sm.triedH) &&
 	    (frameW != h.width || frameH != h.height || PvScanout::wantsMode(port, frameW, frameH))) {
 		uint32_t bigW = 0, bigH = 0;
 		const bool larger = PvScanout::largest(port, bigW, bigH) && frameW > bigW && frameH > bigH;
