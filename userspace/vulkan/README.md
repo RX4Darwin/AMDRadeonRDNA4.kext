@@ -21,6 +21,7 @@ This repository's own:
 | `vkprobe.c` | A small Vulkan program that drives the built driver without a Vulkan loader: two fills by the GPU and a triangle drawn into an image, each submitted, waited for and checked; with `show`, a moving triangle on the boot display for five seconds |
 | `swapprobe.c` | The same moving triangle as a program with a surface and a swapchain writes it: the test of patch 0008 (`make mesa` builds it) |
 | `build-app.sh`, `vkcube-headless.patch` | Khronos's loader and their `vkcube`, fetched and built into the product directory's `bin/`, beside the driver: `vkcube`, the loader as `libvulkan.dylib`, and the manifest that names the driver in `vulkan/icd.d/`, where the loader looks beside a program (`make vkcube`). The patch gives vkcube's `--wsi display` mode a headless surface and makes it open the loader beside itself first; its own macOS version draws through Metal |
+| `radv-app.sh` | A copy of a Vulkan app that links MoltenVK, running on RADV: its `libMoltenVK.dylib` replaced by Khronos's loader from `vkcube.app` (with MoltenVK's install name), the driver and manifest beside it, a `/usr/local/lib` rpath dropped, signed ad hoc. vkQuake's `timedemo demo1` in a 1280x720 window: 285.6 fps on RADV, 203.1 through MoltenVK on the Metal device (2026-11-21) |
 | `shaders/` | The triangle's vertex and fragment shader (`vkprobe.vert`, `vkprobe.frag`) and each compiled to SPIR-V as a header (`glslangValidator -V --vn`) |
 
 The first five patches (about 9,800 lines) add a macOS backend to RADV, Mesa's Vulkan driver for AMD cards. They
