@@ -66,6 +66,7 @@
 #include <mach-o/getsect.h>
 #include <dlfcn.h>
 #include <unordered_map>
+#include <map>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <crt_externs.h>
@@ -269,6 +270,32 @@ void poolFree(std::vector<Pooled> &freed)
 		rdna4_free(p.gpu, &p.buf);
 }
 
+// (diagnostic, RDNA4_ALLOC_TRACE=n: every nth host buffer's maker logged, with the live buffers by length; Mixxx's leak, 2026-11-21)
+void allocTrace(NSUInteger length, int change)
+{
+	static const int every = getenv("RDNA4_ALLOC_TRACE") ? atoi(getenv("RDNA4_ALLOC_TRACE")) : 0;
+	static std::mutex lock;
+	static std::map<NSUInteger, int64_t> live;
+	static int made;
+	if (every <= 0)
+		return;
+	std::lock_guard<std::mutex> hold(lock);
+	live[length] += change;
+	if (change < 0 || ++made % every)
+		return;
+	void *frames[16];
+	const int n = backtrace(frames, 16);
+	char **names = backtrace_symbols(frames, n);
+	NSMutableString *stack = [NSMutableString string], *lengths = [NSMutableString string];
+	for (int i = 2; i < n; i++)
+		[stack appendFormat:@" | %s", names[i] + 4];
+	free(names);
+	for (auto &e : live)
+		if (e.second > 20)
+			[lengths appendFormat:@" %lu:%lld", (unsigned long)e.first, (long long)e.second];
+	RLOG(@"RDNA4MTL: buffer %d of %lu bytes (live by length%@):%@", made, (unsigned long)length, lengths, stack);
+}
+
 bool poolTake(rdna4_t *gpu, uint64_t bytes, rdna4_buffer_t *buf, void **cpu)
 {
 	std::vector<Pooled> freed;
@@ -372,6 +399,7 @@ static void deviceIdle(RDNA4MTLDevice *device);   // (below: the device's work q
 		return nil;
 	}
 	gHostLive += bytes, gHostCount += 1;
+	allocTrace(length, +1);
 	_allocated = bytes;
 	_device = device;
 	_length = length;
@@ -389,6 +417,8 @@ static void deviceIdle(RDNA4MTLDevice *device);   // (below: the device's work q
 			rdna4_free(_device.gpu, &_buf);   // an imported range unmapped and unwired, not freed
 	}
 	gHostLive -= _allocated, gHostCount -= _allocated ? 1 : 0;
+	if (_allocated)
+		allocTrace(_length, -1);
 	if (_shadow)
 		gShadowLive -= _allocated, gShadowCount -= 1;
 	if (_deallocator)
