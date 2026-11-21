@@ -17,7 +17,7 @@ This pass changes the PVGPU present path to prefer dropping a frame over blockin
 
 This is a latency-versus-throughput experiment. It may make pointer/window movement feel less frozen under GPU back-pressure, but can increase visible frame drops or judder. It is not guaranteed to improve average frame rate, and it may make animation less smooth if the GPU is consistently overloaded.
 
-The five-second report adds a count of frames skipped because a head was busy or because the global queue remained full. Compare those counts with the existing missed-frame, underflow, fence-wait, and work-loop timing statistics.
+The five-second report adds counts of frames skipped because a head was busy or because the global queue remained full, both as totals and broken down by display port. A rise on one port points toward that head's scanout/fence pressure; queue-full drops across several ports point toward shared GPU submission pressure. Compare these counts with the existing missed-frame, underflow, fence-wait, and work-loop timing statistics. The counters reset with each five-second reporting window, so compare equivalent windows rather than treating them as lifetime totals.
 
 ## Why required synchronization stays
 
