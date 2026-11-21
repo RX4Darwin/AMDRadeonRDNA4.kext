@@ -315,16 +315,16 @@ bool RDNA4Compute::ihInit() {
 	trail("ih: self-test");
 	const uint32_t sdmaBefore = ihSdmaTrapCount;
 	uint32_t sdmaPacket[8];
-	const bool sdmaFence = sdmaRun(sdmaPacket,
+	const bool sdmaFenceDone = sdmaRun(sdmaPacket,
 	                               Sdma::writeDword(sdmaPacket, poolMc(kSdmaTestOffset),
 	                                                0x1a5a5a5u),
 	                               2000);
 	for (uint32_t ms = 0; ms < 20 && ihSdmaTrapCount == sdmaBefore; ms++)
 		IOSleep(1);
-	if (!sdmaFence || ihSdmaTrapCount == sdmaBefore) {
+	if (!sdmaFenceDone || ihSdmaTrapCount == sdmaBefore) {
 		ihSdmaPolling = true;
 		HLOG("self-test: SDMA fence/trap %s; SDMA waits will use polling",
-		     sdmaFence ? "did not deliver an IH source" : "failed");
+		     sdmaFenceDone ? "did not deliver an IH source" : "failed");
 	} else {
 		HLOG("self-test: SDMA fence/trap delivered (source count %u)", ihSdmaTrapCount);
 	}
