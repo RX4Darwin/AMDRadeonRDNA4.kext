@@ -4705,6 +4705,7 @@ struct TreeEnv {
 	uint64_t nextChunk { 0x2000000 };
 	uint32_t chunksLive { 0 }, shadowLive { 0 }, shadowLimit { 0xffffffffu };
 	uint32_t physCalls { 0 }, failPhysCall { 0 };
+	uint32_t syncCalls { 0 }, failSyncCall { 0 };
 	std::map<uint64_t, std::vector<uint64_t>> vram;           // heap offset -> synced page
 	std::vector<uint64_t> dirtyLog;
 	uint64_t rootPhys { 0 };
@@ -4754,12 +4755,16 @@ struct TreeEnv {
 		rootPhys = root.phys;
 		sync();
 	}
-	void sync() {
+	bool sync() {
 		uint32_t id; uint64_t *shadow, off;
 		while (sp.nextDirty(id, shadow, off)) {
+			syncCalls++;
+			if (failSyncCall && syncCalls == failSyncCall)
+				return false; // model a failed DMA: do not copy or clean this page
 			vram[off] = std::vector<uint64_t>(shadow, shadow + 512);
 			sp.clean(id);
 		}
+		return true;
 	}
 	static bool readEntry(void *c, uint64_t address, uint64_t &entry) {
 		auto *e = static_cast<TreeEnv *>(c);
@@ -4900,6 +4905,27 @@ static int testSparseTree() {
 	f += check(e.sp.pages() == 1 && e.sp.chunksHeld() == 1 && e.shadowLive == 1, "tree: a fresh client is one page (the root), nothing below it");
 	uint64_t phys = 0;
 	f += check(!e.translate(V, phys), "tree: before any mapping every VA faults");
+
+	// A failed page-table transfer must remain dirty and be retried.
+	{
+		static TreeEnv retry;
+		retry = TreeEnv {};
+		retry.open(8);
+		retry.sp.markDirty(0);
+		retry.syncCalls = 0;
+		retry.failSyncCall = 1;
+		f += check(!retry.sync(), "tree: an injected page-table sync failure is reported");
+		uint32_t dirtyId = ~0u; uint64_t *dirtyShadow = nullptr, dirtyOffset = 0;
+		const bool retained = retry.sp.nextDirty(dirtyId, dirtyShadow, dirtyOffset);
+		f += check(retained && dirtyId == 0 && dirtyShadow && dirtyOffset != 0,
+		           "tree: a page whose sync failed remains dirty for retry");
+		retry.failSyncCall = 0;
+		retry.syncCalls = 0;
+		const bool retried = retry.sync();
+		const bool cleared = !retry.sp.nextDirty(dirtyId, dirtyShadow, dirtyOffset);
+		f += check(retried && cleared, "tree: a successful retry copies and clears the dirty page");
+		retry.sp.releaseAll(retry.host, true);
+	}
 
 	// A map inside the first GiB: root + PDB1 + PDB0 + one PT.
 	f += check(treeMap(e, V + 0x1000, MC, 0x3000) && treeResolves(e, V + 0x1000, MC, 0x3000) && e.sp.pages() == 4,
