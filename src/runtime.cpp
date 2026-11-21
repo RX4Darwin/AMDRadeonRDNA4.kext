@@ -1822,6 +1822,9 @@ IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 	rdna4Step("rtOpen: rtLock taken");
 	if (!rtReady)
 		return kIOReturnNotReady;
+	for (const RtClient &client : clients)
+		if (client.quarantinedOwner == owner)
+			return kIOReturnNotResponding;
 	if (RtClient *old = clientFor(owner))
 		return old->aborted ? kIOReturnAborted : kIOReturnSuccess;
 	RtClient *c = nullptr;
