@@ -86,6 +86,8 @@ $(PRODUCT): $(OBJS)
 	$(CXX) $(LDFLAGS) $(OBJS) -o $@
 	@if nm -u $@ | grep -E '^_(g[A-Z]|rdna4|RDNA4)|IOAccel|IOGraphicsAccelerator2|AppleGraphicsDeviceControl' | grep -v -E '^_g(IO|OS)'; then \
 		echo "our own or a derived-from family's symbols above are undefined in $@" >&2; rm -f $@; exit 1; fi
+	@# every undefined symbol must be the kernel's, IOPCIFamily's or Lilu's (with a KDK; tools/build/check-undefined.py)
+	@python3 $(ROOT)/tools/build/check-undefined.py $@ || { rm -f $@; exit 1; }
 
 .cpp.o:
 	$(CXX) $(CXXFLAGS) -c $< -o $@
