@@ -508,7 +508,7 @@ IOReturn RDNA4Compute::ownerStateLocked(const void *owner) const {
 	if (!rtReady)
 		return kIOReturnNotReady;
 	for (const RtClient &c : clients) {
-		if (c.quarantinedOwner == owner)
+		if (owner && c.quarantinedOwner == owner)
 			return kIOReturnNotResponding;
 		if (c.owner == owner && c.active)
 			return c.aborted ? kIOReturnAborted : kIOReturnSuccess;
@@ -1823,7 +1823,7 @@ IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 	if (!rtReady)
 		return kIOReturnNotReady;
 	for (const RtClient &client : clients)
-		if (client.quarantinedOwner == owner)
+		if (owner && client.quarantinedOwner == owner)
 			return kIOReturnNotResponding;
 	if (RtClient *old = clientFor(owner))
 		return old->aborted ? kIOReturnAborted : kIOReturnSuccess;
