@@ -725,18 +725,7 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 				RLOG("vmid %u: failed to sync sparse host-map rollback", c.vmid);
 			return false;
 		}
-		if (sparseSync(c))
-			return true;
-
-		/* As in vmMap(), va is a fresh vaTake() allocation. A failed SDMA can
-		 * leave only part of the new host mapping visible in VRAM, so clear
-		 * the complete shadow range and try to publish the rollback. */
-		RLOG("vmid %u: sparse host-map sync failed; rolling back VA 0x%llx-0x%llx",
-		     c.vmid, va, end);
-		GpuVmTable::treeUnmap(tree, va, end);
-		if (!sparseSync(c))
-			RLOG("vmid %u: sparse host-map rollback sync also failed; dirty pages retained for retry", c.vmid);
-		return false;
+		return sparseSync(c);
 	}
 	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
