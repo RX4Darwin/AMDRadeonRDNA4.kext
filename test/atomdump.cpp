@@ -5008,6 +5008,36 @@ static int testSparseTree() {
 		retry.sp.releaseAll(retry.host, true);
 	}
 
+	// A complete shadow map can still be only partly visible when SDMA fails.
+	// Roll the whole fresh VA range back, then sync the cleared PT pages.
+	{
+		static TreeEnv failedMap;
+		failedMap = TreeEnv {};
+		failedMap.open(8);
+		const uint64_t mapVa = V + 0x1ff000;
+		uint64_t physical = 0;
+		const bool converted = GpuVm::mcToPhysical(MC + 0x800000, kFbMcBase, 0, physical);
+		const bool mapped = converted && GpuVmTable::treeMapVram(
+			failedMap.tree(), GpuVmTable::Policy {}, mapVa, mapVa + 0x2000, physical, false);
+		failedMap.syncCalls = 0;
+		failedMap.failSyncCall = 4;  // PDB1, PDB0, first PT succeed; second PT transfer fails.
+		const bool partialFailure = mapped && !failedMap.sync();
+		uint64_t firstPhysical = 0, secondPhysical = 0;
+		const bool partialVisible = failedMap.translate(mapVa, firstPhysical) &&
+		                            firstPhysical == physical &&
+		                            !failedMap.translate(mapVa + 0x1000, secondPhysical);
+
+		GpuVmTable::treeUnmap(failedMap.tree(), mapVa, mapVa + 0x2000);
+		failedMap.failSyncCall = 0;
+		failedMap.syncCalls = 0;
+		const bool rollbackSynced = failedMap.sync();
+		const bool fullyCleared = !failedMap.translate(mapVa, firstPhysical) &&
+		                          !failedMap.translate(mapVa + 0x1000, secondPhysical);
+		f += check(partialFailure && partialVisible && rollbackSynced && fullyCleared,
+		           "tree: a partial SDMA map failure is rolled back across the whole fresh VA range");
+		failedMap.close();
+	}
+
 	// A map inside the first GiB: root + PDB1 + PDB0 + one PT.
 	f += check(treeMap(e, V + 0x1000, MC, 0x3000) && treeResolves(e, V + 0x1000, MC, 0x3000) && e.sp.pages() == 4,
 	           "tree: a first mapping backs root, PDB1, PDB0 and one PT page (4 pages)");
