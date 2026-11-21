@@ -22,6 +22,8 @@ int main() {
 		CHECK(roundedDouble(bitsOf(0.4), v) && v == 0 && roundedDouble(bitsOf(0.5), v) && v == 1 && roundedDouble(bitsOf(-0.5), v) && v == -1);
 		CHECK(roundedDouble(bitsOf(1279.6), v) && v == 1280 && roundedDouble(bitsOf(-719.4), v) && v == -719 && roundedDouble(bitsOf(3.0), v) && v == 3);
 		CHECK(!roundedDouble(bitsOf(3e9), v) && roundedDouble(bitsOf(-0.0), v) && v == 0);
+		CHECK(roundedDouble(bitsOf(1279.5), v, 8) && v == 1279 * 256 + 128 && roundedDouble(bitsOf(-0.25), v, 8) && v == -64);
+		CHECK(roundedDouble(bitsOf(1.0 / 1024), v, 8) && v == 0 && roundedDouble(bitsOf(3.0), v, 8) && v == 768);
 		CHECK(wholeDouble(bitsOf(1174.0), v) && v == 1174);
 		CHECK(wholeDouble(bitsOf(536870912.0), v) && v == 536870912);   // 2^29
 		CHECK(!wholeDouble(bitsOf(1073741824.0), v));                  // 2^30
@@ -29,6 +31,15 @@ int main() {
 		CHECK(!wholeDouble(bitsOf(1.25), v));
 		CHECK(!wholeDouble(bitsOf(INFINITY), v));
 		CHECK(!wholeDouble(bitsOf(NAN), v));
+	}
+	// fixedAsFloat: q / 2^frac as a float's bits
+	{
+		auto floatOf = [](uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; };
+		CHECK(fixedAsFloat(0, 9) == 0 && floatOf(fixedAsFloat(256, 9)) == 0.5f && floatOf(fixedAsFloat(-1920 * 512, 9)) == -1920.0f);
+		CHECK(floatOf(fixedAsFloat(2 * (1279 * 256 + 128) + 640 * 256, 9)) == 1599.5f);
+		const int64_t qs[] = {33554435ll, -12345679ll, 8388609ll, 1ll << 30};
+		for (int64_t q : qs)
+			CHECK(floatOf(fixedAsFloat(q, 0)) == static_cast<float>(q));
 	}
 	// halfAsFloat: n / 2 as a float's bits, either sign.
 	for (uint32_t n = 0; n < (1u << 16); n++) {
