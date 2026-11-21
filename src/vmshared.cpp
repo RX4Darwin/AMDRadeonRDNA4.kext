@@ -53,28 +53,11 @@ bool RDNA4Compute::sharedStart(uint32_t k) {
 		return false;
 	/* Check the hardware slot before clearing the ring/MQD area: a stale HQD
 	 * can still be fetching from precisely this backing allocation. */
-	grbmSelect(1, s.pipe, s.queue, 0);
-	bool inactive = !(rdGc(CpHqdActive) & 1);
-	if (!inactive) {
-		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
-		for (uint32_t us = 0; us < 100000; us += 10) {
-			if (!(rdGc(CpHqdActive) & 1)) {
-				inactive = true;
-				break;
-			}
-			IODelay(10);
-		}
-		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
-	}
-	if (!inactive) {
-		const uint32_t active = rdGc(CpHqdActive);
-		SLOG("shared queue %u: refusing to clear ring backing while HQD remains active (ACTIVE 0x%08x)", k, active);
+	if (!hqdQuiesce(s.pipe, s.queue, 0, "sharedStart")) {
 		s.up = true;                    // sharedStopAll must retry the bounded dequeue
 		queueUsed[s.pipe][s.queue] = true;
-		grbmSelect(0, 0, 0, 0);
 		return false;
 	}
-	grbmSelect(0, 0, 0, 0);
 	rdna4Step(k ? "sharedStart 1: zeroing its pool area" : "sharedStart 0: zeroing its pool area");
 	for (uint32_t off = 0; off < 0x7000; off += 4)
 		*poolDw(s.area + off) = 0;
