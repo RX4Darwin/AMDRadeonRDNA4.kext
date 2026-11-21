@@ -48,6 +48,15 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$KEXT" "dist/AMDRadeonRDNA4-${GITHUB_REF_NAME}-PVGPU-EXPERIMENTAL.zip"
           shasum -a 256 "dist/AMDRadeonRDNA4-${GITHUB_REF_NAME}-PVGPU-EXPERIMENTAL.zip" > "dist/AMDRadeonRDNA4-${GITHUB_REF_NAME}-PVGPU-EXPERIMENTAL.zip.sha256"
 
+      - name: Upload experimental build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AMDRadeonRDNA4-${{ github.ref_name }}-PVGPU-EXPERIMENTAL
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
       - name: Publish experimental prerelease
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
