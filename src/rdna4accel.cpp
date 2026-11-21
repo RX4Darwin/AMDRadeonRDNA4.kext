@@ -937,12 +937,6 @@ int accelTo(int value)
 	if (value == 4 && !gFamilyClients) {
 		gAccel->setProperty("MetalPluginName", "AMDRadeonRDNA4Metal");   // as the native spike's service (accelcensus.cpp, level 3)
 		gAccel->setProperty("MetalPluginClassName", "RDNA4MTLDevice");
-#ifdef AMDRadeonRDNA4_PVGPU
-		// OpenGL on our Metal device through Apple's GL-on-Metal renderer, as on the paravirtual accelerator (pvgpu.cpp nameGlBundle):
-		// without it GL had only its software renderer and kitty would not start (no accelerated pixel format, 2026-11-21)
-		if (pvgpu::glRendererNameable())
-			gAccel->setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer");
-#endif
 		// as Apple's paravirtual accelerator (its AcceleratorProperties): CoreDisplay presents through display pipe transactions when
 		// these say so; without them it took the older surface path
 		gAccel->setProperty("IOMatchCategory", "IOAccelerator");

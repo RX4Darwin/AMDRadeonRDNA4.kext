@@ -51,8 +51,6 @@ constexpr uint32_t kRegNumDisplays = 0x22c;  // read once by AppleParavirtGPUCon
 // OpenGL on the card (off with rdna4-pvgl=0): AppleMetalOpenGLRenderer patched as its pages come in (pvgpu.cpp); call from Lilu's
 // onPatcherLoad.
 void routeGlPages(KernelPatcher &patcher);
-// Apple's GL-on-Metal renderer can be named in an accelerator's IOGLBundleName: wanted (rdna4-pvgl) and the one routeGlPages patches.
-bool glRendererNameable();
 } // namespace pvgpu
 
 class RDNA4Compute;
