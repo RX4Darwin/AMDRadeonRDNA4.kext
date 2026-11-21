@@ -433,3 +433,16 @@ static inline bool readVertexDescriptor(const uint8_t *pb, uint32_t len, uint32_
 	}
 	return true;
 }
+
+// (the paravirtual host's and the native Metal device's) A view's swizzle over its format's DST_SEL (x bits 0-2 .. w 9-11): Metal's zero 0, one 1, red 2 .. alpha 5 per channel.
+inline uint32_t viewSel(uint32_t sel, uint32_t swizzle) {
+	if (!swizzle)
+		return sel;
+	uint32_t out = 0;
+	for (uint32_t c = 0; c < 4; c++) {
+		const uint32_t s = swizzle >> (8 * c) & 0xff;
+		out |= (s == 0 ? 0 : s == 1 ? 1 : s <= 5 ? sel >> (3 * (s - 2)) & 7 : sel >> (3 * c) & 7) << (3 * c);
+	}
+	return out;
+}
+

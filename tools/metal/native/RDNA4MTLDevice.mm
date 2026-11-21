@@ -57,6 +57,11 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+@interface NSObject (RDNA4MetalPrivate)
+- (id)newSerializedDescriptor;   // MTLVertexDescriptorInternal's (Metal.framework)
+@end
+#include <malloc/malloc.h>
 #include <execinfo.h>
 #import <os/log.h>
 #include <atomic>
@@ -297,6 +302,8 @@ void poolPut(rdna4_t *gpu, rdna4_buffer_t buf, void *cpu, uint64_t bytes)
 }
 }   // namespace
 
+static void deviceIdle(RDNA4MTLDevice *device);   // (below: the device's work queue declared first)
+
 @implementation RDNA4MTLBuffer {
 	RDNA4MTLDevice *_device;
 	rdna4_buffer_t _buf;
@@ -308,6 +315,7 @@ void poolPut(rdna4_t *gpu, rdna4_buffer_t buf, void *cpu, uint64_t bytes)
 	uint64_t _allocated;   // host memory it allocated (the gauge)
 	BOOL _shadow;
 }
+- (BOOL)isComplete { deviceIdle(_device); return YES; }
 
 - (void)keepOwner:(void (^)(void))release { _owner = release; }
 - (void)countAsShadow
@@ -559,6 +567,7 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 }
 
 @implementation RDNA4MTLTexture {
+	uint32_t _swizzle;   // a view's MTLTextureSwizzleChannels, red .. alpha a byte each; 0: none (pvdraw.hpp viewSel)
 	uint64_t _written[kWrittenRanges][2];   // (gCopied) identity addresses [lo, hi), sorted, apart
 	uint32_t _writtenCount;
 	BOOL _shadowAhead;   // (drewIntoShadow) the copy holds newer pixels than the surface: on the root texture, not a view
@@ -619,7 +628,7 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 		return;
 	}
 	const uint32_t w = (uint32_t)MAX(_width >> level, (NSUInteger)1), h = (uint32_t)MAX(_height >> level, (NSUInteger)1);
-	linearImage(t, self.gpuBase + _levelOffset[level], _fm->gfx, _fm->sel, w, h, (uint32_t)(_levelRow[level] / _fm->bpp));
+	linearImage(t, self.gpuBase + _levelOffset[level], _fm->gfx, viewSel(_fm->sel, _swizzle), w, h, (uint32_t)(_levelRow[level] / _fm->bpp));
 }
 
 - (BOOL)shadowed { return _surfaceRows != NULL; }
@@ -752,24 +761,24 @@ static char gCopyKey;
 - (void)descriptor:(uint32_t[8])t
 {
 	if (_samples > 1) {   // its samples (64KB_2D, as the resolve's source)
-		msaaImage(t, self.gpuBase, _fm->gfx, _fm->sel, (uint32_t)_width, (uint32_t)_height, _samples == 4 ? 2 : 1);
+		msaaImage(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), (uint32_t)_width, (uint32_t)_height, _samples == 4 ? 2 : 1);
 		return;
 	}
 	if (_slices) {   // a 2D array's T#, a cube's typed CUBE (11): the hardware's own pitches as a 3D image's
-		linearArray2d(t, self.gpuBase, _fm->gfx, _fm->sel, (uint32_t)_width, (uint32_t)_height, (uint32_t)_slices);
+		linearArray2d(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), (uint32_t)_width, (uint32_t)_height, (uint32_t)_slices);
 		if (_type == MTLTextureTypeCube || _type == MTLTextureTypeCubeArray)
 			t[3] = (t[3] & 0x0fffffffu) | 11u << 28;
 		return;
 	}
 	if (_type == MTLTextureType3D) {   // the hardware's own pitches (pvdraw.hpp linearVolume; the memory laid out so in the init)
-		linearVolume(t, self.gpuBase, _fm->gfx, _fm->sel, (uint32_t)_width, (uint32_t)_height, (uint32_t)_depth);
+		linearVolume(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), (uint32_t)_width, (uint32_t)_height, (uint32_t)_depth);
 		return;
 	}
-	linearImage(t, self.gpuBase, _fm->gfx, _fm->sel, (uint32_t)_width, (uint32_t)_height, (uint32_t)(_rowBytes / _fm->bpp));
+	linearImage(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), (uint32_t)_width, (uint32_t)_height, (uint32_t)(_rowBytes / _fm->bpp));
 	if (_type == MTLTextureType1D)
 		t[3] = (t[3] & 0x0fffffffu) | 8u << 28;   // TYPE 1D
 	else if (_type == MTLTextureType1DArray)
-		linearArray1d(t, self.gpuBase, _fm->gfx, _fm->sel, (uint32_t)_width, (uint32_t)_layers);
+		linearArray1d(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), (uint32_t)_width, (uint32_t)_layers);
 }
 
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
@@ -868,6 +877,16 @@ static char gCopyKey;
 	return [[RDNA4MTLTexture alloc] initViewOf:self format:format type:type levels:levels slices:slices];
 }
 
+// A swizzled view (Apple's GL-on-Metal renderer makes one for each texture it binds; without swizzles it bound none, 2026-11-21)
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices
+                                        swizzle:(MTLTextureSwizzleChannels)swizzle
+{
+	RDNA4MTLTexture *v = [[RDNA4MTLTexture alloc] initViewOf:self format:format type:type levels:levels slices:slices];
+	if (v)
+		v->_swizzle = swizzle.red | swizzle.green << 8 | swizzle.blue << 16 | (uint32_t)swizzle.alpha << 24;
+	return v;
+}
+
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format
 {
 	return [self newTextureViewWithPixelFormat:format textureType:self.textureType levels:NSMakeRange(0, self.mipmapLevelCount)
@@ -898,7 +917,18 @@ static char gCopyKey;
 - (IOSurfaceRef)iosurface { return _surface; }
 - (NSUInteger)iosurfacePlane { return _plane; }
 - (uint32_t)bpp { return _fm ? _fm->bpp : 4; }
-- (MTLTextureSwizzleChannels)swizzle { return MTLTextureSwizzleChannelsDefault; }
+- (MTLTextureSwizzleChannels)swizzle
+{
+	return _swizzle ? MTLTextureSwizzleChannelsMake((MTLTextureSwizzle)(_swizzle & 0xff), (MTLTextureSwizzle)(_swizzle >> 8 & 0xff),
+	                                                (MTLTextureSwizzle)(_swizzle >> 16 & 0xff), (MTLTextureSwizzle)(_swizzle >> 24))
+	                : MTLTextureSwizzleChannelsDefault;
+}
+- (uint32_t)swizzleKey
+{
+	return _swizzle ?: MTLTextureSwizzleRed | MTLTextureSwizzleGreen << 8 | MTLTextureSwizzleBlue << 16 | (uint32_t)MTLTextureSwizzleAlpha << 24;
+}
+- (BOOL)isWriteComplete { deviceIdle(_device); return YES; }
+- (void)waitUntilComplete { deviceIdle(_device); }
 - (MTLTextureCompressionType)compressionType { return MTLTextureCompressionTypeLossless; }
 - (BOOL)allowGPUOptimizedContents { return NO; }
 - (MTLResourceID)gpuResourceID { return (MTLResourceID){ ._impl = self.gpuBase }; }
@@ -1411,10 +1441,94 @@ static NSError *translateByKext(rdna4_t *gpu, NSString *input, NSString *name, N
 
 // `function`'s AIR: our library's metallib (the translator picks the function by name), or the bitcode of a function Metal's own compiler
 // made; nil without either.
+// An OpenGL program (Apple's GL-on-Metal renderer: GL Core IR, bitcodeType not 0, with its GL state as pluginData) as a metallib of AIR.
+// Only Metal's compiler service turns GL Core IR into AIR (libGLDPlugin's OGLCodeGenService, with the state), on its way to a device's
+// compiler plugin; Apple's paravirtual plugin then packs that AIR as a metallib for its host, so it is asked here: an MTLCompiler with
+// that plugin (as -[AppleParavirtDevice setupCompiler] makes it: target {shader version 2, 2}, flags 0x20), one request per function,
+// the state as the request's frameworkData. ponytail: the reply is found by its content (the dispatch_data that is a metallib, an
+// NSString error) in the struct the completion handler gets: its layout is Tahoe 26.6.2's MTLCompiler private.
+static __weak id<MTLDevice> gGlDevice;   // the process's device (initNativeWithAcceleratorPort:): a GL function's own -device is nil
+static char kGlAir, kGlReflection;       // associated-object keys: a GL function's metallib and its reflection
+
+static NSData *glProgramAir(id<MTLFunction> function)
+{
+	id f = function;
+	if (![f respondsToSelector:@selector(pluginData)] || ![f respondsToSelector:@selector(bitcodeType)])
+		return nil;
+	NSData *state = [f performSelector:@selector(pluginData)];
+	const unsigned char type = ((unsigned char (*)(id, SEL))objc_msgSend)(f, @selector(bitcodeType));
+	if (!type || ![state isKindOfClass:[NSData class]])
+		return nil;
+	if (NSData *done = objc_getAssociatedObject(f, &kGlAir))
+		return done;
+	static id compiler;   // ponytail: one for the process (one device)
+	static std::once_flag once;
+	std::call_once(once, ^{
+		const uint32_t target[2] = {2, 2};   // Metal 2.2, the shader version our paravirtual device reports (docs/m0-pvgpu.md)
+		dispatch_data_t targetData = dispatch_data_create(target, sizeof target, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+		uint8_t uuid[32] = "AMDRadeonRDNA4 GL programs";
+		NSString *plugin = @"/System/Library/Extensions/AppleParavirtGPUMetal.bundle/Contents/Resources/libAppleParavirtCompilerPlugin.dylib";
+		Class c = objc_getClass("MTLCompiler");
+		SEL init = sel_registerName("initWithTargetData:cacheUUID:pluginPath:device:compilerFlags:");
+		if (c && [c instancesRespondToSelector:init])   // (the plugin lives in the dyld shared cache: no file to check)
+			compiler = ((id (*)(id, SEL, id, const void *, id, id, unsigned long long))objc_msgSend)([c alloc], init, (id)targetData, uuid, plugin,
+			                                                                                           function.device ?: gGlDevice, 0x20ull);
+		RLOG(@"RDNA4MTL: OpenGL programs through %@: %@", plugin.lastPathComponent, compiler ? @"ready" : @"no MTLCompiler (not Tahoe 26.6's Metal?)");
+	});
+	Class requestClass = objc_getClass("MTLCompileFunctionRequestData");
+	if (!compiler || !requestClass)
+		return nil;
+	id request = [requestClass new];
+	((void (*)(id, SEL, id))objc_msgSend)(request, sel_registerName("setFunction:"), f);
+	((void (*)(id, SEL, signed char))objc_msgSend)(request, sel_registerName("setSync:"), 1);
+	// with the argument information in its reflection (what Apple's GL-on-Metal renderer asks its pipelines for, 0x40003: argument info,
+	// buffer type info, binding info): without it the reflection named no uniform buffer and GL bound none
+	((void (*)(id, SEL, unsigned long long))objc_msgSend)(request, sel_registerName("setPipelineOptions:"), 0x40003ull);
+	((void (*)(id, SEL, id))objc_msgSend)(request, sel_registerName("setFrameworkData:"),
+	                                      (id)dispatch_data_create(state.bytes, state.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT));
+	__block NSData *air = nil, *reflection = nil;
+	__block NSString *why = nil;
+	void (^done)(const void *, uintptr_t) = ^(const void *reply, uintptr_t) {
+		const uintptr_t *w = (const uintptr_t *)reply;
+		for (int i = 0; reply && i < 16; i++) {
+			void *p = (void *)w[i];
+			if ((uintptr_t)p < 0x100000 || !malloc_zone_from_ptr(p) || malloc_size(p) < 16)
+				continue;
+			id o = (__bridge id)p;
+			if ([o isKindOfClass:[NSData class]] && [(NSData *)o length] >= 4 && !memcmp([(NSData *)o bytes], "MTLB", 4))
+				air = [(NSData *)o copy];
+			else if (!reflection && [o isKindOfClass:[NSData class]] && [(NSData *)o length])   // the function's reflection, the first data
+				reflection = [(NSData *)o copy];                                                  // after the metallib (later: the plugin's output)
+			else if ([o isKindOfClass:[NSString class]])
+				why = [o copy];
+		}
+	};
+	((void (*)(id, SEL, id, id))objc_msgSend)(compiler, sel_registerName("compileFunctionRequest:completionHandler:"), request, done);
+	if (!air) {
+		RLOG(@"RDNA4MTL: OpenGL program %@ not compiled: %@", function.name, why ?: @"no metallib in the reply");
+		return nil;
+	}
+	objc_setAssociatedObject(f, &kGlAir, air, OBJC_ASSOCIATION_RETAIN);
+	if (reflection)
+		objc_setAssociatedObject(f, &kGlReflection, reflection, OBJC_ASSOCIATION_RETAIN);
+	return air;
+}
+
+// A GL program's reflection, as the compiler service gave it with its AIR (glProgramAir), else nil
+static NSData *glReflection(id<MTLFunction> function)
+{
+	if (!function)
+		return nil;
+	(void)glProgramAir(function);   // (compiled already when the pipeline was: from the function's own cache then)
+	return objc_getAssociatedObject(function, &kGlReflection);
+}
+
 static NSData *functionAir(id<MTLFunction> function)
 {
 	if ([(id)function isKindOfClass:[RDNA4MTLFunction class]])
 		return [NSData dataWithContentsOfFile:((RDNA4MTLFunction *)function).library.path];
+	if (NSData *gl = glProgramAir(function))
+		return gl;
 	id bitcode = [(id)function respondsToSelector:@selector(bitcodeData)] ? [(id)function performSelector:@selector(bitcodeData)] : nil;
 	return [bitcode isKindOfClass:[NSData class]] ? bitcode : nil;
 }
@@ -1631,6 +1745,16 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 // On the card, before the next draw: a wait for the draws in flight, then the copies (none: the wait alone)
 - (NSError *)gpuBarrier:(const RDNA4Copy *)copies count:(uint32_t)count;
 @end
+
+// Whether the card is done with a resource, as Apple's GL-on-Metal renderer asks (-isComplete, -isWriteComplete, -waitUntilComplete,
+// 2026-11-21): command buffers run in order on the device's work queue, each until its work is done, so the work queue drained is every
+// earlier use done. ponytail: waits for all of the device's work, not this resource's.
+static void deviceIdle(RDNA4MTLDevice *device)
+{
+	if (dispatch_queue_t work = [device work])
+		dispatch_sync(work, ^{});
+}
+
 
 @implementation RDNA4Held {
 	RDNA4MTLDevice *_device;
@@ -2029,8 +2153,14 @@ RDNA4_ANSWER_MISSING
 
 @implementation RDNA4MTLDepthStencilState {
 	RDNA4MTLDevice *_device;
+	BOOL _stencil;   // a face has a stencil descriptor
 }
 @synthesize label;
+// (Apple's GL-on-Metal renderer asks these, 2026-11-21)
+- (BOOL)readsDepth { return _compare != MTLCompareFunctionAlways || _write; }
+- (BOOL)writesDepth { return _write; }
+- (BOOL)readsStencil { return _stencil; }
+- (BOOL)writesStencil { return _stencil && (_writeMask & 0xffff) != 0; }
 
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLDepthStencilDescriptor *)d
 {
@@ -2043,6 +2173,7 @@ RDNA4_ANSWER_MISSING
 		// descriptor: always passes, keeps.
 		static const uint8_t kOp[8] = { 0, 1, 3, 5, 6, 7, 8, 9 };
 		MTLStencilDescriptor *face[2] = { d.frontFaceStencil, d.backFaceStencil };
+		_stencil = face[0] || face[1];
 		uint32_t fn[2], ops[2], rm[2], wm[2];
 		for (int i = 0; i < 2; i++) {
 			fn[i] = face[i] ? (uint32_t)face[i].stencilCompareFunction & 7 : 7;
@@ -2396,6 +2527,9 @@ RDNA4_ANSWER_MISSING
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < kTextures) _textures[1][i] = t; }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < kStageTextures) _samplers[0][i] = s; }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < kStageTextures) _samplers[1][i] = s; }
+// ponytail: the LOD clamps are the sampler's own, not these (Apple's GL-on-Metal renderer sets samplers so, 2026-11-21)
+- (void)setVertexSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i { [self setVertexSamplerState:s atIndex:i]; }
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i { [self setFragmentSamplerState:s atIndex:i]; }
 
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)indexType
                   indexBuffer:(id<MTLBuffer>)indexBuffer indexBufferOffset:(NSUInteger)offset instanceCount:(NSUInteger)instances
@@ -2408,6 +2542,18 @@ RDNA4_ANSWER_MISSING
 {
 	[self record:type start:0 count:count instances:1 baseInstance:0 indices:indexBuffer offset:offset type:indexType];
 }
+
+// The base vertex as the first vertex: the vertex stage adds it (USER_DATA_GS_2) to the vertex id of indexed draws as of others. Apple's
+// GL-on-Metal renderer draws so: answered as a missing selector, every GL draw was dropped (2026-11-21).
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)indexType
+                  indexBuffer:(id<MTLBuffer>)indexBuffer indexBufferOffset:(NSUInteger)offset instanceCount:(NSUInteger)instances
+                   baseVertex:(NSInteger)baseVertex baseInstance:(NSUInteger)baseInstance
+{
+	[self record:type start:(NSUInteger)(uint32_t)baseVertex count:count instances:instances baseInstance:baseInstance indices:indexBuffer
+	      offset:offset type:indexType];
+}
+- (void)setDepthStoreAction:(MTLStoreAction)action {}   // ponytail: depth is kept on the card for the texture's life either way
+- (void)setLineWidth:(float)width {}                    // ponytail: lines are one pixel wide
 
 - (id<MTLDevice>)device { return _commandBuffer.device; }
 
@@ -2447,9 +2593,10 @@ RDNA4_ANSWER_MISSING
 	float M[16], lo[2] = { INFINITY, INFINITY }, hi[2] = { -INFINITY, -INFINITY };   // M: column-major
 	memcpy(M, mp + mo, sizeof M);
 	for (uint32_t i = 0; i < d->count; i++) {
-		const uint32_t v = !ib ? d->start + i : ixBytes == 4 ? ((const uint32_t *)(ix + io))[i] : ((const uint16_t *)(ix + io))[i];
-		if (ib && v == (ixBytes == 4 ? 0xffffffffu : 0xffffu))   // a strip's restart
+		const uint32_t raw = !ib ? i : ixBytes == 4 ? ((const uint32_t *)(ix + io))[i] : ((const uint16_t *)(ix + io))[i];
+		if (ib && raw == (ixBytes == 4 ? 0xffffffffu : 0xffffu))   // a strip's restart
 			continue;
+		const uint32_t v = d->start + raw;
 		const NSUInteger at = vo + (NSUInteger)v * rec[1] + rec[0];
 		if (at + 4 * comps > vb.length)
 			return;
@@ -3138,6 +3285,7 @@ static void eventWait(id event, uint64_t value)
 
 // The work queue runs the steps in order: a draw is submitted behind the draws before it; anything else (a dispatch, a CPU clear, copy or
 // build) first waits for them. The command buffer completes once its last draw has, then presents its drawables.
+- (void)commitAndHold { [self commit]; }   // (Apple's GL-on-Metal renderer: committed as any other)
 - (void)commit
 {
 	if (_status >= MTLCommandBufferStatusCommitted)
@@ -3445,6 +3593,7 @@ static void abortStack(int sig)
 	self = [super init];
 	if (!self)
 		return nil;
+	gGlDevice = self;
 	IOObjectRetain(service);
 	_service = service;
 	IORegistryEntryGetRegistryEntryID(service, &_registryID);
@@ -3949,6 +4098,7 @@ static void abortStack(int sig)
 }
 
 - (BOOL)supportsRaytracing { return YES; }
+- (BOOL)supportsTextureSwizzle { return YES; }   // (views with a swizzle: newTextureViewWithPixelFormat:...swizzle:)
 - (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count == 1; }
 // 1, 2 and 4 samples (2x/4x MSAA textures and resolves). Apple's GL-on-Metal renderer asks the private supportsSampleCount: (answered NO
 // as a missing selector, it made no context: "invalid memory allocation", 2026-11-21).
@@ -4233,9 +4383,26 @@ static void abortStack(int sig)
                                                         reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection
                                                              error:(NSError **)error
 {
-	if (reflection)
-		*reflection = nil;
-	return [self newRenderPipelineStateWithDescriptor:descriptor error:error];
+	id<MTLRenderPipelineState> state = [self newRenderPipelineStateWithDescriptor:descriptor error:error];
+	if (reflection) {
+		// GL's programs: Metal's own reflection object from the compiler service's data, which names their arguments (Apple's GL-on-Metal
+		// renderer binds the uniform buffers it lists, and none without it: every uniform read 0, 2026-11-21). Others: none, as before.
+		NSData *v = glReflection(descriptor.vertexFunction), *f = glReflection(descriptor.fragmentFunction);
+		Class c = objc_getClass("MTLRenderPipelineReflectionInternal");
+		SEL init = sel_registerName("initWithVertexData:fragmentData:serializedVertexDescriptor:device:options:flags:");
+		id r = nil;
+		// the vertex stage's input reflection needs the pipeline's vertex descriptor, serialized as Metal does (nil: Metal aborted)
+		id vd = [descriptor.vertexDescriptor respondsToSelector:@selector(newSerializedDescriptor)]
+		            ? ((id (*)(id, SEL))objc_msgSend)(descriptor.vertexDescriptor, @selector(newSerializedDescriptor)) : nil;
+		if (state && (v || f) && c && [c instancesRespondToSelector:init] && (!v || vd))
+			r = ((id (*)(id, SEL, id, id, id, id, unsigned long long, unsigned long long))objc_msgSend)([c alloc], init,
+				v ? (id)dispatch_data_create(v.bytes, v.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT) : nil,
+				f ? (id)dispatch_data_create(f.bytes, f.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT) : nil, vd, self, options, 0ull);
+		*reflection = r;
+		if ((v || f) && !r)
+			RLOG(@"RDNA4MTL: pipeline %@ / %@: no reflection from its GL programs' data", descriptor.vertexFunction.name, descriptor.fragmentFunction.name);
+	}
+	return state;
 }
 
 - (id<MTLCommandQueue>)newCommandQueue

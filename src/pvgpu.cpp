@@ -4378,18 +4378,6 @@ struct RDNA4PvHost::TextureSource {
 	Surface surface;
 };
 
-// A view's swizzle over its format's DST_SEL (x bits 0-2 .. w 9-11): Metal's zero 0, one 1, red 2 .. alpha 5 per channel.
-static uint32_t viewSel(uint32_t sel, uint32_t swizzle) {
-	if (!swizzle)
-		return sel;
-	uint32_t out = 0;
-	for (uint32_t c = 0; c < 4; c++) {
-		const uint32_t s = swizzle >> (8 * c) & 0xff;
-		out |= (s == 0 ? 0 : s == 1 ? 1 : s <= 5 ? sel >> (3 * (s - 2)) & 7 : sel >> (3 * c) & 7) << (3 * c);
-	}
-	return out;
-}
-
 bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, uint32_t level)
 {
 	uint32_t rec[3], td[160] = {};   // a mipmapped texture's levels come before its format (6 levels: 29 dwords more)
