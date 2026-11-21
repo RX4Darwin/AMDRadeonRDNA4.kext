@@ -1,6 +1,6 @@
 # Packaging and installation plan
 
-Status: proposal (2026-11-21), nothing of it built yet. It replaces the per-component `install.sh` scripts with one layout and one
+Status: proposal (2026-11-21), nothing of it built yet; the open points are decided provisionally at the end. It replaces the per-component `install.sh` scripts with one layout and one
 installer, modelled on how Apple ships its AMD drivers.
 
 ## What ships today
@@ -64,7 +64,7 @@ Apple links against that code.
 /Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle     the Metal driver, renamed after Apple's convention; links the framework
 /Library/LaunchDaemons/org.rdna4.air2amdgpu.plist      -> .../Helpers/air2amdgpu --serve
 /Library/LaunchDaemons/org.rdna4.iop.plist             -> .../Helpers/rdna4-iop
-/Library/LaunchDaemons/org.rdna4.logd.plist            -> .../Helpers/rdna4-logd (optional component)
+/Library/LaunchDaemons/org.rdna4.logd.plist            -> .../Helpers/rdna4-logd (on by default for now)
 /usr/local/share/vulkan/icd.d/radeon_icd.json          -> .../Resources/libvulkan_radeon.dylib (the Khronos loader's search path)
 /usr/local/bin/rdna4-run                               symlink -> .../Helpers/rdna4-run
 EFI/OC/Kexts/AMDRadeonRDNA4.kext                       by the user, from the release zip
@@ -96,7 +96,8 @@ framework.
 
 - `make package` builds everything for one release into `Build/AMDRadeonRDNA4-<version>-<CONFIG>/pkgroot/`, in the layout above, then:
   - `pkgbuild` per component (core: framework + Metal bundle + iop daemon; translator daemon; logd; Vulkan; MoltenVK agent),
-  - `productbuild` with a distribution file: core required, the others optional, a macOS version check (Tahoe 26.x),
+  - `productbuild` with a distribution file: core required, the translator daemon, logd and Vulkan chosen by default, the MoltenVK
+    agent offered but not chosen, a macOS version check (Tahoe 26.x),
   - signed with a Developer ID Installer identity when one is configured (`SIGN_INSTALLER=...`), unsigned otherwise; notarized in the
     release workflow.
 - The Metal bundle and the helpers link the framework (`-F`/`-framework AMDRadeonRDNA4`) instead of compiling `librdna4.c` in.
@@ -133,10 +134,14 @@ and reminds the user to remove the kext and its config.plist entry from the EFI.
 5. Docs: `INSTALL.md` for users; `docs/install-tahoe.md` keeps the rig-specific history.
 6. The per-component `install.sh` scripts stay as developer tools (installing one component from a build), documented as such.
 
-## Open questions
+## Decisions (provisional, 2026-11-21)
 
-- Should the shader translator stay a root daemon? The native Metal driver runs its own copy in each process today; the paravirtual
-  host needs the daemon (the kext asks it). With the framework, both can run the same binary from `Helpers/`.
-- Is the MoltenVK agent still needed on our own Metal device?
-- A Developer ID: whose, and is notarization worth it while the driver needs AMFI relaxed anyway?
-- `rdna4-logd` on by default, or only for bug reports?
+Sunneva had no settled view on these; taken so the work can start, each to be revisited:
+
+- **The shader translator** stays both: the root daemon for the paravirtual host (the kext asks it) and the Metal driver's own run of it
+  in each process. Both run the one binary in `Helpers/`.
+- **The MoltenVK agent** is optional and off by default until vkQuake is tried on our own Metal device; it exists for Apple's
+  paravirtual driver's abort.
+- **No Developer ID for now.** Packages are unsigned (ad-hoc signed binaries) while the driver needs AMFI relaxed anyway; signing and
+  notarization are revisited when that changes.
+- **`rdna4-logd` is on by default** until the driver is more complete (Sunneva): each boot's kernel log is there for bug reports.
