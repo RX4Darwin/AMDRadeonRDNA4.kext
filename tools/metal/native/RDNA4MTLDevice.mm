@@ -270,10 +270,12 @@ void poolFree(std::vector<Pooled> &freed)
 		rdna4_free(p.gpu, &p.buf);
 }
 
-// (diagnostic, RDNA4_ALLOC_TRACE=n: every nth host buffer's maker logged, with the live buffers by length; Mixxx's leak, 2026-11-21)
+// (diagnostic, RDNA4_ALLOC_TRACE=n: every nth host buffer's maker logged, with the live buffers by length; RDNA4_ALLOC_LEN=bytes: only
+// those of that length. Mixxx's leak, 2026-11-21)
 void allocTrace(NSUInteger length, int change)
 {
 	static const int every = getenv("RDNA4_ALLOC_TRACE") ? atoi(getenv("RDNA4_ALLOC_TRACE")) : 0;
+	static const unsigned long only = getenv("RDNA4_ALLOC_LEN") ? strtoul(getenv("RDNA4_ALLOC_LEN"), nullptr, 0) : 0;   // (or those of one length)
 	static std::mutex lock;
 	static std::map<NSUInteger, int64_t> live;
 	static int made;
@@ -281,7 +283,7 @@ void allocTrace(NSUInteger length, int change)
 		return;
 	std::lock_guard<std::mutex> hold(lock);
 	live[length] += change;
-	if (change < 0 || ++made % every)
+	if (change < 0 || (only && length != only) || ++made % every)
 		return;
 	void *frames[16];
 	const int n = backtrace(frames, 16);
@@ -433,7 +435,10 @@ static void deviceIdle(RDNA4MTLDevice *device);   // (below: the device's work q
 - (void *)contents { return _cpu; }
 - (uint64_t)gpuAddress { return _buf.gpu; }
 - (MTLResourceOptions)resourceOptions { return _options; }
-- (MTLStorageMode)storageMode { return MTLStorageModeShared; }
+// the mode it was made with (its memory is host memory the card reads either way): Apple's GL-on-Metal renderer returns a buffer to the
+// pool of its storageMode, and answered Shared, its Private index buffers went to the Shared pool, never taken again: Mixxx made a new
+// one every frame until the client's buffer quota ran out (2026-11-21)
+- (MTLStorageMode)storageMode { return (MTLStorageMode)((_options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift); }
 - (MTLCPUCacheMode)cpuCacheMode { return MTLCPUCacheModeDefaultCache; }
 - (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeTracked; }
 - (NSUInteger)allocatedSize { return (NSUInteger)_buf.bytes; }
@@ -3767,14 +3772,16 @@ static void glSurfacesInstall(void)
 	RTRACE(40, @"GL drawable: surface 0x%x mode 0x%llx depth %u scale 0x%x %ux%u", surface, mode, depth, scale, w, h);
 	return 0;
 }
-- (id)lookupIOSurfaceAtIndex:(unsigned long long)i
+// +1: the renderer CFReleases what it gets (GLRDrawable, after making its textures of it); given +0, every lookup over-released the
+// window's buffer, and Mixxx crashed releasing one that was gone (2026-11-21)
+- (IOSurfaceRef)lookupIOSurfaceAtIndex:(unsigned long long)i
 {
 	std::lock_guard<std::mutex> hold(gGLSurfacesLock);
 	GLSurface *g = [self surface];
 	if (!g || i >= 2)
-		return nil;
+		return nullptr;
 	glSurfaceBuffers(*g);
-	return (__bridge id)g->buffers[i];
+	return g->buffers[i] ? (IOSurfaceRef)CFRetain(g->buffers[i]) : nullptr;
 }
 - (unsigned)width { std::lock_guard<std::mutex> hold(gGLSurfacesLock); GLSurface *g = [self surface]; return g ? g->width : 0; }
 - (unsigned)height { std::lock_guard<std::mutex> hold(gGLSurfacesLock); GLSurface *g = [self surface]; return g ? g->height : 0; }
