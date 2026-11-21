@@ -4417,7 +4417,17 @@ void RDNA4Compute::resetRuntimeForResume() {
 	presentActive = false;
 	presentOwner = nullptr;
 	rtWedged = false;
-	sdmaWedged = false;            // power has reset the engine; staging and DMA buffers are safe to reuse
+	/* The device has reset: any old DMA can no longer touch the quarantined
+	 * bounce buffer or shared staging page, so release the retained mapping. */
+	if (bounceDma) {
+		bounceDma->clearMemoryDescriptor();
+		bounceDma->release();
+		bounceDma = nullptr;
+	}
+	OSSafeReleaseNULL(bounce);
+	bounceVa = nullptr;
+	bounceBus = 0;
+	sdmaWedged = false;
 	sdmaFence = 0;
 	rtReady = false;
 	rtGeneration++;
@@ -4542,6 +4552,10 @@ bool RDNA4Compute::sysCopy(uint64_t srcBus, uint64_t dstBus, uint32_t bytes) {
 }
 
 bool RDNA4Compute::dmaInit() {
+	if (sdmaWedged) {
+		RLOG("dma: not retrying while a timed-out SDMA queue may still be active");
+		return false;
+	}
 	if (!poolCpu || !sdmaRing.sizeBytes() || !sv.fbMcTop) {
 		RLOG("dma: not set up: %s", !sdmaRing.sizeBytes() ? "no SDMA queue" : "no compute pool");
 		return false;
@@ -4703,6 +4717,12 @@ void RDNA4Compute::dmaTeardown(const char *why) {
 	if (busMasterSet) {
 		env.pci->setBusMasterEnable(busMasterWas);
 		busMasterSet = false;
+	}
+	if (sdmaWedged) {
+		/* A timed-out transfer may still reference the pinned bounce buffer.
+		 * Keep it alive until power reset confirms the engine has stopped. */
+		RLOG("dma: retaining timed-out bounce buffer until device reset");
+		return;
 	}
 	if (bounceDma) {
 		bounceDma->clearMemoryDescriptor();
