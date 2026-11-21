@@ -3185,6 +3185,9 @@ static void eventWait(id event, uint64_t value)
 		self->_status = MTLCommandBufferStatusScheduled;
 		dispatch_group_leave(self->_scheduledGroup);
 		NSArray<MTLCommandBufferHandler> *scheduled = [self->_scheduled copy];
+		// given up once run, as the completed ones: a handler holding its command buffer (iTerm2's) kept it, its set*Bytes buffers and its
+		// ops alive for good, 52 small buffers a frame, until the client's buffer quota ran out and iTerm2 crashed (2026-11-21)
+		[self->_scheduled removeAllObjects];
 		if (scheduled.count)
 			dispatch_async(handlers, ^{
 				for (MTLCommandBufferHandler h in scheduled)
