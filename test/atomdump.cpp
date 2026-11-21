@@ -4926,6 +4926,21 @@ static int testDense4GiB() {
 	           words[GpuVmTable::densePte(hostVa) / 8] == 0 &&
 	           words[GpuVmTable::densePte(hostVa + 0x2000) / 8] == 0,
 	           "dense: a misaligned late host bus page is rejected before writing any PTE");
+
+	// A valid host map spanning two PT pages must translate on both sides of the 2 MiB boundary.
+	const uint64_t crossingHostVa = V + 2 * G + 0x1ff000;
+	const uint64_t crossingBuses[2] = { 0x104060000ull, 0x104061000ull };
+	GpuVmTable::Span crossingHostSpan;
+	const bool crossingHostMapped = GpuVmTable::mapHost(access, GpuVmTable::Policy {},
+		GpuVmTable::kDenseTableBytes, crossingHostVa, crossingHostVa + 0x2000,
+		crossingBuses, false, crossingHostSpan);
+	uint64_t hostPhysical0 = 0, hostPhysical1 = 0, hostFlags = 0;
+	const bool crossingHostResolves =
+		GpuVm::walk(kRootPhys, crossingHostVa, read, nullptr, hostPhysical0, hostFlags) &&
+		GpuVm::walk(kRootPhys, crossingHostVa + 0x1000, read, nullptr, hostPhysical1, hostFlags);
+	f += check(crossingHostMapped && crossingHostResolves &&
+	           hostPhysical0 == crossingBuses[0] && hostPhysical1 == crossingBuses[1],
+	           "dense: a valid host mapping across a 2 MiB PT boundary translates both pages");
 	f += check(GpuVmTable::denseVa(4u << 20) == G, "dense: a 4 MiB image still covers only the first GiB");
 	return f;
 }
