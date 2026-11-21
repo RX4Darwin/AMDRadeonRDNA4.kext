@@ -29,6 +29,7 @@
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>   // header-only types for IOMacOSVideo.h
+#include <IOKit/graphics/IOFramebuffer.h>     // (convertCursorImage: a virtual call, no IOGraphics symbol)
 #include <IOKit/ndrvsupport/IOMacOSTypes.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include <IOKit/ndrvsupport/IONDRVLibraries.h>
@@ -1050,6 +1051,80 @@ IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSOb
 	return ret;
 }
 
+#ifdef AMDRadeonRDNA4_PVGPU
+// Our framebuffers' hardware cursor while our own accelerator serves WindowServer: the heads' cursor planes (PvScanout::cursorArgb,
+// cursorMove) as AppleParavirtFramebuffer does it, which WindowServer takes: the image converted for a 128x128 32-bit cursor (its
+// descriptor byte for byte; at 64x64 WindowServer drew the pointer itself), cropped onto the 64x64 plane. IOFramebuffer's first call
+// is its test (convertCursorImage records the descriptor in IOFBCursorInfo and returns false). Otherwise IONDRV's own.
+mach_vm_address_t orgSetCursorImage { 0 }, orgSetCursorState { 0 }, orgFbGetAttribute { 0 };
+constexpr uint32_t kCursorAnnounced = 128;
+uint32_t gCursorHot[8][2];   // each head's image's hot spot: IOFramebuffer moves the image's corner, cursorMove takes the hot spot
+bool gAccelCursor;           // rdna4-accel=4, read where the routes are made
+
+int cursorPort(void *fb)
+{
+	// (the boot-arg, not RDNA4Accel::framebuffersDecided: IOFramebuffer tests the boot display's cursor at its first open, ~7 s before
+	// WindowServer is let go; WindowServer takes a hardware cursor only when every display has one)
+	const int port = gAccelCursor ? PvScanout::portOf(static_cast<IOService *>(fb)) : -1;
+	return port >= 0 && PvScanout::cursorReady(static_cast<uint32_t>(port)) ? port : -1;
+}
+
+IOReturn wrapSetCursorImage(void *fb, void *image)
+{
+	const int port = cursorPort(fb);
+	if (port < 0)
+		return FunctionCast(wrapSetCursorImage, orgSetCursorImage)(fb, image);
+
+	IOHardwareCursorDescriptor desc {};
+	desc.majorVersion = 1;   // (AppleParavirtFramebuffer's IOFBCursorInfo)
+	desc.minorVersion = 1;
+	desc.width = desc.height = kCursorAnnounced;
+	desc.bitDepth = 32;
+	desc.supportedSpecialEncodings = 4;
+	desc.specialEncodings[1] = 0x00ffffff;
+	auto *pixels = static_cast<uint32_t *>(IOMalloc(kCursorAnnounced * kCursorAnnounced * 4));
+	IOHardwareCursorInfo info {};
+	info.majorVersion = kHardwareCursorInfoMajorVersion;
+	info.minorVersion = kHardwareCursorInfoMinorVersion;
+	info.hardwareCursorData = reinterpret_cast<UInt8 *>(pixels);
+	const bool ok = pixels && static_cast<IOFramebuffer *>(fb)->convertCursorImage(image, &desc, &info) &&
+	                PvScanout::cursorArgb(static_cast<uint32_t>(port), pixels, info.cursorWidth, info.cursorHeight, kCursorAnnounced,
+	                                      info.cursorHotSpotX, info.cursorHotSpotY);
+	if (ok && port < 8) {
+		gCursorHot[port][0] = info.cursorHotSpotX;
+		gCursorHot[port][1] = info.cursorHotSpotY;
+	}
+	static uint32_t logged;
+	if (logged++ < 6)
+		FBLOG("cursor: our accelerator's: port %d: image %ux%u, hot spot %u,%u: %s", port, info.cursorWidth, info.cursorHeight,
+		      info.cursorHotSpotX, info.cursorHotSpotY, ok ? "on the head's plane" : "not converted (IOFramebuffer's test, or too large)");
+	if (pixels)
+		IOFree(pixels, kCursorAnnounced * kCursorAnnounced * 4);
+	return ok ? kIOReturnSuccess : kIOReturnUnsupported;
+}
+
+// IOFramebuffer::open asks kIOHardwareCursorAttribute before it uses a hardware cursor at all (+0x19e); IONDRV asks the NDRV, which
+// does not have one for each head.
+IOReturn wrapFbGetAttribute(void *fb, IOSelect attribute, uintptr_t *value)
+{
+	if (attribute == kIOHardwareCursorAttribute && value && cursorPort(fb) >= 0) {
+		*value = 1;
+		return kIOReturnSuccess;
+	}
+	return FunctionCast(wrapFbGetAttribute, orgFbGetAttribute)(fb, attribute, value);
+}
+
+IOReturn wrapSetCursorState(void *fb, SInt32 x, SInt32 y, bool visible)
+{
+	const int port = cursorPort(fb);
+	if (port < 0)
+		return FunctionCast(wrapSetCursorState, orgSetCursorState)(fb, x, y, visible);
+	const uint32_t *hot = port < 8 ? gCursorHot[port] : gCursorHot[0];
+	return PvScanout::cursorMove(static_cast<uint32_t>(port), x + static_cast<int32_t>(hot[0]), y + static_cast<int32_t>(hot[1]), visible)
+	           ? kIOReturnSuccess : kIOReturnUnsupported;
+}
+#endif
+
 // Head 0's framebuffer: on the GPU itself, or on a "display" nub IONDRVSupport hangs under it (the B550 board of 2026-11:
 // there, missing it left the head refused for good, its pipe scanning stale VRAM). The heads' own nubs are skipped; of
 // several, the oldest: the boot display's comes first, other "display" nubs' framebuffers only once the device is up.
@@ -1630,6 +1705,20 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 			      "will not map the second head", patcher.getError());
 		patcher.clearError();
 	}
+#ifdef AMDRadeonRDNA4_PVGPU
+	{   // (pass-through unless our accelerator serves WindowServer)
+		uint32_t accel = 0;
+		gAccelCursor = PE_parse_boot_argn("rdna4-accel", &accel, sizeof(accel)) && accel == 4;
+		KernelPatcher::RouteRequest cursor[] {
+			{ "__ZN17IONDRVFramebuffer14setCursorImageEPv", wrapSetCursorImage, orgSetCursorImage },
+			{ "__ZN17IONDRVFramebuffer14setCursorStateEiib", wrapSetCursorState, orgSetCursorState },
+			{ "__ZN17IONDRVFramebuffer12getAttributeEjPm", wrapFbGetAttribute, orgFbGetAttribute },
+		};
+		if (!patcher.routeMultiple(index, cursor, 3, address, size))
+			FBLOG("cursor: no IONDRVFramebuffer::setCursorImage/setCursorState/getAttribute routes (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+#endif
 	// Both kinds of hot-plug start their HPD poll when IOFramebuffer opens.
 	uint32_t hotplug = second >= 2 ? 2 : 0, dptrain = 0;
 	if (second >= 2)
@@ -2265,6 +2354,27 @@ bool PvScanout::cursorImage(uint32_t port, const uint32_t *argb, uint32_t width,
 	return pvOnCursorPipe(port, [&](RDNA4Device &dev) {
 		return dev.setCursorPixels(argb, width, height, pitch, hotX, hotY) == kIOReturnSuccess;
 	});
+}
+
+// A cursor image larger than the plane (macOS's are announced at 128x128): what it covers (alpha above 0) and its hot spot onto the
+// plane, when that fits.
+bool PvScanout::cursorArgb(uint32_t port, const uint32_t *argb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t hotX, uint32_t hotY)
+{
+	if (!argb || !width || !height)
+		return false;
+
+	uint32_t x0 = hotX < width ? hotX : width - 1, y0 = hotY < height ? hotY : height - 1, x1 = x0, y1 = y0;
+
+	for (uint32_t y = 0; y < height; y++)
+		for (uint32_t x = 0; x < width; x++)
+			if (argb[y * pitch + x] >> 24) {
+				x0 = x < x0 ? x : x0;
+				x1 = x > x1 ? x : x1;
+				y0 = y < y0 ? y : y0;
+				y1 = y > y1 ? y : y1;
+			}
+
+	return cursorImage(port, argb + y0 * pitch + x0, x1 - x0 + 1, y1 - y0 + 1, pitch, hotX - x0, hotY - y0);
 }
 
 // x, y: the hot spot's position (what the guest's page holds); drawHardwareCursor takes the image's top-left corner.

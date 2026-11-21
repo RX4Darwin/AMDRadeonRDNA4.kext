@@ -571,7 +571,7 @@ private:
 	// The cursor size the pages announce, and the head's cursor plane's (cursor.cpp; DCN 4.01's limit, Linux's max_cursor_size). Announced
 	// larger: at 64 WindowServer drew the pointer itself on a HiDPI display (its 2x images need more); each image is cropped to what it
 	// covers, which for the arrow fits the plane.
-	static constexpr uint16_t kPvCursorAnnounced = 128, kPvCursorPixels = 64;
+	static constexpr uint16_t kPvCursorAnnounced = 128;
 	void completeStamp(uint32_t index, uint32_t value);
 	// A system sleep (RDNA4Compute::powerSleepRequest, the card still powered and taking submissions): what lives only in VRAM
 	// written back to the guest, then everything held of the runtime given back, as the card loses its power and VRAM with it;
@@ -8877,29 +8877,15 @@ void RDNA4PvHost::updateCursorGlyph(const pvstream::FifoCommand &c, const uint8_
 	for (uint32_t y = 0; ok && y < h; y++)
 		ok = readGuest(task, va + y * bpr, reinterpret_cast<uint8_t *>(pixels + y * kPvCursorAnnounced), w * 4u);
 
-	// What the image covers (alpha above 0) and its hot spot: the rectangle the plane is given, when it fits.
-	uint32_t x0 = hotX < w ? hotX : w - 1, y0 = hotY < h ? hotY : h - 1, x1 = x0, y1 = y0;
-
-	for (uint32_t y = 0; ok && y < h; y++)
-		for (uint32_t x = 0; x < w; x++)
-			if (pixels[y * kPvCursorAnnounced + x] >> 24) {
-				x0 = x < x0 ? x : x0;
-				x1 = x > x1 ? x : x1;
-				y0 = y < y0 ? y : y0;
-				y1 = y > y1 ? y : y1;
-			}
-	const uint32_t cw = x1 - x0 + 1, ch = y1 - y0 + 1;
-
-	ok = ok && cw <= kPvCursorPixels && ch <= kPvCursorPixels &&
-	     PvScanout::cursorImage(port, pixels + y0 * kPvCursorAnnounced + x0, cw, ch, kPvCursorAnnounced, hotX - x0, hotY - y0);
+	ok = ok && PvScanout::cursorArgb(port, pixels, w, h, kPvCursorAnnounced, hotX, hotY);
 
 	if (ok)
 		mPipe[port].cursorPos = ~1u;   // its position again with the new hot spot (pollDisplay)
 
 	if (lines++ < 8 || !ok)
-		pvstat("host: display pipe %u cursor glyph: task %u, 0x%llx (0x%llx), %llu bytes a row, %ux%u, hot spot %u,%u, covering %ux%u at %u,%u: %s",
+		pvstat("host: display pipe %u cursor glyph: task %u, 0x%llx (0x%llx), %llu bytes a row, %ux%u, hot spot %u,%u: %s",
 		       port, task, static_cast<unsigned long long>(va), static_cast<unsigned long long>(size), static_cast<unsigned long long>(bpr), w, h, hotX,
-		       hotY, cw, ch, x0, y0, ok ? "on the head's cursor plane" : "NOT shown (larger than the plane's 64x64?)");
+		       hotY, ok ? "on the head's cursor plane" : "NOT shown (larger than the plane's 64x64?)");
 }
 
 void RDNA4PvHost::dropPipes() {

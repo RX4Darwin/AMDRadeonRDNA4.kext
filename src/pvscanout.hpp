@@ -120,6 +120,8 @@ bool copySurface(uint32_t sid, uint8_t *dst, uint32_t pitch, uint32_t width, uin
 bool cursorReady(uint32_t port);
 bool cursorImage(uint32_t port, const uint32_t *argb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t hotX, uint32_t hotY);
 bool cursorMove(uint32_t port, int32_t x, int32_t y, bool visible);
+/* cursorImage of the part of a larger image that is not transparent (with its hot spot). */
+bool cursorArgb(uint32_t port, const uint32_t *argb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t hotX, uint32_t hotY);
 
 } /* namespace PvScanout */
 
