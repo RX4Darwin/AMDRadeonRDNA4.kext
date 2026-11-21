@@ -2648,6 +2648,27 @@ RDNA4_ANSWER_MISSING
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < kTextures) _textures[1][i] = t; }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < kStageTextures) _samplers[0][i] = s; }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < kStageTextures) _samplers[1][i] = s; }
+// several at once (MetalQuake's status bar: answered as missing, its textures were never bound, 2026-11-21)
+- (void)setVertexTextures:(const id<MTLTexture> __unsafe_unretained[])t withRange:(NSRange)r
+{
+	for (NSUInteger i = 0; i < r.length; i++)
+		[self setVertexTexture:t[i] atIndex:r.location + i];
+}
+- (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained[])t withRange:(NSRange)r
+{
+	for (NSUInteger i = 0; i < r.length; i++)
+		[self setFragmentTexture:t[i] atIndex:r.location + i];
+}
+- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained[])s withRange:(NSRange)r
+{
+	for (NSUInteger i = 0; i < r.length; i++)
+		[self setVertexSamplerState:s[i] atIndex:r.location + i];
+}
+- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained[])s withRange:(NSRange)r
+{
+	for (NSUInteger i = 0; i < r.length; i++)
+		[self setFragmentSamplerState:s[i] atIndex:r.location + i];
+}
 // ponytail: the LOD clamps are the sampler's own, not these (Apple's GL-on-Metal renderer sets samplers so, 2026-11-21)
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i { [self setVertexSamplerState:s atIndex:i]; }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i { [self setFragmentSamplerState:s atIndex:i]; }
