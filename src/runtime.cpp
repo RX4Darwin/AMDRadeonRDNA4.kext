@@ -676,8 +676,10 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	auto rollback = [&]() {
 		if (vmUnmap(c, va, mapped))
 			return true;
-		c.mappingUnsafe = true;
-		RLOG("vmid %u: VRAM-map rollback could not be confirmed; client marked unsafe", c.vmid);
+		if (c.active)
+			c.mappingUnsafe = true;
+		RLOG("vmid %u: VRAM-map rollback could not be confirmed%s", c.vmid,
+		     c.active ? "; client marked unsafe" : "; client context not active");
 		return false;
 	};
 	if (c.sp) {
