@@ -1836,7 +1836,7 @@ IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 		if (owner && client.quarantinedOwner == owner)
 			return kIOReturnNotResponding;
 	if (RtClient *old = clientFor(owner))
-		return old->aborted ? kIOReturnAborted : kIOReturnSuccess;
+		return old->mappingUnsafe ? kIOReturnNotResponding : old->aborted ? kIOReturnAborted : kIOReturnSuccess;
 	RtClient *c = nullptr;
 	uint32_t slot = 0;
 	for (; slot < clientCap(); slot++)
@@ -2609,6 +2609,11 @@ IOReturn RDNA4Compute::allocLocked(const void *owner, uint64_t bytes, uint64_t &
 	if (c) {
 		b.va = vaTake(*c, bytes);
 		if (!b.va || !vmMap(*c, b.va, b.mc, bytes, true)) {   /* IBs live in user buffers: R|W|X like Mesa (ac_linux_drm.c:235) */
+			if (c->mappingUnsafe) {
+				RLOG("vmid %u: allocation map rollback failed; retaining buffer and quarantining client", c->vmid);
+				quarantineLocked(owner, *c);
+				return kIOReturnNotResponding;
+			}
 			if (b.va)
 				vaGive(*c, b.va, bytes);
 			h.free(b.offset); b.owner = nullptr;
@@ -2931,6 +2936,11 @@ IOReturn RDNA4Compute::rtMapVram(const void *owner, uint64_t barPhys, uint64_t b
 	b.gen = generation;
 	b.foreign = true;
 	if (!b.va || !vmMap(*c, b.va, b.mc, b.bytes, false)) {
+		if (c->mappingUnsafe) {
+			RLOG("vmid %u: BAR mapping rollback failed; retaining client address space", c->vmid);
+			quarantineLocked(owner, *c);
+			return kIOReturnNotResponding;
+		}
 		if (b.va)
 			vaGive(*c, b.va, b.bytes);
 		b.owner = nullptr;
@@ -3028,12 +3038,15 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
 		p.va = vaTake(*c, p.vaBytes);
 
 		if (!p.va || !vmMap(*c, p.va, poolMc(off), p.vaBytes, true)) {
+			if (c->mappingUnsafe) {
+				RLOG("vmid %u: program map rollback failed; retaining code allocation and quarantining client", c->vmid);
+				quarantineLocked(owner, *c);
+				return kIOReturnNotResponding;
+			}
 			if (p.va)
 				vaGive(*c, p.va, p.vaBytes);
-
 			heap.free(off);
 			p.owner = nullptr;
-
 			return kIOReturnNoMemory;
 		}
 	}
@@ -4082,6 +4095,11 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	// Work that could not be ended may still read and write the client's memory: it is left allocated (and its VMID taken) rather than
 	// handed to someone else. A wedged gfx ring halted the CP, but a wave stuck in a shader still runs.
 	if (c && ((gfxBusy && gfxWedged) || !computeDone)) {
+		quarantineLocked(owner, *c);
+		return;
+	}
+	if (c && c->mappingUnsafe) {
+		RLOG("vmid %u: client has an unconfirmed mapping rollback; preserving its address space", c->vmid);
 		quarantineLocked(owner, *c);
 		return;
 	}
