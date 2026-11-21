@@ -4221,6 +4221,8 @@ static int testVmidPool() {
 	const uint32_t quarantined = g.vmid;
 	f += check(pool.quarantine(1, quarantined) && pool.ownerOf(quarantined) == 0 && pool.pinned(quarantined),
 	           "vmid: quarantine drops ownership and pins an uncertain hardware VMID");
+	f += check(pool.forget(1, true, released) && pool.pinned(quarantined),
+	           "vmid: owner teardown cannot release a quarantined hardware VMID");
 	bool avoided = true;
 	for (uintptr_t o = 2; o <= 15; o++)
 		avoided &= pool.grab(o, o * 0x1000, 0, g) == Result::Ok && g.vmid != quarantined;
