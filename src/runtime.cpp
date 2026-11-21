@@ -2701,10 +2701,13 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
                 (flags & RDNA4_HOST_EXECUTABLE) != 0)) {
 		if (pageBuses)
 			IOFree(pageBuses, pageCount * sizeof(uint64_t));
-		if (b.va) {
-			vmUnmap(*c, b.va, rounded);
-			vaGive(*c, b.va, rounded);
+		if (b.va && !vmUnmap(*c, b.va, rounded)) {
+			RLOG("vmid %u: failed host-map rollback; retaining host pages and client", c->vmid);
+			quarantineLocked(owner, *c);
+			return kIOReturnNotResponding;
 		}
+		if (b.va)
+			vaGive(*c, b.va, rounded);
 		releaseHost(b);
 		b.owner = nullptr;
 		return kIOReturnNoMemory;
@@ -2712,7 +2715,11 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 	if (pageBuses)
 		IOFree(pageBuses, pageCount * sizeof(uint64_t));
 	if (!vmInvalidateOwned(*c, "host map")) {
-		vmUnmap(*c, b.va, rounded);
+		if (!vmUnmap(*c, b.va, rounded) || !vmInvalidateOwned(*c, "host map rollback")) {
+			RLOG("vmid %u: host-map rollback could not be confirmed; retaining host pages and client", c->vmid);
+			quarantineLocked(owner, *c);
+			return kIOReturnNotResponding;
+		}
 		vaGive(*c, b.va, rounded);
 		releaseHost(b);
 		b.owner = nullptr;
@@ -2760,10 +2767,13 @@ IOReturn RDNA4Compute::rtMapPages(const void *owner, const uint64_t *pageBuses, 
 	b.host = true;   // unmapped like a host buffer; it has no memory of its own to release
 	b.mapped = true;
 	if (!b.va || b.va + bytes < b.va || b.va + bytes > GpuVm::kVaEnd || !vmMapHost(*c, b.va, pageBuses, bytes, false)) {
-		if (b.va) {
-			vmUnmap(*c, b.va, bytes);
-			vaGive(*c, b.va, bytes);
+		if (b.va && !vmUnmap(*c, b.va, bytes)) {
+			RLOG("vmid %u: failed guest-page map rollback; retaining VA and client", c->vmid);
+			quarantineLocked(owner, *c);
+			return kIOReturnNotResponding;
 		}
+		if (b.va)
+			vaGive(*c, b.va, bytes);
 		b.owner = nullptr;
 		return kIOReturnNoMemory;
 	}
@@ -4188,8 +4198,8 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	}
 }
 
-/* A closing client whose GPU work could not be ended: its buffers and programs kept allocated under a sentinel owner no client has, its slot
- * and VMID kept taken, so nothing of it is handed out again while the work may still touch it. Leaked until the next bring-up. */
+/* A client whose outstanding work or page-table cleanup cannot be proven safe: preserve its buffers, programs, slot and VMID under a
+ * sentinel owner so no resource or translation can be reused until the next bring-up. */
 void RDNA4Compute::quarantineLocked(const void *owner, RtClient &c) {
 	static const char kQuarantined = 0;
 	uint32_t nb = 0, np = 0;
@@ -4209,7 +4219,7 @@ void RDNA4Compute::quarantineLocked(const void *owner, RtClient &c) {
 	}
 
 	c.owner = &kQuarantined;
-	RLOG("vmid %u: client closed with GPU work that did not end: %u buffer(s), %u program(s) and the VMID kept, not reused", c.vmid, nb, np);
+	RLOG("vmid %u: client quarantined: %u buffer(s), %u program(s), its page tables and VMID kept, not reused", c.vmid, nb, np);
 }
 
 void RDNA4Compute::powerWillSleep() {
