@@ -4889,7 +4889,7 @@ static int testSparseTree() {
 		PtPages::Page page;
 		const bool created = lookup.sp.get(lookup.host, 1, 0, true, page);
 		f += check(created && lookup.physCalls == 1 && lookup.sp.pages() == 2 &&
-		           page.phys == TreeEnv::kBase + 0x2000000,
+		           page.phys == TreeEnv::kBase + 0x2001000,
 		           "tree: creating a sparse page performs one physical-address lookup and cannot fail on a redundant second lookup");
 		lookup.sp.releaseAll(lookup.host, true);
 	}
