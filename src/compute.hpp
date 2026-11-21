@@ -1048,6 +1048,7 @@ private:
 	SharedQueue sharedQ[kSharedQueues] {};
 	uint32_t vmShared { 0 };          // rdna4-vmshared: 0 off, 1 static VMIDs 8-15, 2 VMIDs from the pool per job
 	bool sharedInit { false };
+	bool sharedQueueDrainFailed { false }; // an HQD did not confirm inactive; keep its ring memory and VMIDs reserved
 	Vmid::Pool vmPool;
 	static uint32_t requestedVmShared();
 	bool sharedFenceReached(uint32_t domain, uint32_t seq);
@@ -1062,7 +1063,7 @@ private:
 	IOReturn rtOpenShared(const void *owner, uint32_t slot, RtClient *c);
 	IOReturn rtOpenInner(const void *owner);
 	bool sharedStart(uint32_t k);
-	void sharedStopAll(const char *why);
+	bool sharedStopAll(const char *why);
 	bool recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const char *tag);
 	// The VMID a client's next submission runs in. One place: the client's fixed VMID (modes 0 and 1), or, with rdna4-vmshared=2, a VMID the
 	// pool binds to the client's tables for this job (vmAcquire: reused, or an idle one rebound over MMIO). 0 = none available (the caller
