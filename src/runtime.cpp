@@ -4435,6 +4435,10 @@ bool RDNA4Compute::resetRuntimeForResume() {
 	if (!rtLock)
 		return false;
 	Locked g(rtLock);
+	if (sharedQueueDrainFailed) {
+		RLOG("power: resume blocked: a shared HQD never confirmed inactive; retaining shared ring memory and VMIDs");
+		return false;
+	}
 	if (sdmaWedged) {
 		/* A sleep/wake cycle is not proof that SDMA stopped. The queue can
 		 * retain its ring state across wake, so keep every allocation it may
