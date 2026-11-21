@@ -4315,7 +4315,9 @@ static void abortStack(int sig)
 	for (uint64_t at = 0, bytes = copies[c].bytes; at < bytes;) {
 		if (n + 7 > sizeof ib / 4 - 1)   // (a dword left for the page's NOP)
 			return rdna4Error([NSString stringWithFormat:@"%u copies on the card: more than their IB holds", count], 0);
-		const uint32_t len = (uint32_t)MIN(bytes - at, (uint64_t)1 << 20);
+		// 32 MiB a packet (BYTE_COUNT is 26 bits from gfx9 on, Mesa's S_415_BYTE_COUNT_GFX9): 1 MiB ones overflowed the page for vkQuake's
+		// 4K multisampled depth clear (device lost, 2026-11-21)
+		const uint32_t len = (uint32_t)MIN(bytes - at, (uint64_t)1 << 25);
 		const uint64_t from = copies[c].src + at, to = copies[c].dst + at;
 		const bool fill = !copies[c].src;   // SRC_SEL DATA: the pattern (in SRC_ADDR_LO) over the bytes
 		total += fill ? 0 : len;
