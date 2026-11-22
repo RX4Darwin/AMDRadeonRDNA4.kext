@@ -490,6 +490,60 @@ static RDNA4Held *heldFor(IOSurfaceRef surface, BOOL make, RDNA4MTLDevice *devic
 // MTLTextureSwizzleChannels as RDNA4MTLTexture's _swizzle (pvdraw.hpp viewSel): red .. alpha a byte each
 static uint32_t packSwizzle(MTLTextureSwizzleChannels s) { return s.red | s.green << 8 | s.blue << 16 | (uint32_t)s.alpha << 24; }
 
+// BC1-BC3 (DXT1-5: Unity's textures, Daggerfall Unity's title and sky) kept as RGBA8 (sRGB for the sRGB ones: Metal's odd formats 131,
+// 133, 135) and decoded on the CPU as their blocks come in (replaceRegion, the buffer-to-texture blits through it). The bytes of a block,
+// 0: not one of them. ponytail: 4 bytes a texel in memory where the card could sample the blocks (IMG_FORMAT BC1-3) at 0.5-1.
+static uint32_t bcBlockBytes(MTLPixelFormat f) { return f == 130 || f == 131 ? 8 : f >= 132 && f <= 135 ? 16 : 0; }
+
+// A BC1 colour block's 4x4 texels as RGBA8 (`fourColour`: BC2's and BC3's, never the 3-colour mode with transparent black).
+static void bcColour(const uint8_t *b, bool fourColour, uint8_t out[16][4])
+{
+	const uint32_t c0 = b[0] | b[1] << 8, c1 = b[2] | b[3] << 8;
+	uint8_t pal[4][4];
+	for (int k = 0; k < 2; k++) {
+		const uint32_t c = k ? c1 : c0;
+		pal[k][0] = (uint8_t)((c >> 11) * 255 / 31), pal[k][1] = (uint8_t)((c >> 5 & 63) * 255 / 63), pal[k][2] = (uint8_t)((c & 31) * 255 / 31);
+		pal[k][3] = 255;
+	}
+	for (int ch = 0; ch < 3; ch++) {
+		if (fourColour || c0 > c1) {
+			pal[2][ch] = (uint8_t)((2 * pal[0][ch] + pal[1][ch] + 1) / 3);
+			pal[3][ch] = (uint8_t)((pal[0][ch] + 2 * pal[1][ch] + 1) / 3);
+		} else {
+			pal[2][ch] = (uint8_t)((pal[0][ch] + pal[1][ch] + 1) / 2);
+			pal[3][ch] = 0;
+		}
+	}
+	pal[2][3] = 255, pal[3][3] = fourColour || c0 > c1 ? 255 : 0;
+	const uint32_t idx = b[4] | b[5] << 8 | b[6] << 16 | (uint32_t)b[7] << 24;
+	for (int i = 0; i < 16; i++)
+		memcpy(out[i], pal[idx >> (2 * i) & 3], 4);
+}
+
+// One block (`bytes` 8: BC1, 16: BC2 if `explicitAlpha`, else BC3) as 4x4 RGBA8 texels, row by row.
+static void bcBlock(const uint8_t *b, uint32_t bytes, bool explicitAlpha, uint8_t out[16][4])
+{
+	if (bytes == 8) {
+		bcColour(b, false, out);
+		return;
+	}
+	bcColour(b + 8, true, out);
+	if (explicitAlpha) {   // BC2: 4 bits a texel
+		for (int i = 0; i < 16; i++)
+			out[i][3] = (uint8_t)((b[i / 2] >> (4 * (i & 1)) & 15) * 17);
+		return;
+	}
+	uint8_t a[8] = { b[0], b[1] };   // BC3: two end points, 3-bit indices
+	for (int k = 2; k < 8; k++)
+		a[k] = b[0] > b[1] ? (uint8_t)(((8 - k) * b[0] + (k - 1) * b[1] + 3) / 7)
+		       : k < 6 ? (uint8_t)(((6 - k) * b[0] + (k - 1) * b[1] + 2) / 5) : k == 6 ? 0 : 255;
+	uint64_t bits = 0;
+	for (int k = 0; k < 6; k++)
+		bits |= (uint64_t)b[2 + k] << (8 * k);
+	for (int i = 0; i < 16; i++)
+		out[i][3] = a[bits >> (3 * i) & 7];
+}
+
 @interface RDNA4MTLTexture : NSObject <MTLTexture>
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)descriptor;
 // Over an IOSurface (CAMetalLayer's drawables): its memory mapped into the GPU, its rows as the surface has them.
@@ -1070,7 +1124,7 @@ static char gCopyKey;
 {
 	if (!(self = [super init]))
 		return nil;
-	_fm = textureFormat((uint32_t)d.pixelFormat);
+	_fm = textureFormat(bcBlockBytes(d.pixelFormat) ? (d.pixelFormat & 1 ? 71u : 70u) : (uint32_t)d.pixelFormat);   // (BC: as RGBA8)
 	// rows: a 1D texture's one, a 1D array's one a layer (CoreDisplay's combined gamma LUT: R32Float, 8192 wide), their T#s typed so
 	const BOOL oneD = (d.textureType == MTLTextureType1D || (d.textureType == MTLTextureType1DArray && d.arrayLength >= 1 && d.arrayLength <= 2048)) &&
 	                  d.height == 1;
@@ -1202,6 +1256,20 @@ static char gCopyKey;
 		return;
 	[self refresh];   // (a shadowed surface's copy current: all of it goes back below)
 	[self wroteAll];
+	if (const uint32_t bc = bcBlockBytes(_format)) {   // 4x4 blocks from r.origin (a multiple of 4), texels past the level's edge left out
+		const NSUInteger lw = MAX(_width >> level, (NSUInteger)1), lh = MAX(_height >> level, (NSUInteger)1);
+		for (NSUInteger by = 0; by < (r.size.height + 3) / 4; by++)
+			for (NSUInteger bx = 0; bx < (r.size.width + 3) / 4; bx++) {
+				uint8_t texels[16][4];
+				bcBlock((const uint8_t *)bytes + by * bpr + bx * bc, bc, _format == 132 || _format == 133, texels);
+				for (NSUInteger i = 0; i < 16; i++) {
+					const NSUInteger x = r.origin.x + bx * 4 + i % 4, y = r.origin.y + by * 4 + i / 4;
+					if (x < lw && y < lh)
+						memcpy([self at:level x:x y:y z:r.origin.z], texels[i], 4);
+				}
+			}
+		return;
+	}
 	for (NSUInteger y = 0; [self fits:r level:level] && y < r.size.height; y++)
 		memcpy([self at:level x:r.origin.x y:r.origin.y + y z:r.origin.z], (const uint8_t *)bytes + y * bpr, r.size.width * self.bpp);
 	[self shadowToSurface];
