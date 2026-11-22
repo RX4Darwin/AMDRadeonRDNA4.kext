@@ -160,7 +160,20 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 4. *(Optional)* The card's full 2 MiB flash dump as `ATY,bin_image` under the GPU's PciRoot path in `DeviceProperties`.
    Without it the driver reads IP discovery from VRAM and the VBIOS from the PCI expansion ROM (`Discovery,Source` in
    ioreg says which).
-5. Install the user-space driver (Metal, OpenGL, Vulkan) from `AMDRadeonRDNA4-<version>.pkg` of the **same release** as
+5. **Relax SIP and AMFI** so macOS loads the driver's user-space bundle. The kext and the bundle are signed ad hoc, not
+   by Apple, and the bundle lives in `/Library/GPUBundles` (the only place Metal loads a third-party driver from), so
+   two concessions are needed — the same ones every comparable driver (including nullmoth's NVIDIA driver) needs:
+   - **Filesystem Protections off** in `csr-active-config` (bit `0x2`). An Apple platform binary such as WindowServer
+     will not map a non-Apple library while they are on, and this is what makes `amfi_get_out_of_my_way` take effect at
+     all; it cannot be worked around from the kext (tested exhaustively on Tahoe 26.6.2). A Hackintosh already runs with
+     kext signing off (bit `0x1`), so `csr-active-config = 03000000` is the usual minimum (nullmoth's driver uses the
+     looser `0A430000`).
+   - **AMFI relaxed** so the ad-hoc signatures are accepted, one of:
+     - `amfi_get_out_of_my_way=0x1` in `boot-args` (simplest, what the main test system uses), or
+     - [`AMFIPass.kext`](https://github.com/dortania/OpenCore-Legacy-Patcher/blob/main/payloads/Kexts/Acidanthera/AMFIPass-v1.4.1-RELEASE.zip)
+       in `Kernel → Add` after Lilu — it leaves AMFI's library validation on for the rest of the system. On a macOS
+       newer than the kext build knows (Tahoe needs this with v1.4.1), add `-amfipassbeta` to `boot-args`.
+6. Install the user-space driver (Metal, OpenGL, Vulkan) from `AMDRadeonRDNA4-<version>.pkg` of the **same release** as
    the kext, then reboot:
 
    ```bash
@@ -168,9 +181,7 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
    ```
 
    Or double-click it; the package is not signed, so the first time Finder refuses it: Control-click it and choose
-   **Open**. It needs SIP's filesystem protection off (`csr-active-config` bit 1) and AMFI relaxed
-   (`amfi_get_out_of_my_way=0x1` in `boot-args`), as the driver bundle is signed ad hoc. What it installs:
-   [Metal, OpenGL and Vulkan](#metal-opengl-and-vulkan).
+   **Open**. What it installs: [Metal, OpenGL and Vulkan](#metal-opengl-and-vulkan).
 
 Keep a known-good copy of your EFI on a USB stick while testing. `rdna4-off=1` turns the plugin off and `-liluoff` all
 Lilu plugins; macOS then runs its stock framebuffer.
