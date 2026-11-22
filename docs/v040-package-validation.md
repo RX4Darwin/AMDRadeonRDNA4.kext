@@ -35,7 +35,7 @@ On the macOS build runner, verify all of the following before uploading an artif
 
 - Kext executable, Metal driver executable, and all bundled helper executables exist and are executable.
 - Every executable and the RADV dylib contains the expected `x86_64` architecture.
-- Kext, bundle, embedded framework and package metadata report the same release version.
+- Kext, bundle and embedded framework `CFBundleVersion` and `CFBundleShortVersionString` match the Makefile release version. The package components are built with that same version argument.
 - All property lists and the Vulkan ICD manifest parse successfully.
 - The package archive contains its Distribution document and all three component packages.
 - The release archive contains the package, matching kext, README and checksum manifest.
