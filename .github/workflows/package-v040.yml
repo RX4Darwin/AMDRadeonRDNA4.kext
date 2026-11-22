@@ -97,7 +97,8 @@ jobs:
             lipo -verify_arch x86_64 "$executable"
           done
 
-          test -f "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Versions/A/AMDRadeonRDNA4"\n          test -f "$bundle/Contents/Resources/radeon_icd.json"
+          test -f "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Versions/A/AMDRadeonRDNA4"
+          test -f "$bundle/Contents/Resources/radeon_icd.json"
           test -s "$bundle/Contents/Resources/rdna4.metallib"
           test -s "Build/native/probe.metallib"
           test -s "$pkg"
