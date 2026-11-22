@@ -521,6 +521,12 @@ static std::string legalize(Function &k) {
 					constSampler[c] = airSampler(ctx, a ? a->getElementAsInteger(0) : one->getZExtValue());
 					c->setArgOperand(1, ConstantPointerNull::get(cast<PointerType>(c->getArgOperand(1)->getType())));
 				}
+			} else if (auto *e = dyn_cast<ConstantExpr>(c->getArgOperand(1)); e && e->getOpcode() == Instruction::IntToPtr) {
+				// older AIR's literal sampler (Cubase's blits): the state word itself as the pointer, bit 63 set
+				if (auto *word = dyn_cast<ConstantInt>(e->getOperand(0)); word && word->getBitWidth() == 64) {
+					constSampler[c] = airSampler(ctx, word->getZExtValue());
+					c->setArgOperand(1, ConstantPointerNull::get(cast<PointerType>(c->getArgOperand(1)->getType())));
+				}
 			}
 	lowerTables(k);   // after the samplers: theirs are constant globals too
 	std::map<Type *, Type *> globalTypes;
@@ -633,16 +639,17 @@ static std::string legalize(Function &k) {
 			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
 			Value *texel;
 			if (sample) {
-				auto *offset = c->arg_size() > 7 ? dyn_cast<Constant>(c->getArgOperand(4)) : nullptr;
-				auto *level = c->arg_size() > 7 ? dyn_cast<ConstantInt>(c->getArgOperand(5)) : nullptr;
-				Value *value = c->arg_size() > 7 ? c->getArgOperand(6) : nullptr;
+				// (the oldest AIR, Cubase's: seven operands, ending with the bias or LOD)
+				auto *offset = c->arg_size() > 6 ? dyn_cast<Constant>(c->getArgOperand(4)) : nullptr;
+				auto *level = c->arg_size() > 6 ? dyn_cast<ConstantInt>(c->getArgOperand(5)) : nullptr;
+				Value *value = c->arg_size() > 6 ? c->getArgOperand(6) : nullptr;
 				if (!offset || !level)
 					return f->getName().str() + " with a run-time offset or level kind is not supported yet";
 				// A minimum LOD (min_lod_clamp): the _cl forms for an implicit LOD or a bias, an explicit LOD raised to it; outside a fragment
 				// shader (level 0 otherwise) the minimum itself as the explicit LOD. Older AIR (Waves' plugin windows) has no minimum: its
 				// eighth operand is the trailing i32, and it returns the texel alone.
-				Value *minLod = c->getArgOperand(7);
-				const bool clamped = minLod->getType()->isFloatTy() && !match(minLod, m_AnyZeroFP()),
+				Value *minLod = c->arg_size() > 7 ? c->getArgOperand(7) : nullptr;
+				const bool clamped = minLod && minLod->getType()->isFloatTy() && !match(minLod, m_AnyZeroFP()),
 				           fragment = k.getCallingConv() == CallingConv::AMDGPU_PS;
 				if (clamped && (level->isOne() || !fragment)) {
 					value = level->isOne() ? b.CreateBinaryIntrinsic(Intrinsic::maxnum, value, minLod) : minLod;
@@ -899,8 +906,10 @@ static std::string legalize(Function &k) {
 			// atlas through AppleMetalOpenGLRenderer (2026-11-12). The slice is the T#'s array layer, given as a float. An explicit LOD as
 			// given; else, in a fragment shader, from its quads (with the bias), elsewhere level 0.
 			const bool half = tex.starts_with("sample_texture_2d_array.v4f16");
-			auto *level = c->arg_size() >= 10 ? dyn_cast<ConstantInt>(c->getArgOperand(6)) : nullptr;
-			if (!level || !match(c->getArgOperand(5), m_Zero()) || !match(c->getArgOperand(8), m_AnyZeroFP()))
+			// (older AIR, Cubase's text: eight operands, without the minimum LOD and the i32)
+			auto *level = c->arg_size() >= 8 ? dyn_cast<ConstantInt>(c->getArgOperand(6)) : nullptr;
+			Value *minLod = c->arg_size() >= 10 ? c->getArgOperand(8) : nullptr;
+			if (!level || !match(c->getArgOperand(5), m_Zero()) || (minLod && !match(minLod, m_AnyZeroFP())))
 				return f->getName().str() + " with an offset, a minimum LOD or a run-time level flag is not supported yet";
 			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(2), *value = c->getArgOperand(7);
 			Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
@@ -923,7 +932,8 @@ static std::string legalize(Function &k) {
 				                          {b.getInt32(15), x, y, slice, t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
 			if (half)
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
-			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+			// {texel, i8 0}, or older AIR's texel alone
+			r = c->getType()->isStructTy() ? b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1) : texel;
 		} else if (tex.starts_with("read_texture_2d_array.v4f")) {
 			// (texture, uint2 or int2 coord, uint slice, uint lod, i32): kitty's glyph atlas read at the texel (2026-11-12).
 			const bool half = tex.starts_with("read_texture_2d_array.v4f16");
@@ -1441,6 +1451,63 @@ static std::string compile(Module &m, Function *entry, Function *air, bool pal, 
 		if (&f != entry && !f.isDeclaration())
 			f.setLinkage(GlobalValue::InternalLinkage);
 
+	// A local struct reached only through GEPs of a constant field, as an alloca for each field: one field indexed at run time keeps SROA
+	// off the whole struct (Cubase's dashed lines: a copy of {float4, ..., float[12], float, [12 x i8] padding}, its float[12] indexed),
+	// and the field alone AMDGPU keeps in registers.
+	SmallVector<AllocaInst *, 8> structs;   // (collected first: a split erases the instruction after the alloca too)
+	for (Function &f : m)
+		for (Instruction &i : instructions(f))
+			if (auto *a = dyn_cast<AllocaInst>(&i); a && a->isStaticAlloca() && a->getAllocatedType()->isStructTy())
+				structs.push_back(a);
+	const DataLayout &dl = m.getDataLayout();
+	for (AllocaInst *a : structs) {
+		auto *st = cast<StructType>(a->getAllocatedType());
+		if (st->isPacked() || a->use_empty())
+			continue;
+		// (reached through the flat cast legalize gave it, or directly)
+		auto *flat = a->hasOneUse() ? dyn_cast<AddrSpaceCastInst>(*a->user_begin()) : nullptr;
+		Value *base = flat ? static_cast<Value *>(flat) : a;
+		const uint64_t first = st->getNumElements() ? dl.getTypeStoreSize(st->getElementType(0)) : 0;
+		auto fieldAccess = [&](User *u) {
+			// a load or store through the struct's own pointer: its first field (whose GEP folds away)
+			if (auto *l = dyn_cast<LoadInst>(u))
+				return l->isSimple() && dl.getTypeStoreSize(l->getType()) <= first;
+			if (auto *w = dyn_cast<StoreInst>(u))
+				return w->isSimple() && w->getPointerOperand() == base && dl.getTypeStoreSize(w->getValueOperand()->getType()) <= first;
+			auto *g = dyn_cast<GetElementPtrInst>(u);
+			return g && g->getPointerOperand() == base && g->getSourceElementType() == st && g->getNumIndices() >= 2 &&
+			       match(g->getOperand(1), m_Zero()) && isa<ConstantInt>(g->getOperand(2));
+		};
+		if (base->use_empty() || !all_of(base->users(), fieldAccess))
+			continue;
+		IRBuilder<> fb(a);
+		SmallVector<Value *, 16> fields;   // each field's alloca, as base's pointer type
+		for (Type *t : st->elements()) {
+			Value *field = fb.CreateAlloca(t, a->getAddressSpace());
+			fields.push_back(flat ? fb.CreateAddrSpaceCast(field, flat->getType()) : field);
+		}
+		for (User *u : make_early_inc_range(base->users())) {
+			auto *g = dyn_cast<GetElementPtrInst>(u);
+			if (!g) {   // a load or store of the first field
+				cast<Instruction>(u)->replaceUsesOfWith(base, fields[0]);
+				continue;
+			}
+			const uint64_t n = cast<ConstantInt>(g->getOperand(2))->getZExtValue();
+			Value *to = fields[n];
+			if (g->getNumIndices() > 2) {
+				SmallVector<Value *, 4> rest = {ConstantInt::get(g->getOperand(1)->getType(), 0)};
+				rest.append(g->idx_begin() + 2, g->idx_end());
+				IRBuilder<> gb(g);
+				to = gb.CreateGEP(st->getElementType(n), fields[n], rest, "", g->isInBounds());
+			}
+			g->replaceAllUsesWith(to);
+			g->eraseFromParent();
+		}
+		if (flat)
+			flat->eraseFromParent();
+		a->eraseFromParent();
+	}
+
 	// A local struct of 32-bit fields and arrays of them (Quake II's shadow lights: {float key[4]; uint idx[4]}) as an array of i32s:
 	// AMDGPU's promotion takes arrays only, and a struct written at an index known only at run time stays in scratch otherwise. The
 	// accesses are byte offsets on an opaque pointer, so only the alloca's type changes.
@@ -1613,7 +1680,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 				const std::string q = mdString(a, k);
 				flat |= q == "air.flat";
 				centroid |= q == "air.centroid";
-				center |= q == "air.center";
+				// per sample (air.sample: Cubase's line caps) read at the centre as well: no per-sample shading, one sample a pixel
+				center |= q == "air.center" || q == "air.sample";
 				linear |= q == "air.no_perspective";
 			}
 			if (!flat && !center && !centroid)
