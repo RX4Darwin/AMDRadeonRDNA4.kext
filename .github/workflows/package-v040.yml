@@ -83,7 +83,7 @@ jobs:
           mkdir -p dist/AMDRadeonRDNA4-0.4.0
           ditto "$kext" dist/AMDRadeonRDNA4-0.4.0/AMDRadeonRDNA4.kext
           cp "$pkg" README.md dist/AMDRadeonRDNA4-0.4.0/
-          shasum -a 256 "$pkg" README.md "$kext/Contents/MacOS/AMDRadeonRDNA4" > dist/AMDRadeonRDNA4-0.4.0/SHA256SUMS.txt
+          (cd dist/AMDRadeonRDNA4-0.4.0 && shasum -a 256 AMDRadeonRDNA4-0.4.0.pkg README.md AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4 > SHA256SUMS.txt)
           ditto -c -k --sequesterRsrc --keepParent dist/AMDRadeonRDNA4-0.4.0 AMDRadeonRDNA4-0.4.0-macos-tahoe.zip
           shasum -a 256 AMDRadeonRDNA4-0.4.0-macos-tahoe.zip
 
