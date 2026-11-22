@@ -6,6 +6,7 @@ on:
     branches: ["install/**"]
     paths:
       - ".github/workflows/package-v040.yml"
+      - ".github/workflows/package-v040.yml"
       - "Makefile"
       - "tools/metal/**"
       - "userspace/vulkan/**"
