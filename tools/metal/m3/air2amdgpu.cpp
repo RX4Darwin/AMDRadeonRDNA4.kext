@@ -941,6 +941,68 @@ static std::string legalize(Function &k) {
 				value = b.CreateFPExt(value, v4f);
 			Value *x = b.CreateZExt(b.CreateExtractElement(xy, uint64_t(0)), b.getInt32Ty()), *y = b.CreateZExt(b.CreateExtractElement(xy, 1), b.getInt32Ty());
 			b.CreateIntrinsic(Intrinsic::amdgcn_image_store_2d, {v4f, b.getInt32Ty(), t->getType()}, {value, b.getInt32(15), x, y, t, b.getInt32(0), b.getInt32(0)});
+		} else if (tex.starts_with("write_texture_3d.") || tex.starts_with("write_texture_2d_array.")) {
+			// 3D: (texture, uint3 coord, value, i32 lod, i32 access); 2D array: (texture, uint2 coord, uint slice, value, i32 lod, i32
+			// access). Float or half texels, or an integer texture's bits as write_texture_2d's. Unity's post-processing bakes its colour
+			// grading table into a 3D texture this way (Daggerfall Unity, 2026-11-22). Level 0 only.
+			const bool array = tex.starts_with("write_texture_2d_array.");
+			const unsigned vi = array ? 3 : 2;
+			if (c->arg_size() < vi + 2 || !match(c->getArgOperand(vi + 1), m_Zero()))
+				return f->getName().str() + " to a level other than 0 is not supported yet";
+			const StringRef kind = tex.drop_front(array ? strlen("write_texture_2d_array.") : strlen("write_texture_3d."));
+			Value *t = descriptor(c->getArgOperand(0), 8), *xyz = c->getArgOperand(1), *value = c->getArgOperand(vi);
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4), *v4i = FixedVectorType::get(b.getInt32Ty(), 4);
+			if (!kind.starts_with("v4f"))
+				value = b.CreateBitCast(b.CreateIntCast(value, v4i, kind.starts_with("s.")), v4f);
+			else if (value->getType() != v4f)
+				value = b.CreateFPExt(value, v4f);
+			auto coord = [&](Value *v, unsigned i) { return b.CreateZExtOrTrunc(b.CreateExtractElement(v, uint64_t(i)), b.getInt32Ty()); };
+			Value *z = array ? b.CreateZExtOrTrunc(c->getArgOperand(2), b.getInt32Ty()) : coord(xyz, 2);
+			b.CreateIntrinsic(array ? Intrinsic::amdgcn_image_store_2darray : Intrinsic::amdgcn_image_store_3d, {v4f, b.getInt32Ty(), t->getType()},
+			                  {value, b.getInt32(15), coord(xyz, 0), coord(xyz, 1), z, t, b.getInt32(0), b.getInt32(0)});
+		} else if (tex.starts_with("read_texture_3d.v4f")) {
+			// (texture, sampler, uint3 coord, int3 offset, i32 lod, i32): the offset added, a level other than 0 through image_load_mip
+			Value *t = descriptor(c->getArgOperand(0), 8), *xyz = c->getArgOperand(2), *offset = c->getArgOperand(3), *lod = c->getArgOperand(4);
+			Value *v[3];
+			for (unsigned i = 0; i < 3; i++) {
+				v[i] = b.CreateZExtOrTrunc(b.CreateExtractElement(xyz, uint64_t(i)), b.getInt32Ty());
+				if (!isa<ConstantAggregateZero>(offset))
+					v[i] = b.CreateAdd(v[i], b.CreateSExtOrTrunc(b.CreateExtractElement(offset, uint64_t(i)), b.getInt32Ty()));
+			}
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
+			Value *texel = match(lod, m_Zero())
+			                   ? b.CreateIntrinsic(Intrinsic::amdgcn_image_load_3d, {v4f, b.getInt32Ty(), t->getType()},
+			                                       {b.getInt32(15), v[0], v[1], v[2], t, b.getInt32(0), b.getInt32(0)})
+			                   : b.CreateIntrinsic(Intrinsic::amdgcn_image_load_mip_3d, {v4f, b.getInt32Ty(), t->getType()},
+			                                       {b.getInt32(15), v[0], v[1], v[2], b.CreateZExtOrTrunc(lod, b.getInt32Ty()), t, b.getInt32(0),
+			                                        b.getInt32(0)});
+			if (tex.starts_with("read_texture_3d.v4f16"))
+				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+		} else if (tex.starts_with("gather_texture_2d_array.v4f")) {
+			// (texture, sampler, float2 coord, uint slice, i1, int2 offset, i32 component, i32): as gather_texture_2d's, the slice the
+			// T#'s array layer as a float
+			auto *offset = dyn_cast<Constant>(c->getArgOperand(5));
+			auto *component = dyn_cast<ConstantInt>(c->getArgOperand(6));
+			if (!offset || !component || component->getZExtValue() > 3)
+				return f->getName().str() + " with a run-time offset or component is not supported yet";
+			uint32_t packed = 0;
+			for (unsigned i = 0; i < 2; i++)
+				if (auto *e = dyn_cast_or_null<ConstantInt>(offset->getAggregateElement(i)))
+					packed |= (static_cast<uint32_t>(e->getSExtValue()) & 0x3f) << (8 * i);
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(2);
+			Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
+			SmallVector<Value *, 11> args = {b.getInt32(1u << component->getZExtValue())};
+			if (packed)
+				args.push_back(b.getInt32(packed));
+			args.append({b.CreateExtractElement(xy, uint64_t(0)), b.CreateExtractElement(xy, 1), b.CreateUIToFP(c->getArgOperand(3), b.getFloatTy()),
+			             t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+			Value *texel = b.CreateIntrinsic(packed ? Intrinsic::amdgcn_image_gather4_lz_o_2darray : Intrinsic::amdgcn_image_gather4_lz_2darray,
+			                                 {v4f, b.getFloatTy(), t->getType(), sm->getType()}, args);
+			if (tex.starts_with("gather_texture_2d_array.v4f16"))
+				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
 		} else if (name == "fence_texture_2d") {   // the thread's texture writes seen by its reads after: their memory, in order
 			b.CreateFence(AtomicOrdering::AcquireRelease, ctx.getOrInsertSyncScopeID("agent"));
 		} else if (name.starts_with("get_sample_position.")) {   // ponytail: the pixel's centre, as [[sample_id]] is 0 (see there)

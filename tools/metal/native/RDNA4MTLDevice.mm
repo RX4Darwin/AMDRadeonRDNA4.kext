@@ -1164,7 +1164,10 @@ static char gCopyKey;
 	NSUInteger bytes = _rowBytes * d.height * _layers;
 	if (threeD || slices) {   // the hardware's pitches for a linear 3D image (pvdraw.hpp linearVolume): rows at 128 bytes, slices at 256
 		_rowBytes = (d.width * _fm->bpp + 127) & ~(NSUInteger)127;
-		_slicePitch = (_rowBytes * d.height + 255) & ~(NSUInteger)255;
+		// a slice `height` rows of the row's bytes aligned to 256, the rows in it 128 apart (docs/m0-pvgpu.md, rdna4-mtltex3d): aligning the
+		// slice's whole size instead, a kernel's image_load / image_store on an 8x8x8 RGBA32Float texture ran past its memory (a page
+		// fault 8 KiB in), Unity's colour grading table (Daggerfall Unity, 2026-11-22)
+		_slicePitch = ((d.width * _fm->bpp + 255) & ~(NSUInteger)255) * d.height;
 		bytes = _slicePitch * (slices ?: _depth);
 	}
 	_levels = twoD ? d.mipmapLevelCount : 1;
@@ -1332,6 +1335,10 @@ static char gCopyKey;
 	if (_slices && slice < _slices && !level && [self fits:r level:0])
 		for (NSUInteger y = 0; y < r.size.height; y++)
 			memcpy((uint8_t *)bytes + y * bpr, [self at:0 x:r.origin.x y:r.origin.y + y z:slice], r.size.width * self.bpp);
+	else if (_type == MTLTextureType3D && [self fits:r level:level])   // every slice of the region, as replaceRegion's (only z 0 before)
+		for (NSUInteger z = 0; z < MAX(r.size.depth, (NSUInteger)1); z++)
+			for (NSUInteger y = 0; y < r.size.height; y++)
+				memcpy((uint8_t *)bytes + z * bpi + y * bpr, [self at:0 x:r.origin.x y:r.origin.y + y z:r.origin.z + z], r.size.width * self.bpp);
 	else if (!slice)
 		[self getBytes:bytes bytesPerRow:bpr fromRegion:r mipmapLevel:level];
 }
