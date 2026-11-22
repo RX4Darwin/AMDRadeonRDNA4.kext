@@ -1,0 +1,200 @@
+name: Package v0.4.0
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["install/**"]
+    tags: ["v*"]
+    paths:
+      - ".github/workflows/package-v040.yml"
+      - "Makefile"
+      - "README.md"
+      - ".gitmodules"
+      - "Info.plist"
+      - "lib/Lilu/**"
+      - "tools/build/**"
+      - "tools/metal/**"
+      - "userspace/vulkan/**"
+      - "userspace/rdna4-run/**"
+      - "tools/package/**"
+      - "src/**"
+      - "include/**"
+      - "firmware/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-v040-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Build complete v0.4.0 installer
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          brew install llvm lld ninja bison flex pkg-config glslang cmake
+          echo "LLVM=$(brew --prefix llvm)" >> "$GITHUB_ENV"
+          echo "LLD=$(brew --prefix lld)" >> "$GITHUB_ENV"
+          echo "PATH=$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH" >> "$GITHUB_ENV"
+          sw_vers
+          xcodebuild -version
+          uname -m
+
+      - name: Verify Metal toolchain
+        run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+
+      - name: Fetch AMD firmware
+        run: tools/build/fetch-firmware.sh
+
+      - name: Check packaging shell syntax
+        run: |
+          sh -n tools/package/package.sh
+          sh -n tools/package/uninstall.sh
+
+      - name: Build matching release kext and test tools
+        run: make all PVGPU=1
+
+      - name: Build x86_64 Metal shader translator
+        run: make metal-helper
+
+      - name: Build Mesa RADV Vulkan driver
+        run: make mesa
+
+      - name: Build complete user-space bundle and installer
+        run: make package
+
+      - name: Validate generated installer scripts and daemon plists
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$(make -s product-dir CONFIG=RELEASE)"
+          for script in \
+            "$dir/pkg/core-scripts/preinstall" \
+            "$dir/pkg/core-scripts/postinstall" \
+            "$dir/pkg/logd-scripts/preinstall" \
+            "$dir/pkg/logd-scripts/postinstall"; do
+            test -s "$script"
+            sh -n "$script"
+            grep -Fq 'set -e' "$script"
+            grep -Fq 'exit 0' "$script"
+          done
+          grep -Fq 'launchctl bootout system/$l 2> /dev/null || true' "$dir/pkg/core-scripts/preinstall"
+          grep -Fq 'launchctl bootout system/org.rdna4.logd 2> /dev/null || true' "$dir/pkg/logd-scripts/preinstall"
+          grep -Fq 'launchctl bootstrap system /Library/LaunchDaemons/$l.plist' "$dir/pkg/core-scripts/postinstall"
+          grep -Fq 'launchctl bootout system/org.rdna4.logd' "$dir/pkg/logd-scripts/preinstall"
+          grep -Fq 'launchctl bootstrap system/org.rdna4.logd' "$dir/pkg/logd-scripts/postinstall"
+          for plist in \
+            "$dir/pkg/core-root/Library/LaunchDaemons/org.rdna4.air2amdgpu.plist" \
+            "$dir/pkg/core-root/Library/LaunchDaemons/org.rdna4.iop.plist" \
+            "$dir/pkg/logd-root/Library/LaunchDaemons/org.rdna4.logd.plist"; do
+            plutil -lint "$plist"
+          done
+          grep -Fq '/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/Contents/Helpers/air2amdgpu' "$dir/pkg/core-root/Library/LaunchDaemons/org.rdna4.air2amdgpu.plist"
+          grep -Fq '/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/Contents/Helpers/rdna4-iop' "$dir/pkg/core-root/Library/LaunchDaemons/org.rdna4.iop.plist"
+          grep -Fq '/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/Contents/Helpers/rdna4-logd' "$dir/pkg/logd-root/Library/LaunchDaemons/org.rdna4.logd.plist"
+
+      - name: Validate package contents and assemble release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^VERSION[[:space:]]*=[[:space:]]*//p' Makefile | head -n 1)"
+          test -n "$version"
+          dir="$(make -s product-dir CONFIG=RELEASE)"
+          kext="$dir/AMDRadeonRDNA4.kext"
+          bundle="$dir/AMDRadeonRDNA4MTLDriver.bundle"
+          pkg="$dir/AMDRadeonRDNA4-$version.pkg"
+          stage="dist/AMDRadeonRDNA4-$version"
+          archive="AMDRadeonRDNA4-$version-macos-tahoe.zip"
+
+          # Required kext, native driver, framework, helpers and Vulkan library.
+          for executable in \
+            "$kext/Contents/MacOS/AMDRadeonRDNA4" \
+            "$bundle/Contents/MacOS/AMDRadeonRDNA4MTLDriver" \
+            "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Versions/A/AMDRadeonRDNA4" \
+            "$bundle/Contents/Helpers/air2amdgpu" \
+            "$bundle/Contents/Helpers/rdna4-run" \
+            "$bundle/Contents/Helpers/rdna4-iop" \
+            "$bundle/Contents/Helpers/rdna4-logd" \
+            "$bundle/Contents/Frameworks/libvulkan_radeon.dylib"; do
+            test -x "$executable" || { echo "Missing or non-executable required file: $executable" >&2; exit 1; }
+          done
+
+          for executable in \
+            "$kext/Contents/MacOS/AMDRadeonRDNA4" \
+            "$bundle/Contents/MacOS/AMDRadeonRDNA4MTLDriver" \
+            "$bundle/Contents/Helpers/air2amdgpu" \
+            "$bundle/Contents/Helpers/rdna4-run" \
+            "$bundle/Contents/Helpers/rdna4-iop" \
+            "$bundle/Contents/Helpers/rdna4-logd" \
+            "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Versions/A/AMDRadeonRDNA4" \
+            "$bundle/Contents/Frameworks/libvulkan_radeon.dylib"; do
+            lipo -verify_arch x86_64 "$executable"
+          done
+
+          test -f "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Versions/A/AMDRadeonRDNA4"
+          test -f "$bundle/Contents/Resources/radeon_icd.json"
+          test -s "$bundle/Contents/Resources/rdna4.metallib"
+          test -s "Build/native/probe.metallib"
+          test -s "$pkg"
+          plutil -lint "$kext/Contents/Info.plist"
+          plutil -lint "$bundle/Contents/Info.plist"
+          plutil -lint "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Resources/Info.plist"
+          for plist in \
+            "$kext/Contents/Info.plist" \
+            "$bundle/Contents/Info.plist" \
+            "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Resources/Info.plist"; do
+            for key in CFBundleVersion CFBundleShortVersionString; do
+              actual="$(plutil -extract "$key" raw -o - "$plist")"
+              test "$actual" = "$version" || {
+                echo "$plist: $key is $actual, expected $version" >&2
+                exit 1
+              }
+            done
+          done
+          python3 -m json.tool "$bundle/Contents/Resources/radeon_icd.json" >/dev/null
+
+          # Confirm the product archive contains all three selectable component packages.
+          package_contents="$(xar -tf "$pkg")"
+          printf '%s\n' "$package_contents" | grep -Eq '(^|/)Distribution$'
+          for component in core.pkg logd.pkg vulkan.pkg; do
+            printf '%s\n' "$package_contents" | grep -Eq "(^|/)$component$"
+          done
+
+          mkdir -p "$stage"
+          ditto "$kext" "$stage/AMDRadeonRDNA4.kext"
+          cp "$pkg" README.md "$stage/"
+          (
+            cd "$stage"
+            shasum -a 256 "AMDRadeonRDNA4-$version.pkg" README.md AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4 > SHA256SUMS.txt
+            shasum -a 256 -c SHA256SUMS.txt
+          )
+
+          ditto -c -k --sequesterRsrc --keepParent "$stage" "$archive"
+          verify_dir="$(mktemp -d)"
+          ditto -x -k "$archive" "$verify_dir"
+          extracted="$verify_dir/$(basename "$stage")"
+          test -x "$extracted/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4"
+          (
+            cd "$extracted"
+            shasum -a 256 -c SHA256SUMS.txt
+          )
+          rm -rf "$verify_dir"
+          shasum -a 256 "$archive"
+
+      - name: Upload complete installer and matching kext
+        uses: actions/upload-artifact@v4
+        with:
+          name: AMDRadeonRDNA4-macos-tahoe-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            AMDRadeonRDNA4-*-macos-tahoe.zip
+            dist/AMDRadeonRDNA4-*/
