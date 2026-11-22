@@ -778,6 +778,7 @@ void coldStartHeads(RDNA4Device &dev) {
 		      mode ? ", its modes set up" : "", h->surface.width, h->surface.height, h->surface.physBase);
 	}
 	dev.selectExtra(0);
+	dev.coldStartPending = false;   // the second pipes' power requests act again
 }
 
 void fillHeads(RDNA4Device &dev) {
