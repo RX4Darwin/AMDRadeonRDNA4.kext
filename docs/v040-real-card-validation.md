@@ -35,24 +35,17 @@ mtlprobe devices
 mtlprobe info
 ```
 
-`mtlprobe all` runs the legacy paravirtual-device probe set. It is useful only when that paravirtual path is deliberately enabled; it is **not** a complete validation of the native `RDNA4MTLDevice` path. Do not enable the paravirtual path just to make this test pass.
+The native path is opt-in and must be explicitly enabled by the matching build's documented setup. Do not enable it globally for every process: the native device has historically been gated to selected test processes while its implementation is incomplete. Confirm that `RDNA4MTLDevice` appears before running native tests.
 
-For the native device, run the native probes individually after confirming that `RDNA4MTLDevice` is listed:
+**Native baseline, in evidence order:**
 
-```sh
-mtlprobe nativesrc
-mtlprobe nativespin
-mtlprobe nativestencil
-mtlprobe nativeevent
-mtlprobe nativeargbuf
-mtlprobe nativecd
-mtlprobe nativeca
-```
+1. `mtlprobe nativesrc` checks Metal source compilation, pipeline creation and a compute result. This is the most useful first native check; the project records a passing run on the development rig.
+2. If the matching `probe.metallib` was built and staged, run `mtlprobe native <path-to-probe.metallib>`. This exercises the documented compute, render and ray-query gates. Keep the metallib from the same revision.
+3. Only after those pass, explore `nativeevent`, `nativeargbuf`, `nativecd`, `nativeca`, `nativespin`, `nativestencil` and `nativewin` individually. These are separate feature probes, not an assumed passing suite. Record unsupported selectors, command failures and visual results separately.
 
-Run `mtlprobe native <probe.metallib>` only when the matching probe metallib has been built and supplied. `nativewin` is a visual/window stability check, not a substitute for pixel-checked tests. Preserve each command's exit status and complete output; a pass requires the expected checks to pass, not merely a window to appear.
+`mtlprobe all` runs the legacy paravirtual-device probe set. It is useful only when that paravirtual path is deliberately enabled; it is **not** a complete validation of the native `RDNA4MTLDevice` path. The `mix`, `coverage2`, `ctex`, `fbfetch` and `varyings` probes in that set must not be reported as native-device validation.
 
-The separate `all` set includes `mix` (runtime translation of a kernel not already in the table), `coverage2`, `ctex`, `fbfetch` and `varyings`. Those probes are useful for the paravirtual stream path, but must not be reported as native-device validation. Use the exact probe names supported by the checked-out source and never mix binaries from different commits.
-
+Preserve each command's exit status and complete output. A pass requires the expected data checks to pass, not merely a device listing or window appearing. Never mix binaries from different commits.
 ## 4. OpenGL application checks
 
 The project uses Apple's OpenGL-on-Metal renderer rather than a separate RDNA4 OpenGL bundle. Test a small known OpenGL application first, then a second application with a different rendering workload.
