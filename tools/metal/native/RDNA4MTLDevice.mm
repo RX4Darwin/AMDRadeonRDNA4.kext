@@ -1316,7 +1316,7 @@ static char gCopyKey;
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes
           bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
 {
-	if (self.vramOnly)
+	if (self.vramOnly || (bcBlockBytes(_format) && (_slices || slice)))   // ponytail: BC arrays and cubes not decoded (their rows are blocks)
 		return;
 	if (_type == MTLTextureType1DArray && slice < _layers && !level && r.origin.x + r.size.width <= _width)   // a layer is a row
 		memcpy(self.bytes + slice * _rowBytes + r.origin.x * self.bpp, bytes, r.size.width * self.bpp);
@@ -1334,7 +1334,7 @@ static char gCopyKey;
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level
            slice:(NSUInteger)slice
 {
-	if (self.vramOnly)
+	if (self.vramOnly || bcBlockBytes(_format))   // (a BC texture's CPU reads give nothing: see the 2D getBytes)
 		return;
 	if (_slices && slice < _slices && !level && [self fits:r level:0])
 		for (NSUInteger y = 0; y < r.size.height; y++)
@@ -1351,6 +1351,12 @@ static char gCopyKey;
 {
 	if (self.vramOnly)
 		return;
+	// ponytail: a BC texture's CPU reads give nothing: it is kept as RGBA8, and the caller's rows are blocks (8 or 16 bytes for 4x4
+	// texels), 4-8 times smaller than ours; copied, they ran past its buffer (OpenMW's heap corrupted, malloc aborted, 2026-11-22)
+	if (bcBlockBytes(_format)) {
+		RTRACE(4, @"CPU read of a BC texture (format %lu): not given", (unsigned long)_format);
+		return;
+	}
 	[self refresh];   // (a shadowed surface: its copy current, unless draws not yet written back made it newer)
 	for (NSUInteger y = 0; [self fits:r level:level] && y < r.size.height; y++)
 		memcpy((uint8_t *)bytes + y * bpr, [self at:level x:r.origin.x y:r.origin.y + y z:r.origin.z], r.size.width * self.bpp);
