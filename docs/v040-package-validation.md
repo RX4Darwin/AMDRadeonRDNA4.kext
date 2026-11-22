@@ -49,6 +49,7 @@ A package that merely exists is not a successful package build. Missing optional
 Review the generated component scripts as well as the package payload:
 
 - Core preinstall stops the old helper daemons and removes only the legacy paths documented by the package script.
+- Core preinstall also removes stale optional logd and RADV manifest files from an earlier installation; selected optional components are then installed from this package.
 - Core postinstall bootstraps the two core daemons.
 - Logd preinstall and postinstall stop and start only the log collection daemon.
 - The Vulkan choice installs only the RADV ICD manifest and does not silently alter unrelated Vulkan installations.
