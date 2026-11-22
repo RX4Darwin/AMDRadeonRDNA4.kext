@@ -46,6 +46,7 @@ The native path is opt-in and must be explicitly enabled by the matching build's
 `mtlprobe all` runs the legacy paravirtual-device probe set. It is useful only when that paravirtual path is deliberately enabled; it is **not** a complete validation of the native `RDNA4MTLDevice` path. The `mix`, `coverage2`, `ctex`, `fbfetch` and `varyings` probes in that set must not be reported as native-device validation.
 
 Preserve each command's exit status and complete output. A pass requires the expected data checks to pass, not merely a device listing or window appearing. Never mix binaries from different commits.
+
 ## 4. OpenGL application checks
 
 The project uses Apple's OpenGL-on-Metal renderer rather than a separate RDNA4 OpenGL bundle. Test a small known OpenGL application first, then a second application with a different rendering workload.
