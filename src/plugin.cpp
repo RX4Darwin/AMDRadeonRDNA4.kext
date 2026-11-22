@@ -1652,6 +1652,47 @@ IOReturn wrapFbSetPowerState(IOService *fb, unsigned long state, IOService *devi
 	return FunctionCast(wrapFbSetPowerState, orgFbSetPowerState)(fb, state, device);
 }
 
+// WebKit's GPU process may read /Library/GPUBundles but its sandbox (com.apple.WebKit.GPUProcess.sb) denies
+// file-map-executable there: Apple's own GPU drivers live in /System/Library/Extensions, which it allows, so Apple never
+// needs the exec-map of a third-party bundle. The result is that the GPU process can read our Metal driver but not run it,
+// and WebGL/Metal in Safari fall back or fail. This turns a *denied* executable mmap into an allow, only for a WebKit
+// process mapping a file inside our own bundle; every other mmap decision is left to the system policy. It is free on the
+// common path (the vnode/path/name work runs only after the policy already said no). Opt out with rdna4-webkitgpu=0.
+// Resolved by solveSymbol at patcher load, called through these: fg_get_vnode is not a KPI export, so calling it directly
+// would leave an unresolved kernel symbol and stop the kext loading. proc_best_name gives p_name when set (the full
+// "com.apple.WebKit.GPU", not p_comm's 16 chars).
+void *(*gFgGetVnode)(void *fg) = nullptr;                 // the fileglob's vnode, or null for a non-vnode file
+int (*gVnGetpath)(void *vp, char *buf, int *len) = nullptr;
+const char *(*gProcBestName)(void *proc) = nullptr;
+void *(*gCurrentProc)(void) = nullptr;
+
+mach_vm_address_t orgMacFileCheckMmap;
+
+int wrapMacFileCheckMmap(void *cred, void *fg, int prot, int flags, unsigned long long offset, int *maxprot) {
+	const int r = FunctionCast(wrapMacFileCheckMmap, orgMacFileCheckMmap)(cred, fg, prot, flags, offset, maxprot);
+	if (r == 0 || !fg)   // allowed already, or no file: the overwhelmingly common path, no further work
+		return r;
+	void *vp = gFgGetVnode(fg);
+	if (!vp)
+		return r;
+	char path[1024];
+	int len = sizeof(path);
+	if (gVnGetpath(vp, path, &len) != 0)
+		return r;
+	static const char kBundle[] = "/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/";
+	if (strncmp(path, kBundle, sizeof(kBundle) - 1) != 0)
+		return r;
+	const char *name = gProcBestName(gCurrentProc());
+	if (!name || strncmp(name, "com.apple.WebKit", 16) != 0)   // WebKit's GPU (and other WebKit) processes only
+		return r;
+	static uint32_t logged = 0;
+	if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 4)
+		FBLOG("sandbox: %s may map %s (the sandbox had denied the executable mapping)", name, path);
+	if (maxprot)
+		*maxprot |= 0x4;   // VM_PROT_EXECUTE: the policy cleared it; the map is allowed to be executable
+	return 0;
+}
+
 void processGraphics(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	if (index != kextIOGraphics.loadIndex)
 		return;
@@ -1936,6 +1977,25 @@ void pluginStart() {
 #endif
 	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
 		gPatcher = &patcher;
+		uint32_t webkit = 1;   // default on; rdna4-webkitgpu=0 opts out
+		if (!Trial::bootArg("rdna4-webkitgpu", webkit) || webkit) {
+			gFgGetVnode = reinterpret_cast<decltype(gFgGetVnode)>(patcher.solveSymbol(KernelPatcher::KernelID, "_fg_get_vnode"));
+			gVnGetpath = reinterpret_cast<decltype(gVnGetpath)>(patcher.solveSymbol(KernelPatcher::KernelID, "_vn_getpath"));
+			gProcBestName = reinterpret_cast<decltype(gProcBestName)>(patcher.solveSymbol(KernelPatcher::KernelID, "_proc_best_name"));
+			gCurrentProc = reinterpret_cast<decltype(gCurrentProc)>(patcher.solveSymbol(KernelPatcher::KernelID, "_current_proc"));
+			patcher.clearError();
+			if (gFgGetVnode && gVnGetpath && gProcBestName && gCurrentProc) {
+				KernelPatcher::RouteRequest wk {
+					"_mac_file_check_mmap", wrapMacFileCheckMmap, orgMacFileCheckMmap,
+				};
+				const bool routed = patcher.routeMultiple(KernelPatcher::KernelID, &wk, 1);
+				FBLOG("sandbox: mac_file_check_mmap %s: WebKit's GPU process may run /Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle",
+				      routed ? "routed" : "NOT routed");
+				patcher.clearError();
+			} else {
+				FBLOG("sandbox: not hooking mac_file_check_mmap: a helper symbol was not found (WebKit GPU map left to the system)");
+			}
+		}
 		if (RDNA4Device::systemSleepWanted()) {
 			KernelPatcher::RouteRequest power {
 				"__ZN9IOService19registerPowerDriverEPS_P14IOPMPowerStatem", wrapRegisterPowerDriver,
