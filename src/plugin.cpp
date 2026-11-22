@@ -1935,13 +1935,16 @@ void lateNdrvCheck(thread_call_param_t, thread_call_param_t) {
 }
 
 void pluginStart() {
-	rdna4LogInit();
-	FBLOG("version " AMDRADEONRDNA4_BUILD);
+	// Keep the isolation switch genuinely inert: even the log ring and its
+	// sysctls must not be initialised when testing whether this plugin is
+	// involved in an early boot failure.
 	uint32_t off = 0;
 	if (PE_parse_boot_argn("rdna4-off", &off, sizeof(off)) && off) {
-		FBLOG("disabled by rdna4-off boot-arg");
+		IOLog("AMDRadeonRDNA4: disabled by rdna4-off boot-arg\\n");
 		return;
 	}
+	rdna4LogInit();
+	FBLOG("version " AMDRADEONRDNA4_BUILD);
 	uint32_t trace = 0;
 	const bool traceArg = PE_parse_boot_argn("rdna4-trace", &trace, sizeof(trace));
 	rdna4TraceLevel = traceArg ? trace : 0;
