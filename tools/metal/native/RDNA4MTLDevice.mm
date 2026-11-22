@@ -1815,7 +1815,10 @@ static NSData *glProgramAir(id<MTLFunction> function)
 	};
 	((void (*)(id, SEL, id, id))objc_msgSend)(compiler, sel_registerName("compileFunctionRequest:completionHandler:"), request, done);
 	if (!air) {
-		RLOG(@"RDNA4MTL: OpenGL program %@ not compiled: %@", function.name, why ?: @"no metallib in the reply");
+		// (Metal's compiler service crashes on some of OpenMW's water programs, in MTLDeserializePluginDataDictionary, whatever their order
+		// or how often asked, 2026-11-22: not found yet)
+		RLOG(@"RDNA4MTL: OpenGL program %@ not compiled: %@ (bitcode type %u, state %lu bytes)", function.name,
+		     why ?: @"no metallib in the reply", type, (unsigned long)state.length);
 		return nil;
 	}
 	objc_setAssociatedObject(f, &kGlAir, air, OBJC_ASSOCIATION_RETAIN);
