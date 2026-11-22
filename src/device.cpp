@@ -2628,12 +2628,24 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	owner->setProperty("GPU,Variant", model);
 
 	if (isAmd) {
+		// Optional read-only PCI snapshot around the one configuration-space
+		// change made during normal attach. This helps distinguish a bad
+		// firmware/bridge hand-off from a failure caused by enabling MMIO.
+		uint32_t pciDiag = 0;
+		const bool tracePci = PE_parse_boot_argn("rdna4-pcidiag", &pciDiag, sizeof(pciDiag)) && pciDiag != 0;
+		if (tracePci)
+			logPciState("before-memory-enable");
+
 		// Enable memory space so the aperture is reachable; never bus
 		// mastering — nothing here issues DMA.
 		pciDevice->setMemoryEnable(true);
+		if (tracePci)
+			logPciState("after-memory-enable");
 
 		// Registers first: the on-die discovery fallback needs MMIO.
 		bool haveMmio = mapRegisters();
+		if (tracePci)
+			logPciState(haveMmio ? "after-bar5-map" : "bar5-map-failed");
 
 		// Connector layout and firmware info for mode setting; the display
 		// itself does not depend on this.
