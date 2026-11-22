@@ -1280,7 +1280,8 @@ struct Kernel {
 // A vertex or fragment function as a gfx12 shader with the hardware ABI of the kext's hand-written triangle shaders, for the host's draws
 // (src/pvgpu.cpp), as an RGFX blob: {char[4] "RGFX", u32 stage (1 vertex, 2 fragment), u32 code bytes, u32 SPI_SHADER_PGM_RSRC1, u32 RSRC2,
 // u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes (bits 0-15 the values between the stages; bit 16 its textures' levels read
-// (RDNA4_MTLC_LEVEL_FIRST); bit 18 dual-source blending (the colour and [[color(0), index(1)]] to the dual-source targets); bits 20-27 the colour attachments
+// (RDNA4_MTLC_LEVEL_FIRST); bit 18 dual-source blending (the colour and [[color(0), index(1)]] to the dual-source targets); bit 19 the depth
+// exported (MRTZ, 32_R); bits 20-27 the colour attachments
 // written when several, chosen by the host; bits 28-30 the one attachment other than 0 written; bit 31: a fragment shader without a colour)}, then the code
 // (relocation-free, the entry at its start), then per attribute
 // {u32 hash of its AIR name (FNV-1a), u32 flags: bit 0 flat, bit 1 the point's coordinate (no name)}: the vertex function's outputs in ring-slot order, the fragment function's
@@ -1444,6 +1445,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	// Dual-source blending: [[color(0), index(1)]], the blend's second source (Sublime Text's subpixel text through AppleMetalOpenGLRenderer
 	// blends with Source1Color): exported beside the colour (header bit 18), not as it
 	int dualMember = -1;
+	int depthMember = -1;   // the struct member that is the fragment's depth
 	for (unsigned k = 0; k < outputs->getNumOperands(); k++) {
 		const auto *o = cast<MDNode>(outputs->getOperand(k));
 		const std::string kind = mdString(o, 0);
@@ -1474,9 +1476,9 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			other = static_cast<int>(k);
 			otherIndex = static_cast<int>(mdInt(o, 1));
 		} else if (!vertex && kind == "air.depth") {
-			// ponytail: the depth a fragment shader writes is dropped (the rasterised depth is tested and written): the draw's colour
-			// rather than no draw (vkQuake's through MoltenVK, 2026-11-21); exporting it needs Z export in the draw stream
-			// (SPI_SHADER_Z_FORMAT, DB_SHADER_CONTROL.Z_EXPORT_ENABLE)
+			// [[depth(any)]] (vkQuake's gl_FragDepth through MoltenVK): exported to MRTZ before the colour, header bit 19 (the host sets
+			// SPI_SHADER_Z_FORMAT 32_R and DB_SHADER_CONTROL's Z_EXPORT_ENABLE, late Z)
+			depthMember = static_cast<int>(k);
 			continue;
 		} else if (!(!vertex && kind == "air.render_target")) {
 			return std::string(vertex ? "vertex" : "fragment") + " output " + kind + " is not supported yet";
@@ -1844,6 +1846,13 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			b.CreateIntrinsic(Intrinsic::amdgcn_exp, {f32}, {b.getInt32(0), b.getInt32(0), undef, undef, undef, undef, b.getTrue(), b.getTrue()});
 		} else {
 			Value *out = toVec4(colour->getType()->isStructTy() ? b.CreateExtractValue(colour, colourMember) : colour);
+			if (depthMember >= 0 && colour->getType()->isStructTy() && static_cast<unsigned>(depthMember) != colourMember) {
+				Value *undef = PoisonValue::get(f32);
+				b.CreateIntrinsic(Intrinsic::amdgcn_exp, {f32}, {b.getInt32(8), b.getInt32(1), b.CreateExtractValue(colour, static_cast<unsigned>(depthMember)),
+				                                                 undef, undef, undef, b.getFalse(), b.getTrue()});   // mrtz: the depth in x
+			} else {
+				depthMember = -1;
+			}
 			if (writes) {   // the attachment the host draws into, from the table
 				Value *at = b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(RDNA4_MTLC_TABLE_ATTACHMENT)), PointerType::get(ctx, 4));
 				Value *sel = b.CreateAlignedLoad(i32, at, Align(4));
@@ -1937,7 +1946,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		return "explicit LODs with textures 16-30: their levels have no T#s yet";
 	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3],
 	                          static_cast<uint32_t>(vars.size()) | writes << 20 | (attachment > 0 ? static_cast<uint32_t>(attachment) << 28 : 0) |
-	                          (noColour ? 1u << 31 : 0) | (f->hasFnAttribute("rdna4-levels") ? 1u << 16 : 0) | (dualMember >= 0 ? 1u << 18 : 0)};
+	                          (noColour ? 1u << 31 : 0) | (f->hasFnAttribute("rdna4-levels") ? 1u << 16 : 0) | (dualMember >= 0 ? 1u << 18 : 0) | (depthMember >= 0 ? 1u << 19 : 0)};
 	out.hsaco.assign(reinterpret_cast<const char *>(head), sizeof(head));
 	out.hsaco += code.str();
 	for (const Var &v : vars) {

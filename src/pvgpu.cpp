@@ -6412,6 +6412,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// subpixel text blends with Source1Color): both exports in the colour's format and in CB_SHADER_MASK, DISABLE_DUAL_QUAD, no SX blend
 	// optimisation (RADV's)
 	const bool dualSource = ps && (ps[7] >> 18 & 1) && !noColour;
+	const bool depthOut = ps && (ps[7] >> 19 & 1);   // the fragment shader exports its depth (MRTZ)
+	const uint32_t dbShader = noColour ? 0x600u : 0x10u;
 	// the one attachment other than 0 it writes (air2amdgpu.cpp, bits 28-30: CoreGraphics' path coverage into attachment 1): drawn into
 	// that attachment's texture
 	// a shader that writes several (bits 20-27): the first of them the pipeline writes (its mask) and the pass has a texture for, told to it
@@ -6714,7 +6716,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x69, 0x215, dualSource ? 0xffu : 0xfu},                          // CB_SHADER_MASK: the exports' channels (ac_get_cb_shader_mask), both sources'
 		// DB_SHADER_CONTROL: a shader without a colour writes memory, which runs only with EXEC_ON_HIER_FAIL and EXEC_ON_NOOP, after the depth
 		// test (LATE_Z; RADV's for writes_memory, gfx12.json); else the template's EARLY_Z_THEN_LATE_Z
-		{0x69, 0x1b, noColour ? 0x600u : 0x10u},
+		{0x69, 0x1b, depthOut ? (dbShader & ~0x30u) | 1u : dbShader},
+		{0x69, 0x194, depthOut ? 1u : 0u},   // SPI_SHADER_Z_FORMAT: 32_R for the shader's depth (Z_EXPORT_ENABLE, LATE_Z above), else ZERO
 		// Multisampling (ms; else the template's values): CB_COLOR0_ATTRIB NUM_FRAGMENTS, ATTRIB3 COLOR_SW_MODE 64KB_2D (its RESOURCE_TYPE 2D
 		// kept), PA_SC_AA_CONFIG MSAA_NUM_SAMPLES and MSAA_EXPOSED_SAMPLES, PA_SC_MODE_CNTL_0 MSAA_ENABLE, DB_EQAA MASK_EXPORT_NUM_SAMPLES and
 		// ALPHA_TO_MASK_NUM_SAMPLES (radeonsi's gfx12 values), the centroid order and the sample positions of the quad's four pixels

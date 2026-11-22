@@ -2199,7 +2199,7 @@ static id<MTLFunction> noFragmentFunction(RDNA4MTLDevice *device)
 		if (_blob[k].length < 4 * kHead || h[0] != kRgfxMagic || h[1] != (uint32_t)k + 1 || h[2] > room[k] || (h[7] & 0xffff) > 16 ||
 		    4ull * kHead + h[2] + 8ull * (h[7] & 0xffff) > _blob[k].length)
 			return rdna4Error([NSString stringWithFormat:@"%@: not a %s shader that fits its slot", fn[k].name, k ? "fragment" : "vertex"], 0);
-		if (h[7] & 0x7fff0000u & ~(k ? 0x7ff50000u : 0x00010000u))   // (several attachments: the PV host's choice; bit 18 dual source)
+		if (h[7] & 0x7fff0000u & ~(k ? 0x7ffd0000u : 0x00010000u))   // (several attachments: the PV host's choice; bit 18 dual source, 19 depth)
 			return rdna4Error([NSString stringWithFormat:@"%@: attributes 0x%x not supported yet", fn[k].name, h[7]], 0);
 	}
 	for (int k = 0; k < 2; k++) {   // the records after the values (TXRD, POSM)
@@ -4562,6 +4562,8 @@ static void abortStack(int sig)
 	// Apple's GL-on-Metal renderer), as the PV host: both exports in the colour's format and in CB_SHADER_MASK, DISABLE_DUAL_QUAD, no SX
 	// blend optimisation
 	const BOOL dualSource = (ps[7] >> 18 & 1) && !noColour;
+	const BOOL depthOut = ps[7] >> 19 & 1;   // the fragment shader exports its depth (MRTZ)
+	const uint32_t dbShader = noColour ? 0x600u : 0x10u;
 	// Blending as the PV host's runDraw: the colour pass and, when alpha's equation differs and both are written, an alpha-only pass after it
 	// (the card ignores SEPARATE_ALPHA_BLEND). ponytail: a colour factor reading destination alpha sees the alpha from before the draw.
 	const uint32_t *blend = [p blendOf:d->attachment];
@@ -4606,7 +4608,9 @@ static void abortStack(int sig)
 		{ 0x69, 0x214, noColour ? 0u : split ? mask & 7 : mask },         // CB_TARGET_MASK
 		{ 0x69, 0x195, noColour ? 0u : dualSource ? 0x99u : 9u },        // SPI_SHADER_COL_FORMAT: 32_ABGR (both sources)
 		{ 0x69, 0x215, dualSource ? 0xffu : 0xfu },                      // CB_SHADER_MASK: the exports' channels
-		{ 0x69, 0x1b, noColour ? 0x600u : 0x10u },                       // DB_SHADER_CONTROL
+		// DB_SHADER_CONTROL; with the shader's depth Z_EXPORT_ENABLE and LATE_Z (Z_ORDER 0); SPI_SHADER_Z_FORMAT 32_R for it, else ZERO
+		{ 0x69, 0x1b, depthOut ? (dbShader & ~0x30u) | 1u : dbShader },
+		{ 0x69, 0x194, depthOut ? 1u : 0u },
 		{ 0x69, 0x31b, logSamples }, { 0x69, 0x31f, 0x01000000u | (logSamples ? 3u << 15 : 0u) }, { 0x69, 0x2f8, logSamples | logSamples << 20 },
 		{ 0x69, 0x292, 0x22u | (logSamples ? 1u : 0u) }, { 0x69, 0x1e, 0x00110000u | logSamples << 8 | logSamples << 12 },
 		{ 0x69, 0x2fc, kCentroid[logSamples] }, { 0x69, 0x2fd, kCentroid[logSamples] }, { 0x69, 0x2fe, kLocs[logSamples] },
