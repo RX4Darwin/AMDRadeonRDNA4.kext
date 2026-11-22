@@ -34,6 +34,13 @@ enum { kMtlcNext = 0, kMtlcDeliver = 1 };
 #define RDNA4_MTLC_TABLE_TEXTURES_HIGH 0x4200u
 #define RDNA4_MTLC_TEXTURES 31u
 #define RDNA4_MTLC_TEXTURE_AT(n) ((n) < 16 ? RDNA4_MTLC_TABLE_TEXTURES + 32u * (n) : RDNA4_MTLC_TABLE_TEXTURES_HIGH + 32u * ((n) - 16))
+/* Textures 0-127 as handles, for a shader that binds textures past 30 or an array across the ranges above (MetalQuake's static world: 96 and
+ * 32 in one draw; its RGFX "TXRD" record's bit 31; the native device only): texture n's handle (8 bytes, the address of its T#) at
+ * RDNA4_MTLC_TABLE_TEXTURE_HANDLES + 8 n of the stage's table: n 0-30 the address of its T# in the table, 31-127 the texture's own T# slot
+ * (its gpuResourceID). An array of them is a pointer into it. */
+#define RDNA4_MTLC_TABLE_TEXTURE_HANDLES 0x4c00u
+#define RDNA4_MTLC_MAX_TEXTURES 128u
+#define RDNA4_MTLC_TXRD_HANDLES (1u << 31)
 #define RDNA4_MTLC_TABLE_SAMPLERS 576u
 /* The fragment stage's colour attachment 0 as the draw found it, for shaders that read it (Metal's [[color(0)]] input): a T# of the host's
  * staged RGBA8 copy of the target. */

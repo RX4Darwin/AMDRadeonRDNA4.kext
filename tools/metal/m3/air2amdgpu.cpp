@@ -1440,11 +1440,16 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 					count = k + 2 < a->getNumOperands() ? static_cast<int>(mdInt(a, k + 2)) : 1;
 				}
 			const bool texture = kind == "air.texture";   // textures 0-30 (an array within 0-15 or 16-30: include/rdna4mtlc.h), samplers 0-15
-			if (location < 0 || count < 1 || location + count > (texture ? static_cast<int>(RDNA4_MTLC_TEXTURES) : 16) ||
-			    (location < 16 && location + count > 16))
-				return kind + " argument " + std::to_string(index) + ": only indices 0-" + (texture ? "30" : "15") + " so far";
-			from[index] = (texture ? 200 : 300) + location;
-			texturesRead |= texture ? ((1u << count) - 1) << location : 0;
+			// past 30, or an array across those ranges: through the stage's texture handles (the native device's; textures 0-127)
+			const bool handles = texture && (location + count > static_cast<int>(RDNA4_MTLC_TEXTURES) || (location < 16 && location + count > 16));
+			if (location < 0 || count < 1 || location + count > (!texture ? 16 : handles ? static_cast<int>(RDNA4_MTLC_MAX_TEXTURES)
+			                                                                             : static_cast<int>(RDNA4_MTLC_TEXTURES)) ||
+			    (!texture && location < 16 && location + count > 16))
+				return kind + " argument " + std::to_string(index) + ": only indices 0-" + (texture ? "127" : "15") + " so far";
+			from[index] = (handles ? 1000 : texture ? 200 : 300) + location;   // (1000: past the attributes' 500 + n)
+			for (int n = location; texture && n < location + count && n < static_cast<int>(RDNA4_MTLC_TEXTURES); n++)
+				texturesRead |= 1u << n;   // (the handles of 0-30 are their T#s' places in the table: those filled too)
+			texturesRead |= handles ? RDNA4_MTLC_TXRD_HANDLES : 0;
 		}
 		else if (unused)
 			from[index] = -1;
@@ -1778,10 +1783,23 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			b.CreateStore(handle(at + stride * i, array->getElementType()), b.CreateConstInBoundsGEP2_32(array, handles, 0, i));
 		return handles;
 	};
+	// A texture or an array of them through the stage's texture handles (RDNA4_MTLC_TABLE_TEXTURE_HANDLES): one, its handle loaded from there;
+	// an array, a pointer into them for the shader to index (not copied: byval dropped, an array of 128 would need scratch memory, which draws
+	// have none of).
+	auto throughHandles = [&](unsigned k, unsigned n) -> Value * {
+		const uint64_t at = RDNA4_MTLC_TABLE_TEXTURE_HANDLES + 8 * n;
+		if (air->getArg(k)->hasByValAttr()) {
+			air->removeParamAttr(k, Attribute::ByVal);
+			return b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(at)), air->getArg(k)->getType());
+		}
+		Value *slot = b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(at)), PointerType::get(ctx, 4));
+		return b.CreateIntToPtr(b.CreateAlignedLoad(b.getInt64Ty(), slot, Align(8)), air->getArg(k)->getType());
+	};
 	auto callAir = [&](Value *vid) {
 		SmallVector<Value *, 4> args;
 		for (unsigned k = 0; k < air->arg_size(); k++)
-			args.push_back(from[k] >= 500 ? attribute(static_cast<unsigned>(from[k] - 500), vid, b.CreateAdd(f->getArg(kInstanceId), f->getArg(kBaseInstance)),
+			args.push_back(from[k] >= 1000 ? throughHandles(k, static_cast<unsigned>(from[k] - 1000))
+			               : from[k] >= 500 ? attribute(static_cast<unsigned>(from[k] - 500), vid, b.CreateAdd(f->getArg(kInstanceId), f->getArg(kBaseInstance)),
 			                                          air->getArg(k)->getType())
 			               : from[k] == 0 ? b.CreateZExtOrTrunc(vid, air->getArg(k)->getType())   // uint or ushort
 			               : from[k] == 1 ? b.CreateZExtOrTrunc(b.CreateAdd(f->getArg(kInstanceId), f->getArg(kBaseInstance)), air->getArg(k)->getType())   // with the base instance

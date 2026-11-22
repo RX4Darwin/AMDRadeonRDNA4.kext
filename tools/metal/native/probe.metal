@@ -60,3 +60,13 @@ kernel void argbuf(constant ArgProbe &a [[buffer(0)]], uint i [[thread_position_
 	a.out[i] = a.tex.read(uint2(i, 0));
 	a.out[i + 4] = a.tex.sample(a.smp, float2((i + 0.5f) / 4.0f, 0.5f), level(0));
 }
+
+// mtlprobe native, bindless: a triangle over the 4x1 target whose fragment reads texture idx[x] of 128 (MetalQuake's static world binds 96 and
+// 32 in one draw), so textures in all three of the table's ranges and its texture handles.
+vertex float4 bindless_v(uint vid [[vertex_id]]) {
+	return float4(float2((vid << 1) & 2, vid & 2) * 2 - 1, 0, 1);
+}
+
+fragment float4 bindless_f(float4 pos [[position]], array<texture2d<float>, 128> t [[texture(0)]], constant uint4 &idx [[buffer(0)]]) {
+	return t[idx[min(uint(pos.x), 3u)]].read(uint2(0));
+}

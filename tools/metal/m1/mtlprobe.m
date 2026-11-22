@@ -2716,6 +2716,60 @@ static BOOL nativeRays(id<MTLDevice> d, id<MTLLibrary> lib)
 #undef rnd
 }
 
+// Bindless textures (MetalQuake's static world): 128 textures of one texel each, n's colour (n, 255 - n, 2n, 255); a 4x1 target whose pixel x
+// reads texture 5, 20, 40 and 127 (the table's three ranges and its texture handles) from an array<texture2d, 128>.
+static BOOL nativeBindless(id<MTLDevice> d, id<MTLLibrary> lib)
+{
+	NSError *err = nil;
+	MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+	rd.vertexFunction = [lib newFunctionWithName:@"bindless_v"];
+	rd.fragmentFunction = [lib newFunctionWithName:@"bindless_f"];
+	rd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	id<MTLRenderPipelineState> rps = [d newRenderPipelineStateWithDescriptor:rd error:&err];
+	if (!rps) {
+		OUT("native: bindless FAIL: %s", err.localizedDescription.UTF8String);
+		return NO;
+	}
+	id<MTLTexture> textures[128];
+	MTLTextureDescriptor *one = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+	for (int n = 0; n < 128; n++) {
+		const uint8_t texel[4] = { (uint8_t)n, (uint8_t)(255 - n), (uint8_t)(2 * n), 255 };
+		textures[n] = [d newTextureWithDescriptor:one];
+		[textures[n] replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:texel bytesPerRow:4];
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:1 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	id<MTLTexture> target = [d newTextureWithDescriptor:td];
+	const uint32_t want[4] = { 5, 20, 40, 127 };
+	id<MTLBuffer> idx = [d newBufferWithBytes:want length:sizeof want options:MTLResourceStorageModeShared];
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = target;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	id<MTLCommandBuffer> cb = [[d newCommandQueue] commandBuffer];
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:pass];
+	[re setRenderPipelineState:rps];
+	[re setFragmentTextures:textures withRange:NSMakeRange(0, 128)];
+	[re setFragmentBuffer:idx offset:0 atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[re endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	uint8_t got[16] = {};
+	[target getBytes:got bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+	int bad = 0;
+	for (int x = 0; x < 4; x++) {
+		const uint32_t n = want[x];
+		bad += got[4 * x] != n || got[4 * x + 1] != 255 - n || got[4 * x + 2] != (uint8_t)(2 * n) || got[4 * x + 3] != 255;
+	}
+	const BOOL ok = !bad && cb.status == MTLCommandBufferStatusCompleted;
+	OUT("native: bindless %s: %d of 4 pixels wrong: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x (status %ld%s%s)",
+	    ok ? "PASS" : "FAIL", bad, got[0], got[1], got[2], got[3], got[4], got[5], got[6], got[7], got[8], got[9], got[10], got[11], got[12],
+	    got[13], got[14], got[15], (long)cb.status, cb.error ? ", " : "", cb.error ? cb.error.localizedDescription.UTF8String : "");
+	return ok;
+}
+
 // Instances (MetalQuake's shadow rays): the same rays against an instance structure of one instance of the triangles, turned 90 degrees
 // about z and moved 1 along z, queried as MetalQuake does (intersector<instancing>, no triangle data); each ray's distance and instance
 // against the nearest of the turned and moved triangles by the CPU.
@@ -2927,7 +2981,7 @@ int main(int argc, char **argv) {
 			    "near the vertices 0x%08x 0x%08x 0x%08x, pixel (0,0) 0x%08x (status %ld%s%s)", renderOk ? "PASS" : "FAIL", tr.covered, tr.minX, tr.maxX,
 			    tr.minY, tr.maxY, tr.maxChannelErr256 / 256.0, tr.maxSumErr, tr.centroid, tr.near0, tr.near1, tr.near2, img[0], (long)rb.status,
 			    rb.error ? ", " : "", rb.error ? rb.error.localizedDescription.UTF8String : "");
-			const BOOL raysOk = nativeRays(d, lib) & nativeInstanceRays(d, lib);
+			const BOOL raysOk = nativeRays(d, lib) & nativeInstanceRays(d, lib) & nativeBindless(d, lib);   // (bindless: a render, here for its order)
 			const BOOL queueOk = nativeQueue(d, scale, rps, pass, tex);
 			return computeOk && renderOk && raysOk && queueOk ? 0 : 1;
 		}

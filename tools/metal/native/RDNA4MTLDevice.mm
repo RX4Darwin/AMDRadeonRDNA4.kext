@@ -226,6 +226,7 @@ static void missingCall(id obj, NSInvocation *inv)
 - (uint64_t)handle:(uint64_t)handle words:(const uint32_t *)words count:(unsigned)count;
 - (void)freeHandle:(uint64_t)handle;
 - (void)spareImage:(uint32_t[8])t;   // the T# of an unbound texture slot: one texel of the zeroed spare buffer
+- (uint64_t)spareHandle;              // a T# slot holding that T# (an unbound texture handle)
 @end
 
 static NSError *rdna4Error(NSString *what, kern_return_t kr)
@@ -1945,7 +1946,8 @@ enum { kRgfxMagic = 0x58464752u, kHead = 8, kTxrd = 0x44525854u, kPosm = 0x4d534
 
 // One draw as recorded: everything the device needs to run it.
 enum { kStageTextures = 16 };   // a stage's table holds samplers 0-15 and the textures that have levels (include/rdna4mtlc.h)
-enum { kTextures = RDNA4_MTLC_TEXTURES };   // and textures 0-30
+enum { kTextures = RDNA4_MTLC_TEXTURES };   // and textures 0-30 as T#s
+enum { kMaxTextures = RDNA4_MTLC_MAX_TEXTURES, kHandleTextures = kMaxTextures - kTextures };   // 31-127 through handles (include/rdna4mtlc.h)
 
 typedef struct {
 	uint64_t table[2][kTableBuffers];   // per stage, its buffers' GPU addresses by index (0: unbound)
@@ -1956,6 +1958,7 @@ typedef struct {
 	uint32_t covered[4];                // what of it the draw can write: its vertices' bounds where those are known (bound:), else the scissor
 	uint32_t attachment;                // the colour attachment the draw goes into (RDNA4_MTLC_TABLE_ATTACHMENT)
 	const uint8_t *levelT;              // for shaders that sample explicit levels: per stage, levels 1-7, textures 0-15, a T# each (else NULL)
+	const uint64_t *handles;            // for shaders that use texture handles: per stage, textures 31-127's T# slots (else NULL)
 	float blendColour[4];
 	uint64_t indexGpu;                  // an indexed draw's indices (0: not indexed), 16- or 32-bit
 	uint32_t indexBytes;
@@ -2832,7 +2835,7 @@ RDNA4_ANSWER_MISSING
 	id<MTLBuffer> _bound[2][kTableBuffers];
 	id<MTLBuffer> _indirect;   // (record:, while an indirect draw is recorded) where its arguments are, at _indirectOffset
 	NSUInteger _indirectOffset;
-	id<MTLTexture> _textures[2][kTextures];
+	id<MTLTexture> _textures[2][kMaxTextures];
 	id<MTLSamplerState> _samplers[2][kStageTextures];
 	RDNA4MTLTexture *_depth, *_stencil;   // the pass's depth and stencil attachments of this device (the same texture for Depth32Float_Stencil8)
 	RDNA4MTLDepthStencilState *_depthState;
@@ -2944,8 +2947,8 @@ RDNA4_ANSWER_MISSING
 	_depthState = [(id)state isKindOfClass:[RDNA4MTLDepthStencilState class]] ? (RDNA4MTLDepthStencilState *)state : nil;
 }
 
-- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < kTextures) _textures[0][i] = t; }
-- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < kTextures) _textures[1][i] = t; }
+- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < kMaxTextures) _textures[0][i] = t; }
+- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < kMaxTextures) _textures[1][i] = t; }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < kStageTextures) _samplers[0][i] = s; }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < kStageTextures) _samplers[1][i] = s; }
 // several at once (MetalQuake's status bar: answered as missing, its textures were never bound, 2026-11-21)
@@ -3155,6 +3158,8 @@ RDNA4_ANSWER_MISSING
 	NSMutableArray *reads = [NSMutableArray array];   // {stage, slot, texture}: what the draw samples
 	const BOOL wantsLevels = _pipeline && ((_pipeline.vs[7] | _pipeline.ps[7]) >> 16 & 1);
 	NSMutableData *levelT = wantsLevels ? [NSMutableData dataWithLength:2 * 7 * 16 * 32] : nil;
+	const BOOL wantsHandles = _pipeline && (([_pipeline texturesOf:0] | [_pipeline texturesOf:1]) & RDNA4_MTLC_TXRD_HANDLES);
+	NSMutableData *handles = wantsHandles ? [NSMutableData dataWithLength:2 * kHandleTextures * 8] : nil;
 	for (int st = 0; st < 2; st++) {
 		for (int i = 0; i < kTableBuffers; i++)
 			if (_bound[st][i])
@@ -3176,7 +3181,21 @@ RDNA4_ANSWER_MISSING
 			if (i < kStageTextures && [(id)_samplers[st][i] isKindOfClass:[RDNA4MTLSamplerState class]])
 				memcpy(d.samplers[st][i], ((RDNA4MTLSamplerState *)_samplers[st][i]).words, 16);
 		}
+		// textures 31-127: their T# slots (gpuResourceID writes the T# as it is now), unbound ones the spare texel's
+		for (int i = kTextures; handles && (uses & RDNA4_MTLC_TXRD_HANDLES) && i < kMaxTextures; i++) {
+			RDNA4MTLTexture *t = [(id)_textures[st][i] isKindOfClass:[RDNA4MTLTexture class]] ? (RDNA4MTLTexture *)_textures[st][i] : nil;
+			const uint64_t slot = t ? t.gpuResourceID._impl : 0;
+			((uint64_t *)handles.mutableBytes)[st * kHandleTextures + (i - kTextures)] = slot ?: [(RDNA4MTLDevice *)self.device spareHandle];
+			if (!t || t.isDepth)
+				continue;
+			if (t.shadowed)
+				[shadowed addObject:t];
+			[held addObject:t];
+			[reads addObject:@[ @(st), @(i), t ]];
+		}
 	}
+	if (handles)
+		[held addObject:handles];
 	if (indexBuffer) {
 		d.indexGpu = indexBuffer.gpuAddress + indexOffset;
 		d.indexBytes = indexType == MTLIndexTypeUInt32 ? 4 : 2;
@@ -3220,6 +3239,7 @@ RDNA4_ANSWER_MISSING
 	if (pipeline)
 		[self bound:&d pipeline:pipeline indices:indexBuffer offset:indexOffset type:indexType];
 	d.levelT = (const uint8_t *)levelT.bytes;
+	d.handles = (const uint64_t *)handles.bytes;
 	if (pipeline && !pipeline.described) {   // what each pipeline's first draw binds: a hang's draw named (drainGfx), this says what it read
 		pipeline.described = YES;
 		NSMutableString *what = [NSMutableString stringWithFormat:@"pipeline %@: vs 0x%08x ps 0x%08x, vs rsrc %08x %08x, ps rsrc %08x %08x ena %08x addr %08x, blend",
@@ -3977,7 +3997,7 @@ static uint32_t floatBits(float f)
 
 // the state page: the stream's fence at +0, the vertex stage's table at +0x400, the fragment stage's at +0x800, the levels' T#s from +0x1000
 // (RDNA4_MTLC_LEVEL_FIRST, written only for a stage that samples at explicit LODs)
-enum { kMiscBytes = 0x5000, kMiscTables = 0x1000 };
+enum { kMiscBytes = 0x5800, kMiscTables = 0x1000 };   // (0x5800: the fragment stage's texture handles end at 0x5800)
 // draws in flight: each has its own IB page and state page until its fence has come. 16 kept the submit loop waiting for the card for
 // most of a frame of 80 draws, and WindowServer's main thread with it (commitAndWaitUntilSubmitted: 25 % of a window drag, 2026-11-20)
 enum { kSlots = 128, kBatchSlots = 32 };   // a batch is submitted at kBatchSlots: up to 96 slots in flight while the next is written
@@ -4205,6 +4225,7 @@ RDNA4_ANSWER_MISSING
 @implementation RDNA4MTLDevice {
 	id<MTLBuffer> _handles;           // (handle:words:count:) the slots, the spare T# in each free one: an explicit-LOD sample reads past its
 	NSMutableIndexSet *_freeHandles;  // handle's slot (RDNA4_MTLC_LEVEL_FIRST), and an all-zero T# can stall the texture unit
+	uint64_t _spareHandle;            // (spareHandle)
 	io_service_t _service;
 	uint64_t _registryID;
 	__weak id _accelService;   // Metal's MTLIOAccelService for our service
@@ -4495,6 +4516,18 @@ static void abortStack(int sig)
 	linearImage(t, _spare.gpu, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 1, 1, 64);
 }
 
+- (uint64_t)spareHandle
+{
+	@synchronized(self) {
+		if (!_spareHandle) {
+			uint32_t spare[8];
+			[self spareImage:spare];
+			_spareHandle = [self handle:0 words:spare count:8];
+		}
+		return _spareHandle;
+	}
+}
+
 // ponytail: 32768 slots (1 MiB) for the process, its textures and samplers that were asked their gpuResourceID; a second slab if that runs out.
 - (uint64_t)handle:(uint64_t)handle words:(const uint32_t *)words count:(unsigned)count
 {
@@ -4732,7 +4765,9 @@ static void abortStack(int sig)
 	}
 	// The stages' tables in the state page (unbound buffers: a zeroed spare, as the PV host), the fence word at +0 zeroed.
 	const BOOL levels = (vs[7] | ps[7]) >> 16 & 1;   // a stage samples at explicit LODs: levels 1-7 of each texture (one level: level 0's T#)
-	const size_t miscBytes = levels ? kMiscBytes : kMiscTables;
+	// the whole page for those and for textures past 15 (+0x4200) or texture handles (+0x4c00), else the tables
+	const BOOL highTextures = (([p texturesOf:0] | [p texturesOf:1]) >> 16) != 0;
+	const size_t miscBytes = levels || highTextures ? kMiscBytes : kMiscTables;
 	memset(misc, 0, miscBytes);
 	for (unsigned st = 0; st < 2; st++)
 		for (unsigned k = 0; k < kTableBuffers; k++) {
@@ -4751,12 +4786,19 @@ static void abortStack(int sig)
 	[self spareImage:spare];
 	static const uint32_t none[8] = {};
 	static_assert(0x800 + RDNA4_MTLC_TEXTURE_AT(kTextures) <= kMiscBytes, "textures 16-30 fit the state page");
+	static_assert(0x800 + RDNA4_MTLC_TABLE_TEXTURE_HANDLES + 8 * kMaxTextures <= kMiscBytes, "the texture handles fit the state page");
+	static_assert(0x400 + RDNA4_MTLC_TABLE_TEXTURE_HANDLES >= 0x800 + RDNA4_MTLC_TEXTURE_AT(kTextures) &&
+	              0x400 + RDNA4_MTLC_TABLE_TEXTURE_HANDLES + 8 * kMaxTextures <= 0x800 + RDNA4_MTLC_TABLE_TEXTURE_HANDLES,
+	              "the vertex stage's handles between the fragment stage's textures 16-30 and its handles");
 	for (unsigned st = 0; st < 2; st++) {   // the T#s at RDNA4_MTLC_TEXTURE_AT(n), the S#s at +576 + 16 n of the stage's table (include/rdna4mtlc.h)
 		uint8_t *table = (uint8_t *)misc + 0x400 + 0x400 * st;
 		for (unsigned k = 0; k < kTextures; k++)   // unbound: the spare texel (here and at every level)
 			memcpy(table + RDNA4_MTLC_TEXTURE_AT(k), memcmp(d->textures[st][k], none, 32) ? d->textures[st][k] : spare, 32);
 		for (unsigned k = 0; k < kStageTextures; k++)
 			memcpy(table + RDNA4_MTLC_TABLE_SAMPLERS + 16 * k, d->samplers[st][k], 16);
+		uint64_t *handle = (uint64_t *)(table + RDNA4_MTLC_TABLE_TEXTURE_HANDLES);   // 0-30: their T#s just written, 31-127: recorded
+		for (unsigned k = 0; d->handles && k < kMaxTextures; k++)
+			handle[k] = k < kTextures ? miscGpu + 0x400 + 0x400 * st + RDNA4_MTLC_TEXTURE_AT(k) : d->handles[st * kHandleTextures + (k - kTextures)];
 	}
 	// The draw in place of the template's DRAW_INDEX_AUTO: blend colour, the fragment inputs, the stages' tables (USER_DATA_GS_0/1, _PS_0/1),
 	// the first vertex and base instance (USER_DATA_GS_2/3), NUM_INSTANCES, DRAW_INDEX_AUTO.
