@@ -636,8 +636,18 @@ static std::string legalize(Function &k) {
 				auto *offset = c->arg_size() > 7 ? dyn_cast<Constant>(c->getArgOperand(4)) : nullptr;
 				auto *level = c->arg_size() > 7 ? dyn_cast<ConstantInt>(c->getArgOperand(5)) : nullptr;
 				Value *value = c->arg_size() > 7 ? c->getArgOperand(6) : nullptr;
-				if (!offset || !level || !match(c->getArgOperand(7), m_AnyZeroFP()))
-					return f->getName().str() + " with a run-time offset or a minimum LOD is not supported yet";
+				if (!offset || !level)
+					return f->getName().str() + " with a run-time offset or level kind is not supported yet";
+				// A minimum LOD (min_lod_clamp): the _cl forms for an implicit LOD or a bias, an explicit LOD raised to it; outside a fragment
+				// shader (level 0 otherwise) the minimum itself as the explicit LOD. Older AIR (Waves' plugin windows) has no minimum: its
+				// eighth operand is the trailing i32, and it returns the texel alone.
+				Value *minLod = c->getArgOperand(7);
+				const bool clamped = minLod->getType()->isFloatTy() && !match(minLod, m_AnyZeroFP()),
+				           fragment = k.getCallingConv() == CallingConv::AMDGPU_PS;
+				if (clamped && (level->isOne() || !fragment)) {
+					value = level->isOne() ? b.CreateBinaryIntrinsic(Intrinsic::maxnum, value, minLod) : minLod;
+					level = b.getTrue();
+				}
 				// The offset as the hardware takes it: x [5:0], y [13:8], 6-bit signed.
 				uint32_t packed = 0;
 				for (unsigned k = 0; k < (cube ? 3u : 2u); k++)
@@ -653,6 +663,12 @@ static std::string legalize(Function &k) {
 				// (and biases) read level 0.
 				const bool quads = k.getCallingConv() == CallingConv::AMDGPU_PS;
 				const unsigned mode = !quads && !(lod && !zero) ? 3 : bias ? 1 : lod ? (zero ? 3 : 2) : 0;
+				const bool cl = clamped && mode < 2;   // (an implicit LOD or a bias in a fragment shader, its minimum after the coordinates)
+				static const Intrinsic::ID clIds[2][2][2] = {   // [3D][offset][plain, bias]
+					{{Intrinsic::amdgcn_image_sample_cl_2d, Intrinsic::amdgcn_image_sample_b_cl_2d},
+					 {Intrinsic::amdgcn_image_sample_cl_o_2d, Intrinsic::amdgcn_image_sample_b_cl_o_2d}},
+					{{Intrinsic::amdgcn_image_sample_cl_3d, Intrinsic::amdgcn_image_sample_b_cl_3d},
+					 {Intrinsic::amdgcn_image_sample_cl_o_3d, Intrinsic::amdgcn_image_sample_b_cl_o_3d}}};
 				Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
 				SmallVector<Type *, 5> types = {v4f};   // the overloads: the texel, [the bias], the coordinates, the descriptors
 				SmallVector<Value *, 11> args = {b.getInt32(15)};
@@ -668,6 +684,8 @@ static std::string legalize(Function &k) {
 					args.push_back(b.CreateExtractElement(xy, 2));
 				if (mode == 2)
 					args.push_back(value);
+				if (cl)
+					args.push_back(minLod);
 				types.append({t->getType(), sm->getType()});
 				args.append({t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
 				const CallingConv::ID cc = k.getCallingConv();
@@ -697,7 +715,7 @@ static std::string legalize(Function &k) {
 					Value *s0 = levelSample(l0), *s1 = levelSample(l1);
 					texel = b.CreateFAdd(s0, b.CreateFMul(b.CreateFSub(s1, s0), b.CreateVectorSplat(4, fraction)));
 				} else
-					texel = b.CreateIntrinsic(ids[cube][packed != 0][mode], types, args);
+					texel = b.CreateIntrinsic(cl ? clIds[cube][packed != 0][mode] : ids[cube][packed != 0][mode], types, args);
 			} else {
 				// The offset is added to the coordinates; a level other than 0 reads that mip level (image_load_mip).
 				if (!samplerless && c->arg_size() < 5)
@@ -725,7 +743,8 @@ static std::string legalize(Function &k) {
 			if (readInt)
 				texel = b.CreateIntCast(b.CreateBitCast(texel, FixedVectorType::get(b.getInt32Ty(), 4)),
 				                        cast<StructType>(c->getType())->getElementType(0), tex.starts_with("read_texture_2d.s"));
-			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+			// {texel, i8 0}, or older AIR's texel alone
+			r = c->getType()->isStructTy() ? b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1) : texel;
 		} else if (tex.starts_with("sample_texture_2d_grad.v4f")) {
 			// (texture, sampler, float2 coord, float2 dPdx, float2 dPdy, float min LOD, i1, int2 offset, i32): explicit gradients
 			// (Unity's xlatMtlMain shaders, Daggerfall Unity) as image_sample_d: dsdh, dtdh = dPdx, dsdv, dtdv = dPdy.
