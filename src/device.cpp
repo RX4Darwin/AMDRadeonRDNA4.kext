@@ -202,9 +202,22 @@ void RDNA4Device::publishVBIOSInfo() {
 }
 
 bool RDNA4Device::loadVBIOS() {
-	if (!copyVBIOSFromProperty() && !copyVBIOSFromExpansionROM()) {
-		FBLOG("VBIOS: no image available (inject ATY,bin_image via DeviceProperties)");
-		return false;
+	// Reading the VBIOS from the expansion ROM requires writes to the PCI
+	// Expansion ROM BAR (including a sizing probe). Some firmware/platform
+	// combinations do not tolerate that transaction after boot hand-off.
+	// Prefer an injected image and leave PCI configuration untouched by
+	// default. The ROM path remains available as an explicit diagnostic opt-in.
+	if (!copyVBIOSFromProperty()) {
+		uint32_t romRead = 0;
+		const bool allowRomRead = PE_parse_boot_argn("rdna4-vbiosrom", &romRead, sizeof(romRead)) && romRead != 0;
+		if (!allowRomRead) {
+			FBLOG("VBIOS: no injected image; expansion-ROM PCI probing skipped (use rdna4-vbiosrom=1 to opt in)");
+			return false;
+		}
+		if (!copyVBIOSFromExpansionROM()) {
+			FBLOG("VBIOS: expansion-ROM read failed");
+			return false;
+		}
 	}
 
 	if (!atomBios.init(vbiosData, vbiosSize)) {
