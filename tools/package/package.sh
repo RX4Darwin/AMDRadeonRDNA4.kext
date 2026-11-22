@@ -77,7 +77,7 @@ cp "$dir/$bundle/Contents/Resources/radeon_icd.json" "$r/usr/local/share/vulkan/
 script() {
 	mkdir -p "$w/$1-scripts"
 	{
-		printf '#!/bin/sh\n# %s %s (tools/package/package.sh)\n' "$1" "$2"
+		printf '#!/bin/sh\n# %s %s (tools/package/package.sh)\nset -e\n' "$1" "$2"
 		printf '%b\n' "$3"
 		printf 'exit 0\n'
 	} > "$w/$1-scripts/$2"
