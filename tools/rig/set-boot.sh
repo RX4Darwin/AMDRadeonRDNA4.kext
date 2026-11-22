@@ -18,7 +18,7 @@
 #   5  base + GFXOFF (optional, ALWAYS LAST, then power off)   rdna4-gfxpm=24 rdna4-gfxoff=1
 #   8  boot 2 + the gfx ring left UP for applications (W12k): rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1, WITHOUT rdna4-gfxprobe/gfxdiag (boot 3's probe parks PFP/ME after its
 #      draws, so no client could draw there). Bring-up draws G3 (+G4) and runs the kernel's synthetic client-IB self-test (gfx-client); diagnostic-log.sh then runs
-#      `rdna4-run info` (must show GFX), `rdna4-run tri` and `rdna4-run tricol` (rows gfx-app-tri / gfx-app-tricol). On the emulator: tri PASS, tricol FAIL (G4 is not modelled).
+#      `rdna4-run info` (must show GFX), `rdna4-run tri` and `rdna4-run tricol` (rows gfx-app-tri / gfx-app-tricol). On the emulator: tri and tricol PASS (G4 is modelled since 2026-11-21, docs/emu-linux.md).
 #      Needs docs/w12k-gfx-submit.md's dependency (W13 S0: rtFree invalidates device buffers) before it is enabled on the real card.
 #  10  boot 8 + rdna4-gfxidle=1 (power P2/P3, docs/power-gfx.md s.9): software-only idle accounting (idle:/Compute,GFXIdle) next to the SMU's view; diagnostic-log.sh rows post-idle
 #      (sensors 3 s after the application steps: FAIL when activity stays >= 10 % or power >= 40 W) and gfx-idle-acct. Changes no hardware state.

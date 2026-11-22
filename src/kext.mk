@@ -65,7 +65,8 @@ COMMON_FLAGS = \
 # does not export — kmutil then fails to link ("could not find a kext which
 # exports ___cxa_atexit"). Kext teardown is handled by the kmod _stop path,
 # so static destructors are never wanted here.
-# fwconfig.h defines AMDRadeonRDNA4_NO_FIRMWARE when the firmware is not there.
+# fwconfig.h defines AMDRadeonRDNA4_NO_FIRMWARE when the firmware is not there, and otherwise which sets are
+# (AMDRadeonRDNA4_FW_NAVI48, AMDRadeonRDNA4_FW_NAVI44).
 CXXFLAGS  = $(COMMON_FLAGS) -std=c++17 -fno-exceptions -fno-rtti -fcheck-new \
             -fno-c++-static-destructors -include fwconfig.h $(VMTEST_FLAGS_$(VMTEST))
 CFLAGS    = $(COMMON_FLAGS)
@@ -105,8 +106,8 @@ fwblobs.o: $(ROOT)/src/fwblobs.S fwconfig.h
 		echo "no firmware in firmware/amdgpu (tools/build/fetch-firmware.sh): the kext is built without it"; \
 		echo "" | $(CC) $(TARGET) -x c -c - -o $@; \
 	else \
-		echo "$(CC) $(TARGET) -I$(ROOT) -c $(ROOT)/src/fwblobs.S -o $@"; \
-		$(CC) $(TARGET) -I$(ROOT) -c $(ROOT)/src/fwblobs.S -o $@; \
+		echo "$(CC) $(TARGET) -I$(ROOT) -include fwconfig.h -c $(ROOT)/src/fwblobs.S -o $@"; \
+		$(CC) $(TARGET) -I$(ROOT) -include fwconfig.h -c $(ROOT)/src/fwblobs.S -o $@; \
 	fi
 
 # IOAcceleratorFamily2's functions our accelerator reaches, as jumps through a table (tools/gen/accelgen.py, src/rdna4accel.cpp).

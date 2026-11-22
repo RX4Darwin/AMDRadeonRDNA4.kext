@@ -31,6 +31,8 @@
 #include "../src/dpphy.hpp"
 #include "../src/dpdual.hpp"
 #include "../src/amdfw.hpp"
+#include "../src/fwset.hpp"
+#include "../src/sku.hpp"
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
 #include "../src/ih.hpp"
@@ -54,6 +56,7 @@
 #include "../src/dcninit.hpp"
 #include "rdna4compute.h"
 
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstddef>
@@ -3361,6 +3364,103 @@ static int testGfxImages() {
 	return failures;
 }
 
+// The Navi 44 firmware set (RX 9060 XT: PSP 14.0.2, SMU 14.0.2, SDMA 7.0.0, GC 12.0.0) through the same parsers as
+// the Navi 48 set above: the containers are the same, the contents another chip's. The structure is checked (the
+// 19 images of the RLC autoload, their order and types); the sizes and versions of the Navi 44 blobs are not pinned,
+// since nothing has run on that chip.
+static int testNavi44Firmware() {
+	int failures = 0;
+	failures += check(FwSet::forGc(12, 0, 0) == FwSet::Family::Navi44 && FwSet::forGc(12, 0, 1) == FwSet::Family::Navi48 &&
+	                  FwSet::forGc(12, 1, 0) == FwSet::Family::None, "navi44: firmware set from the GC version");
+	failures += check(Sku::computeUnits(Sku::kNavi44, 0xC0) == 32 &&
+	                  !strcmp(Sku::modelName(Sku::kNavi44, 0xC0), "AMD Radeon RX 9060 XT") &&
+	                  !strcmp(Sku::modelName(Sku::kNavi48, Sku::kRevRx9070Xt), "AMD Radeon RX 9070 XT"),
+	                  "navi44: model name and compute units");
+
+	// A kernel built for gfx1200 is taken as one built for gfx1201 is (the same instruction set); another chip's is not.
+	{
+		std::vector<uint8_t> elf(kVaddCodeObject, kVaddCodeObject + sizeof(kVaddCodeObject));
+		CodeObj::Kernel k;
+		const char *why = nullptr;
+		failures += check(elf[48] == 0x4e, "navi44: the vadd code object is not a gfx1201 one (0x%02x)", elf[48]);
+		elf[48] = 0x48;   // EF_AMDGPU_MACH_AMDGCN_GFX1200, as llvm-mc -mcpu=gfx1200 writes it
+		failures += check(CodeObj::findKernel(elf.data(), elf.size(), "vadd", k, &why), "navi44: a gfx1200 code object refused (%s)",
+		                  why ? why : "-");
+		elf[48] = 0x4a;   // gfx1151
+		failures += check(!CodeObj::findKernel(elf.data(), elf.size(), "vadd", k, &why), "navi44: a gfx1151 code object accepted");
+	}
+
+	static const char *const names[] = {
+		"firmware/amdgpu/sdma_7_0_0.bin", "firmware/amdgpu/gc_12_0_0_pfp.bin",
+		"firmware/amdgpu/gc_12_0_0_me.bin", "firmware/amdgpu/gc_12_0_0_mec.bin",
+		"firmware/amdgpu/gc_12_0_0_uni_mes.bin", "firmware/amdgpu/gc_12_0_0_imu.bin",
+		"firmware/amdgpu/gc_12_0_0_rlc.bin",
+	};
+	std::vector<uint8_t> sosFile, smuFile, files[7];
+	bool present = readFile("firmware/amdgpu/psp_14_0_2_sos.bin", sosFile) &&
+	               readFile("firmware/amdgpu/smu_14_0_2.bin", smuFile);
+	for (int i = 0; i < 7 && present; i++)
+		present = readFile(names[i], files[i]);
+	if (!present) {
+		printf("\nnavi44: firmware/amdgpu/ blobs of the Navi 44 set absent, the firmware checks skipped\n");
+		return failures;
+	}
+
+	// What stage 2 hands the PSP's bootloader and secure OS. Navi 44's package has no RAS driver and no RL
+	// (9 parts where Navi 48's has 11): Psp::Driver::loadSos skips what a package does not have, as psp_hw_start does.
+	AmdFw::PspPackage pkg;
+	failures += check(AmdFw::parsePsp(sosFile.data(), sosFile.size(), pkg), "navi44: sOS package rejected");
+	static const AmdFw::PspPart need[] = { AmdFw::PspKdb, AmdFw::PspSysDrv, AmdFw::PspSos, AmdFw::PspToc };
+	for (AmdFw::PspPart part : need)
+		failures += check(pkg.part[part].valid(), "navi44: sOS package without %s", AmdFw::pspPartName(part));
+	for (uint32_t part = 1; part < AmdFw::PspPartCount; part++)
+		failures += check(!pkg.part[part].valid() || (pkg.part[part].data >= sosFile.data() &&
+		                  pkg.part[part].data + pkg.part[part].size <= sosFile.data() + sosFile.size()),
+		                  "navi44: sOS package part %s outside the file", AmdFw::pspPartName(part));
+	failures += check(!AmdFw::parsePsp(sosFile.data(), 200, pkg), "navi44: truncated sOS package accepted");
+	AmdFw::parsePsp(sosFile.data(), sosFile.size(), pkg);
+	AmdFw::Blob smu;
+	AmdFw::Common smuHdr {};
+	failures += check(AmdFw::payload(smuFile.data(), smuFile.size(), smu) && smu.size && smu.size % 4 == 0 &&
+	                  AmdFw::parseCommon(smuFile.data(), smuFile.size(), smuHdr), "navi44: SMU payload (%u bytes)", smu.size);
+
+	// The same 19 images in amdgpu's load order as for GC 12.0.1.
+	auto blob = [&](int i) { return AmdFw::Blob { files[i].data(), static_cast<uint32_t>(files[i].size()) }; };
+	AmdFw::GfxBlobs b { blob(0), blob(1), blob(2), blob(3), blob(4), blob(5), blob(6) };
+	AmdFw::GfxImage img[AmdFw::kMaxGfxImages];
+	const char *why = nullptr;
+	const uint32_t n = AmdFw::buildGfxImages(b, img, AmdFw::kMaxGfxImages, &why);
+	failures += check(n == 19, "navi44: gfx images: %u built (%s)", n, why ? why : "-");
+	static const struct { const char *name; uint32_t type; } expect[] = {
+		{ "SDMA_RS64", 71 }, { "RS64_PFP", 87 }, { "RS64_ME", 88 }, { "RS64_MEC", 89 },
+		{ "RS64_PFP_P0_STACK", 90 }, { "RS64_ME_P0_STACK", 92 }, { "RS64_MEC_P0_STACK", 94 },
+		{ "RS64_MEC_P1_STACK", 95 }, { "CP_MES", 33 }, { "CP_MES_DATA", 34 },
+		{ "CP_MES1", 81 }, { "CP_MES1_DATA", 82 }, { "IMU_I", 68 }, { "IMU_D", 69 },
+	};
+	for (uint32_t i = 0; i < 14 && i < n; i++)
+		failures += check(!strcmp(img[i].name, expect[i].name) && img[i].pspType == expect[i].type,
+		                  "navi44: gfx images: [%u] %s/%u, expected %s/%u", i, img[i].name,
+		                  img[i].pspType, expect[i].name, expect[i].type);
+	failures += check(n && !strcmp(img[n - 1].name, "RLC_G") && img[n - 1].pspType == 8, "navi44: gfx images: RLC_G must come last");
+	bool inside = true;
+	for (uint32_t i = 0; i < n; i++) {
+		bool ok = false;
+		for (auto &f : files)
+			ok |= img[i].payload.data >= f.data() &&
+			      img[i].payload.data + img[i].payload.size <= f.data() + f.size();
+		inside &= ok && img[i].payload.size && img[i].payload.size % 4 == 0;
+	}
+	failures += check(inside, "navi44: gfx images: payload outside its blob, empty or misaligned");
+
+	// The RS64 microengines' start addresses (cpConfigRs64, mecStart) are read at offsets 52 and 56 of these blobs.
+	failures += check(files[1].size() >= 60 && files[2].size() >= 60 && files[3].size() >= 60,
+	                  "navi44: PFP/ME/MEC blobs too short for their start addresses");
+
+	printf("\nnavi44: sOS package %u parts (sOS 0x%08x), SMU %u bytes (ucode 0x%08x), %u gfx images: %s\n", pkg.count,
+	       pkg.version[AmdFw::PspSos], smu.size, smuHdr.ucodeVersion, n, failures ? "FAILED" : "ok");
+	return failures;
+}
+
 // SDMA 7 packets, as sdma_v7_0.c emits them (ring test, fence, fill, copy).
 static int testSdmaPackets() {
 	int failures = 0;
@@ -5269,6 +5369,7 @@ int main(int argc, char **argv) {
 	failures += testN48N();
 	failures += testPsp();
 	failures += testGfxImages();
+	failures += testNavi44Firmware();
 	failures += testSdmaPackets();
 	failures += testIhRing();
 	failures += testSmuMetricsOffsets();

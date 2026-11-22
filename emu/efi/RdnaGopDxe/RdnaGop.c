@@ -30,7 +30,8 @@
 #include <Library/UefiLib.h>
 
 #define RDNA_VENDOR_ID  0x1002
-#define RDNA_DEVICE_ID  0x7550
+#define RDNA_DEVICE_ID  0x7550          // Navi 48: RX 9070 XT
+#define RDNA_DEVICE_ID_NAVI44  0x7590   // Navi 44: RX 9060 XT (the emulator's chip=navi44)
 #define RDNA_FB_BAR     0
 #define RDNA_WIDTH      1920
 #define RDNA_HEIGHT     1080
@@ -151,7 +152,7 @@ RdnaGopBlt (
   return RETURN_ERROR (Status) ? EFI_INVALID_PARAMETER : EFI_SUCCESS;
 }
 
-/** The emulated card: AMD 1002:7550, display class. */
+/** The emulated card: AMD 1002:7550 or 1002:7590, display class. */
 STATIC
 BOOLEAN
 IsRdnaDevice (
@@ -166,7 +167,7 @@ IsRdnaDevice (
 
   return IS_PCI_DISPLAY (&Pci) &&
          (Pci.Hdr.VendorId == RDNA_VENDOR_ID) &&
-         (Pci.Hdr.DeviceId == RDNA_DEVICE_ID);
+         ((Pci.Hdr.DeviceId == RDNA_DEVICE_ID) || (Pci.Hdr.DeviceId == RDNA_DEVICE_ID_NAVI44));
 }
 
 STATIC

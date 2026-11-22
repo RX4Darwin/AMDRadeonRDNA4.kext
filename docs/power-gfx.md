@@ -174,7 +174,7 @@ instruction first in the START-HERE**, exactly like boot 5/GFXOFF ("ALWAYS LAST"
 **What `emu/qemu/rdna4.c` models for power [M: code]:** the SMU mailbox and the messages `AllowGfxOff`/`DisallowGfxOff` (`:1754-1777`: Allow enters "at once"; Disallow clears the HQD registers and resets
 the clock-gating registers to reset values, `gpm_restoring_reads = 2` for the RLC restore poll), `SetWorkloadMask`, `SetSoft{Min,Max}ByFreq` (CurrClock follows a lower soft max), a live `MetricsCounter`,
 the GFXOFF **hazard detector** (any GC register or doorbell access while allowed is counted/logged, `:2692-2730`, `:6356`; reads all-ones, writes dropped), options `gfxoff-preset`, `smu-preloaded`, `smu-stale`,
-`gfxoff-force`; metrics values are fixed (3 % / 2100 MHz / 120 W; 0 % / 8 W while GFXOFF is active, `:1735-1739`).
+`gfxoff-force`; metrics values were fixed (3 % / 2100 MHz / 120 W; 0 % / 8 W while GFXOFF is active) until 2026-11-21; activity and power now follow the model's state (`docs/emu-linux.md`).
 
 | Question | Emulator | Card |
 |---|---|---|
