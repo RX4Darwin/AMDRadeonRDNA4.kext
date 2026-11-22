@@ -3,7 +3,7 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
-## After 0.3.3 (on `next`, no number yet)
+## 0.4.0 (2026-11-22)
 
 **Navi 44 (RX 9060 XT), a first step: not run on a card**
 - One kext for both chips: it carries the Navi 48 firmware set and the Navi 44 one (PSP 14.0.2, SMU 14.0.2, SDMA 7.0.0, GC 12.0.0),
