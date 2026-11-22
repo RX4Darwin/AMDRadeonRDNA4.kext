@@ -696,6 +696,7 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 	NSUInteger _layers, _depth, _slicePitch;   // a 1D array's layers; a 3D texture's slices and the bytes from one to the next
 	NSUInteger _slices;   // a 2D array's, a cube's (6) or a cube array's 2D images, laid out as a 3D texture's slices (_slicePitch)
 	NSUInteger _levels, _levelOffset[16], _levelRow[16];   // a mipmapped 2D texture's levels: each an image of its own in _memory
+	NSUInteger _askedLevels;   // an array's or cube's mip levels as asked for (level 0 only kept)
 	const uint8_t *_surfaceRows;   // shadowed: the IOSurface's own pixels, _surfaceRowBytes apart; _memory is the GPU's copy
 	NSUInteger _surfaceRowBytes;
 	uint32_t _shadowSeed;   // a planar surface's seed when last refreshed (_shadowSeeded)
@@ -1140,10 +1141,13 @@ static char gCopyKey;
 	// 2D arrays and cubes (VectorKit's: Maps aborted on a nil 8x8 cube, 2026-11-20), one level: their images as a 3D texture's slices
 	const BOOL cube = d.textureType == MTLTextureTypeCube || d.textureType == MTLTextureTypeCubeArray;
 	NSUInteger slices = 0;
-	if (d.mipmapLevelCount == 1 && cube)
+	// With mip levels (Daggerfall Unity's world textures: a 64x64 array of 56 layers, 7 levels): level 0 kept and sampled, uploads to the
+	// others left out (fits:), the count asked for reported. ponytail: no mipmapping in arrays and cubes (aliasing far away).
+	if (d.mipmapLevelCount <= 15 && cube)
 		slices = 6 * MAX(d.arrayLength, (NSUInteger)1);
-	else if (d.mipmapLevelCount == 1 && d.textureType == MTLTextureType2DArray)
+	else if (d.mipmapLevelCount <= 15 && d.textureType == MTLTextureType2DArray)
 		slices = d.arrayLength;
+	_askedLevels = slices ? d.mipmapLevelCount : 0;
 	// 2x and 4x (Maps' 600x600 BGRA8 sRGB, 2026-11-20), 1, 2, 4 or 8 bytes a pixel (vkQuake's R8 through MoltenVK, 2026-11-21): the samples
 	// in the card's memory, as the PV host's msaaSurface
 	const BOOL msaa = d.textureType == MTLTextureType2DMultisample && (d.sampleCount == 2 || d.sampleCount == 4) && d.mipmapLevelCount == 1 &&
@@ -1202,7 +1206,7 @@ static char gCopyKey;
 - (NSUInteger)width { return _width; }
 - (NSUInteger)height { return _height; }
 - (NSUInteger)depth { return _depth ?: 1; }
-- (NSUInteger)mipmapLevelCount { return _levels ?: 1; }
+- (NSUInteger)mipmapLevelCount { return _askedLevels ?: _levels ?: 1; }
 - (NSUInteger)sampleCount { return MAX(_samples, 1u); }
 - (uint32_t)samples { return MAX(_samples, 1u); }
 - (NSUInteger)arrayLength { return _layers ?: 1; }
@@ -3356,6 +3360,15 @@ RDNA4_ANSWER_MISSING
 	RDNA4MTLTexture *target = _targets[d.attachment];
 	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
 	RDNA4MTLTexture *depthTarget = _depth;   // (drewDepth: once the draw ran)
+	// The other attachments it writes (Unity's deferred G-buffer: four), each a draw of its own after it into that attachment
+	// (RDNA4_MTLC_TABLE_ATTACHMENT picks the value the shader exports). ponytail: a draw a target instead of the colour block's MRTs.
+	NSMutableArray<NSNumber *> *more = [NSMutableArray array];
+	NSMutableArray<RDNA4MTLTexture *> *moreTargets = [NSMutableArray array];
+	for (uint32_t k = d.attachment + 1; k < 8; k++)
+		if ((writes >> k & 1) && [pipeline blendOf:k][9] && _targets[k]) {
+			[more addObject:@(k)];
+			[moreTargets addObject:_targets[k]];
+		}
 	// A pass of depth (and stencil) only (Unity's shadow maps): as if into a stand-in of the depth's size, colour not written. Refused
 	// before: "a draw without ... a colour attachment", and the command buffer's later work with it (Daggerfall Unity, 2026-11-22).
 	if (!target && (_depth || _stencil) && (target = [device standInFor:_depth ?: _stencil]))
@@ -3468,6 +3481,18 @@ RDNA4_ANSWER_MISSING
 		why = [device draw:&dd pipeline:pipeline target:target];
 		if (!why)
 			[cb drewInto:target];
+		// the others: the same pixels (depth equal to what the first wrote, not written again; stencil tested, not written)
+		for (NSUInteger i = 0; i < more.count && !why; i++) {
+			RDNA4Draw again = dd;
+			again.attachment = more[i].unsignedIntValue;
+			if (again.depthGpu)
+				again.depthCompare = MTLCompareFunctionEqual, again.depthWrite = 0;
+			again.stencilWriteMask = 0;
+			RDNA4MTLTexture *t = moreTargets[i];
+			why = [device draw:&again pipeline:pipeline target:t];
+			if (!why)
+				[cb drewInto:t];
+		}
 		if (!why && dd.depthWrite)   // a draw sampling it next waits for it (a shadow map: drawn, then read in the same command buffer)
 			[device drewDepth:depthTarget];
 		statAdd(kStatDraws, 1);
