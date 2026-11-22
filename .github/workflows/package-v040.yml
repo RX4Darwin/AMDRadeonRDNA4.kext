@@ -87,6 +87,7 @@ jobs:
           done
           grep -Fq 'launchctl bootout system/$l 2> /dev/null || true' "$dir/pkg/core-scripts/preinstall"
           grep -Fq 'launchctl bootout system/org.rdna4.logd 2> /dev/null || true' "$dir/pkg/logd-scripts/preinstall"
+          grep -Fq 'rm -f /Library/LaunchDaemons/org.rdna4.logd.plist /usr/local/share/vulkan/icd.d/radeon_icd.json' "$dir/pkg/core-scripts/preinstall"
           grep -Fq 'launchctl bootstrap system /Library/LaunchDaemons/$l.plist' "$dir/pkg/core-scripts/postinstall"
           grep -Fq 'launchctl bootout system/org.rdna4.logd' "$dir/pkg/logd-scripts/preinstall"
           grep -Fq 'launchctl bootstrap system/org.rdna4.logd' "$dir/pkg/logd-scripts/postinstall"
