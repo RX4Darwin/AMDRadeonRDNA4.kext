@@ -130,7 +130,7 @@ forgot them would fault in its *own* VM (an unmapped address), not touch anyone 
   check), `test/test-gfx12tricol.c`, `test/test-w12k-pm4.cpp` (the ring packets against amdgpu's captured IB packet and the emulator's acceptance rules). The IB bytes `rdna4-run tri` records are the ones
   `tools/linux/linux-replay` proves on the card through amdgpu (baseline and `REPLAY_VARIANT=4096` re-run: 8192 px).
 - **Emulator / macOS later:** `rdna4-run tri` / `tricol` on a booted kext with `rdna4-vm=1 rdna4-gfx=2` (no probe): `info` shows the GFX flag; `tri` prints `PASS tri: 8192 px ...`. For `tricol` the emulator refuses the draw (G4 is
-  not modelled, `docs/g4-colour.md` section 7), so there `tricol` FAILs with 0 px by design.
+  not modelled, `docs/g4-colour.md` section 7), so there `tricol` FAILs with 0 px by design. (Modelled since 2026-11-21: `tricol` passes on the emulator now, `docs/emu-linux.md`.)
 
 ### What is not measured
 

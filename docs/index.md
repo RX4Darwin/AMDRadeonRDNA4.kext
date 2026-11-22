@@ -28,7 +28,8 @@ are in the [README](../README.md).
 | `src/gfxregs.hpp` | Register map of the compute side (GC 12.0.1, SDMA 7, GC/MM hubs, NBIF HDP remap, PSP and SMU mailboxes) as segment + dword offset pairs. |
 | `src/amdfw.{hpp,cpp}` | Freestanding parser for AMD firmware containers: common header, LOAD_IP_FW payloads, the PSP secure-OS package. Host-tested against the real blobs. |
 | `src/psp.{hpp,cpp}` | Freestanding PSP driver: bootloader component loading, GPCOM ring, command submission with fences, LOAD_TOC, LOAD_IP_FW. Host-tested against a simulated PSP. |
-| `src/fwblobs.S` | Embeds the PSP sOS, SMU, SDMA and GC 12.0.1 firmware from `firmware/amdgpu/` (linux-firmware, AMD redistributable license) into the kext. |
+| `src/fwblobs.S` | Embeds the PSP sOS, SMU, SDMA and GC firmware from `firmware/amdgpu/` (linux-firmware, AMD redistributable license) into the kext: the Navi 48 set (GC 12.0.1) and the Navi 44 set (GC 12.0.0). |
+| `src/fwset.hpp` | Which of the two firmware sets a card takes, from the GC version in its IP discovery table. |
 | `src/sdma.{hpp,cpp}` | SDMA 7 packet builders (WRITE, FENCE, CONST_FILL, COPY) and ring writer. Host-tested. |
 | `src/ih.{hpp,cpp}`, `src/ihdecode.cpp` | IH v7 ring setup, PCI MSI filter/action, bounded fence waits, vector decode and source accounting. Host-tested decode and ring arithmetic. |
 | `src/pm4.{hpp,cpp}` | PM4 type-3 packet builders (SET_UCONFIG_REG, SET_SH_REG, WRITE_DATA, ACQUIRE/RELEASE_MEM, DISPATCH_DIRECT) and compute queue writer. Host-tested. |

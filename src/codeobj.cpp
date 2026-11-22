@@ -11,7 +11,8 @@ namespace CodeObj {
 
 namespace {
 constexpr uint16_t kEmAmdgpu    = 224;
-constexpr uint32_t kMachGfx1201 = 0x4e;           // EF_AMDGPU_MACH_AMDGCN_GFX1201
+constexpr uint32_t kMachGfx1200 = 0x48;           // EF_AMDGPU_MACH_AMDGCN_GFX1200 (Navi 44)
+constexpr uint32_t kMachGfx1201 = 0x4e;           // EF_AMDGPU_MACH_AMDGCN_GFX1201 (Navi 48)
 constexpr uint32_t kShtSymtab   = 2, kShtDynsym = 11;
 
 uint16_t u16(const uint8_t *p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); }
@@ -57,15 +58,18 @@ struct Elf {
 };
 
 // The ELF header checks both entry points share; nullptr when it is a
-// gfx1201 AMDGPU code object with sane section headers.
+// gfx1200 or gfx1201 AMDGPU code object with sane section headers. A kernel built for one is taken on either chip:
+// LLVM 23 emits the same code for both (src/shaders/*.s and *.cl give byte-identical .text with -mcpu=gfx1200 and
+// -mcpu=gfx1201; only the ELF header's processor differs).
 const char *checkHeader(const uint8_t *d, size_t n, Elf &e) {
 	if (!d || n < 64 || d[0] != 0x7f || d[1] != 'E' || d[2] != 'L' || d[3] != 'F' ||
 	    d[4] != 2 /* ELFCLASS64 */ || d[5] != 1 /* little-endian */)
 		return "not an ELF64 little-endian file";
 	if (u16(d + 18) != kEmAmdgpu)
 		return "not an AMDGPU code object";
-	if ((u32(d + 48) & 0xff) != kMachGfx1201)
-		return "not built for gfx1201";
+	const uint32_t mach = u32(d + 48) & 0xff;
+	if (mach != kMachGfx1200 && mach != kMachGfx1201)
+		return "not built for gfx1200 or gfx1201";
 	e = Elf { d, n, u64(d + 40), u16(d + 58), u16(d + 60) };
 	if (e.shentsize < 64 || !inside(n, e.shoff, static_cast<uint64_t>(e.shnum) * e.shentsize))
 		return "bad section headers";

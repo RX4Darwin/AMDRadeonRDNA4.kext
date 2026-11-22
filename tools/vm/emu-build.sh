@@ -21,7 +21,14 @@ QEMU_VER=10.0.13
 QEMU_SRC=${QEMU_SRC:-$HOME/qemu-$QEMU_VER}
 EDK2=${EDK2:-$HOME/edk2}
 OUT=$HERE/Build/emu
-FLASH=$HERE/firmware/Sapphire.RX9070XT.16384.241213.rom
+FLASH=${FLASH:-$HERE/firmware/Sapphire.RX9070XT.16384.241213.rom}
+# ATOM_ROM=<file>: a legacy AtomBIOS image taken as it is (what amdgpu's debugfs amdgpu_vbios gives), instead of
+# cutting it out of the flash dump. ROM_DEVICE_ID: the PCI device id the option ROM is made for (0x7590 for an RX 9060 XT).
+# Another device id's ROM gets its own file (Build/emu/rdna4-7590.rom), so that it never replaces the RX 9070 XT's;
+# boot it with ROM=<that file> (tools/vm/emu-boot.sh, tools/vm/emu-linux.sh).
+ATOM_ROM=${ATOM_ROM:-}
+ROM_DEVICE_ID=${ROM_DEVICE_ID:-0x7550}
+case $ROM_DEVICE_ID in 0x7550) ROM_OUT=$OUT/rdna4.rom ;; *) ROM_OUT=$OUT/rdna4-${ROM_DEVICE_ID#0x}.rom ;; esac
 JOBS=$(nproc)
 
 build_qemu() {
@@ -74,14 +81,18 @@ build_rom() {
 	mkdir -p "$OUT"
 	# Legacy AtomBIOS image of the real card: flash 0x40000, 0xe600 bytes
 	# (PCI data structure: 1002:7550, code type 0, not the last image).
-	dd if="$FLASH" of="$OUT/atombios-legacy.bin" bs=4096 skip=$((0x40000 / 4096)) \
-		count=$((0xe600 / 4096)) status=none
-	dd if="$FLASH" bs=1 skip=$((0x40000 + 0xe000)) count=$((0xe600 - 0xe000)) status=none \
-		>> "$OUT/atombios-legacy.bin"
-	"$EDK2/BaseTools/Source/C/bin/EfiRom" -f 0x1002 -i 0x7550 -l 0x030000 \
-		-b "$OUT/atombios-legacy.bin" -ec "$OUT/RdnaGopDxe.efi" -o "$OUT/rdna4.rom"
-	"$EDK2/BaseTools/Source/C/bin/EfiRom" -d "$OUT/rdna4.rom" | grep -E "Image|Code type|Vendor|Device|Indicator|size" || true
-	echo "built $OUT/rdna4.rom ($(stat -c %s "$OUT/rdna4.rom") bytes)"
+	if [ -n "$ATOM_ROM" ]; then
+		cp "$ATOM_ROM" "$OUT/atombios-legacy.bin"
+	else
+		dd if="$FLASH" of="$OUT/atombios-legacy.bin" bs=4096 skip=$((0x40000 / 4096)) \
+			count=$((0xe600 / 4096)) status=none
+		dd if="$FLASH" bs=1 skip=$((0x40000 + 0xe000)) count=$((0xe600 - 0xe000)) status=none \
+			>> "$OUT/atombios-legacy.bin"
+	fi
+	"$EDK2/BaseTools/Source/C/bin/EfiRom" -f 0x1002 -i "$ROM_DEVICE_ID" -l 0x030000 \
+		-b "$OUT/atombios-legacy.bin" -ec "$OUT/RdnaGopDxe.efi" -o "$ROM_OUT"
+	"$EDK2/BaseTools/Source/C/bin/EfiRom" -d "$ROM_OUT" | grep -E "Image|Code type|Vendor|Device|Indicator|size" || true
+	echo "built $ROM_OUT ($(stat -c %s "$ROM_OUT") bytes)"
 }
 
 case ${1:-all} in
