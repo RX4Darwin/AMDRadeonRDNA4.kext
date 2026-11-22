@@ -1,7 +1,9 @@
 # Packaging and installation plan
 
-Status: proposal (2026-11-21); migration steps 1 and 2 built on 2026-11-22 (`make metal-driver`: `AMDRadeonRDNA4MTLDriver.bundle` with
-the framework, RADV and the helpers inside, the kext's new `MetalPluginName`; card-verified), the rest not yet. The open points are decided provisionally at the end. It replaces the per-component `install.sh` scripts with one layout and one
+Status (2026-11-22): built and card-verified: the driver bundle with the framework, RADV and the helpers inside (`make metal-driver`),
+the kext's new `MetalPluginName`, the ABI check in `rdna4_open`, the LaunchDaemons running from the bundle, `make package` (one `.pkg`,
+three choices) and the uninstaller. Not yet: versions in `rdna4-run info`, the release zip with `INSTALL.md`, `rdna4-setup`, the MoltenVK
+agent as a choice. The open points are decided provisionally at the end. It replaces the per-component `install.sh` scripts with one layout and one
 installer, modelled on how Apple ships its AMD drivers.
 
 ## What ships today
@@ -61,11 +63,11 @@ Apple links against that code.
     Helpers/                                air2amdgpu, rdna4-run, rdna4-iop, rdna4-logd
     Resources/                              rdna4.metallib (the driver's own functions), radeon_icd.json (RADV's manifest, absolute
                                             path into the bundle); later: the LaunchDaemon plists, uninstall.sh
-/Library/LaunchDaemons/org.rdna4.air2amdgpu.plist      -> .../Helpers/air2amdgpu --serve          (not yet: still /usr/local/libexec)
-/Library/LaunchDaemons/org.rdna4.iop.plist             -> .../Helpers/rdna4-iop                     (not yet)
-/Library/LaunchDaemons/org.rdna4.logd.plist            -> .../Helpers/rdna4-logd (on by default)    (not yet)
-/usr/local/share/vulkan/icd.d/radeon_icd.json          -> the bundle's manifest (the Khronos loader's search path) (not yet)
-/usr/local/bin/rdna4-run                               symlink -> .../Helpers/rdna4-run             (not yet)
+/Library/LaunchDaemons/org.rdna4.air2amdgpu.plist      -> .../Helpers/air2amdgpu --serve
+/Library/LaunchDaemons/org.rdna4.iop.plist             -> .../Helpers/rdna4-iop
+/Library/LaunchDaemons/org.rdna4.logd.plist            -> .../Helpers/rdna4-logd (on by default)
+/usr/local/share/vulkan/icd.d/radeon_icd.json          -> the bundle's manifest (the Khronos loader's search path)
+/usr/local/bin/rdna4-run                               symlink -> .../Helpers/rdna4-run
 EFI/OC/Kexts/AMDRadeonRDNA4.kext                       by the user, from the release zip
 ```
 

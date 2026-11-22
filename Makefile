@@ -108,7 +108,7 @@ RUN          = userspace/rdna4-run
 VULKAN       = userspace/vulkan
 CENSUS       = tools/metal/accelcensus
 
-.PHONY: all kext tools userspace metal-driver n48nprobe mesa metal-helper vulkan-products vkcube census-tool census-stub census-pathlog \
+.PHONY: all kext tools userspace metal-driver package n48nprobe mesa metal-helper vulkan-products vkcube census-tool census-stub census-pathlog \
         test atomdump check-isa check-config product-dir clean distclean
 
 all: check-config kext tools
@@ -243,6 +243,11 @@ vulkan-products:
 # RADV in Contents/Frameworks, the translator and the programs in Contents/Helpers.
 metal-driver:
 	sh tools/metal/native/build.sh
+
+# One installer for the driver bundle and its daemons (tools/package/package.sh): AMDRadeonRDNA4-<version>.pkg in the product dir. Needs
+# the translator (make metal-helper) and RADV (make mesa) built first; the kext is not in it.
+package: metal-driver
+	sh tools/package/package.sh $(PRODUCT_DIR) $(VERSION)
 
 # The Metal kernel translator's run-time helper for the rig (M3, docs/m1-stream.md s.5b); builds LLVM for x86_64 the first time.
 metal-helper:

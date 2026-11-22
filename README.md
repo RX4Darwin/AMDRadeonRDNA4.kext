@@ -159,9 +159,23 @@ Lilu plugins; macOS then runs its stock framebuffer.
 
 ### Metal, OpenGL and Vulkan
 
-The release zips' `README.txt` says what each file is; unzipped into the `Build/` folder of a checkout of the same tag,
-the commands below work as written. To build it yourself: `make PVGPU=1 all metal-helper mesa metal-driver` (the shader
-translator builds LLVM for x86_64 in `Build/llvm` the first time, which takes a while).
+Install `AMDRadeonRDNA4-<version>.pkg` from the release of the kext you put on the EFI (or build it: `make PVGPU=1 all
+metal-helper mesa package`; the shader translator builds LLVM for x86_64 in `Build/llvm` the first time, which takes a while):
+
+```bash
+sudo installer -pkg AMDRadeonRDNA4-0.4.0.pkg -target /
+```
+
+Then reboot. It installs:
+
+| Choice | What |
+|--------|------|
+| Metal driver (required) | the driver bundle below; the LaunchDaemons `org.rdna4.air2amdgpu` (the shader translator for WindowServer, log `/var/log/rdna4-air2amdgpu.log`) and `org.rdna4.iop` (sets CoreDisplay up for each boot, log `/var/log/rdna4-iop.log`); `/usr/local/bin/rdna4-run` |
+| Boot logs | the LaunchDaemon `org.rdna4.logd`: each boot's kernel log in `/var/log/rdna4` |
+| Vulkan (RADV) | RADV's manifest in `/usr/local/share/vulkan/icd.d`, where Khronos's Vulkan loader looks |
+
+It replaces what 0.3's per-component scripts installed. To remove it:
+`sudo sh /Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/Contents/Resources/uninstall.sh` (the kext stays on the EFI).
 
 The user-space driver is one bundle, `AMDRadeonRDNA4MTLDriver.bundle`, installed in `/Library/GPUBundles`, the only place
 Metal loads a third-party driver from:
@@ -177,17 +191,7 @@ Everything stays inside the bundle: WindowServer's sandbox does not let it map l
 loads a bundle from `/Library/GPUBundles` only with SIP's filesystem protection off (`csr-active-config` bit 1). The kext
 and the bundle must come from the same release (0.4.0 renamed the bundle from `AMDRadeonRDNA4Metal.bundle`).
 
-On the Mac with the card, from the repository:
-
-```bash
-sudo tools/metal/native/install.sh Build/AMDRadeonRDNA4-0.4.0-RELEASE/AMDRadeonRDNA4MTLDriver.bundle   # the driver (and removes 0.3's)
-sudo tools/metal/m3/install-helper.sh Build/m3/x86_64/air2amdgpu   # the shader translator for WindowServer (log: /var/log/rdna4-air2amdgpu.log)
-sudo userspace/rdna4-iop/install.sh                                # sets CoreDisplay up for each boot (log: /var/log/rdna4-iop.log)
-sudo userspace/rdna4-logd/install.sh                               # optional: each boot's kernel log in /var/log/rdna4
-```
-
-Then reboot. For a Vulkan program that uses Khronos's loader:
-`VK_DRIVER_FILES=/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/Contents/Resources/radeon_icd.json`.
+For development, `sudo tools/metal/native/install.sh <bundle>` replaces just the driver bundle with one from a build.
 
 No boot-args are needed: the driver's defaults (`src/trial.cpp`) are the accelerated desktop, WindowServer and Metal on the driver's
 own accelerator. For Apple's paravirtual GPU on the card instead (the desktop before 0.4.0), set `rdna4-accel=0 rdna4-pvgpu=1`.
@@ -304,6 +308,7 @@ make PVGPU=1                    # with the paravirtual GPU (Metal, OpenGL, Vulka
 make PVGPU=1 metal-helper       # the shader translator for it
 make mesa && make vkcube        # RADV and Khronos's vkcube
 make metal-driver               # AMDRadeonRDNA4MTLDriver.bundle: the Metal driver with librdna4, RADV and the helpers
+make package                    # AMDRadeonRDNA4-<version>.pkg: the bundle and its daemons in one installer
 make CONFIG=DEBUG               # unoptimised, with DEBUG defined
 make test                       # host-side tests: parsers, EDID fixtures, the display engines' plans against Linux's
 make clean                      # what make built (make distclean: all of Build/)
