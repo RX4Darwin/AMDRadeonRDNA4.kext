@@ -5,6 +5,24 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## 0.4.0 (2026-11-22)
 
+**In short** (all on the RX 9070 XT, macOS Tahoe 26.6.2; the sections below and the commits have the details)
+- **The native desktop is the default**: WindowServer composes on the driver's own Metal device, through the driver's own
+  accelerator (an `IOGraphicsAccelerator2` derived at run time), its display pipes and a hardware cursor on both displays; not
+  Apple's paravirtual GPU any more (`rdna4-accel=0 rdna4-pvgpu=1` brings that back). No boot-args are needed: the options the
+  accelerated desktop needs are built in (`src/trial.cpp`). Updating from 0.3.3: README, "Updating from 0.3.3".
+- **OpenGL on the native device** (Apple's GL-on-Metal renderer, `rdna4-accelgl`, on by default): kitty, Sublime Text, Mixxx.
+- **Apps and games on the native device**: Safari and Chrome (WebGL), Maps, iTerm2/Metalterm, App Store and Finder icons, System
+  Settings' Displays pane, the Dock and Liquid Glass; vkQuake through MoltenVK (argument buffers); MetalQuake and Quake II
+  (BeauBender's `ref_metal`) with ray-traced shadows and effects (instance acceleration structures, ray queries in shaders, up to
+  128 textures through handles); Daggerfall Unity and OpenMW (shadow maps, depth-only passes, several colour attachments, BC
+  textures, depth views); plugin windows in Logic, Ableton Live 12 (Waves) and Cubase 11 (older AIR forms the translator now reads).
+- **Vulkan**: RADV in windows on the accelerated desktop (`VK_EXT_metal_surface`), three RADV clients at a time.
+- **One installer**: `AMDRadeonRDNA4-0.4.0.pkg` installs one driver bundle, `AMDRadeonRDNA4MTLDriver.bundle` (the Metal driver,
+  `librdna4`, RADV, the shader translator and the helpers inside), its daemons and `rdna4-run`; it replaces 0.3's scripts.
+- **System sleep on the native desktop**: both displays and the session come back (the runtime's clients and their VRAM kept
+  across the sleep), about 30 s from Sleep to S3.
+- **Navi 44 (RX 9060 XT)**: matched and given its firmware set; not run on a card.
+
 **Navi 44 (RX 9060 XT), a first step: not run on a card**
 - One kext for both chips: it carries the Navi 48 firmware set and the Navi 44 one (PSP 14.0.2, SMU 14.0.2, SDMA 7.0.0, GC 12.0.0),
   each when its files are in `firmware/amdgpu/`, and takes the set of the GC version the card's IP discovery table gives
