@@ -1493,6 +1493,22 @@ uint8_t *fbController(IOService *fb) {
 	return priv ? *reinterpret_cast<uint8_t **>(priv) : nullptr;
 }
 
+// The controller's 'wsup' bit of framebuffer `fb` cleared (see wrapFbOpen): for one WindowServer never opens. Returns the controller's
+// bits before, or -1 without a controller or slot.
+int clearServerUpBit(IOService *fb) {
+	uint8_t *ctl = fb && fb->metaCast("IONDRVFramebuffer") ? fbController(fb) : nullptr;
+	if (!ctl)
+		return -1;
+	auto *const *table = reinterpret_cast<IOService *const *>(ctl + 0x18);
+	for (uint32_t slot = 0; slot < 8; slot++)
+		if (table[slot] == fb) {
+			const uint8_t was = ctl[0x1b4];
+			__atomic_fetch_and(ctl + 0x1b4, static_cast<uint8_t>(~(1u << slot)), __ATOMIC_SEQ_CST);
+			return was;
+		}
+	return -1;
+}
+
 // The paravirtual GPU's framebuffer (Apple's driver, on our nub).
 bool isParavirtFb(IOService *fb) {
 	const OSMetaClass *meta = fb ? fb->getMetaClass() : nullptr;
@@ -1551,6 +1567,10 @@ IOReturn wrapFbOpen(IOService *fb) {
 		      fb->getName(), fb->getRegistryEntryID(), ctl[0x1b4]);
 		ctl[0x1b4] = 0;
 	}
+	// On the native desktop (rdna4-accel=4) the bare ones are hidden from WindowServer the same way (RDNA4Accel::isBareFramebuffer):
+	// one opened after that was decided is marked up here, the ones before when it is (ndrvServerNeverOpens).
+	if (ctl && r == kIOReturnSuccess && RDNA4Accel::framebuffersDecided() && RDNA4Accel::isBareFramebuffer(fb))
+		ndrvServerNeverOpens(fb);
 	return r;
 }
 
@@ -2028,6 +2048,16 @@ void pluginStart() {
 const char *bootargDebug[] { "-rdna4dbg" };
 
 } // namespace
+
+// rdna4accel.cpp, as WindowServer is let go: framebuffer `fb` is bare and hidden from it, so WindowServer never tells its controller
+// it is up ('wsup'); without this the controller's state kept bit 0x8 and every system sleep waited 90 s for it (gIOGNotifyTO:
+// "PM priority notification timeout (com.apple.iokit.IOGraphicsFamily)", 2026-11-22).
+void ndrvServerNeverOpens(IOService *fb) {
+	const int was = clearServerUpBit(fb);
+	if (was >= 0)
+		FBLOG("ndrv: %s %llx (bare, hidden from WindowServer): marked up for WindowServer (controller's bits 0x%02x before)",
+		      fb->getName(), fb->getRegistryEntryID(), was);
+}
 
 PluginConfiguration ADDPR(config) {
 	xStringify(PRODUCT_NAME),

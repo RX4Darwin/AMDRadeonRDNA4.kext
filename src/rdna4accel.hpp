@@ -4,6 +4,7 @@
 #pragma once
 
 class IORegistryEntry;
+class IOService;
 class OSDictionary;
 class OSObject;
 
@@ -27,3 +28,6 @@ bool namesAsAmd(OSObject *object);
 // Whether `accel` is our accelerator (pvhooks.cpp wrapAccelNewUserClient: the native Metal device's client in sandboxed processes)
 bool isOurs(const void *accel);
 }
+
+// plugin.cpp: a bare framebuffer's controller told it is up for WindowServer, which never opens it (else a sleep waits 90 s for it)
+void ndrvServerNeverOpens(IOService *fb);

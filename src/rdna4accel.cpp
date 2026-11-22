@@ -1340,8 +1340,10 @@ void RDNA4Accel::waitForWindowServer()
 			auto *fb = OSDynamicCast(IOService, e);
 			const bool on = fb && isLit(fb);
 			lit += on;
-			if (e->metaCast("IONDRVFramebuffer") && !on && gBareCount < 8)
+			if (e->metaCast("IONDRVFramebuffer") && !on && gBareCount < 8) {
 				gBare[gBareCount++] = e->getRegistryEntryID();
+				ndrvServerNeverOpens(fb);
+			}
 			rdna4Log("AMDRadeonRDNA4: accel: framebuffer %s 0x%llx: %s\n", e->getName(), e->getRegistryEntryID(), on ? "lit" : "bare");
 			return true;
 		});
