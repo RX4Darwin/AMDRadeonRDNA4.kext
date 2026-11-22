@@ -86,6 +86,9 @@ script() {
 script core preinstall '
 for l in org.rdna4.air2amdgpu org.rdna4.iop com.hackintosh.AMDRadeonRDNA4.air2amdgpu; do launchctl bootout system/$l 2> /dev/null || true; done
 rm -f /Library/LaunchDaemons/com.hackintosh.AMDRadeonRDNA4.air2amdgpu.plist /usr/local/libexec/rdna4-air2amdgpu /usr/local/libexec/rdna4-iop
+# Clear optional components from an older install too; selected choices are installed again afterwards.
+launchctl bootout system/org.rdna4.logd 2> /dev/null || true
+rm -f /Library/LaunchDaemons/org.rdna4.logd.plist /usr/local/share/vulkan/icd.d/radeon_icd.json
 rm -rf /Library/GPUBundles/AMDRadeonRDNA4Metal.bundle /Library/Frameworks/AMDRadeonRDNA4.framework '"$installed"
 script core postinstall '
 for l in org.rdna4.air2amdgpu org.rdna4.iop; do launchctl bootstrap system /Library/LaunchDaemons/$l.plist; done'
