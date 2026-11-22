@@ -52,16 +52,34 @@ jobs:
           sh tools/metal/native/build.sh
           clang -arch x86_64 -mmacosx-version-min=11.0 -fobjc-arc tools/metal/m1/mtlprobe.m -framework Foundation -framework Metal \
             -framework IOSurface -framework AppKit -framework QuartzCore -framework IOKit -o Build/mtlprobe
-      - name: Upload release and debug build outputs
+      - name: Resolve versioned artifact paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^VERSION[[:space:]]*=[[:space:]]*//p' Makefile | head -n 1)"
+          release_dir="$(make -s product-dir CONFIG=RELEASE)"
+          debug_dir="$(make -s product-dir CONFIG=DEBUG)"
+          test -n "$version"
+          test -d "$release_dir"
+          test -d "$debug_dir"
+          test -s Build/native/probe.metallib
+          {
+            echo "RDNA4_VERSION=$version"
+            echo "RDNA4_RELEASE_DIR=$release_dir"
+            echo "RDNA4_DEBUG_DIR=$debug_dir"
+          } >> "$GITHUB_ENV"
+
+      - name: Upload release, debug and native probe outputs
         uses: actions/upload-artifact@v4
         with:
-          name: rdna4-v0.4.0-ci-build-${{ github.sha }}
+          name: rdna4-v${{ env.RDNA4_VERSION }}-ci-build-${{ github.sha }}
           if-no-files-found: error
           retention-days: 14
           path: |
-            Build/AMDRadeonRDNA4-0.4.0-RELEASE/
-            Build/AMDRadeonRDNA4-0.4.0-DEBUG/
+            ${{ env.RDNA4_RELEASE_DIR }}/
+            ${{ env.RDNA4_DEBUG_DIR }}/
             Build/mtlprobe
+            Build/native/probe.metallib
 
   firmware:
     # The checks that need AMD's linux-firmware blobs (fetched from upstream, so upstream can break this job without us)
