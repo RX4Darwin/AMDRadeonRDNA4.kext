@@ -106,6 +106,18 @@ jobs:
           plutil -lint "$kext/Contents/Info.plist"
           plutil -lint "$bundle/Contents/Info.plist"
           plutil -lint "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Resources/Info.plist"
+          for plist in \
+            "$kext/Contents/Info.plist" \
+            "$bundle/Contents/Info.plist" \
+            "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Resources/Info.plist"; do
+            for key in CFBundleVersion CFBundleShortVersionString; do
+              actual="$(plutil -extract "$key" raw -o - "$plist")"
+              test "$actual" = "$version" || {
+                echo "$plist: $key is $actual, expected $version" >&2
+                exit 1
+              }
+            done
+          done
           python3 -m json.tool "$bundle/Contents/Resources/radeon_icd.json" >/dev/null
 
           # Confirm the product archive contains all three selectable component packages.
