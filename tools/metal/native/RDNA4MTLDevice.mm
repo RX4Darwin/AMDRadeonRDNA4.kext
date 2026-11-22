@@ -800,6 +800,17 @@ static char gCopyKey;
 	r->_shadowAhead = NO;
 }
 
+// A CPU write into a shadowed surface's copy (replaceRegion, and the blits through it) put into the surface at once. Left to the next draw's
+// write-back, it never reached the surface without one, and a blit read a copy no draw had refreshed: Core Animation's partial repaints
+// of Safari's tiles (2543 pixels wide, 10176 bytes a row) blitted the old tile as zeros, the page black but for what changed (2026-11-22).
+// _shadowAhead stays as it was: draws later in the command buffer are still written back.
+- (void)shadowToSurface
+{
+	RDNA4MTLTexture *r = self.root;
+	for (NSUInteger y = 0; r->_surfaceRows && y < r->_height; y++)
+		memcpy((uint8_t *)r->_surfaceRows + y * r->_surfaceRowBytes, r.bytes + y * r->_rowBytes, r->_width * r.bpp);
+}
+
 - (void)refresh
 {
 	if (!_surfaceRows || self.root->_shadowAhead)
@@ -1189,9 +1200,11 @@ static char gCopyKey;
 {
 	if (self.vramOnly)
 		return;
+	[self refresh];   // (a shadowed surface's copy current: all of it goes back below)
 	[self wroteAll];
 	for (NSUInteger y = 0; [self fits:r level:level] && y < r.size.height; y++)
 		memcpy([self at:level x:r.origin.x y:r.origin.y + y z:r.origin.z], (const uint8_t *)bytes + y * bpr, r.size.width * self.bpp);
+	[self shadowToSurface];
 }
 
 - (void)generateMipmaps
@@ -1252,6 +1265,7 @@ static char gCopyKey;
 {
 	if (self.vramOnly)
 		return;
+	[self refresh];   // (a shadowed surface: its copy current, unless draws not yet written back made it newer)
 	for (NSUInteger y = 0; [self fits:r level:level] && y < r.size.height; y++)
 		memcpy((uint8_t *)bytes + y * bpr, [self at:level x:r.origin.x y:r.origin.y + y z:r.origin.z], r.size.width * self.bpp);
 }
@@ -1987,7 +2001,7 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 - (dispatch_queue_t)work;
 - (const rdna4_program_t *)resolveKernel:(BOOL)srgb;   // rdna4_resolve or rdna4_resolve_srgb, loaded on first use (NULL: not loaded)
 - (uint64_t)spareBuffer;             // what an unbound buffer slot points at: the zeroed spare buffer
-- (BOOL)drawnInFlight:(RDNA4MTLTexture *)t;   // a draw not yet waited for draws into it
+- (BOOL)drawnInFlight:(RDNA4MTLTexture *)t;   // a draw not yet waited for draws into it, a view of it or the texture it views
 // On the card, before the next draw: a wait for the draws in flight, then the copies (none: the wait alone)
 - (NSError *)gpuBarrier:(const RDNA4Copy *)copies count:(uint32_t)count;
 // A kernel on the gfx ring behind the draws before it, not waited for (RDNA4_RINGDISPATCH=1); NO: not one it takes (scratch, other user data)
@@ -3563,6 +3577,7 @@ static NSError *colourOnly(id<MTLTexture> t)
 		if (why)
 			return why;
 		RDNA4MTLTexture *f = [(RDNA4MTLTexture *)from level:fromLevel];
+		[f refresh];   // (a shadowed surface's copy current)
 		[to replaceRegion:MTLRegionMake2D(toOrigin.x, toOrigin.y, size.width, size.height) mipmapLevel:toLevel
 		        withBytes:f.bytes + fromOrigin.y * f.rowBytes + f.bpp * fromOrigin.x bytesPerRow:f.rowBytes];
 		return nil;
@@ -4401,7 +4416,9 @@ static void abortStack(int sig)
 
 - (uint64_t)gfxRings { return rdna4_trirun_rings_va(_rings.gpu); }
 
-- (BOOL)drawnInFlight:(RDNA4MTLTexture *)t { return [_drawnInFlight containsObject:t]; }
+// By the root texture: a pass draws into a level's view (level:) or a view, the next draw samples the texture; by the object, that draw
+// missed the barrier and read texels not yet written: squares in every menu's glass blur, popping in and out (2026-11-22)
+- (BOOL)drawnInFlight:(RDNA4MTLTexture *)t { return [_drawnInFlight containsObject:t.root]; }
 
 // A slot's IB onto the gfx ring; again while the ring is full (kIOReturnBusy: every client's submissions in it at once, at most 128;
 // kIOReturnNoResources: no room for the packets), for up to 2 s.
@@ -4926,7 +4943,7 @@ static void abortStack(int sig)
 		wrote(t.identity + cy * t.rowBytes, t.identity + (uint64_t)(cy2 - 1) * t.rowBytes + cx2 * t.bpp);
 	if (!_drawnInFlight)
 		_drawnInFlight = [NSHashTable weakObjectsHashTable];
-	[_drawnInFlight addObject:t];
+	[_drawnInFlight addObject:t.root];
 	_slotPipe[slot] = p;
 	const uint32_t what[5] = { d->count, d->instances, (uint32_t)t.width, (uint32_t)t.height, (uint32_t)t.pixelFormat };
 	memcpy(_slotWhat[slot], what, sizeof what);
