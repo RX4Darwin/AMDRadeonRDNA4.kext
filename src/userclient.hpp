@@ -35,6 +35,14 @@ public:
 	                       IOService *whatDevice) APPLE_KEXT_OVERRIDE;
 };
 
+// rdna4-client-policy: the console user may open the runtime's clients (the default), not root alone (userclient.cpp)
+bool localClientsAllowed();
+
+// The published service (the runtime's), for clients made through the paravirtual accelerator (rdna4AcceleratorClient).
+extern RDNA4ComputeService *gComputeService;
+// A compute client for `task`, attached to the IOAccelerator `accel` it opened with type RDNA4_NATIVE_UC_TYPE (pvhooks.cpp).
+IOReturn rdna4AcceleratorClient(IOService *accel, task_t task, void *security, IOUserClient **handler);
+
 class RDNA4ComputeClient : public IOUserClient {
 	OSDeclareDefaultStructors(RDNA4ComputeClient)
 public:
@@ -55,6 +63,7 @@ private:
 	IOLock       *gate;     // guards calls and closed
 	uint32_t      calls;    // externalMethod calls in flight
 	bool          closed;   // released: no more calls
+	bool          privileged;   // root: every selector; else (rdna4-client-policy=local) the ones a graphics client needs, in its own VM
 
 	void release();
 
@@ -80,10 +89,19 @@ private:
 	static IOReturn sWaitFence(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sSubmitGfxIb(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sWaitGfxFence(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sImportHost(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sTranslate(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sPresentSource(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sPvNext(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sPvAccess(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sPvDone(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sSensorsEx(OSObject *t, void *, IOExternalMethodArguments *a);
+};
+
+// The class clients get (runtime.cpp's IOUserClientClass): RDNA4ComputeClient under a name WindowServer's sandbox lets it open
+// (com.apple.WindowServer.sb allows iokit-open of classes prefixed IOAccel), for the native desktop (docs/native-metal-spike.md).
+class IOAccelRDNA4ComputeClient : public RDNA4ComputeClient {
+	OSDeclareDefaultStructors(IOAccelRDNA4ComputeClient)
 };
 
 #endif /* RDNA4UserClient_hpp */

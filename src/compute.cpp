@@ -14,6 +14,7 @@
 #include "dmub.hpp"
 #include "dmubload.hpp"
 #include "flip.hpp"
+#include "fwset.hpp"
 #include "pm4.hpp"
 #include "probe_kernel.h"
 #include "sdma.hpp"
@@ -43,20 +44,63 @@ static const char *kNvramForceSync = "IONVRAM-FORCESYNCNOW-PROPERTY";
 using namespace GfxReg;
 
 #ifndef AMDRadeonRDNA4_NO_FIRMWARE
-// src/fwblobs.S: linux-firmware blobs embedded at build time.
+// src/fwblobs.S: linux-firmware blobs embedded at build time, one set a chip (src/fwset.hpp) and the display
+// microcontroller's, which both chips share.
 extern "C" {
-extern const uint8_t rdna4_fw_psp_sos[], rdna4_fw_psp_sos_end[];
-extern const uint8_t rdna4_fw_smu[], rdna4_fw_smu_end[];
-extern const uint8_t rdna4_fw_sdma[], rdna4_fw_sdma_end[];
-extern const uint8_t rdna4_fw_pfp[], rdna4_fw_pfp_end[];
-extern const uint8_t rdna4_fw_me[], rdna4_fw_me_end[];
-extern const uint8_t rdna4_fw_mec[], rdna4_fw_mec_end[];
-extern const uint8_t rdna4_fw_mes[], rdna4_fw_mes_end[];
-extern const uint8_t rdna4_fw_imu[], rdna4_fw_imu_end[];
-extern const uint8_t rdna4_fw_rlc[], rdna4_fw_rlc_end[];
-extern const uint8_t rdna4_fw_dmcub[], rdna4_fw_dmcub_end[];
+#define FW_DECL(n) extern const uint8_t rdna4_fw_##n[], rdna4_fw_##n##_end[];
+#define FW_DECL_SET(p) FW_DECL(p##psp_sos) FW_DECL(p##smu) FW_DECL(p##sdma) FW_DECL(p##pfp) FW_DECL(p##me) \
+	FW_DECL(p##mec) FW_DECL(p##mes) FW_DECL(p##imu) FW_DECL(p##rlc)
+#ifdef AMDRadeonRDNA4_FW_NAVI48
+FW_DECL_SET(n48_)
+#endif
+#ifdef AMDRadeonRDNA4_FW_NAVI44
+FW_DECL_SET(n44_)
+#endif
+FW_DECL(dmcub)
+#undef FW_DECL_SET
+#undef FW_DECL
 }
-#define FW_BLOB(n) AmdFw::Blob { rdna4_fw_##n, static_cast<uint32_t>(rdna4_fw_##n##_end - rdna4_fw_##n) }
+
+namespace {
+enum FwKind { Fw_psp_sos, Fw_smu, Fw_sdma, Fw_pfp, Fw_me, Fw_mec, Fw_mes, Fw_imu, Fw_rlc };
+
+// The blob of one kind from the set of the card's chip: nothing when this build does not carry that set.
+AmdFw::Blob fwBlob(FwSet::Family family, FwKind kind) {
+#define FW_AT(n) AmdFw::Blob { rdna4_fw_##n, static_cast<uint32_t>(rdna4_fw_##n##_end - rdna4_fw_##n) }
+#define FW_SET(p) \
+	switch (kind) { \
+	case Fw_psp_sos: return FW_AT(p##psp_sos); \
+	case Fw_smu:     return FW_AT(p##smu); \
+	case Fw_sdma:    return FW_AT(p##sdma); \
+	case Fw_pfp:     return FW_AT(p##pfp); \
+	case Fw_me:      return FW_AT(p##me); \
+	case Fw_mec:     return FW_AT(p##mec); \
+	case Fw_mes:     return FW_AT(p##mes); \
+	case Fw_imu:     return FW_AT(p##imu); \
+	case Fw_rlc:     return FW_AT(p##rlc); \
+	} \
+	break;
+	switch (family) {
+#ifdef AMDRadeonRDNA4_FW_NAVI48
+	case FwSet::Family::Navi48:
+		FW_SET(n48_)
+#endif
+#ifdef AMDRadeonRDNA4_FW_NAVI44
+	case FwSet::Family::Navi44:
+		FW_SET(n44_)
+#endif
+	default:
+		break;
+	}
+#undef FW_SET
+#undef FW_AT
+	return AmdFw::Blob { nullptr, 0 };
+}
+} // namespace
+
+// In RDNA4Compute's functions: the set follows the GC version the survey read from the card.
+#define FW_FAMILY() FwSet::forGc(sv.gcMajor, sv.gcMinor, sv.gcRev)
+#define FW_BLOB(n) fwBlob(FW_FAMILY(), Fw_##n)
 #endif
 
 namespace {
@@ -128,7 +172,7 @@ uint32_t RDNA4Compute::requestedStage() {
 // (docs/vulkan-port.md sections 8 and 9).
 uint32_t RDNA4Compute::requestedVmShared() {
 	uint32_t mode = 1;
-	(void)PE_parse_boot_argn("rdna4-vmshared", &mode, sizeof(mode));
+	(void)Trial::bootArg("rdna4-vmshared", mode);
 	return mode > 2 ? 2 : mode;
 }
 
@@ -592,6 +636,7 @@ void RDNA4Compute::resumeMain(void *arg, wait_result_t) {
 		if (!self->rtReady)
 			self->powerSleeping = false;
 		self->powerSleepClear();
+		IOLockWakeup(self->rtLock, &self->resumePending, false);   // the user clients' calls held by waitAwake
 		IOLockUnlock(self->rtLock);
 	}
 	thread_terminate(current_thread());
@@ -1934,6 +1979,16 @@ bool RDNA4Compute::stagePsp() {
 	publishResult("firmware", "FAIL none in this kext: tools/build/fetch-firmware.sh, then make clean && make");
 	return false;
 #else
+	const FwSet::Family family = FW_FAMILY();
+	const AmdFw::Blob sos = FW_BLOB(psp_sos), smuFw = FW_BLOB(smu);
+	if (!sos.valid() || !smuFw.valid()) {
+		CLOG("psp: this build carries no firmware for GC %u.%u.%u (%s: %s, %s)", sv.gcMajor, sv.gcMinor, sv.gcRev,
+		     FwSet::name(family), FwSet::pspStem(family), FwSet::gcStem(family));
+		publishResult("firmware", "FAIL none for this chip in this kext: tools/build/fetch-firmware.sh, then make clean && make");
+		return false;
+	}
+	CLOG("psp: firmware set of %s (%s, %s)", FwSet::name(family), FwSet::pspStem(family), FwSet::gcStem(family));
+
 	OSDictionary *d = OSDictionary::withCapacity(12);
 	auto put = [d](const char *key, uint64_t v) {
 		if (OSNumber *n = d ? OSNumber::withNumber(v, 64) : nullptr) {
@@ -1966,10 +2021,10 @@ bool RDNA4Compute::stagePsp() {
 
 	AmdFw::PspPackage pkg;
 	AmdFw::Blob smu;
-	const size_t sosLen = static_cast<size_t>(rdna4_fw_psp_sos_end - rdna4_fw_psp_sos);
-	const size_t smuLen = static_cast<size_t>(rdna4_fw_smu_end - rdna4_fw_smu);
-	if (!AmdFw::parsePsp(rdna4_fw_psp_sos, sosLen, pkg) ||
-	    !AmdFw::payload(rdna4_fw_smu, smuLen, smu)) {
+	const size_t sosLen = sos.size;
+	const size_t smuLen = smuFw.size;
+	if (!AmdFw::parsePsp(sos.data, sosLen, pkg) ||
+	    !AmdFw::payload(smuFw.data, smuLen, smu)) {
 		CLOG("psp: embedded firmware does not parse (sos %lu, smu %lu bytes)",
 		     static_cast<unsigned long>(sosLen), static_cast<unsigned long>(smuLen));
 		publish();
@@ -2083,7 +2138,7 @@ void RDNA4Compute::dmubWrite(void *ctx, uint32_t reg, uint32_t value) {
 // which dmubRing finds from the window registers.
 void RDNA4Compute::stageDmub() {
 	uint32_t on = 0;
-	if (!PE_parse_boot_argn("rdna4-dmubload", &on, sizeof(on)) || !on)
+	if (!Trial::bootArg("rdna4-dmubload", on) || !on)
 		return;
 #ifdef AMDRadeonRDNA4_NO_FIRMWARE
 	CLOG("dmub: this build carries no firmware");

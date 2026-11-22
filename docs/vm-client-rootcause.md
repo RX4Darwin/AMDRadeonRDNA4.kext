@@ -1,6 +1,6 @@
 # Why per-client GPU VM work fails on the real card (hub-task-311)
 
-Author: Anvil, branch `premetal/power`, 2026-09-30. **No kext code was changed and no GPU was run for this document.**
+Author: Anvil, branch `power`, 2026-09-30. **No kext code was changed and no GPU was run for this document.**
 Evidence tags: **[M]** measured (log file:line, or a header/source line I read), **[I]** inferred, **[U]** unknown.
 Logs: `/run/media/miguer/OPENCORE/rdna4fb-diag-2026093*.txt` and `old-logs/` (read-only). "053316" = round 5 boot 2, "061829" = round 6 boot 2,
 "062351" = round 6 boot 3 (same args plus `rdna4-gfx=2`).
@@ -13,7 +13,7 @@ after the boot test) is active **even when the baseline passes**; the other diag
 - §0 item 2 and H1 ("the pin appears in every `vm=1` boot") are **confounded with F**: the round 5 and 6 VM boots all had it; no plain VM boot has been measured with clock gating on. New hypothesis **H9**: F's window or restore leaves the GC L2/hub in a state that stalls MEC service. Discriminator: boot 9 (plain, no vm-diag) vs boot 9b (round 6's exact arguments).
 - "Client path == boot test" (§3) still holds for the registers compared; the boot test of round 6 was, however, the F-instrumented one.
 - §9 said `+ rdna4-compute=1`: wrong. `rdna4-compute=1` stops bring-up at the survey stage; the boot keeps `rdna4-compute=7`.
-The final definition of the boots is `docs/boot9-vm-diagnostic.md` on branch `premetal/vmdiag`.
+The final definition of the boots is `docs/boot9-vm-diagnostic.md` on branch `vmdiag`.
 
 ## 0. Verdict
 

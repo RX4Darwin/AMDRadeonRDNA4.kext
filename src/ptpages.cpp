@@ -153,6 +153,8 @@ static uint64_t sparseKey(uint32_t level, uint64_t key) {
 bool Sparse::get(const Host &h, uint32_t level, uint64_t key, bool create, Page &out) {
 	const uint64_t k = sparseKey(level, key);
 	int id = dir.find(k);
+	uint64_t physical = 0;
+	bool havePhysical = false;
 	if (id < 0) {
 		if (!create || nextId >= kMaxPages)
 			return false;
@@ -161,7 +163,6 @@ bool Sparse::get(const Host &h, uint32_t level, uint64_t key, bool create, Page 
 		if (!table.page(fresh, h.be, heapOffset))
 			return false;
 		uint64_t *mem = h.allocShadow ? h.allocShadow(h.context) : nullptr;
-		uint64_t physical = 0;
 		if (!mem || !h.physOf || !h.physOf(h.context, heapOffset, physical) || !dir.insert(k, static_cast<uint16_t>(fresh))) {
 			if (mem && h.freeShadow)
 				h.freeShadow(h.context, mem);
@@ -172,11 +173,13 @@ bool Sparse::get(const Host &h, uint32_t level, uint64_t key, bool create, Page 
 		nextId++;
 		markDirty(fresh);       // a new page must reach VRAM (zeros) before anything points at it
 		id = static_cast<int>(fresh);
+		havePhysical = true;    // reuse the successful lookup; do not introduce a second failure point
 	}
-	uint64_t heapOffset = table.offsetOf(static_cast<uint32_t>(id));
-	uint64_t physical = 0;
-	if (!h.physOf(h.context, heapOffset, physical))
-		return false;
+	if (!havePhysical) {
+		const uint64_t heapOffset = table.offsetOf(static_cast<uint32_t>(id));
+		if (!h.physOf(h.context, heapOffset, physical))
+			return false;
+	}
 	out.entries = shadow[id];
 	out.phys = physical;
 	out.id = static_cast<uint32_t>(id);

@@ -14,6 +14,11 @@
 # /usr/local/lib would otherwise be taken, with the SDK's drivers). The driver shows a headless swapchain on the
 # display the kext lends (mesa-patches/0008).
 #
+# Also vkcube.app, its own macOS version (a window, VK_EXT_metal_surface: mesa-patches/0009), with the loader inside it
+# and the driver and its manifest in Contents/Resources/vulkan/icd.d, where the loader looks in an application. A
+# MoltenVK installed on the machine is a driver too: VK_DRIVER_FILES=<vkcube.app>/Contents/Resources/vulkan/icd.d/
+# radeon_icd.json keeps the loader to ours (open -a ... --env VK_DRIVER_FILES=...).
+#
 # Needs clang, cmake and ninja.
 #
 set -e
@@ -46,3 +51,19 @@ cat > "$out/vulkan/icd.d/radeon_icd.json" <<JSON
 }
 JSON
 rm -f "$out/libvulkan.1.dylib" "$out/radeon_icd.json"   # where an earlier version of this script put them
+# vkcube.app: the system's ICD discovery, not a MoltenVK of its own (APPLE_USE_SYSTEM_ICD)
+[ -d tools-build ] || cmake -S Vulkan-Tools -B tools-build $cm -DCMAKE_PREFIX_PATH="$W/prefix" -DAPPLE_USE_SYSTEM_ICD=ON \
+	-DBUILD_CUBE=ON -DBUILD_VULKANINFO=OFF -DBUILD_ICD=OFF -DTOOLS_CODEGEN=OFF > /dev/null
+cmake --build tools-build --target vkcube > /dev/null
+app="$out/vkcube.app"
+rm -rf "$app" && cp -R tools-build/cube/macOS/cube/vkcube.app "$app"
+cp loader-build/loader/libvulkan.1.dylib "$app/Contents/MacOS/libvulkan.dylib"
+mkdir -p "$app/Contents/Frameworks" "$app/Contents/Resources/vulkan/icd.d"
+cp "$driver" "$app/Contents/Frameworks/libvulkan_radeon.dylib"
+cat > "$app/Contents/Resources/vulkan/icd.d/radeon_icd.json" <<JSON
+{
+	"file_format_version": "1.0.1",
+	"ICD": { "library_path": "../../../Frameworks/libvulkan_radeon.dylib", "api_version": "1.4.363" }
+}
+JSON
+codesign -s - -f --deep "$app" > /dev/null 2>&1

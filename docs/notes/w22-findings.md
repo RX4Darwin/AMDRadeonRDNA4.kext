@@ -1,6 +1,6 @@
-# W22 vmfix3: round-3 results vs amdgpu (branch premetal/vmfix3, off premetal/int 39786af)
+# W22 vmfix3: round-3 results vs amdgpu (branch vmfix3, off int 39786af)
 
-Logs: premetal/hw-logs/rdna4fb-diag-20260929-013433.txt (boot 2), -015807.txt (boot 8).
+Logs: rdna4fb-diag-20260929-013433.txt (boot 2), -015807.txt (boot 8).
 amdgpu references: ~/src/linux-amd/drivers/gpu/drm/amd (paths below are relative to it).
 
 ## Round-3 facts (real card)

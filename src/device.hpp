@@ -295,6 +295,7 @@ public:
 	// (coldStartHeads), as after a power loss. True from the reset on.
 	class RDNA4Compute *compute { nullptr };   // the runtime beside this device (its sleep and wake: see sleepWakeMessage)
 	bool coldBoot { false };   // also from a wake (rdna4-syssleep): the card lost its power and its state
+	bool coldStartPending { false };   // a wake's power loss whose cold start (coldStartHeads) has not run yet
 	void captureGopState();    // the GOP's scanout address, DCHUB timer and boot link, for a later cold start
 	uint32_t vramMark { 0 };   // what sleepWakeMessage wrote into VRAM before sleep (0: nothing)
 	uint64_t coldGopSurface { 0 };

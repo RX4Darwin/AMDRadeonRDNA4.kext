@@ -1561,7 +1561,7 @@ void RDNA4Device::dmubTrace(const char *tag) {
 	static int on = -1;
 	if (on < 0) {
 		uint32_t v = 0;
-		on = PE_parse_boot_argn("rdna4-dmubload", &v, sizeof(v)) && v;
+		on = Trial::bootArg("rdna4-dmubload", v) && v;
 	}
 	const uint32_t cw5 = 5 - 3;   // window 5's index in the CW3..6 register runs
 	const uint64_t mc = regReadDmu(2, kDmcubCw3Offset + 2 * cw5) |
@@ -2361,7 +2361,7 @@ IOReturn RDNA4Device::sleepWakeMessage(void *target, void *, UInt32 type, IOServ
 		}
 	} else if (type == kIOMessageSystemWillPowerOn) {
 		dev->logPciState("waking");
-		dev->coldBoot = true;
+		dev->coldBoot = dev->coldStartPending = true;
 		FBLOG("cold: waking: the card lost its power: the next cold start runs as after a reset");
 	} else if (type == kIOMessageSystemWillNotSleep) {   // a sleep called off after the engines were quiesced
 		FBLOG("cold: the sleep was called off: the runtime comes back");
@@ -2503,7 +2503,7 @@ IOReturn RDNA4Device::pciPowerMessage(void *target, void *, UInt32 type, IOServi
 		// on long before that message, which only comes with the full wake, and the bring-up below would run warm (no displays).
 		if (!dev->coldBoot)
 			FBLOG("cold: pci powered on: the card lost its power: the next cold start runs as after a reset");
-		dev->coldBoot = true;
+		dev->coldBoot = dev->coldStartPending = true;
 		if (dev->drivesRuntimePower())
 			dev->compute->powerDidWake();
 	}
@@ -3305,16 +3305,21 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 		a.pixelClockKHz = b.pixelClockKHz;
 		return Edid::sameTiming(a, b) && diff <= b.pixelClockKHz / 2000;
 	};
-	// The one boot pipe there is a table for: the GOP's DisplayPort display on pipe 0 at its 4K timing.
+	// The one boot pipe there is a table for: the GOP's DisplayPort display on pipe 0 at its 4K timing. After a power
+	// loss it may have been switched to another mode since (2560x1440 on the native desktop, 2026-11-22: the cold start
+	// refused, neither display came back from sleep): lit at the table's timing, then switched back to that mode below.
+	const Edid::DetailedTiming wanted = liveTiming;
 	if (!pipe.valid() || pipe.otg != 0 || pipe.hubp != 0 || pipe.dig != 0 || pipe.link != 0 || pipe.hpd != 1 ||
 	    !bootDpLinkKnown || !pathForHpd(pipe.hpd, path) || !Pipe2::use(1, false, 0, true) ||
-	    !nearTiming(liveTiming, Pipe2::config().timing)) {
+	    (!coldBoot && !nearTiming(liveTiming, Pipe2::config().timing))) {
 		FBLOG("dcninit: not run: the boot pipe is not the DisplayPort one on pipe 0 at the table's 3840x2160 "
 		      "(OTG%u HUBP%u DIG%u link %u HPD%u, %ux%u at %u kHz, link known %d)", pipe.otg, pipe.hubp, pipe.dig,
 		      pipe.link, pipe.hpd, liveTiming.hActive, liveTiming.vActive, liveTiming.pixelClockKHz, bootDpLinkKnown);
 		useSlotTable();   // the slot's own table again
 		return false;
 	}
+	// (read now: the slot's own table is selected again before the lighting is checked below)
+	const Edid::DetailedTiming table = Pipe2::config().timing;
 	// The console's address as the display hub counts it, computed (as after a power loss, when no pipe holds it);
 	// on this warm card it has to be the address the GOP's HUBP0 scans.
 	const uint64_t gop = coldBoot ? coldGopSurface : bootScanout();
@@ -3430,6 +3435,14 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
 	FBLOG("dcninit: %s%s%s; OTG0 measured %u.%03u Hz, HUBP0_DCHUBP_CNTL 0x%08x", ok ? "boot pipe lit again" : "FAILED",
 	      *why ? ": " : "", why, mHz / 1000, mHz % 1000, regReadDmu(2, 0x05f4));
+	// Lit at the table's timing, with the table's request timing: the mode it ran before the power loss set again.
+	if (ok && !nearTiming(wanted, table)) {
+		liveTiming = reqTiming = table;
+		liveTimingValid = reqTimingValid = true;
+		const IOReturn back = applyMode(Modes::Mode { currentModeId, wanted, wanted.refreshMilliHz(), false, Modes::SourceBoot });
+		FBLOG("dcninit: the mode before the power loss (%ux%u at %u kHz) set again: %s (0x%x)", wanted.hActive, wanted.vActive,
+		      wanted.pixelClockKHz, back == kIOReturnSuccess ? "done" : "FAILED, the table's timing kept", back);
+	}
 	return ok;
 }
 
@@ -4428,6 +4441,13 @@ bool RDNA4Device::runSecondPipePart(Pipe2::Part part, size_t *steps) {
 void RDNA4Device::setSecondPipePower(bool on) {
 	if (!xp().lit || on == xp().on)
 		return;
+	// After a wake's power loss the cold start lights the pipe (coldStartHeads): before it nothing runs (no DMUB, the AUX
+	// pads in their reset mode), and a wake tried then stopped with the stream encoder on, which the cold start's plan
+	// then refused (the second display stayed dark, card, 2026-11-22).
+	if (on && coldStartPending) {
+		displayPowerNote(on, "pipe2", "left to the cold start after the power loss");
+		return;
+	}
 	if (!displaySleepEnabled) {
 		displayPowerNote(on, "pipe2", "ignored: rdna4-nosleep=1");
 		return;

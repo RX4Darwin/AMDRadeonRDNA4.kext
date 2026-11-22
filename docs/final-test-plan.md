@@ -1,15 +1,15 @@
-# Final real-card test plan (branch `premetal/final`)
+# Final real-card test plan (branch `final`)
 
 Author: Anvil (hub-task-331/334). One document for the user: the exact order, what each boot is for, what it should print, what a FAIL means and whether to go on.
 Everything below was built and dry-checked off the card only (kext + `rdna4-run` build, `nm -u` unchanged, `make test`, userspace host tests, `tools/vm/emu-qtest-vm.py` 35/35, `bash -n`);
 **no boot here has run on the card**, and the emulator dry run of the whole plan is Kiln's (result in the hub-task-331 report / its doc). Evidence tags: [M] measured on the card in an earlier round, [I] inferred, [U] unknown.
 
-## 0. What `premetal/final` contains
+## 0. What `final` contains
 
-`premetal/vmdiag` (= `premetal/w13` d9ec129: S0 invalidate fix, S1 VMID/queue diagnostic round 2, S7-lite shared queues `rdna4-vmshared=1`, ptpages; + boots 9/9b) + `premetal/power` (P2 idle
-accounting, P3 post-client idle row, P7 sleep/wake hardening, on `premetal/w12k` f43d3c9: W12k client gfx IBs, G4 colour triangle) + `premetal/emu-linux` 658e1a2 and Kiln's script commits 762bf45, 8080095.
-Not included: Forge's S8 (hub-task-329) and any stale-TLB correctness fix Forge may still commit to `premetal/w13` (hub-task-334): `git merge premetal/w13` refreshes the tree when it lands; this
-document does not change. **Build the kext from `premetal/final`'s tip** (`OSXCROSS=$HOME/.local/share/osxcross bash tools/build/build-osxcross.sh`, then copy `Build/AMDRadeonRDNA4-<version>-RELEASE/AMDRadeonRDNA4.kext` and `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-run` to the stick
+`vmdiag` (= `w13` d9ec129: S0 invalidate fix, S1 VMID/queue diagnostic round 2, S7-lite shared queues `rdna4-vmshared=1`, ptpages; + boots 9/9b) + `power` (P2 idle
+accounting, P3 post-client idle row, P7 sleep/wake hardening, on `w12k` f43d3c9: W12k client gfx IBs, G4 colour triangle) + `emu-linux` 658e1a2 and Kiln's script commits 762bf45, 8080095.
+Not included: Forge's S8 (hub-task-329) and any stale-TLB correctness fix Forge may still commit to `w13` (hub-task-334): `git merge w13` refreshes the tree when it lands; this
+document does not change. **Build the kext from `final`'s tip** (`OSXCROSS=$HOME/.local/share/osxcross bash tools/build/build-osxcross.sh`, then copy `Build/AMDRadeonRDNA4-<version>-RELEASE/AMDRadeonRDNA4.kext` and `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-run` to the stick
 together with `tools/rig/set-boot.sh` and `tools/rig/diagnostic-log.sh`).
 
 ## 1. How to run one boot (unchanged loop)
@@ -106,7 +106,7 @@ boot 9/9b/12: `runtime/submitib/fault/vm PASS`, `vmidtest` **all P** (T5c, T5b, 
 Boot 10: `gfx-idle-acct PASS` with the expected `idle:` transitions. **Findings and what was done:**
 - **Boot 13 gfx rows FAILED** (`tri: SubmitGfxIb: resource shortage`, `gfx-client FAIL setup`): `rtOpenShared` did not set the client's gfx fence. Fixed in `4365f84` (same two lines Kiln confirmed); the rule "gfx rows of boot 13 = boot 8" holds again (Kiln's scratch run); the fixed tree is not re-run in the emulator yet.
 - **Boot 11s FAILED on the emulator** (`sleep FAIL`): after the simulated sleep the re-bring-up stopped at stage 4 (SDMA): the engine still held its 64-bit pointers (0x17604) and the kext restarted the ring at wptr 0, which SDMA 7 treats as "nothing to do" (card-proven rule, `ae70f2e`). Kiln's run never triggered the emulator's sleep reset (its `power reset` line is at VM start), so this **was the no-power-loss case, which is what the real card is in after the driver's simulated sleep**; it was *not* an emulator gap. Fixed in `12ac79b` (the ring resumes at the engine's own pointers after a wake; emulator: ring position = RB_RPTR mod size); **re-run **passes with and without a power loss** (Kiln, hub-task-363). What the emulator still cannot validate: the rest of the re-bring-up (PSP/firmware autoload again on a live GPU) and what a real S3 does to the card. Treat 11s as a low-value fallback.
-- `post-idle FAIL` and every idle figure on the emulator come from a constant synthetic SMU (3 % / 120 W): not a kext result. `vmidtest` all-P means **the emulator does not reproduce the round 6 card failure**: what breaks the clients on the card is not modelled (this is what boots 9/9b/12 are for).
+- (Until 2026-11-21: `post-idle FAIL` and every idle figure on the emulator came from a constant synthetic SMU, 3 % / 120 W. They now follow the model's state, `docs/emu-linux.md`; still not a card's power.) `vmidtest` all-P means **the emulator does not reproduce the round 6 card failure**: what breaks the clients on the card is not modelled (this is what boots 9/9b/12 are for).
 - **Kiln's re-run on `20c2997` (hub-task-371), 11s with and without a power loss:** `sleep PASS`; `gfx PASS` ("ring test after the sleep cycle ... draw proven BEFORE the sleep"); `runtime/submitib/fault/vm/ih/gfx-client/gfx-app-tri/gfx-idle-acct PASS`; **zero** `IH self-test CP wait timed out` / `dispatch waits will use polling` (961a0d2 fixed it) and `ih: self-test: CP EOP delivered` after the wake; `sdma: ... the ring resumes at 0x17604` (no loss) / `at 0x0` (reset run). Boot 11 (no sleeptest) unchanged.
 - **Display power property (emulator, boot 1 after `pmset displaysleepnow`):** the section printed `power: HDMI display blanked via DPG on OPP0 (ctl 0x00000041)`, `ndrv: Control csc 11 -> 0x0` and the registry copy `AMDRadeonRDNA4,DisplayPower = #1 t92638ms OFF HDMI DPG: DPG ctl 0x00000041`. No ON event: macOS never sent a power-on request in the emulated Recovery, so the un-blank path is still unexercised (what the optional idle step on the card is for).
 - `pmset sleepnow` in the emulator's Recovery is a display sleep only and the display does not come back (hub-task-344): see the plan for boot 11s and `docs/power-gfx.md` s.9.7.

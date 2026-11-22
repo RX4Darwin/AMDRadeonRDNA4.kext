@@ -149,6 +149,9 @@ inline bool find(const char *text, const char *key, uint32_t &value)
  */
 bool option(const char *key, uint32_t &value);
 
+/* The boot-arg, else the driver's default (trial.cpp builtIn): for code that runs before NVRAM is read. */
+bool bootArg(const char *key, uint32_t &value);
+
 /* Whether the variable could be read yet (NVRAM comes up after the first framebuffers). */
 bool loaded();
 #endif

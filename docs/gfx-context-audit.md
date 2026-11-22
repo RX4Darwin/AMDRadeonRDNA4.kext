@@ -70,7 +70,7 @@ Reading it: `probe mid` all equal and still no pixels and no marker: state is ri
 line and the RS64 bases decide whether the CP itself is unhealthy. Some registers differ: they were not applied (a `SET_*` packet the CP ignores or
 a filter); fix that packet form. DC_BASE 0: program the firmware's data base as the direct-load path does.
 
-## 5. W33: the W31 review follow-ups (`premetal/w31-review.md`)
+## 5. W33: the W31 review follow-ups (`w31-review.md`)
 
 - **S1, which packet makes the CPG read and write VA 0.** The IH vectors of round 4 are a *read and a write* at VA 0 (`src_data[1]` 0x40 and 0x20) and they recur with every
   submission that carries a `RELEASE_MEM`; the IH ring only comes up after the ring tests, so a fault during the bring-up left no IV. Instead of moving IH earlier

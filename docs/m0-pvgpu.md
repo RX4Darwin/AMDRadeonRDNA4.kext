@@ -1,6 +1,6 @@
 # M0, kext side: the fake Apple paravirtual GPU (hub-task-427)
 
-Branch `premetal/m0` (from `premetal/metal-spike`). Code: `src/pvgpu.{hpp,cpp}`, boot-arg `rdna4-pvgpu=1|2` (default off); display side (hub-task-451): `rdna4-pvgpu-disp=<bits>` (bit 0 = report the display *online*, bit 1 = ~60 Hz VBL events for pipes whose guest enabled VBL; default 2, level 2 forces 3) and `rdna4-pvgpu-width=` / `rdna4-pvgpu-height=` (the display's mode, default 1920x1080). Helpers: `tools/metal/m0/pvdis.py` (read Apple's kext), `tools/metal/m0/check-vtable.py` (is our `IOPCIDevice` the one Tahoe has).
+Branch `m0` (from `metal-spike`). Code: `src/pvgpu.{hpp,cpp}`, boot-arg `rdna4-pvgpu=1|2` (default off); display side (hub-task-451): `rdna4-pvgpu-disp=<bits>` (bit 0 = report the display *online*, bit 1 = ~60 Hz VBL events for pipes whose guest enabled VBL; default 2, level 2 forces 3) and `rdna4-pvgpu-width=` / `rdna4-pvgpu-height=` (the display's mode, default 1920x1080). Helpers: `tools/metal/m0/pvdis.py` (read Apple's kext), `tools/metal/m0/check-vtable.py` (is our `IOPCIDevice` the one Tahoe has).
 Status words as in `docs/metal-readiness.md`: **measured** = read from Apple's binaries or a run; **inferred** = reasoned, not shown; **code** = written and compiled, not run.
 
 ## What it is, in one paragraph

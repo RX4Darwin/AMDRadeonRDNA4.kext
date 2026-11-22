@@ -270,22 +270,31 @@ uint32_t RDNA4Compute::vmAcquire(RtClient &c) {
 		}
 		c.vmid = g.vmid;
 		if (!vmContextInit(c)) {
-			SLOG("VMID %u: context programming for client slot %d failed", g.vmid, static_cast<int>(&c - clients));
-			uint32_t dropped = 0;
-			vmPool.forget(reinterpret_cast<uintptr_t>(&c), true, dropped);
+			SLOG("VMID %u: context programming for client slot %d failed; quarantining until GPU reset", g.vmid, static_cast<int>(&c - clients));
+			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + g.vmid - 1 }, 0);
+			wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, 0);
+			vmPool.quarantine(reinterpret_cast<uintptr_t>(&c), g.vmid);
+			c.vmid = 0;
 			return 0;
 		}
 		wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, c.pasid);      // IH_VMID_n_LUT = PASID: a fault vector from this VMID names the client
-		(void)vmInvalidate(g.vmid, "vmpool rebind");
-		if (g.stolen)
-			SLOG("VMID %u: rebound from client slot %d to slot %d (PASID %u)", g.vmid,
-			     reinterpret_cast<const RtClient *>(g.prevOwner) >= clients ? static_cast<int>(reinterpret_cast<const RtClient *>(g.prevOwner) - clients) : -1,
-			     static_cast<int>(&c - clients), c.pasid);
 	} else {
 		c.vmid = g.vmid;
-		if (g.flush)
-			(void)vmInvalidate(g.vmid, "vmpool flush");
 	}
+	/* Do not let the pool forget a flush until the GPU has acknowledged it. On timeout the binding
+	 * remains owned and flush-pending, so the next grab retries instead of submitting with stale TLBs. */
+	if (g.flush) {
+		if (!vmInvalidate(g.vmid, g.rebind ? "vmpool rebind" : "vmpool flush") ||
+		    !vmPool.flushComplete(reinterpret_cast<uintptr_t>(&c), g.vmid, g.flushSeq)) {
+			SLOG("VMID %u: client slot %d submission refused; TLB invalidation remains pending", g.vmid,
+			     static_cast<int>(&c - clients));
+			return 0;
+		}
+	}
+	if (g.stolen)
+		SLOG("VMID %u: rebound from client slot %d to slot %d (PASID %u)", g.vmid,
+		     reinterpret_cast<const RtClient *>(g.prevOwner) >= clients ? static_cast<int>(reinterpret_cast<const RtClient *>(g.prevOwner) - clients) : -1,
+		     static_cast<int>(&c - clients), c.pasid);
 	return g.vmid;
 }
 
@@ -297,7 +306,12 @@ void RDNA4Compute::vmReleaseVmids(RtClient &c) {
 			continue;
 		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + v - 1 }, 0);
 		wr(IpDiscovery::HwOsssys, Reg { 0, v }, 0);
-		(void)vmInvalidate(v, "vmpool release");
+		if (!vmInvalidate(v, "vmpool release")) {
+			/* A stale translation may still name memory the client is about to free.
+			 * Keep this hardware VMID unavailable until a GPU reset clears its TLB. */
+			SLOG("VMID %u: release invalidation failed; quarantining until GPU reset", v);
+			vmPool.quarantine(owner, v);
+		}
 	}
 	uint32_t first = 0;
 	vmPool.forget(owner, true, first);

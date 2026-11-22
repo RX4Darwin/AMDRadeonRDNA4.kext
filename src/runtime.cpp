@@ -90,10 +90,24 @@ uint32_t nextFence(uint32_t previous) {
 constexpr uint64_t kCopyChunk = 4ull << 20;   // wired at a time
 constexpr uint32_t kCodePad = 0x100;          // zeroed past the image: instruction prefetch
 
+// The runtime's lock, held for a scope. Held or waited for 50 ms or more: logged with the line that took it (the pointer stood for a second
+// at times, 2026-11-20: who holds the lock that long).
 struct Locked {
 	IOLock *l;
-	explicit Locked(IOLock *lock) : l(lock) { IOLockLock(l); }
-	~Locked() { IOLockUnlock(l); }
+	int line;
+	uint64_t asked, got;
+	explicit Locked(IOLock *lock, int at = __builtin_LINE()) : l(lock), line(at), asked(mach_absolute_time()) {
+		IOLockLock(l);
+		got = mach_absolute_time();
+	}
+	~Locked() {
+		IOLockUnlock(l);
+		uint64_t held = 0, waited = 0;
+		absolutetime_to_nanoseconds(mach_absolute_time() - got, &held);
+		absolutetime_to_nanoseconds(got - asked, &waited);
+		if (held >= 50000000 || waited >= 50000000)
+			RLOG("lock: line %d waited %llu ms for it and held it %llu ms", line, waited / 1000000, held / 1000000);
+	}
 };
 
 // Copy between a user range and kernel memory, `length` bytes.
@@ -387,6 +401,13 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 		return;
 	}
 	IOLockLock(rtLock);
+	// After a sleep that kept the clients: their memory back first (else discarded, and the heaps made anew).
+	if (sleepKept && !sleepRestoreLocked() && !initRuntimeHeap()) {
+		IOLockUnlock(rtLock);
+		RLOG("not published: no heap after the discarded wake");
+		publishResult("runtime", "FAIL runtime heap");
+		return;
+	}
 	rtStage = stage;
 	rtReady = true;
 	IOLockUnlock(rtLock);
@@ -413,7 +434,8 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 		return;
 	}
 	svc->compute = this;
-	svc->setProperty("IOUserClientClass", "RDNA4ComputeClient");
+	gComputeService = svc;
+	svc->setProperty("IOUserClientClass", "IOAccelRDNA4ComputeClient");   // RDNA4ComputeClient (userclient.hpp)
 	svc->setProperty("ABI", static_cast<uint64_t>(RDNA4_COMPUTE_ABI), 32);
 	svc->setProperty("HeapBytes", devHeap.size() ? devHeap.size() : heap.size(), 64);
 	svc->setProperty("DMA", dmaReady);
@@ -657,6 +679,8 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	uint64_t physical = 0;
 	if (!gpuPhysical(mc, physical))
 		return false;
+	if (bytes > ~0ull - (GpuVm::kPageBytes - 1))
+		return false;   // the round-up would wrap (to a small size that passes the checks below)
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
 	if (end < va || end > GpuVm::kVaEnd)
 		return false;
@@ -664,7 +688,26 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 		/* Sparse tables: GpuVmTable::treeMapVram creates the directories and PT pages the range needs; the pages it changed are synced. */
 		TreeCtx tc { this, &c };
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
-		return GpuVmTable::treeMapVram(tree, vmPolicy(), va, end, physical, executable) && sparseSync(c);
+		if (!GpuVmTable::treeMapVram(tree, vmPolicy(), va, end, physical, executable)) {
+			/* treeMapVram clears any prefix it installed in the shadow. Sync
+			 * that rollback too, or VRAM may retain a partial mapping. */
+			if (!sparseSync(c))
+				RLOG("vmid %u: failed to sync sparse VRAM-map rollback", c.vmid);
+			return false;
+		}
+		if (sparseSync(c))
+			return true;
+
+		/* The shadow map is complete, but a failed SDMA may have copied only
+		 * some of its page-table pages. This VA came from vaTake(), so it is a
+		 * fresh allocation, not an existing mapping to preserve. Clear the
+		 * whole range and push that rollback before reporting map failure. */
+		RLOG("vmid %u: sparse VRAM-map sync failed; rolling back VA 0x%llx-0x%llx",
+		     c.vmid, va, end);
+		GpuVmTable::treeUnmap(tree, va, end);
+		if (!sparseSync(c))
+			RLOG("vmid %u: sparse VRAM-map rollback sync also failed; dirty pages retained for retry", c.vmid);
+		return false;
 	}
 	/* The entries are written by GpuVmTable::mapVram (src/gpuvmtable.cpp): the pre-S8 loop, byte-compared against the old code by the host test. */
 	PtCtx ctx { this, &c };
@@ -685,7 +728,7 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 }
 
 bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses,
-                             uint64_t bytes, bool executable) {
+                             uint64_t bytes, bool executable, bool readOnly) {
 	if (!poolCpu || !hasTables(c) || !pageBuses || !bytes ||
 	    (va & (GpuVm::kPageBytes - 1)))
 		return false;
@@ -696,12 +739,19 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 	if (c.sp) {
 		TreeCtx tc { this, &c };
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
-		return GpuVmTable::treeMapHost(tree, vmPolicy(), va, end, pageBuses, executable) && sparseSync(c);
+		if (!GpuVmTable::treeMapHost(tree, vmPolicy(), va, end, pageBuses, executable, readOnly)) {
+			/* Flush the rollback as well as the successful path: a prefix PTE
+			 * may already have reached VRAM before a later allocation failed. */
+			if (!sparseSync(c))
+				RLOG("vmid %u: failed to sync sparse host-map rollback", c.vmid);
+			return false;
+		}
+		return sparseSync(c);
 	}
 	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
-	if (!GpuVmTable::mapHost(access, vmPolicy(), kVmTableBytes, va, end, pageBuses, executable, span))
+	if (!GpuVmTable::mapHost(access, vmPolicy(), kVmTableBytes, va, end, pageBuses, executable, span, readOnly))
 		return false;
 	/* The root and directory pages when a PDE was written (the first mapping in a 2 MiB range: once written, a PDE stays), then the leaf
 	 * pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its size, is what a mapping costs. */
@@ -716,25 +766,30 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 bool RDNA4Compute::initRuntimeHeap() {
 	if (!rtLock || !poolCpu || pool.size <= kHeapOffset)
 		return false;
-	if (heap.size())
+	// Heaps kept across a sleep (sleepKept) still need the wake's DMA; a heap discarded after a failed restore is made anew.
+	if (heap.size() && (dmaReady || !sleepKept))
 		return true;
 	/* DMA first: its self-test drives SDMA directly, before any client can;
 	 * then the interrupts (W1), off for one boot if the last one hung in
 	 * "ih: ...". */
-	if (dmaInit()) {
+	const bool dmaNew = !dmaReady && dmaInit();
+	if (dmaReady && !devHeap.size())
 		devHeapInit();
+	if (dmaNew) {
 		faultPageToSystem();
 		if (featureAllowed("ih"))
 			ihInit();
 	}
-	heap.init(kHeapOffset, pool.size - kHeapOffset, 4096, heapMap, sizeof(heapMap));
-	n48nKeep();   // after a sleep: pool memory a process still maps stays out of the new heap
+	if (!heap.size()) {
+		heap.init(kHeapOffset, pool.size - kHeapOffset, 4096, heapMap, sizeof(heapMap));
+		n48nKeep();   // after a sleep: pool memory a process still maps stays out of the new heap
+	}
 	return heap.size() != 0;
 }
 
 void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
-	if (!poolCpu || !hasTables(c) || !bytes || va & (GpuVm::kPageBytes - 1))
-		return;
+	if (!poolCpu || !hasTables(c) || !bytes || va & (GpuVm::kPageBytes - 1) || bytes > ~0ull - (GpuVm::kPageBytes - 1))
+		return;   // (the last: the round-up would wrap)
 	c.tlbSeq++;      /* a removed PTE: the next job on any VMID this client owns flushes first (amdgpu's tlb_seq) */
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
 	if (c.sp) {
@@ -896,9 +951,12 @@ void RDNA4Compute::releaseHost(RtBuffer &b) {
 		b.hostDma = nullptr;
 	}
 	if (b.hostMemory) {
+		if (b.hostImported)   // the client's own pages, wired by rtImportHost
+			b.hostMemory->complete();
 		b.hostMemory->release();
 		b.hostMemory = nullptr;
 	}
+	b.hostImported = false;
 	b.hostUser = 0;
 	b.host = false;
 }
@@ -1757,6 +1815,11 @@ void rdna4Step(const char *what) {
 	IOSleep(ms);
 }
 
+bool RDNA4Compute::rtClientIsolated(const void *owner) {
+	Locked g(rtLock);
+	return vmEnabled && vmClientFor(owner);
+}
+
 IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	rdna4Step("rtOpen: taking rtLock");
 	const IOReturn r = rtOpenInner(owner);
@@ -2372,16 +2435,17 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	return allocLocked(owner, bytes, handle, gpu);
 }
 
-// The dense tables' VA (4 GiB from kVaStart) in 64 KiB granules, one bit each, per client slot: taken first fit, given back exactly.
-// The list of holes it replaces held 32: a range freed with them all taken was lost, and the paravirtual host's churn of mappings and
-// shadows filled the client's VA within minutes (Mission Control: every draw then failed to map). The VA below nextVa when the bitmap is
-// first used (the client's queue, fence and kernarg pages, taken by bumping nextVa) is marked taken. Sparse tables keep the list.
+// A client's VA in 64 KiB granules, one bit each, per client slot: taken first fit, given back exactly; the dense tables' 4 GiB from
+// kVaStart, the sparse ones' 16 GiB. The list of holes it replaces held 32: a range freed with them all taken was lost, and the
+// paravirtual host's churn of mappings and shadows filled the client's VA within minutes (Mission Control: every draw then failed to
+// map); the sparse tables kept the list until WindowServer's VA on our accelerator ran out the same way after 11 minutes (2026-11-21).
+// The VA below nextVa when the bitmap is first used (the client's queue, fence and kernarg pages, taken by bumping nextVa) is marked taken.
 uint64_t *RDNA4Compute::vaBitsOf(RtClient &c)
 {
 	uint64_t *&bits = vaBits[&c - clients];
 
 	if (!bits)   // kept for the slot once made (8 KiB)
-		bits = static_cast<uint64_t *>(IOMalloc(kVaGranules / 8));
+		bits = static_cast<uint64_t *>(IOMalloc(kSparseVaGranules / 8));
 
 	if (!bits)
 		return nullptr;
@@ -2389,9 +2453,9 @@ uint64_t *RDNA4Compute::vaBitsOf(RtClient &c)
 	if (!c.vaBitsReady) {
 		const uint64_t below = c.nextVa > GpuVm::kVaStart ? (c.nextVa - GpuVm::kVaStart + 0xffff) >> 16 : 0;
 
-		memset(bits, 0, kVaGranules / 8);
+		memset(bits, 0, kSparseVaGranules / 8);
 
-		for (uint64_t g = 0; g < below && g < kVaGranules; g++)
+		for (uint64_t g = 0; g < below && g < kSparseVaGranules; g++)
 			bits[g / 64] |= 1ull << (g % 64);
 
 		c.vaBitsReady = true;
@@ -2403,105 +2467,52 @@ uint64_t *RDNA4Compute::vaBitsOf(RtClient &c)
 // VA for a buffer of `bytes`, 64 KiB aligned; 0 if there is none.
 uint64_t RDNA4Compute::vaTake(RtClient &c, uint64_t bytes)
 {
-	const uint64_t size = (bytes + 0xffff) & ~0xffffull;
+	const uint64_t size = (bytes + 0xffff) & ~0xffffull, n = size >> 16, granules = c.sp ? kSparseVaGranules : kVaGranules;
+	uint64_t *bits = vaBitsOf(c);
 
-	if (!c.sp) {
-		uint64_t *bits = vaBitsOf(c);
-		const uint64_t n = size >> 16;
+	if (!bits)
+		return 0;
 
-		if (!bits)
-			return 0;
-
-		for (uint64_t g = 0; g + n <= kVaGranules;) {
-			if (!(g % 64) && bits[g / 64] == ~0ull) {   // a word all taken
-				g += 64;
-				continue;
-			}
-
-			uint64_t run = 0;
-
-			while (run < n && !(bits[(g + run) / 64] >> ((g + run) % 64) & 1))
-				run++;
-
-			if (run < n) {
-				g += run + 1;
-				continue;
-			}
-
-			for (uint64_t i = g; i < g + n; i++)
-				bits[i / 64] |= 1ull << (i % 64);
-
-			const uint64_t va = GpuVm::kVaStart + (g << 16);
-
-			c.nextVa = va + size > c.nextVa ? va + size : c.nextVa;
-
-			return va;
+	for (uint64_t g = 0; g + n <= granules;) {
+		if (!(g % 64) && bits[g / 64] == ~0ull) {   // a word all taken
+			g += 64;
+			continue;
 		}
 
-		return 0;
-	}
+		uint64_t run = 0;
 
-	for (uint32_t i = 0; i < c.vaHoleCount; i++) {
-		RtClient::VaHole &h = c.vaHoles[i];
+		while (run < n && !(bits[(g + run) / 64] >> ((g + run) % 64) & 1))
+			run++;
 
-		if (h.bytes < size)
+		if (run < n) {
+			g += run + 1;
 			continue;
+		}
 
-		const uint64_t va = h.va;
-		h.va += size;
-		h.bytes -= size;
+		for (uint64_t i = g; i < g + n; i++)
+			bits[i / 64] |= 1ull << (i % 64);
 
-		if (!h.bytes)
-			h = c.vaHoles[--c.vaHoleCount];
+		const uint64_t va = GpuVm::kVaStart + (g << 16);
+
+		c.nextVa = va + size > c.nextVa ? va + size : c.nextVa;
 
 		return va;
 	}
 
-	const uint64_t va = (c.nextVa + 0xffff) & ~0xffffull;
-	if (va + size < va)
-		return 0;
-
-	c.nextVa = va + size;
-
-	return va;
+	return 0;
 }
 
-// A freed buffer's VA back to the client. Sparse tables: the end of its VA moves down when the range is last, else it becomes a hole,
-// joined with a neighbour where it touches one; with the holes all taken, the range is lost (VA only, not memory).
+// A freed buffer's VA back to the client.
 void RDNA4Compute::vaGive(RtClient &c, uint64_t va, uint64_t bytes)
 {
 	uint64_t size = (bytes + 0xffff) & ~0xffffull;
+	uint64_t *bits = vaBitsOf(c);
 
-	if (!c.sp) {
-		uint64_t *bits = vaBitsOf(c);
-
-		if (!bits)
-			return;
-
-		for (uint64_t g = (va - GpuVm::kVaStart) >> 16; va >= GpuVm::kVaStart && g < kVaGranules && size; g++, size -= 0x10000)
-			bits[g / 64] &= ~(1ull << (g % 64));
-
+	if (!bits)
 		return;
-	}
 
-	for (uint32_t i = 0; i < c.vaHoleCount; i++) {
-		RtClient::VaHole &h = c.vaHoles[i];
-
-		if (h.va + h.bytes != va && va + size != h.va)
-			continue;
-
-		va = h.va < va ? h.va : va;
-		size += h.bytes;
-		c.vaHoles[i--] = c.vaHoles[--c.vaHoleCount];   // taken out and joined; look again for the other side
-	}
-
-	if (va + size == c.nextVa) {
-		c.nextVa = va;
-		return;
-	}
-
-	if (c.vaHoleCount < kVaHoles)
-		c.vaHoles[c.vaHoleCount++] = { va, size };
+	for (uint64_t g = (va - GpuVm::kVaStart) >> 16; va >= GpuVm::kVaStart && g < kSparseVaGranules && size; g++, size -= 0x10000)
+		bits[g / 64] &= ~(1ull << (g % 64));
 }
 
 // rtAlloc under rtLock: a buffer of the owner's, mapped into its VM.
@@ -2563,28 +2574,10 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
                                    uint64_t flags, uint64_t &handle, uint64_t &gpu,
                                    uint64_t &user) {
 	Locked g(rtLock);
-	const IOReturn state = ownerStateLocked(owner);
-	if (state != kIOReturnSuccess)
-		return state;
-	if (!vmEnabled)
-		return kIOReturnUnsupported;
-	RtClient *c = vmClientFor(owner);
-	if (!c || !dmaReady || !busMasterSet)
-		return kIOReturnUnsupported;
-	if (!bytes || bytes > kHostMaxBuffer || (flags & ~static_cast<uint64_t>(RDNA4_HOST_EXECUTABLE)))
-		return bytes > kHostMaxBuffer ? kIOReturnNoResources : kIOReturnBadArgument;
-	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) &
-	                         ~(GpuVm::kPageBytes - 1);
-	if (rounded < bytes || rounded > kHostMaxBuffer ||
-	    rounded > kHostMaxClient - c->hostBytes ||
-	    rounded > kHostMaxTotal - hostBytesTotal)
-		return kIOReturnNoResources;
-	uint32_t slot = 0;
-	while (slot < bufferCap() && buffers[slot].owner)
-		slot++;
-	if (slot == bufferCap() || clientOverQuota(owner, false))
-		return kIOReturnNoResources;
-
+	IOReturn r = hostChecks(owner, bytes, flags);
+	if (r != kIOReturnSuccess)
+		return r;
+	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
 	IOBufferMemoryDescriptor *memory = IOBufferMemoryDescriptor::inTaskWithOptions(
 		kernel_task, kIODirectionInOut, rounded, GpuVm::kPageBytes);
 	if (!memory)
@@ -2594,12 +2587,78 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 		memory->release();
 		return kIOReturnNoMemory;
 	}
+	return mapHostLocked(owner, memory, map, map->getAddress(), false, bytes, flags, handle, gpu, user);
+}
+
+// A range of the caller's own memory (an IOSurface's, the native Metal device's drawables: docs/native-metal-spike.md) wired and mapped
+// into its GPU address space, as rtAllocHost maps the memory it allocates; unwired when the buffer is freed.
+IOReturn RDNA4Compute::rtImportHost(const void *owner, task_t task, uint64_t address, uint64_t bytes, uint64_t flags,
+                                    uint64_t &handle, uint64_t &gpu) {
+	Locked g(rtLock);
+	IOReturn r = (address & (GpuVm::kPageBytes - 1)) ? kIOReturnBadArgument : hostChecks(owner, bytes, flags, false);
+	if (r != kIOReturnSuccess)
+		return r;
+	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	// read-only memory (RDNA4_HOST_READ_ONLY): wired for the device to read (kIODirectionOut), mapped without WRITEABLE (mapHostLocked)
+	IOMemoryDescriptor *memory = IOMemoryDescriptor::withAddressRange(address, rounded, (flags & RDNA4_HOST_READ_ONLY) ? kIODirectionOut
+	                                                                                                                  : kIODirectionInOut, task);
+	if (!memory)
+		return kIOReturnNoMemory;
+	if ((r = memory->prepare()) != kIOReturnSuccess) {
+		memory->release();
+		return r;
+	}
+	uint64_t user = 0;
+	return mapHostLocked(owner, memory, nullptr, address, true, bytes, flags, handle, gpu, user);
+}
+
+// What a host buffer may be: a client with its own VM and DMA, flags the API knows, the per-buffer, per-client and total limits, a free slot.
+IOReturn RDNA4Compute::hostChecks(const void *owner, uint64_t bytes, uint64_t flags, bool counted) {
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	if (!vmEnabled)
+		return kIOReturnUnsupported;
+	RtClient *c = vmClientFor(owner);
+	if (!c || !dmaReady || !busMasterSet)
+		return kIOReturnUnsupported;
+	if (!bytes || bytes > kHostMaxBuffer || (flags & ~static_cast<uint64_t>(RDNA4_HOST_EXECUTABLE | RDNA4_HOST_READ_ONLY)))
+		return bytes > kHostMaxBuffer ? kIOReturnNoResources : kIOReturnBadArgument;
+	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	if (rounded < bytes || rounded > kHostMaxBuffer ||
+	    (counted && (rounded > kHostMaxClient - c->hostBytes || rounded > kHostMaxTotal - hostBytesTotal)))
+		return kIOReturnNoResources;
+	uint32_t slot = 0;
+	while (slot < bufferCap() && buffers[slot].owner)
+		slot++;
+	return slot == bufferCap() || clientOverQuota(owner, false) ? kIOReturnNoResources : kIOReturnSuccess;
+}
+
+// `memory` (wired; `imported`: prepared here, completed when freed) and its user view (`map`, or none for the caller's own range at
+// `userAddress`) into a buffer slot and the client's GPU address space. Takes `memory` and `map` whatever happens.
+IOReturn RDNA4Compute::mapHostLocked(const void *owner, IOMemoryDescriptor *memory, IOMemoryMap *map, uint64_t userAddress, bool imported,
+                                     uint64_t bytes, uint64_t flags, uint64_t &handle, uint64_t &gpu, uint64_t &user) {
+	RtClient *c = vmClientFor(owner);
+	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	uint32_t slot = 0;
+	while (slot < bufferCap() && buffers[slot].owner)
+		slot++;
+	auto drop = [&]() {
+		if (map)
+			map->release();
+		if (imported)
+			memory->complete();
+		memory->release();
+	};
+	if (!c || slot == bufferCap()) {
+		drop();
+		return kIOReturnNoResources;
+	}
 	const uint64_t pageCount = rounded / GpuVm::kPageBytes;
 	IODMACommand *dma = IODMACommand::withSpecification(
 		kIODMACommandOutputHost64, 48, 0, IODMACommand::kMapped, 0, GpuVm::kPageBytes);
 	if (!dma) {
-		map->release();
-		memory->release();
+		drop();
 		return kIOReturnNoMemory;
 	}
 	const uint64_t segBytes = pageCount * sizeof(IODMACommand::Segment64);
@@ -2633,8 +2692,7 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 		dma->release();
 		if (pageBuses)
 			IOFree(pageBuses, pageCount * sizeof(uint64_t));
-		map->release();
-		memory->release();
+		drop();
 		return kIOReturnNoResources;
 	}
 
@@ -2647,13 +2705,14 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 	b.gen = generation;
 	b.host = true;
 	b.hostMemory = memory;
+	b.hostImported = imported;
 	b.hostDma = dma;
 	b.hostMap = map;
-	b.hostUser = map->getAddress();
+	b.hostUser = userAddress;
 	if (!b.hostUser || !b.va ||
 	    b.va + rounded < b.va || b.va + rounded > GpuVm::kVaEnd ||
 	    !vmMapHost(*c, b.va, pageBuses, rounded,
-                (flags & RDNA4_HOST_EXECUTABLE) != 0)) {
+                (flags & RDNA4_HOST_EXECUTABLE) != 0, (flags & RDNA4_HOST_READ_ONLY) != 0)) {
 		if (pageBuses)
 			IOFree(pageBuses, pageCount * sizeof(uint64_t));
 		if (b.va) {
@@ -2673,13 +2732,16 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 		b.owner = nullptr;
 		return kIOReturnNotResponding;
 	}
-	c->hostBytes += rounded;
-	hostBytesTotal += rounded;
+	if (!imported) {   // imports allocate nothing: the VA and the buffer slots limit them (WindowServer on the native device imports every
+		               // window's surface; counted, they ran it past 1 GiB and its own allocations failed, 2026-11-20)
+		c->hostBytes += rounded;
+		hostBytesTotal += rounded;
+	}
 	handle = makeHandle(slot, b.gen);
 	gpu = b.va;
 	user = b.hostUser;
-	RLOG("vmid %u: host buffer %llu bytes mapped at GPU VA 0x%llx, user 0x%llx, %llu pages",
-	     c->vmid, bytes, b.va, b.hostUser, pageCount);
+	RLOG("vmid %u: host buffer %llu bytes %s at GPU VA 0x%llx, user 0x%llx, %llu pages",
+	     c->vmid, bytes, imported ? "imported from the client and mapped" : "mapped", b.va, b.hostUser, pageCount);
 	return kIOReturnSuccess;
 }
 
@@ -2761,7 +2823,7 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	if (c && b->va && forgotten)
 		vaGive(*c, b->va, b->bytes);   // after the invalidation: nothing cached reaches the range when it is mapped again
 	if (host) {
-		if (c && !b->mapped) {
+		if (c && !b->mapped && !b->hostImported) {
 			const uint64_t rounded = (b->bytes + GpuVm::kPageBytes - 1) &
 			                         ~(GpuVm::kPageBytes - 1);
 			if (c->hostBytes >= rounded)
@@ -2844,6 +2906,29 @@ IOReturn RDNA4Compute::rtMapVram(const void *owner, uint64_t barPhys, uint64_t b
 	if (!c || !bytes || bytes > sv.bar0Size || barPhys < sv.bar0Phys || barPhys - sv.bar0Phys > sv.bar0Size - bytes ||
 	    (barPhys & (GpuVm::kPageBytes - 1)))
 		return kIOReturnBadArgument;
+	return mapMcLocked(owner, vramMc(barPhys - sv.bar0Phys), bytes, handle, gpu);
+}
+
+IOReturn RDNA4Compute::rtMapClientVram(const void *owner, const void *client, uint64_t clientHandle, uint64_t &handle, uint64_t &gpu,
+                                       uint64_t &bytes) {
+	Locked g(rtLock);
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	if (!vmEnabled)
+		return kIOReturnUnsupported;
+	const RtBuffer *b = bufferFor(client, clientHandle);
+	if (!b || b->host || b->foreign || !b->mc)   // VRAM the runtime gave the client (either heap) only
+		return kIOReturnBadArgument;
+	bytes = b->bytes;
+	return mapMcLocked(owner, b->mc, b->bytes, handle, gpu);
+}
+
+// (rtLock held) `bytes` of VRAM at MC address `mc` mapped into owner's GPU address space, as a buffer of its that frees only the mapping.
+IOReturn RDNA4Compute::mapMcLocked(const void *owner, uint64_t mc, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
+	RtClient *c = vmClientFor(owner);
+	if (!c)
+		return kIOReturnBadArgument;
 	uint32_t slot = 0;
 	while (slot < bufferCap() && buffers[slot].owner)
 		slot++;
@@ -2855,7 +2940,7 @@ IOReturn RDNA4Compute::rtMapVram(const void *owner, uint64_t barPhys, uint64_t b
 	b = RtBuffer {};
 	b.owner = owner;
 	b.bytes = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
-	b.mc = vramMc(barPhys - sv.bar0Phys);
+	b.mc = mc;
 	b.va = vaTake(*c, b.bytes);
 	b.gen = generation;
 	b.foreign = true;
@@ -3599,7 +3684,7 @@ bool RDNA4Compute::pauseUnlocked(const RtClient &c, const void *owner) {
 
 /* `pause`: the caller holds rtLock and nothing of the client's but the client itself; the lock is let go between the polls after the first
  * 2 ms (pauseUnlocked). */
-bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why, bool pause) {
+bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why, bool pause, uint32_t firstPoll) {
 	// Slow is not hung: past the timeout the wait goes on while the CP still moves (another IB, less of it left, or fences coming), up to
 	// kMovingMs in all, and ends only once nothing moved for kStillMs. Copies of 4K targets from the guest's memory took longer than the
 	// host's 50 ms in a batch, and the ring was ended under them (2026-11-07).
@@ -3612,7 +3697,7 @@ bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(kMovingMs) * 1000000, &moving);
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(kStillMs) * 1000000, &still);
 	bool done = false;
-	for (uint32_t polls = 0;; polls++) {
+	for (uint32_t polls = firstPoll;; polls++) {
 		done = fenceReached(*c.gfxFenceCpu, fence);
 		const uint64_t now = mach_absolute_time();
 
@@ -3723,6 +3808,25 @@ bool RDNA4Compute::rtGfxFenceDone(const void *owner, uint32_t fence) {
 }
 
 IOReturn RDNA4Compute::rtWaitGfxFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns) {
+	// The first 2 ms polled without the lock: held, it kept every other client from submitting meanwhile (WindowServer's frames waited
+	// behind the paravirtual host's waits and the other way round, the cursor and the VBL events late, 2026-11-20). The caller's own fence
+	// page stays while its call runs (a client is closed after its calls).
+	volatile uint32_t *own = nullptr;
+	{
+		Locked g(rtLock);
+		RtClient *c = ownerStateLocked(owner) == kIOReturnSuccess && vmEnabled ? vmClientFor(owner) : nullptr;
+		own = c && gfxMode && !gfxWedged && timeoutMs <= RDNA4_MAX_TIMEOUT_MS && static_cast<int32_t>(fence - c->gfxFence) <= 0 ? c->gfxFenceCpu
+		                                                                                                                      : nullptr;
+	}
+	const uint64_t t0 = mach_absolute_time();
+	uint32_t polls = 0;
+	for (; own && polls < 200; polls++) {
+		if (fenceReached(*own, fence)) {
+			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+			return kIOReturnSuccess;
+		}
+		IODelay(10);
+	}
 	Locked g(rtLock);
 	IdleUse idle(this, "wait-gfx");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
 	checkPresentationTimeoutLocked();
@@ -3741,7 +3845,7 @@ IOReturn RDNA4Compute::rtWaitGfxFence(const void *owner, uint32_t fence, uint32_
 	if (gfxWedged)
 		return kIOReturnNotResponding;
 	waitAborted = false;
-	if (gfxClientWait(*c, fence, timeoutMs ? timeoutMs : 1000, ns, "IB wait", true))
+	if (gfxClientWait(*c, fence, timeoutMs ? timeoutMs : 1000, ns, "IB wait", true, own ? polls : 0))
 		return kIOReturnSuccess;
 	if (c->owner != owner)
 		return kIOReturnNotOpen;
@@ -4045,8 +4149,8 @@ void RDNA4Compute::rtRelease(const void *owner) {
 
 	for (RtBuffer &b : buffers) {
 		if (b.owner == owner && b.host) {
-			const uint64_t rounded = b.mapped ? 0 : (b.bytes + GpuVm::kPageBytes - 1) &
-			                                        ~(GpuVm::kPageBytes - 1);
+			const uint64_t rounded = b.mapped || b.hostImported ? 0 : (b.bytes + GpuVm::kPageBytes - 1) &
+			                                                          ~(GpuVm::kPageBytes - 1);
 			if (c && c->hostBytes >= rounded)
 				c->hostBytes -= rounded;
 			if (hostBytesTotal >= rounded)
@@ -4216,6 +4320,7 @@ void RDNA4Compute::powerWillSleep() {
 	gfxSleepDrain();            // P7: give client gfx IBs 100 ms, then drop them (no wedge), BEFORE PFP/ME are halted
 	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
 	wr(IpDiscovery::HwGc, CpMecRs64Cntl, rdGc(CpMecRs64Cntl) | kRs64Halt);
+	sleepKept = sleepSaveLocked();   // while the copy engine still runs
 	dmaTeardown("system sleep");
 	RLOG("power: quiesce complete; compute engines halted");
 }
@@ -4224,6 +4329,42 @@ void RDNA4Compute::resetRuntimeForResume() {
 	if (!rtLock)
 		return;
 	Locked g(rtLock);
+	if (!sleepKept) {
+		discardRuntimeLocked();
+		return;
+	}
+	// The clients kept (sleepSaveLocked): their buffers, programs, page tables (shadows in host memory, pages in the saved VRAM)
+	// and VA stay; what ran on the card is gone. Nothing in flight comes back: publishRuntime marks their fences reached.
+	for (RtClient &c : clients) {
+		if (!c.active)
+			continue;
+		c.vmid = 0;          // pooled: bound again at the next job
+		c.ibOutstanding = 0;
+		c.gfxOutstanding = 0;
+	}
+	if (gfxRings) {        // the wake's gfx stage makes the GE rings anew
+		devHeap.free(gfxRings);
+		gfxRings = 0;
+	}
+	bzero(vmidUsed, sizeof(vmidUsed));
+	bzero(queueUsed, sizeof(queueUsed));
+	for (SharedQueue &q : sharedQ)
+		q.up = q.wedged = false;
+	sharedInit = false;
+	vmPool.unbindAll();
+	// ponytail: the Vulkan (N48N) sessions are still dropped across a sleep; what they held in the kept heaps stays taken
+	// until the next boot. Keep them too if a Vulkan app has to survive a sleep.
+	n48nDiscard();
+	dropPendingPresentsLocked(kIOReturnAborted);
+	presentActive = false;
+	presentOwner = nullptr;
+	rtWedged = false;
+	rtReady = false;
+	rtGeneration++;
+	RLOG("power: clients, buffers, programs and page tables kept across the sleep; their memory goes back when the runtime is up");
+}
+
+void RDNA4Compute::discardRuntimeLocked() {
 	for (RtBuffer &b : buffers) {
 		if (!b.owner)
 			continue;
@@ -4284,6 +4425,135 @@ void RDNA4Compute::resetRuntimeForResume() {
 	rtReady = false;
 	rtGeneration++;
 	RLOG("power: old runtime buffers, heaps and VM contexts discarded; client objects retained as aborted");
+}
+
+// One saved range through the bounce buffer, 16 MiB at a time (the cache flushes as dmaCopy's). rtLock held, dmaReady.
+bool RDNA4Compute::sleepCopyRun(const SleepRun &r, bool toGpu) {
+	auto *copy = static_cast<uint8_t *>(sleepCopy->getBytesNoCopy());
+	for (uint64_t done = 0; done < r.bytes;) {
+		const uint32_t n = static_cast<uint32_t>(r.bytes - done < kBounceBytes ? r.bytes - done : kBounceBytes);
+		if (toGpu) {
+			memcpy(bounceVa, copy + r.at + done, n);
+			bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
+			if (!bounceCopy(r.mc + done, 0, n, true))
+				return false;
+		} else {
+			bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
+			if (!bounceCopy(r.mc + done, 0, n, false))
+				return false;
+			bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
+			memcpy(copy + r.at + done, bounceVa, n);
+		}
+		done += n;
+	}
+	return true;
+}
+
+void RDNA4Compute::sleepDropSave() {
+	OSSafeReleaseNULL(sleepCopy);
+	if (sleepRuns)
+		IOFree(sleepRuns, sleepRunCount * sizeof(SleepRun));
+	sleepRuns = nullptr;
+	sleepRunCount = 0;
+}
+
+// powerWillSleep, rtLock held, the engines drained, SDMA still running: what both heaps hold, copied to host memory. False
+// (nothing kept: the wake discards as before) without a pooled client, without the copy engine, or without the memory.
+bool RDNA4Compute::sleepSaveLocked() {
+	uint32_t keep = 1;
+	(void)PE_parse_boot_argn("rdna4-sleepkeep", &keep, sizeof(keep));
+	uint32_t live = 0;
+	for (const RtClient &c : clients)
+		live += c.active && !c.aborted;
+	if (!keep || !live || !vmEnabled || vmShared != 2 || !dmaReady || !bounce) {
+		RLOG("power: sleep: clients not kept (%s)", !keep ? "rdna4-sleepkeep=0" : !live ? "none open" : !dmaReady ? "no copy engine"
+		     : "needs rdna4-vmshared=2");
+		return false;
+	}
+	sleepDropSave();
+	const uint64_t from = mach_absolute_time();
+	GpuHeap::Heap *const heaps[2] = { &heap, &devHeap };
+	uint64_t total = 0, cursor, offset, bytes;
+	uint32_t runs = 0;
+	for (const GpuHeap::Heap *h : heaps)
+		for (cursor = 0; h->nextUsed(cursor, offset, bytes); runs++)
+			total += bytes;
+	if (runs)
+		sleepRuns = static_cast<SleepRun *>(IOMalloc(runs * sizeof(SleepRun)));
+	sleepRunCount = runs;
+	sleepCopy = total ? IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryPageable, total, page_size)
+	                  : nullptr;
+	if (!runs || !sleepRuns || !sleepCopy || !sleepCopy->getBytesNoCopy()) {
+		RLOG("power: sleep: clients not kept: no host memory for %llu MiB in %u range(s)", total >> 20, runs);
+		sleepDropSave();
+		return false;
+	}
+	uint64_t at = 0;
+	uint32_t i = 0;
+	for (const GpuHeap::Heap *h : heaps)
+		for (cursor = 0; i < runs && h->nextUsed(cursor, offset, bytes); i++) {
+			sleepRuns[i] = SleepRun { h == &heap ? poolMc(offset) : vramMc(offset), bytes, at };
+			at += bytes;
+			if (!sleepCopyRun(sleepRuns[i], false)) {
+				RLOG("power: sleep: clients not kept: the copy of range %u (MC 0x%llx, %llu KiB) failed", i, sleepRuns[i].mc, bytes >> 10);
+				sleepDropSave();
+				return false;
+			}
+		}
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - from, &ns);
+	RLOG("power: sleep: %u client(s) kept: %llu MiB of VRAM in %u range(s) saved to host memory in %llu ms", live, total >> 20, runs,
+	     ns / 1000000);
+	return true;
+}
+
+// publishRuntime, rtLock held, the wake's bring-up done (DMA, shared queues' VMIDs): the saved memory back at its addresses, the
+// shared queues up, every kept client's fences at the last value handed out (what ran at the sleep is not run again).
+bool RDNA4Compute::sleepRestoreLocked() {
+	sleepKept = false;
+	bool ok = dmaReady && bounce && sleepCopy;
+	const uint64_t from = mach_absolute_time();
+	for (uint32_t i = 0; ok && i < sleepRunCount; i++)
+		ok = sleepCopyRun(sleepRuns[i], true);
+	ok = ok && vmSharedEnsure();
+	uint32_t kept = 0;
+	for (RtClient &c : clients) {
+		if (!ok || !c.active || !c.shared)
+			continue;
+		c.pipe = sharedQ[c.sq].pipe;
+		c.queue = sharedQ[c.sq].queue;
+		c.doorbell = sharedQ[c.sq].doorbell;
+		if (c.fenceCpu)
+			*c.fenceCpu = c.fence;
+		if (c.gfxFenceCpu)
+			*c.gfxFenceCpu = c.gfxFence;
+		kept++;
+	}
+	flushHdp();
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - from, &ns);
+	sleepDropSave();
+	if (!ok) {
+		RLOG("power: wake: the kept clients' memory could not go back (%s): discarded, the clients aborted",
+		     !dmaReady ? "no copy engine" : "copy or shared queues failed");
+		discardRuntimeLocked();
+		return false;
+	}
+	RLOG("power: wake: %u kept client(s) back, their memory restored in %llu ms", kept, ns / 1000000);
+	return true;
+}
+
+void RDNA4Compute::waitAwake() {
+	if (!rtLock)
+		return;
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(30, kSecondScale, &deadline);   // awake time: the clock stands still while the machine sleeps
+	// Until the wake's bring-up has ended (resumePending): before, its gfx ring refuses client work (gfxClientReady).
+	IOLockLock(rtLock);
+	while ((powerSleeping || resumePending) && !shutdownQuiesced)
+		if (IOLockSleepDeadline(rtLock, &resumePending, deadline, THREAD_ABORTSAFE) != THREAD_AWAKENED)
+			break;
+	IOLockUnlock(rtLock);
 }
 
 // ---------------------------------------------------------------------------

@@ -31,6 +31,8 @@
 #include "../src/dpphy.hpp"
 #include "../src/dpdual.hpp"
 #include "../src/amdfw.hpp"
+#include "../src/fwset.hpp"
+#include "../src/sku.hpp"
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
 #include "../src/ih.hpp"
@@ -54,6 +56,7 @@
 #include "../src/dcninit.hpp"
 #include "rdna4compute.h"
 
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstddef>
@@ -3361,6 +3364,103 @@ static int testGfxImages() {
 	return failures;
 }
 
+// The Navi 44 firmware set (RX 9060 XT: PSP 14.0.2, SMU 14.0.2, SDMA 7.0.0, GC 12.0.0) through the same parsers as
+// the Navi 48 set above: the containers are the same, the contents another chip's. The structure is checked (the
+// 19 images of the RLC autoload, their order and types); the sizes and versions of the Navi 44 blobs are not pinned,
+// since nothing has run on that chip.
+static int testNavi44Firmware() {
+	int failures = 0;
+	failures += check(FwSet::forGc(12, 0, 0) == FwSet::Family::Navi44 && FwSet::forGc(12, 0, 1) == FwSet::Family::Navi48 &&
+	                  FwSet::forGc(12, 1, 0) == FwSet::Family::None, "navi44: firmware set from the GC version");
+	failures += check(Sku::computeUnits(Sku::kNavi44, 0xC0) == 32 &&
+	                  !strcmp(Sku::modelName(Sku::kNavi44, 0xC0), "AMD Radeon RX 9060 XT") &&
+	                  !strcmp(Sku::modelName(Sku::kNavi48, Sku::kRevRx9070Xt), "AMD Radeon RX 9070 XT"),
+	                  "navi44: model name and compute units");
+
+	// A kernel built for gfx1200 is taken as one built for gfx1201 is (the same instruction set); another chip's is not.
+	{
+		std::vector<uint8_t> elf(kVaddCodeObject, kVaddCodeObject + sizeof(kVaddCodeObject));
+		CodeObj::Kernel k;
+		const char *why = nullptr;
+		failures += check(elf[48] == 0x4e, "navi44: the vadd code object is not a gfx1201 one (0x%02x)", elf[48]);
+		elf[48] = 0x48;   // EF_AMDGPU_MACH_AMDGCN_GFX1200, as llvm-mc -mcpu=gfx1200 writes it
+		failures += check(CodeObj::findKernel(elf.data(), elf.size(), "vadd", k, &why), "navi44: a gfx1200 code object refused (%s)",
+		                  why ? why : "-");
+		elf[48] = 0x4a;   // gfx1151
+		failures += check(!CodeObj::findKernel(elf.data(), elf.size(), "vadd", k, &why), "navi44: a gfx1151 code object accepted");
+	}
+
+	static const char *const names[] = {
+		"firmware/amdgpu/sdma_7_0_0.bin", "firmware/amdgpu/gc_12_0_0_pfp.bin",
+		"firmware/amdgpu/gc_12_0_0_me.bin", "firmware/amdgpu/gc_12_0_0_mec.bin",
+		"firmware/amdgpu/gc_12_0_0_uni_mes.bin", "firmware/amdgpu/gc_12_0_0_imu.bin",
+		"firmware/amdgpu/gc_12_0_0_rlc.bin",
+	};
+	std::vector<uint8_t> sosFile, smuFile, files[7];
+	bool present = readFile("firmware/amdgpu/psp_14_0_2_sos.bin", sosFile) &&
+	               readFile("firmware/amdgpu/smu_14_0_2.bin", smuFile);
+	for (int i = 0; i < 7 && present; i++)
+		present = readFile(names[i], files[i]);
+	if (!present) {
+		printf("\nnavi44: firmware/amdgpu/ blobs of the Navi 44 set absent, the firmware checks skipped\n");
+		return failures;
+	}
+
+	// What stage 2 hands the PSP's bootloader and secure OS. Navi 44's package has no RAS driver and no RL
+	// (9 parts where Navi 48's has 11): Psp::Driver::loadSos skips what a package does not have, as psp_hw_start does.
+	AmdFw::PspPackage pkg;
+	failures += check(AmdFw::parsePsp(sosFile.data(), sosFile.size(), pkg), "navi44: sOS package rejected");
+	static const AmdFw::PspPart need[] = { AmdFw::PspKdb, AmdFw::PspSysDrv, AmdFw::PspSos, AmdFw::PspToc };
+	for (AmdFw::PspPart part : need)
+		failures += check(pkg.part[part].valid(), "navi44: sOS package without %s", AmdFw::pspPartName(part));
+	for (uint32_t part = 1; part < AmdFw::PspPartCount; part++)
+		failures += check(!pkg.part[part].valid() || (pkg.part[part].data >= sosFile.data() &&
+		                  pkg.part[part].data + pkg.part[part].size <= sosFile.data() + sosFile.size()),
+		                  "navi44: sOS package part %s outside the file", AmdFw::pspPartName(part));
+	failures += check(!AmdFw::parsePsp(sosFile.data(), 200, pkg), "navi44: truncated sOS package accepted");
+	AmdFw::parsePsp(sosFile.data(), sosFile.size(), pkg);
+	AmdFw::Blob smu;
+	AmdFw::Common smuHdr {};
+	failures += check(AmdFw::payload(smuFile.data(), smuFile.size(), smu) && smu.size && smu.size % 4 == 0 &&
+	                  AmdFw::parseCommon(smuFile.data(), smuFile.size(), smuHdr), "navi44: SMU payload (%u bytes)", smu.size);
+
+	// The same 19 images in amdgpu's load order as for GC 12.0.1.
+	auto blob = [&](int i) { return AmdFw::Blob { files[i].data(), static_cast<uint32_t>(files[i].size()) }; };
+	AmdFw::GfxBlobs b { blob(0), blob(1), blob(2), blob(3), blob(4), blob(5), blob(6) };
+	AmdFw::GfxImage img[AmdFw::kMaxGfxImages];
+	const char *why = nullptr;
+	const uint32_t n = AmdFw::buildGfxImages(b, img, AmdFw::kMaxGfxImages, &why);
+	failures += check(n == 19, "navi44: gfx images: %u built (%s)", n, why ? why : "-");
+	static const struct { const char *name; uint32_t type; } expect[] = {
+		{ "SDMA_RS64", 71 }, { "RS64_PFP", 87 }, { "RS64_ME", 88 }, { "RS64_MEC", 89 },
+		{ "RS64_PFP_P0_STACK", 90 }, { "RS64_ME_P0_STACK", 92 }, { "RS64_MEC_P0_STACK", 94 },
+		{ "RS64_MEC_P1_STACK", 95 }, { "CP_MES", 33 }, { "CP_MES_DATA", 34 },
+		{ "CP_MES1", 81 }, { "CP_MES1_DATA", 82 }, { "IMU_I", 68 }, { "IMU_D", 69 },
+	};
+	for (uint32_t i = 0; i < 14 && i < n; i++)
+		failures += check(!strcmp(img[i].name, expect[i].name) && img[i].pspType == expect[i].type,
+		                  "navi44: gfx images: [%u] %s/%u, expected %s/%u", i, img[i].name,
+		                  img[i].pspType, expect[i].name, expect[i].type);
+	failures += check(n && !strcmp(img[n - 1].name, "RLC_G") && img[n - 1].pspType == 8, "navi44: gfx images: RLC_G must come last");
+	bool inside = true;
+	for (uint32_t i = 0; i < n; i++) {
+		bool ok = false;
+		for (auto &f : files)
+			ok |= img[i].payload.data >= f.data() &&
+			      img[i].payload.data + img[i].payload.size <= f.data() + f.size();
+		inside &= ok && img[i].payload.size && img[i].payload.size % 4 == 0;
+	}
+	failures += check(inside, "navi44: gfx images: payload outside its blob, empty or misaligned");
+
+	// The RS64 microengines' start addresses (cpConfigRs64, mecStart) are read at offsets 52 and 56 of these blobs.
+	failures += check(files[1].size() >= 60 && files[2].size() >= 60 && files[3].size() >= 60,
+	                  "navi44: PFP/ME/MEC blobs too short for their start addresses");
+
+	printf("\nnavi44: sOS package %u parts (sOS 0x%08x), SMU %u bytes (ucode 0x%08x), %u gfx images: %s\n", pkg.count,
+	       pkg.version[AmdFw::PspSos], smu.size, smuHdr.ucodeVersion, n, failures ? "FAILED" : "ok");
+	return failures;
+}
+
 // SDMA 7 packets, as sdma_v7_0.c emits them (ring test, fence, fill, copy).
 static int testSdmaPackets() {
 	int failures = 0;
@@ -3713,6 +3813,21 @@ static int testGpuHeap() {
 	h.free(b);
 	h.free(c);
 	failures += check(h.free(base + 8 * G) && h.freeBytes() == h.size(), "heap: a taken range is freed like an allocation");
+	// nextUsed: allocated ranges in order, adjacent allocations as one, the last granule included.
+	{
+		uint64_t cur = 0, off = 0, n = 0, p = 0, q = 0, r = 0, s = 0;
+		bool walk = !h.nextUsed(cur, off, n);   // empty heap
+		walk = walk && h.alloc(2 * G, p) && h.alloc(G, q) && h.alloc(G, r) && h.free(q) && h.take(base + 63 * G, G);
+		s = base + 63 * G;
+		cur = 0;
+		walk = walk && h.nextUsed(cur, off, n) && off == p && n == 2 * G && h.nextUsed(cur, off, n) && off == r && n == G &&
+		       h.nextUsed(cur, off, n) && off == s && n == G && !h.nextUsed(cur, off, n);
+		failures += check(walk, "heap: nextUsed walks the allocated ranges (off 0x%llx n 0x%llx)", (unsigned long long)off,
+		                  (unsigned long long)n);
+		h.free(p);
+		h.free(r);
+		h.free(s);
+	}
 
 	// The device heap's shape: gigabytes in 64 KiB granules, the map cut
 	// short by its capacity, and allocations far from the base.
@@ -3987,18 +4102,30 @@ static int testVmidPool() {
 	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.rebind && g.flush && !g.stolen &&
 	           g.vmid >= kFirst && g.vmid <= kLast, "vmid: first grab binds a fresh VMID");
 	const uint32_t v1 = g.vmid;
+	f += check(!pool.flushComplete(2, v1, g.flushSeq), "vmid: another owner cannot acknowledge this VMID's flush");
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid == v1 && !g.rebind && g.flush,
+	           "vmid: a bind keeps its flush pending until hardware acknowledgement");
+	f += check(pool.flushComplete(1, v1, g.flushSeq), "vmid: successful hardware invalidation acknowledges the bind flush");
 	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid == v1 && !g.rebind && !g.flush,
-	           "vmid: same owner and PD reuse the VMID with no rebind and no flush");
+	           "vmid: same owner and PD reuse the acknowledged VMID without another flush");
 
-	// A flush is owed only when the client removed PTEs (its tlbSeq moved) since the last flush.
+	// A flush is owed only when the client removed PTEs (its tlbSeq moved) since the last acknowledged flush.
 	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && g.vmid == v1 && !g.rebind && g.flush,
 	           "vmid: tlbSeq advanced -> flush, still no rebind");
-	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && !g.flush, "vmid: the flush is owed once");
-	// Negative control: a pool that ignored tlbSeq would fail the two checks above.
+	const uint64_t flush3 = g.flushSeq;
+	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && g.flush,
+	           "vmid: failed/unacknowledged flush remains pending on retry");
+	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && g.flush,
+	           "vmid: a newer PTE-removal sequence extends an outstanding flush");
+	f += check(!pool.flushComplete(1, v1, flush3),
+	           "vmid: an acknowledgement for an older sequence cannot clear a newer pending flush");
+	f += check(pool.flushComplete(1, v1, g.flushSeq), "vmid: the flush is cleared only after acknowledgement");
+	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && !g.flush, "vmid: acknowledged latest flush is not repeated");
+	// Negative control: a pool that ignored tlbSeq or acknowledged before hardware completion would fail these checks.
 
 	// A flush does not need an idle VMID (an invalidation only drops cached translations).
 	pool.noteSubmit(v1, 0, 10);
-	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && g.vmid == v1 && g.flush && !g.rebind,
+	f += check(pool.grab(1, 0x1000, 5, g) == Result::Ok && g.vmid == v1 && g.flush && !g.rebind,
 	           "vmid: a busy VMID may be flushed");
 	fences.now[0] = 10;
 
@@ -4181,6 +4308,20 @@ static int testVmidPool() {
 	f += check(!pool.forget(1, false, released) && pool.ownerOf(g.vmid) == 1, "vmid: forget is refused with a job in flight");
 	f += check(pool.forget(1, true, released) && released == g.vmid && pool.ownerOf(g.vmid) == 0 && pool.idle(g.vmid),
 	           "vmid: a forced forget releases it and clears the pending work");
+
+	// A VMID whose hardware state cannot be trusted is quarantined until a GPU reset.
+	pool.init(fakeReached, &fences);
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t quarantined = g.vmid;
+	f += check(pool.quarantine(1, quarantined) && pool.ownerOf(quarantined) == 0 && pool.pinned(quarantined),
+	           "vmid: quarantine drops ownership and pins an uncertain hardware VMID");
+	bool avoided = true;
+	for (uintptr_t o = 2; o <= 15; o++)
+		avoided &= pool.grab(o, o * 0x1000, 0, g) == Result::Ok && g.vmid != quarantined;
+	f += check(avoided, "vmid: no client can receive a quarantined VMID");
+	pool.unbindAll();
+	f += check(!pool.pinned(quarantined) && pool.grab(16, 0x16000, 0, g) == Result::Ok,
+	           "vmid: GPU reset unbindAll releases quarantined VMIDs");
 
 	// Reserved VMIDs are never granted.
 	pool.init(fakeReached, &fences, 1u << 8);
@@ -4494,7 +4635,14 @@ struct Pair {
 		compare("map", a, b);
 	}
 	void mapHost(uint64_t va, const std::vector<uint64_t> &buses, uint64_t bytes, bool exec) {
-		const bool a = !beyondDense(va, bytes) && legacyVmMapHost(ref, va, buses.data(), bytes, exec),
+		const uint64_t mapped = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+		bool aligned = mapped >= bytes && buses.size() >= mapped / GpuVm::kPageBytes;
+		for (uint64_t i = 0; aligned && i < mapped / GpuVm::kPageBytes; i++)
+			aligned = !(buses[i] & (GpuVm::kPageBytes - 1)) &&
+			          buses[i] <= GpuVm::kPhysicalMask;
+		/* The pre-S8 implementation could partially write before discovering a
+		 * misaligned later page. The new contract rejects that range atomically. */
+		const bool a = aligned && !beyondDense(va, bytes) && legacyVmMapHost(ref, va, buses.data(), bytes, exec),
 		           b = newVmMapHost(nw, va, buses.data(), bytes, exec);
 		(a ? okHost : failedHost)++;
 		compare("mapHost", a, b);
@@ -4531,6 +4679,19 @@ static int testVmTableDifferential() {
 			pair = Pair {};
 			pair.setup(pol, fbOffset);
 			Pair &P = pair;
+			{
+				const GpuVmTable::Access access { newEntry, newPhys, &P.nw };
+				GpuVmTable::Span span;
+				const uint64_t highPhysical = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
+				failures += check(!GpuVmTable::mapVram(access, P.nw.pol, kTableBytes,
+				                                GpuVm::kVaStart + 0x10000, GpuVm::kVaStart + 0x11000,
+				                                highPhysical, false, span) && span.firstPt == ~0ull,
+				           "dense: an aligned VRAM address above the hardware physical mask is rejected before writing PTEs");
+				failures += check(!GpuVmTable::mapVram(access, P.nw.pol, kTableBytes,
+				                                GpuVm::kVaStart + 0x12000, GpuVm::kVaStart + 0x14000,
+				                                GpuVm::kPhysicalMask, false, span) && span.firstPt == ~0ull,
+				           "dense: a VRAM range that crosses the hardware physical limit is rejected before writing its first PTE");
+			}
 
 			// 1. The boot self-test / rtOpen layout: ring (executable), EOP, rptr, wptr, fence, kernarg, then user buffers.
 			P.map(V + 0x0000, MC + 0x1a000000, 0x1000, true);
@@ -4545,6 +4706,13 @@ static int testVmTableDifferential() {
 			for (uint32_t i = 0; i < 16; i++)
 				buses[i] = 0x104048000ull + 0x3000ull * i;
 			P.mapHost(V + 0xb0000, buses, 0x10000, false);
+			// A bad final bus page must reject the whole map without leaving the first 15 PTEs behind.
+			std::vector<uint64_t> badBuses = buses;
+			badBuses.back() |= 0x40;
+			P.mapHost(V + 0xc0000, badBuses, 0x10000, false);
+			badBuses = buses;
+			badBuses.back() = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
+			P.mapHost(V + 0xe0000, badBuses, 0x10000, false);
 			P.unmap(V + 0xb0000, 0x10000);                       // the freed buffer; the next dispatch through it must fault
 			P.mapHost(V + 0xd0000, buses, 0x10000, true);
 			P.unmap(V + 0x10000, 0x3000);                        // the program is unloaded
@@ -4630,6 +4798,8 @@ struct TreeEnv {
 	PtPages::Sparse sp;
 	uint64_t nextChunk { 0x2000000 };
 	uint32_t chunksLive { 0 }, shadowLive { 0 }, shadowLimit { 0xffffffffu };
+	uint32_t physCalls { 0 }, failPhysCall { 0 };
+	uint32_t syncCalls { 0 }, failSyncCall { 0 };
 	std::map<uint64_t, std::vector<uint64_t>> vram;           // heap offset -> synced page
 	std::vector<uint64_t> dirtyLog;
 	uint64_t rootPhys { 0 };
@@ -4647,7 +4817,14 @@ struct TreeEnv {
 		return static_cast<uint64_t *>(calloc(512, 8));
 	}
 	static void freeShadow(void *c, uint64_t *p) { static_cast<TreeEnv *>(c)->shadowLive--; free(p); }
-	static bool physOf(void *, uint64_t heapOffset, uint64_t &phys) { phys = kBase + heapOffset; return true; }
+	static bool physOf(void *c, uint64_t heapOffset, uint64_t &phys) {
+		auto *e = static_cast<TreeEnv *>(c);
+		e->physCalls++;
+		if (e->failPhysCall && e->physCalls == e->failPhysCall)
+			return false;
+		phys = kBase + heapOffset;
+		return true;
+	}
 	static bool treePage(void *c, uint32_t level, uint64_t key, bool create, uint64_t *&entries, uint64_t &phys, uint32_t &id) {
 		auto *e = static_cast<TreeEnv *>(c);
 		PtPages::Page p;
@@ -4672,12 +4849,16 @@ struct TreeEnv {
 		rootPhys = root.phys;
 		sync();
 	}
-	void sync() {
+	bool sync() {
 		uint32_t id; uint64_t *shadow, off;
 		while (sp.nextDirty(id, shadow, off)) {
+			syncCalls++;
+			if (failSyncCall && syncCalls == failSyncCall)
+				return false; // model a failed DMA: do not copy or clean this page
 			vram[off] = std::vector<uint64_t>(shadow, shadow + 512);
 			sp.clean(id);
 		}
+		return true;
 	}
 	static bool readEntry(void *c, uint64_t address, uint64_t &entry) {
 		auto *e = static_cast<TreeEnv *>(c);
@@ -4762,6 +4943,32 @@ static int testDense4GiB() {
 	           "dense: a map in the last GiB translates");
 	f += check(resolves(V + 0x1000, MC, 0x3000) && resolves(V + G - 0x10000, MC + 0x100000, 0x20000), "dense: the earlier maps are undisturbed");
 	f += check(!map(V + 4 * G - 0x1000, MC, 0x2000), "dense: a map past 4 GiB is refused");
+	// Dense host mappings must reject a bad late bus page before writing even the first PTE.
+	const uint64_t hostVa = V + 2 * G + 0x400000;
+	uint64_t hostBuses[3] = { 0x104048000ull, 0x10404b000ull, 0x10404e000ull | 0x40ull };
+	GpuVmTable::Span hostSpan;
+	const bool badHostRejected = !GpuVmTable::mapHost(access, GpuVmTable::Policy {},
+		GpuVmTable::kDenseTableBytes, hostVa, hostVa + 0x3000, hostBuses, false, hostSpan);
+	f += check(badHostRejected &&
+	           words[GpuVmTable::densePde(hostVa) / 8] == 0 &&
+	           words[GpuVmTable::densePte(hostVa) / 8] == 0 &&
+	           words[GpuVmTable::densePte(hostVa + 0x2000) / 8] == 0,
+	           "dense: a misaligned late host bus page is rejected before writing any PTE");
+
+	// A valid host map spanning two PT pages must translate on both sides of the 2 MiB boundary.
+	const uint64_t crossingHostVa = V + 2 * G + 0x1ff000;
+	const uint64_t crossingBuses[2] = { 0x104060000ull, 0x104061000ull };
+	GpuVmTable::Span crossingHostSpan;
+	const bool crossingHostMapped = GpuVmTable::mapHost(access, GpuVmTable::Policy {},
+		GpuVmTable::kDenseTableBytes, crossingHostVa, crossingHostVa + 0x2000,
+		crossingBuses, false, crossingHostSpan);
+	uint64_t hostPhysical0 = 0, hostPhysical1 = 0, hostFlags = 0;
+	const bool crossingHostResolves =
+		GpuVm::walk(kRootPhys, crossingHostVa, read, nullptr, hostPhysical0, hostFlags) &&
+		GpuVm::walk(kRootPhys, crossingHostVa + 0x1000, read, nullptr, hostPhysical1, hostFlags);
+	f += check(crossingHostMapped && crossingHostResolves &&
+	           hostPhysical0 == crossingBuses[0] && hostPhysical1 == crossingBuses[1],
+	           "dense: a valid host mapping across a 2 MiB PT boundary translates both pages");
 	f += check(GpuVmTable::denseVa(4u << 20) == G, "dense: a 4 MiB image still covers only the first GiB");
 	return f;
 }
@@ -4769,13 +4976,84 @@ static int testDense4GiB() {
 static int testSparseTree() {
 	int f = 0;
 	const uint64_t V = GpuVm::kVaStart, G = 1ull << 30;
+
+	// Creating a page must use the physical address already obtained during allocation.
+	// A redundant second physOf call could fail after the page had been inserted.
+	{
+		static TreeEnv lookup;
+		lookup = TreeEnv {};
+		lookup.open(8);
+		lookup.physCalls = 0;
+		lookup.failPhysCall = 2;
+		PtPages::Page page;
+		const bool created = lookup.sp.get(lookup.host, 1, 0, true, page);
+		f += check(created && lookup.physCalls == 1 && lookup.sp.pages() == 2 &&
+		           page.phys == TreeEnv::kBase + 0x2001000,
+		           "tree: creating a sparse page performs one physical-address lookup and cannot fail on a redundant second lookup");
+		lookup.sp.releaseAll(lookup.host, true);
+	}
 	const uint64_t MC = kFbMcBase + 0x1000000;
 	static TreeEnv e;
 	e = TreeEnv {};
 	e.open(PtPages::kMaxPages);
-	f += check(e.sp.pages() == 1 && e.sp.chunksHeld() == 1 && e.shadowLive == 1, "tree: a fresh client is one page (the root), nothing below it");
+	f += check(e.sp.pages() == 1 && e.sp.chunksHeld() == 1 && e.shadowLive == 1 &&
+	           e.rootPhys == TreeEnv::kBase + 0x2000000ull,
+	           "tree: a fresh client has one root page with its allocated physical address");
 	uint64_t phys = 0;
 	f += check(!e.translate(V, phys), "tree: before any mapping every VA faults");
+
+	// A failed page-table transfer must remain dirty and be retried.
+	{
+		static TreeEnv retry;
+		retry = TreeEnv {};
+		retry.open(8);
+		PtPages::Page extra;
+		const bool extraCreated = retry.sp.get(retry.host, 1, 0, true, extra);
+		retry.sp.markDirty(0);
+		retry.syncCalls = 0;
+		retry.failSyncCall = 2;
+		f += check(extraCreated && !retry.sync(), "tree: a later page-table sync failure is reported after earlier progress");
+		uint32_t dirtyId = ~0u; uint64_t *dirtyShadow = nullptr, dirtyOffset = 0;
+		const bool retained = retry.sp.nextDirty(dirtyId, dirtyShadow, dirtyOffset);
+		f += check(retained && dirtyId == extra.id && dirtyShadow == extra.entries && dirtyOffset != 0,
+		           "tree: earlier pages stay clean while the failed page remains dirty for retry");
+		retry.failSyncCall = 0;
+		retry.syncCalls = 0;
+		const bool retried = retry.sync();
+		const bool cleared = !retry.sp.nextDirty(dirtyId, dirtyShadow, dirtyOffset);
+		f += check(retried && cleared, "tree: a successful retry copies and clears the dirty page");
+		retry.sp.releaseAll(retry.host, true);
+	}
+
+	// A complete shadow map can still be only partly visible when SDMA fails.
+	// Roll the whole fresh VA range back, then sync the cleared PT pages.
+	{
+		static TreeEnv failedMap;
+		failedMap = TreeEnv {};
+		failedMap.open(8);
+		const uint64_t mapVa = V + 0x1ff000;
+		uint64_t physical = 0;
+		const bool converted = GpuVm::mcToPhysical(MC + 0x800000, kFbMcBase, 0, physical);
+		const bool mapped = converted && GpuVmTable::treeMapVram(
+			failedMap.tree(), GpuVmTable::Policy {}, mapVa, mapVa + 0x2000, physical, false);
+		failedMap.syncCalls = 0;
+		failedMap.failSyncCall = 5;  // root, PDB1, PDB0 and first PT succeed; second PT transfer fails.
+		const bool partialFailure = mapped && !failedMap.sync();
+		uint64_t firstPhysical = 0, secondPhysical = 0;
+		const bool partialVisible = failedMap.translate(mapVa, firstPhysical) &&
+		                            firstPhysical == physical &&
+		                            !failedMap.translate(mapVa + 0x1000, secondPhysical);
+
+		GpuVmTable::treeUnmap(failedMap.tree(), mapVa, mapVa + 0x2000);
+		failedMap.failSyncCall = 0;
+		failedMap.syncCalls = 0;
+		const bool rollbackSynced = failedMap.sync();
+		const bool fullyCleared = !failedMap.translate(mapVa, firstPhysical) &&
+		                          !failedMap.translate(mapVa + 0x1000, secondPhysical);
+		f += check(partialFailure && partialVisible && rollbackSynced && fullyCleared,
+		           "tree: a partial SDMA map failure is rolled back across the whole fresh VA range");
+		failedMap.close();
+	}
 
 	// A map inside the first GiB: root + PDB1 + PDB0 + one PT.
 	f += check(treeMap(e, V + 0x1000, MC, 0x3000) && treeResolves(e, V + 0x1000, MC, 0x3000) && e.sp.pages() == 4,
@@ -4826,7 +5104,21 @@ static int testSparseTree() {
 	f += check(treeMap(e, far, MC + 0x200000, 0x1000) && treeResolves(e, far, MC + 0x200000, 0x1000), "tree: a map 600 GiB up (root entry 1, its own PDB1 page) translates");
 	const uint64_t top = GpuVm::kVaEnd - 0x2000;
 	f += check(treeMap(e, top, MC + 0x300000, 0x2000) && treeResolves(e, top, MC + 0x300000, 0x2000), "tree: the last two pages of the 48-bit space translate");
-	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V - 0x1000, V + 0x1000, 0x1000, false), "tree: a map starting below kVaStart is refused");
+	const uint32_t pagesBeforeBadVa = e.sp.pages();
+	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, top, GpuVm::kVaEnd + 0x1000, 0x4000, false) &&
+	           e.sp.pages() == pagesBeforeBadVa,
+	           "tree: a range ending above kVaEnd is rejected before allocating tables");
+	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V - 0x1000, V + 0x1000, 0x1000, false) &&
+	           e.sp.pages() == pagesBeforeBadVa,
+	           "tree: a map starting below kVaStart is rejected before allocating tables");
+	const uint32_t pagesBeforeHighPhysical = e.sp.pages();
+	const uint64_t highPhysical = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
+	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x500000, V + 0x501000, highPhysical, false) &&
+	           e.sp.pages() == pagesBeforeHighPhysical,
+	           "tree: an aligned VRAM address above the hardware physical mask is rejected before allocating tables");
+	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x502000, V + 0x504000, GpuVm::kPhysicalMask, false) &&
+	           e.sp.pages() == pagesBeforeHighPhysical,
+	           "tree: a VRAM range crossing the physical limit is rejected before allocating tables");
 	f += check(treeResolves(e, cross, crossMc, 0x20000) && treeResolves(e, V + 0x1000, MC, 0x3000), "tree: the earlier mappings are undisturbed by the later ones");
 
 	// Unmap: PTEs go (through the dirty path), pages stay, nothing is created for a range that was never mapped.
@@ -4856,7 +5148,15 @@ static int testSparseTree() {
 		f += check(hm2 && e.translate(hv2, phys) && phys == buses[0] && e.translate(hv2 + 0x1000, phys) && phys == buses[1],
 		           "tree: a later host mapping into an existing PT page reaches VRAM");
 		buses[3] |= 0x40;
-		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, hv + 0x20000, hv + 0x28000, buses.data(), false), "tree: a misaligned bus address is refused");
+		const uint32_t pagesBeforeBadMap = e.sp.pages();
+		const uint64_t badVa = hv + 0x20000;
+		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, badVa, badVa + 0x8000, buses.data(), false) &&
+		           e.sp.pages() == pagesBeforeBadMap && !e.translate(badVa, phys) && !e.translate(badVa + 0x2000, phys),
+		           "tree: a misaligned later bus page is refused before allocating tables or writing any PTE");
+		buses[3] = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
+		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, badVa, badVa + 0x8000, buses.data(), false) &&
+		           e.sp.pages() == pagesBeforeBadMap && !e.translate(badVa, phys),
+		           "tree: an aligned host bus address above the hardware physical mask is rejected before allocation");
 	}
 
 	// Quota: the VA limit is the page quota. Nothing half-made, earlier mappings survive.
@@ -4877,6 +5177,43 @@ static int testSparseTree() {
 		f += check(still, "quota: what was mapped before the refusal still translates");
 		q.close();
 		f += check(q.chunksLive == 0 && q.shadowLive == 0, "quota: close returns every chunk and shadow page");
+			// A multi-page map can succeed in one new PT page, then run out of quota
+		// on the next. Its already-written prefix must be cleared before failure returns.
+		q = TreeEnv {};
+		q.open(8);
+		bool four = true;
+		for (uint32_t i = 0; i < 4; i++)
+			four &= treeMap(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		const uint64_t partial = V + 6 * 0x200000ull + 0x1ff000;
+		const bool partialRejected = !treeMap(q, partial, MC + 0x900000, 0x3000);
+		uint64_t partialPhys = 0;
+		bool earlierStill = true;
+		for (uint32_t i = 0; i < 4; i++)
+			earlierStill &= treeResolves(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		f += check(four && partialRejected && q.sp.pages() == 8 &&
+		           !q.translate(partial, partialPhys) && !q.translate(partial + 0x1000, partialPhys) && earlierStill,
+		           "quota: a map that runs out of pages mid-range rolls back its mapped prefix and preserves earlier mappings");
+		q.close();
+
+		// The same mid-range failure path for host bus pages: the first new PT
+		// page is available, the second is not, so no prefix may remain mapped.
+		q = TreeEnv {};
+		q.open(8);
+		four = true;
+		for (uint32_t i = 0; i < 4; i++)
+			four &= treeMap(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		std::vector<uint64_t> partialBuses {
+			0x104050000ull, 0x104051000ull, 0x104052000ull
+		};
+		const bool hostPartialRejected = !GpuVmTable::treeMapHost(
+			q.tree(), GpuVmTable::Policy {}, partial, partial + 0x3000, partialBuses.data(), false);
+		q.sync();
+		f += check(four && hostPartialRejected && q.sp.pages() == 8 &&
+		           !q.translate(partial, partialPhys) && !q.translate(partial + 0x1000, partialPhys) &&
+		           treeResolves(q, V + 3 * 0x200000ull, MC + 3 * 0x10000, 0x1000),
+		           "quota: a host map that runs out of pages mid-range rolls back its mapped prefix");
+		q.close();
+
 		// host memory exhaustion behaves like the quota
 		q = TreeEnv {};
 		q.shadowLimit = 3;
@@ -5269,6 +5606,7 @@ int main(int argc, char **argv) {
 	failures += testN48N();
 	failures += testPsp();
 	failures += testGfxImages();
+	failures += testNavi44Firmware();
 	failures += testSdmaPackets();
 	failures += testIhRing();
 	failures += testSmuMetricsOffsets();

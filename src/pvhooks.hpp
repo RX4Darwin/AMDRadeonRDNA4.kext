@@ -33,6 +33,9 @@ void start();
 /* Once the heads are decided to be the paravirtual displays: IONDRVFramebuffer (fb's class) left out of user-space matching. */
 void hideFramebuffers(void *fb);
 
+/* IOFramebuffer::open of `fb` (which makes its IODisplayConnects): our accelerator's lit framebuffers before WindowServer comes. */
+int openFramebuffer(void *fb);
+
 } /* namespace PvHooks */
 
 #endif /* PvHooks_hpp */

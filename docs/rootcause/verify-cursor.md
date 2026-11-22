@@ -7,7 +7,7 @@ Path prefixes:
 - `dm:` = `.../display/amdgpu_dm/`
 - `hdr:` = `.../include/asic_reg/dcn/dcn_4_1_0_{offset,sh_mask}.h`
 - `k:` = `AMDRadeonRDNA4-int/src/`
-- `log:` = `premetal/hw-logs/rdna4fb-diag-20260929-`
+- `log:` = `rdna4fb-diag-20260929-`
 
 The Linux tree is at d266640 (7.3-rc5).
 

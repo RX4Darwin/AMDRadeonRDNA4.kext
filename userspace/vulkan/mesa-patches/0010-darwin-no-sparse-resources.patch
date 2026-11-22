@@ -1,0 +1,25 @@
+From bc0fa6d17ccb63972a09c1d9cf7e36f8f069ea21 Mon Sep 17 00:00:00 2001
+From: "Sunneva N. Mariu" <sunnevanattsol@gmail.com>
+Date: Sat, 21 Nov 2026 23:47:24 +0000
+Subject: [PATCH] darwin: no sparse resources
+
+Generated-by: LLM
+---
+ src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+index cf7ab40..59e8e90 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+@@ -362,6 +362,7 @@ radv_amdgpu_winsys_query_info(int fd, const BITSET_WORD *debug_flags, bool is_vi
+ #ifdef HAVE_AMDGPU_DARWIN
+    /* No DRM fd: syncobjs come from the device's userspace sync provider. */
+    info->syncobj_sync_type = vk_drm_syncobj_get_type_from_provider(ac_drm_device_get_sync_provider(dev));
++   info->base.has_sparse = false;
+ #else
+    info->syncobj_sync_type = vk_drm_syncobj_get_type(fd);
+ #endif
+-- 
+2.55.0
+

@@ -8,24 +8,12 @@
 //  nothing here is modified. Built only when the files are present (see
 //  the Makefile); otherwise the kext is built with AMDRadeonRDNA4_NO_FIRMWARE.
 //
+//  One set a chip (src/fwset.hpp), each embedded when its files are there:
+//  fwconfig.h defines AMDRadeonRDNA4_FW_NAVI48 and AMDRadeonRDNA4_FW_NAVI44.
+//
 
 	.section __TEXT,__const
 
-	.p2align 4
-	.globl _rdna4_fw_psp_sos
-_rdna4_fw_psp_sos:
-	.incbin "firmware/amdgpu/psp_14_0_3_sos.bin"
-	.globl _rdna4_fw_psp_sos_end
-_rdna4_fw_psp_sos_end:
-
-	.p2align 4
-	.globl _rdna4_fw_smu
-_rdna4_fw_smu:
-	.incbin "firmware/amdgpu/smu_14_0_3.bin"
-	.globl _rdna4_fw_smu_end
-_rdna4_fw_smu_end:
-
-// GC 12.0.1 set for the RLC autoload (stage 3), and SDMA 7.0.1.
 .macro FWBLOB name, file
 	.p2align 4
 	.globl _rdna4_fw_\name
@@ -35,13 +23,31 @@ _rdna4_fw_\name:
 _rdna4_fw_\name\()_end:
 .endm
 
-	FWBLOB sdma, "firmware/amdgpu/sdma_7_0_1.bin"
-	FWBLOB pfp,  "firmware/amdgpu/gc_12_0_1_pfp.bin"
-	FWBLOB me,   "firmware/amdgpu/gc_12_0_1_me.bin"
-	FWBLOB mec,  "firmware/amdgpu/gc_12_0_1_mec.bin"
-	FWBLOB mes,  "firmware/amdgpu/gc_12_0_1_uni_mes.bin"
-	FWBLOB imu,  "firmware/amdgpu/gc_12_0_1_imu.bin"
-	FWBLOB rlc,  "firmware/amdgpu/gc_12_0_1_rlc.bin"
+#ifdef AMDRadeonRDNA4_FW_NAVI48
+// Navi 48: PSP 14.0.3, SMU 14.0.3, the GC 12.0.1 set for the RLC autoload (stage 3), and SDMA 7.0.1.
+	FWBLOB n48_psp_sos, "firmware/amdgpu/psp_14_0_3_sos.bin"
+	FWBLOB n48_smu,     "firmware/amdgpu/smu_14_0_3.bin"
+	FWBLOB n48_sdma,    "firmware/amdgpu/sdma_7_0_1.bin"
+	FWBLOB n48_pfp,     "firmware/amdgpu/gc_12_0_1_pfp.bin"
+	FWBLOB n48_me,      "firmware/amdgpu/gc_12_0_1_me.bin"
+	FWBLOB n48_mec,     "firmware/amdgpu/gc_12_0_1_mec.bin"
+	FWBLOB n48_mes,     "firmware/amdgpu/gc_12_0_1_uni_mes.bin"
+	FWBLOB n48_imu,     "firmware/amdgpu/gc_12_0_1_imu.bin"
+	FWBLOB n48_rlc,     "firmware/amdgpu/gc_12_0_1_rlc.bin"
+#endif
 
-// The display microcontroller's firmware (DCN 4.0.1), loaded through the PSP with rdna4-dmubload=1.
+#ifdef AMDRadeonRDNA4_FW_NAVI44
+// Navi 44: PSP 14.0.2, SMU 14.0.2, the GC 12.0.0 set, and SDMA 7.0.0.
+	FWBLOB n44_psp_sos, "firmware/amdgpu/psp_14_0_2_sos.bin"
+	FWBLOB n44_smu,     "firmware/amdgpu/smu_14_0_2.bin"
+	FWBLOB n44_sdma,    "firmware/amdgpu/sdma_7_0_0.bin"
+	FWBLOB n44_pfp,     "firmware/amdgpu/gc_12_0_0_pfp.bin"
+	FWBLOB n44_me,      "firmware/amdgpu/gc_12_0_0_me.bin"
+	FWBLOB n44_mec,     "firmware/amdgpu/gc_12_0_0_mec.bin"
+	FWBLOB n44_mes,     "firmware/amdgpu/gc_12_0_0_uni_mes.bin"
+	FWBLOB n44_imu,     "firmware/amdgpu/gc_12_0_0_imu.bin"
+	FWBLOB n44_rlc,     "firmware/amdgpu/gc_12_0_0_rlc.bin"
+#endif
+
+// The display microcontroller's firmware (DCN 4.0.1, both chips), loaded through the PSP with rdna4-dmubload=1.
 	FWBLOB dmcub, "firmware/amdgpu/dcn_4_0_1_dmcub.bin"

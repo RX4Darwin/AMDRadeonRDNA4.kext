@@ -31,6 +31,9 @@
 #include <stdint.h>
 
 #define RDNA4_COMPUTE_SERVICE   "RDNA4ComputeService"
+/* The compute client through the paravirtual accelerator: IOServiceOpen of it with this type (sandboxed apps, WebKit's, may open an
+ * IOAccelerator's clients, not RDNA4ComputeService's). */
+#define RDNA4_NATIVE_UC_TYPE    0x52444e34u   /* 'RDN4' */
 #define RDNA4_COMPUTE_ABI       4u   /* 4: per-client GPUVM and one MEC queue per client */
 
 /* Largest kernarg block a dispatch carries; bytes past what the caller
@@ -92,11 +95,26 @@ enum {
 	kRDNA4MethodSubmitGfxIb,
 	/* gfx fence value, timeout milliseconds -> elapsed nanoseconds */
 	kRDNA4MethodWaitGfxFence,
+	/* page-aligned address in the caller's task, bytes, flags (RDNA4_HOST_*) -> handle, GPU VA. The caller's own memory (an
+	 * IOSurface's) wired and mapped into its GPU address space; freed with Free, which unwires it. */
+	kRDNA4MethodImportHost,
+	/* AIR's address and bytes (a metallib or bitcode, at most RDNA4_MTLC_MAX_LIB), the function name's address (NUL-terminated, under 64
+	 * bytes), the result's address and room (RDNA4_MTLC_MAX_ELF) -> the result's bytes, the kernel's buffer count. The function translated
+	 * by the translator helper (include/rdna4mtlc.h): a kernel's code object or a shader's RGFX blob. For callers that cannot start the
+	 * translator themselves (WindowServer's sandbox); kIOReturnUnsupported in builds without the paravirtual GPU. */
+	kRDNA4MethodTranslate,
+	/* IOSurface ID, handle of a VRAM buffer of the caller's (0: none) -> : the surface's frames presented from that buffer, laid out as the
+	 * surface (the native Metal device keeps WindowServer's frames in VRAM). WindowServer only; kIOReturnUnsupported without the
+	 * paravirtual GPU. */
+	kRDNA4MethodPresentSource,
 	kRDNA4MethodCount
 };
 
 /* AllocHost flags.  Host memory is non-executable unless this bit is set. */
 #define RDNA4_HOST_EXECUTABLE (1u << 0)
+/* ImportHost: memory the caller may only read (another process's, shared read-only: Core Animation's in WindowServer), mapped for the GPU
+ * to read only (no PTE WRITEABLE): its updates seen, never written through. */
+#define RDNA4_HOST_READ_ONLY  (1u << 1)
 
 #define RDNA4_FLAG_READY   (1u << 0)   /* bring-up reached a dispatching stage */
 #define RDNA4_FLAG_WEDGED  (1u << 1)   /* a dispatch timed out: no more work */

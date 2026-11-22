@@ -24,7 +24,7 @@ VMTEST_FLAGS_1 = -DAMDRadeonRDNA4_VM_TEST
 
 # The fake paravirtual GPU of M0 (PVGPU=1 in the Makefile, which also defines AMDRadeonRDNA4_PVGPU in fwconfig.h).
 PVGPU_OBJS_0   =
-PVGPU_OBJS_1   = pvgpu.o pvstream.o pvhooks.o pvscanout.o
+PVGPU_OBJS_1   = pvgpu.o pvstream.o pvhooks.o pvscanout.o translator.o iosurface.o
 
 # RELEASE is what has run on the card. DEBUG has not, as of 0.1.0: no optimisation (larger stack frames), and
 # DEBUG defined, which turns Lilu's DBGLOG lines on.
@@ -34,7 +34,7 @@ OPT_DEBUG      = -O0 -DDEBUG
 # In link order. plugin_start.cpp is Lilu's (lib/Lilu/Lilu/Library); fwblobs.o is the firmware, or nothing.
 USER_OBJS = klog.o trial.o vrambench.o regsnap.o plugin.o device.o clk.o cursor.o ndrv.o modeset.o pipe2.o dptrain.o dpphy.o dmubload.o dcninit.o compute.o gfxring.o pmidle.o \
             flip.o amdfw.o psp.o sdma.o ih.o ihdecode.o pm4.o codeobj.o gpuheap.o gpuvm.o vmtree.o n48n.o \
-            n48nkext.o vmid.o ptpages.o gpuvmtable.o runtime.o vmtest.o vmshared.o userclient.o accelcensus.o \
+            n48nkext.o vmid.o ptpages.o gpuvmtable.o runtime.o vmtest.o vmshared.o userclient.o accelcensus.o rdna4accel.o ioaccel_thunks.o \
             $(PVGPU_OBJS_$(PVGPU)) plugin_start.o atombios.o ipdiscovery.o edid.o otgtiming.o modes.o pipe.o \
             $(VMTEST_OBJS_$(VMTEST)) fwblobs.o
 # kmod_info.o is linked after the other objects.
@@ -65,7 +65,8 @@ COMMON_FLAGS = \
 # does not export — kmutil then fails to link ("could not find a kext which
 # exports ___cxa_atexit"). Kext teardown is handled by the kmod _stop path,
 # so static destructors are never wanted here.
-# fwconfig.h defines AMDRadeonRDNA4_NO_FIRMWARE when the firmware is not there.
+# fwconfig.h defines AMDRadeonRDNA4_NO_FIRMWARE when the firmware is not there, and otherwise which sets are
+# (AMDRadeonRDNA4_FW_NAVI48, AMDRadeonRDNA4_FW_NAVI44).
 CXXFLAGS  = $(COMMON_FLAGS) -std=c++17 -fno-exceptions -fno-rtti -fcheck-new \
             -fno-c++-static-destructors -include fwconfig.h $(VMTEST_FLAGS_$(VMTEST))
 CFLAGS    = $(COMMON_FLAGS)
@@ -79,8 +80,15 @@ LDFLAGS   = \
 	-lkmodc++ -lkmod \
 	-Wl,-no_deduplicate
 
+# Our own globals (g..., rdna4..., RDNA4...) and IOAcceleratorFamily2's symbols (we reach them through thunks only) must never be left
+# undefined: OpenCore binds them to junk. Twice it panicked the rig (an extern of another file's anonymous-namespace variable; a
+# Base::f() call through the family's vtable symbol, 2026-11-20).
 $(PRODUCT): $(OBJS)
 	$(CXX) $(LDFLAGS) $(OBJS) -o $@
+	@if nm -u $@ | grep -E '^_(g[A-Z]|rdna4|RDNA4)|IOAccel|IOGraphicsAccelerator2|AppleGraphicsDeviceControl' | grep -v -E '^_g(IO|OS)'; then \
+		echo "our own or a derived-from family's symbols above are undefined in $@" >&2; rm -f $@; exit 1; fi
+	@# every undefined symbol must be the kernel's, IOPCIFamily's or Lilu's (with a KDK; tools/build/check-undefined.py)
+	@python3 $(ROOT)/tools/build/check-undefined.py $@ || { rm -f $@; exit 1; }
 
 .cpp.o:
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -98,9 +106,13 @@ fwblobs.o: $(ROOT)/src/fwblobs.S fwconfig.h
 		echo "no firmware in firmware/amdgpu (tools/build/fetch-firmware.sh): the kext is built without it"; \
 		echo "" | $(CC) $(TARGET) -x c -c - -o $@; \
 	else \
-		echo "$(CC) $(TARGET) -I$(ROOT) -c $(ROOT)/src/fwblobs.S -o $@"; \
-		$(CC) $(TARGET) -I$(ROOT) -c $(ROOT)/src/fwblobs.S -o $@; \
+		echo "$(CC) $(TARGET) -I$(ROOT) -include fwconfig.h -c $(ROOT)/src/fwblobs.S -o $@"; \
+		$(CC) $(TARGET) -I$(ROOT) -include fwconfig.h -c $(ROOT)/src/fwblobs.S -o $@; \
 	fi
+
+# IOAcceleratorFamily2's functions our accelerator reaches, as jumps through a table (tools/gen/accelgen.py, src/rdna4accel.cpp).
+ioaccel_thunks.o: $(ROOT)/src/ioaccel_thunks.S
+	$(CC) $(TARGET) -c $(ROOT)/src/ioaccel_thunks.S -o $@
 
 # Header dependencies from -MMD.
 -include $(OBJS:.o=.d)

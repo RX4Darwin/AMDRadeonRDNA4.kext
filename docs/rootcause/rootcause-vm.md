@@ -6,7 +6,7 @@ Sources and snapshots:
 - umr: AMD's register and VM debugger, `gitlab.freedesktop.org/tomstdenis/umr` @ 8438c15 (2026-09-23), shallow clone.
 - Mesa: `~/src/mesa`.
 - Kext: `AMDRadeonRDNA4-int/src`.
-- Logs: `premetal/hw-logs/rdna4fb-diag-20260929-081555.txt` (round 4 boot 8, "L" below), -013433 (round 3 boot 2), -015807 (round 3 boot 8).
+- Logs: `rdna4fb-diag-20260929-081555.txt` (round 4 boot 8, "L" below), -013433 (round 3 boot 2), -015807 (round 3 boot 8).
 
 ## 0. Answer
 
@@ -32,7 +32,7 @@ EXECUTE permission. amdgpu/Mesa map every BO R|W|X. Ours are R|W only.
 | E5 | So every normal amdgpu leaf PTE on GC 12.0.x carries IS_PTE. KFD SVM sets it explicitly for gc >= 12.0.0, and the GART table is memset with it. | FACT/INFER | kfd_svm.c:1374-1375; amdgpu_gart.c:276; amdgpu_gmc.c:1143 |
 | E6 | **umr models the hardware this way.** For GFX12, `is_pde = !pte` ("Inverted logic for GFX12"). A valid leaf with bit 63 = 0 becomes `pte_is_pde = 1` and the walker goes one level further (`goto pte_further`), reading at the entry's PDE-style address (bits 47:6). | FACT | umr src/lib/vm/decode_pte_entry.c:132-152; src/lib/vm/access_vram_ai.c:1063-1069, :1071-1151 |
 | E7 | Our leaves have no bit 63. The readback shows `PT[eop] 0x0000000009a01065` (VALID\|SNOOPED\|READ\|WRITE). `vmMap` builds `kValid\|kSnooped\|kReadable\|kWritable`. `vmMapHost` builds the same set plus kSystem. Nothing adds bit 63. | FACT | L:313-321; runtime.cpp:520-531, :572-577; gpuvm.cpp:11-18 |
-| E8 | The kext's own reasoning encodes the error: "PDE_PTE is reserved for a huge page leaf" (gpuvm.cpp:24-26). The W22 table says "On PTB (leaf) PTEs of the normal BO path it is NOT set". It cites `amdgpu_ttm_tt_pte_flags` but not its body. vm-deep-research D9 says the same. | FACT | premetal/w22-findings.md (a) row 1; premetal/vm-deep-research.md D9 |
+| E8 | The kext's own reasoning encodes the error: "PDE_PTE is reserved for a huge page leaf" (gpuvm.cpp:24-26). The W22 table says "On PTB (leaf) PTEs of the normal BO path it is NOT set". It cites `amdgpu_ttm_tt_pte_flags` but not its body. vm-deep-research D9 says the same. | FACT | w22-findings.md (a) row 1; vm-deep-research.md D9 |
 | E9 | The fix was already coded as diag variant **d** (`vmPteSet = kPdePte`), but it **never ran on the card**. Round 3 used mask 31, which has no d bit. Round 4 used mask 481, which includes d, but every test after the aliased control was abandoned ("d 0/0"). | FACT | runtime.cpp:1258-1266; 015807 boot-args (diag=31); L:18, L:372-373 |
 
 **How the failure follows [INFER from E6+E7].** Take VA 0x100001000. The walker reads PDB2[0], PDB1[4] and PDB0[0], all valid, with
@@ -57,7 +57,7 @@ The same holds for the PQ page (13 ring dwords written, so +0x40 is 0) and for E
 - **"IS_PTE bit 63 is NOT set on normal PTB leaves (verified equal)": false** (E2-E5). This is the error that hid the cause.
 - **"the multi-level walk is what fails; the flat walk can read VRAM": not shown.**
   - The flat-case entry is 0 (compute.cpp:2236-2247, ctx0 START=END=0), so a correct read and a failed read look the same. It was a
-    stray CPG access, not a probe (premetal/w31-review.md s.1).
+    stray CPG access, not a probe (w31-review.md s.1).
   - Three variables differ at once: depth, VMID (0 vs 8), and table location (pool below 256 MiB vs devHeap past the BAR).
   - Real amdgpu on gfx1200 reports **WALKER_ERROR 5 for a VMID0 CPC read of a flat GART page** (status 0x00000B3A, VA 0x2ba000,
     amd-gfx thread 2026-07, ratatoskr.run/amd-gfx/2026/07/17210951). So 5 does not mean "multi-level failure".

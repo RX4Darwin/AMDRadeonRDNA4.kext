@@ -37,3 +37,36 @@ kernel void rays(raytracing::primitive_acceleration_structure accel [[buffer(0)]
 	out[i] = hit.type == raytracing::intersection_type::triangle ? float4(hit.distance, hit.triangle_barycentric_coord, float(hit.primitive_id))
 	                                                              : float4(-1);
 }
+
+// mtlprobe native, instances: as MetalQuake's shadow rays (intersector<instancing>, no triangle data): {distance, instance, primitive, 0}.
+kernel void rays_instanced(raytracing::instance_acceleration_structure accel [[buffer(0)]], device const float4 *origins [[buffer(1)]],
+                           device const float4 *directions [[buffer(2)]], device float4 *out [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+	raytracing::ray r(origins[i].xyz, directions[i].xyz, 0.0f, 100.0f);
+	raytracing::intersector<raytracing::instancing> isect;
+	isect.assume_geometry_type(raytracing::geometry_type::triangle);
+	auto hit = isect.intersect(r, accel);
+	out[i] = hit.type != raytracing::intersection_type::none ? float4(hit.distance, float(hit.instance_id), float(hit.primitive_id), 0) : float4(-1);
+}
+
+// mtlprobe nativeargbuf: a texture, a sampler and the output buffer reached through a tier-2 argument buffer (MoltenVK's descriptor sets),
+// which the app fills with their gpuResourceID / gpuAddress: out[i] = texel i of the 4x1 texture, read and sampled.
+struct ArgProbe {
+	texture2d<float> tex [[id(0)]];
+	sampler smp [[id(1)]];
+	device float4 *out [[id(2)]];
+};
+
+kernel void argbuf(constant ArgProbe &a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+	a.out[i] = a.tex.read(uint2(i, 0));
+	a.out[i + 4] = a.tex.sample(a.smp, float2((i + 0.5f) / 4.0f, 0.5f), level(0));
+}
+
+// mtlprobe native, bindless: a triangle over the 4x1 target whose fragment reads texture idx[x] of 128 (MetalQuake's static world binds 96 and
+// 32 in one draw), so textures in all three of the table's ranges and its texture handles.
+vertex float4 bindless_v(uint vid [[vertex_id]]) {
+	return float4(float2((vid << 1) & 2, vid & 2) * 2 - 1, 0, 1);
+}
+
+fragment float4 bindless_f(float4 pos [[position]], array<texture2d<float>, 128> t [[texture(0)]], constant uint4 &idx [[buffer(0)]]) {
+	return t[idx[min(uint(pos.x), 3u)]].read(uint2(0));
+}

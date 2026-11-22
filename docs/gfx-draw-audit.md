@@ -14,7 +14,7 @@ executed the whole stream including the `RELEASE_MEM` that follows `DRAW_INDEX_A
 0 covered and 0 "other" pixels. Nothing wrote to it. That happens if no wave ran (no primitive reached the rasterizer
 or no pixel wave started) or if the colour-buffer write never reached memory.
 
-Sources: the earlier spec `premetal/gfx12-draw-notes.md` (Mesa `eda9aceb39d5`, amdgpu `d266640c6c76`); amdgpu paths are
+Sources: the earlier spec `gfx12-draw-notes.md` (Mesa `eda9aceb39d5`, amdgpu `d266640c6c76`); amdgpu paths are
 under `drivers/gpu/drm/amd/`.
 
 ## Suspects, most likely first

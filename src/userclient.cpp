@@ -8,14 +8,20 @@
 //  of the handlers below runs.
 //
 
+#include <sys/proc.h>
 #include "userclient.hpp"
 #include "klog.hpp"
 #include "compute.hpp"
+#include "pvgpu.hpp"
+#include "translator.hpp"
+#include "rdna4mtlc.h"
 
 #include <IOKit/IOLib.h>
+#include <sys/kauth.h>
 
 OSDefineMetaClassAndStructors(RDNA4ComputeService, IOService)
 OSDefineMetaClassAndStructors(RDNA4ComputeClient, IOUserClient)
+OSDefineMetaClassAndStructors(IOAccelRDNA4ComputeClient, RDNA4ComputeClient)
 
 static IOPMPowerState kComputePowerStates[2] = {
 	/* IOKit ordinals run from the lowest power state to the highest. */
@@ -46,12 +52,23 @@ bool RDNA4ComputeService::registerPowerManagement(IOService *provider) {
 	return registerPowerDriver(this, kComputePowerStates, 2) == kIOReturnSuccess;
 }
 
-// A kernel runs in VMID0 and can reach all of VRAM: only root may open.
+// Who may open (docs/w13-client-access.md): root, with every selector. With rdna4-client-policy=local also the user logged in at the
+// console (the native Metal device's apps, docs/native-metal-spike.md), only in a GPU address space of its own (start: rtClientIsolated) and
+// only with the selectors a graphics client needs (kLocalSelectors): without the VM a kernel runs in VMID0 and reaches all of VRAM. So is
+// WindowServer (_windowserver, uid 88: not the console user), for the native desktop.
+// The default since 2026-11-21 (the accelerated desktop's apps need it); rdna4-client-policy=root: root only.
+bool localClientsAllowed() {
+	char policy[8] = {};
+	return !PE_parse_boot_argn("rdna4-client-policy", policy, sizeof(policy)) || !strncmp(policy, "local", sizeof(policy));
+}
+
 bool RDNA4ComputeClient::initWithTask(task_t owningTask, void *securityToken, UInt32 type,
                                       OSDictionary *properties) {
 	if (!IOUserClient::initWithTask(owningTask, securityToken, type, properties))
 		return false;
-	if (clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+	privileged = clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
+	if (!privileged && !(localClientsAllowed() && (clientHasPrivilege(securityToken, kIOClientPrivilegeLocalUser) == kIOReturnSuccess ||
+	                                                kauth_getuid() == 88)))
 		return false;
 	gate = IOLockAlloc();
 	task = owningTask;
@@ -65,13 +82,44 @@ void RDNA4ComputeClient::free() {
 	IOUserClient::free();
 }
 
+RDNA4ComputeService *gComputeService;
+
+// Through the paravirtual accelerator: an app's sandbox lets it open an IOAccelerator's clients only ((iokit-connection "IOAccelerator"),
+// WebKit's GPU process: Safari on the native device was refused ours, 2026-11-20). The client is the runtime's all the same.
+IOReturn rdna4AcceleratorClient(IOService *accel, task_t task, void *security, IOUserClient **handler) {
+	if (!gComputeService || !gComputeService->compute)
+		return kIOReturnNotReady;
+	auto *client = OSTypeAlloc(RDNA4ComputeClient);
+	if (!client)
+		return kIOReturnNoMemory;
+	if (!client->initWithTask(task, security, RDNA4_NATIVE_UC_TYPE, nullptr) || !client->attach(accel)) {
+		static_cast<OSObject *>(client)->release();   // (RDNA4ComputeClient::release is the client's own close)
+		return kIOReturnNotPermitted;
+	}
+	if (!client->start(accel)) {
+		client->detach(accel);
+		static_cast<OSObject *>(client)->release();
+		return kIOReturnNotPermitted;
+	}
+	*handler = client;
+	return kIOReturnSuccess;
+}
+
 bool RDNA4ComputeClient::start(IOService *provider) {
-	auto *svc = OSDynamicCast(RDNA4ComputeService, provider);
+	auto *svc = OSDynamicCast(RDNA4ComputeService, provider) ?: gComputeService;   // (the accelerator: rdna4AcceleratorClient)
 	rdna4Step("user client: start");
 	if (!svc || !svc->compute || !IOUserClient::start(provider))
 		return false;
 	compute = svc->compute;
-	return compute->rtOpen(this) == kIOReturnSuccess;
+	if (compute->rtOpen(this) != kIOReturnSuccess)
+		return false;
+	if (!privileged && !compute->rtClientIsolated(this)) {   // a local client in VMID0 would reach all of VRAM
+		rdna4Log("AMDRadeonRDNA4: user client: a client that is not root, without an address space of its own (rdna4-vm=1): refused\n");
+		compute->rtRelease(this);
+		compute = nullptr;
+		return false;
+	}
+	return true;
 }
 
 // Once, after the calls in flight: they use the client's buffers, and compute stays set for them.
@@ -87,6 +135,9 @@ void RDNA4ComputeClient::release() {
 		IOLockSleep(gate, &calls, THREAD_UNINT);
 	IOLockUnlock(gate);
 
+#ifdef AMDRadeonRDNA4_PVGPU
+	pvPresentSourcesOf(this);
+#endif
 	if (compute)
 		compute->rtRelease(this);
 }
@@ -128,13 +179,30 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sSensorsEx,  0,          0,                          0,           sizeof(RDNA4SensorsEx) },
 	{ sSubmitGfxIb, 3,         0,                          1,           0 },
 	{ sWaitGfxFence, 2,        0,                          1,           0 },
+	{ sImportHost, 3,          0,                          2,           0 },
+	{ sTranslate,  5,          0,                          2,           0 },
+	{ sPresentSource, 2,       0,                          0,           0 },
 };
-static_assert(kRDNA4MethodCount == 22, "kMethods has one entry per selector");
+static_assert(kRDNA4MethodCount == 25, "kMethods has one entry per selector");
+
+// What a client that is not root may call: its own buffers, programs and submissions. Not the display (present, restore, vblank), the
+// sensors, the sleep test or the quiesce.
+static constexpr uint32_t kLocalSelectors = 1u << kRDNA4MethodInfo | 1u << kRDNA4MethodAlloc | 1u << kRDNA4MethodFree |
+                                            1u << kRDNA4MethodWrite | 1u << kRDNA4MethodRead | 1u << kRDNA4MethodLoad |
+                                            1u << kRDNA4MethodUnload | 1u << kRDNA4MethodDispatch | 1u << kRDNA4MethodAllocHost |
+                                            1u << kRDNA4MethodSubmitIb | 1u << kRDNA4MethodWaitFence |
+                                            1u << kRDNA4MethodSubmitGfxIb | 1u << kRDNA4MethodWaitGfxFence | 1u << kRDNA4MethodImportHost |
+                                            1u << kRDNA4MethodTranslate | 1u << kRDNA4MethodPresentSource;
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                                             IOExternalMethodDispatch *, OSObject *, void *) {
 	if (selector >= kRDNA4MethodCount || !compute)
 		return kIOReturnUnsupported;
+	if (!privileged && !(kLocalSelectors >> selector & 1))
+		return kIOReturnNotPrivileged;
+	// During a system sleep and the wake's bring-up: held, not refused. WindowServer's Metal device took a refused allocation as
+	// a failed pipeline and aborted at every sleep (2026-11-22); with the clients kept across it (sleepKept) the call goes on after.
+	compute->waitAwake();
 
 	IOLockLock(gate);
 	if (closed) {
@@ -273,6 +341,54 @@ IOReturn RDNA4ComputeClient::sWaitFence(OSObject *t, void *, IOExternalMethodArg
 IOReturn RDNA4ComputeClient::sSubmitGfxIb(OSObject *t, void *, IOExternalMethodArguments *a) {
 	return self(t)->compute->rtSubmitGfxIb(t, a->scalarInput[0], a->scalarInput[1],
 	                                       a->scalarInput[2], a->scalarOutput[0]);
+}
+
+// What the displays show comes from the caller's VRAM: WindowServer only (another process could put its own pixels on the screen so).
+IOReturn RDNA4ComputeClient::sPresentSource(OSObject *t, void *, IOExternalMethodArguments *a) {
+#ifdef AMDRadeonRDNA4_PVGPU
+	char name[32] = {};
+	proc_selfname(name, sizeof(name));
+	if (strcmp(name, "WindowServer"))
+		return kIOReturnNotPrivileged;
+	return pvPresentSource(t, static_cast<uint32_t>(a->scalarInput[0]), a->scalarInput[1]);
+#else
+	(void)t, (void)a;
+	return kIOReturnUnsupported;
+#endif
+}
+
+// The caller's AIR copied in, translated by the helper (translateForClient), the result copied out to the caller's room.
+IOReturn RDNA4ComputeClient::sTranslate(OSObject *, void *, IOExternalMethodArguments *a) {
+#ifdef AMDRadeonRDNA4_PVGPU
+	const uint64_t *in = a->scalarInput;
+	char name[RDNA4_MTLC_NAME] = {};
+	size_t got = 0;
+	if (!in[1] || in[1] > RDNA4_MTLC_MAX_LIB || copyinstr(static_cast<user_addr_t>(in[2]), name, sizeof(name), &got))
+		return kIOReturnBadArgument;
+	auto *lib = static_cast<uint8_t *>(IOMalloc(in[1]));
+	if (!lib)
+		return kIOReturnNoMemory;
+	uint8_t *out = nullptr;
+	uint32_t outLen = 0, buffers = 0;
+	IOReturn r = copyin(static_cast<user_addr_t>(in[0]), lib, in[1]) ? kIOReturnBadArgument
+	           : translateForClient(lib, static_cast<uint32_t>(in[1]), name, out, outLen, buffers);
+	IOFree(lib, in[1]);
+	if (r == kIOReturnSuccess && (outLen > in[4] || copyout(out, static_cast<user_addr_t>(in[3]), outLen)))
+		r = kIOReturnNoSpace;
+	if (out)
+		IOFree(out, outLen);
+	a->scalarOutput[0] = r == kIOReturnSuccess ? outLen : 0;
+	a->scalarOutput[1] = buffers;
+	return r;
+#else
+	(void)a;
+	return kIOReturnUnsupported;
+#endif
+}
+
+IOReturn RDNA4ComputeClient::sImportHost(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtImportHost(t, self(t)->task, a->scalarInput[0], a->scalarInput[1], a->scalarInput[2], a->scalarOutput[0],
+	                                      a->scalarOutput[1]);
 }
 
 IOReturn RDNA4ComputeClient::sWaitGfxFence(OSObject *t, void *, IOExternalMethodArguments *a) {

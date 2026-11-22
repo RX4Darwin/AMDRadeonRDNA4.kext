@@ -5,7 +5,8 @@
  *  (tools/metal/m3/air2amdgpu.cpp --serve) to translate them. The helper opens a user client of type RDNA4_MTLC_TYPE on RDNA4ComputeService
  *  (one helper at a time) and loops:
  *
- *    kMtlcNext     scalars in {buffer address, buffer bytes}; out {request id, metallib bytes}; structure out: char name[64].
+ *    kMtlcNext     scalars in {buffer address, buffer bytes}; out {request id, metallib bytes}; structure out: char name[64 or more]
+ *                  (RDNA4_MTLC_NAME: as much of the name as fits; Core Image's stitched kernels' names run to hundreds of characters).
  *                  Blocks until the host has a function to translate; the guest's whole metallib is copied into the buffer.
  *    kMtlcDeliver  scalars in {request id, code object address, code object bytes (0 = could not translate), buffers, written mask
  *                  [, textures written mask]}: the linked gfx1201 code object and its interface as air2amdgpu describes it (8-byte buffer
@@ -19,6 +20,7 @@
 #define RDNA4_MTLC_TYPE 0x4d544c43u   /* 'MTLC' */
 #define RDNA4_MTLC_MAX_LIB (1u << 20)
 #define RDNA4_MTLC_MAX_ELF (1u << 20)
+#define RDNA4_MTLC_NAME 512u   /* a function's name, its terminating zero included */
 
 enum { kMtlcNext = 0, kMtlcDeliver = 1 };
 
@@ -26,6 +28,19 @@ enum { kMtlcNext = 0, kMtlcDeliver = 1 };
  * +0 (indices 0-7), texture n's T# (8 dwords) at RDNA4_MTLC_TABLE_TEXTURES + 32 n, sampler n's S# (4 dwords) at RDNA4_MTLC_TABLE_SAMPLERS
  * + 16 n (n 0-15). */
 #define RDNA4_MTLC_TABLE_TEXTURES 64u
+/* Textures 16-30 (Metalterm's fragment shader samples 17): their T#s at RDNA4_MTLC_TABLE_TEXTURES_HIGH + 32 (n - 16) of the stage's table,
+ * past the levels' T#s (level 0 only: a shader sampling at explicit LODs uses textures 0-15 alone). An array of textures is within one of
+ * the two ranges. */
+#define RDNA4_MTLC_TABLE_TEXTURES_HIGH 0x4200u
+#define RDNA4_MTLC_TEXTURES 31u
+#define RDNA4_MTLC_TEXTURE_AT(n) ((n) < 16 ? RDNA4_MTLC_TABLE_TEXTURES + 32u * (n) : RDNA4_MTLC_TABLE_TEXTURES_HIGH + 32u * ((n) - 16))
+/* Textures 0-127 as handles, for a shader that binds textures past 30 or an array across the ranges above (MetalQuake's static world: 96 and
+ * 32 in one draw; its RGFX "TXRD" record's bit 31; the native device only): texture n's handle (8 bytes, the address of its T#) at
+ * RDNA4_MTLC_TABLE_TEXTURE_HANDLES + 8 n of the stage's table: n 0-30 the address of its T# in the table, 31-127 the texture's own T# slot
+ * (its gpuResourceID). An array of them is a pointer into it. */
+#define RDNA4_MTLC_TABLE_TEXTURE_HANDLES 0x4c00u
+#define RDNA4_MTLC_MAX_TEXTURES 128u
+#define RDNA4_MTLC_TXRD_HANDLES (1u << 31)
 #define RDNA4_MTLC_TABLE_SAMPLERS 576u
 /* The fragment stage's colour attachment 0 as the draw found it, for shaders that read it (Metal's [[color(0)]] input): a T# of the host's
  * staged RGBA8 copy of the target. */
@@ -44,6 +59,9 @@ enum { kMtlcNext = 0, kMtlcDeliver = 1 };
 /* The fragment stage's u32 colour attachment the draw goes into, for a shader that writes several (its RGFX header's bits 20-27): the value
  * of that attachment is the one exported. */
 #define RDNA4_MTLC_TABLE_ATTACHMENT 0x500u
+/* The fragment stage's u32 alpha to coverage (the pipeline's alphaToCoverageEnabled): non-zero, a fragment whose exported alpha is below 0.5
+ * is discarded, as the hardware's alpha to mask does for one sample (Unity's billboards: AlphaToMask On). */
+#define RDNA4_MTLC_TABLE_ALPHA_TO_COVERAGE 0x504u
 #define RDNA4_MTLC_MAX_ATTRIBUTES 16u
 /* A shader that samples at an explicit LOD (its RGFX header's bit 16): level L (1-7) of texture n's T# at RDNA4_MTLC_LEVEL_FIRST
  * + RDNA4_MTLC_LEVEL_STRIDE (L - 1) past its level 0 T#, in both stages (the host's state page: the vertex stage's table at +0x400, the

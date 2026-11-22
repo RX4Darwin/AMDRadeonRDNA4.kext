@@ -1,0 +1,130 @@
+From ada74ac4454d96b3bc7c9acbcff387908ed60943 Mon Sep 17 00:00:00 2001
+From: "Sunneva N. Mariu" <sunnevanattsol@gmail.com>
+Date: Sat, 21 Nov 2026 21:58:41 +0000
+Subject: [PATCH] darwin: windows through VK_EXT_metal_surface
+
+Generated-by: LLM
+---
+ src/amd/vulkan/radv_instance.c    |  3 +++
+ src/vulkan/wsi/wsi_common_metal.c | 28 ++++++++++++++++++----------
+ 2 files changed, 21 insertions(+), 10 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_instance.c b/src/amd/vulkan/radv_instance.c
+index 8d42262..6ba29ff 100644
+--- a/src/amd/vulkan/radv_instance.c
++++ b/src/amd/vulkan/radv_instance.c
+@@ -227,6 +227,9 @@ static const struct vk_instance_extension_table radv_instance_extensions_support
+ #ifndef VK_USE_PLATFORM_WIN32_KHR
+    .EXT_headless_surface = true,
+ #endif
++#ifdef VK_USE_PLATFORM_METAL_EXT
++   .EXT_metal_surface = true,
++#endif
+ };
+ 
+ static enum radeon_ctx_pstate
+diff --git a/src/vulkan/wsi/wsi_common_metal.c b/src/vulkan/wsi/wsi_common_metal.c
+index 54542c6..b28d668 100644
+--- a/src/vulkan/wsi/wsi_common_metal.c
++++ b/src/vulkan/wsi/wsi_common_metal.c
+@@ -39,6 +39,12 @@ wsi_metal_surface_get_support(VkIcdSurfaceBase *surface,
+    return VK_SUCCESS;
+ }
+ 
++static inline bool
++wsi_metal_cpu(const struct wsi_device *wsi)
++{
++   return wsi->sw || !wsi->metal.bind_drawable_to_vkimage;
++}
++
+ static const VkPresentModeKHR present_modes[] = {
+    VK_PRESENT_MODE_IMMEDIATE_KHR,
+    VK_PRESENT_MODE_FIFO_KHR,
+@@ -440,7 +446,7 @@ wsi_cmd_blit_image_to_image(const struct wsi_swapchain *chain,
+                             struct wsi_image *image)
+ {
+    /* Should only be called from non-software backends */
+-   assert(!chain->wsi->sw);
++   assert(!wsi_metal_cpu(chain->wsi));
+    
+    const struct wsi_device *wsi = chain->wsi;
+    const struct wsi_metal_swapchain *metal_chain =
+@@ -610,7 +616,7 @@ wsi_metal_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
+          struct wsi_metal_image *image = &chain->images[i];
+          *image_index = i;
+          image->drawable = drawable;
+-         if (!wsi_chain->wsi->sw) {
++         if (!wsi_metal_cpu(wsi_chain->wsi)) {
+             chain->base.wsi->metal.bind_drawable_to_vkimage(image->base.blit.image,
+                                                             image->drawable);
+             /* Since present images will only be backed by MTLTextures after acquisition,
+@@ -641,7 +647,7 @@ wsi_metal_swapchain_release_images(struct wsi_swapchain *wsi_chain,
+    for (uint32_t idx = 0; idx < count; idx++) {
+       struct wsi_metal_image *image = &chain->images[indices[idx]];
+ 
+-      if (!wsi->sw) {
++      if (!wsi_metal_cpu(wsi)) {
+          /* Free the command buffers recording the drawable present, in case
+           * they retain any references */
+          for (uint32_t queue_idx = 0; queue_idx < queue_count; queue_idx++) {
+@@ -705,7 +711,9 @@ wsi_metal_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+          present_id);
+    }
+ 
+-   if (wsi_chain->wsi->sw) {
++   if (wsi_metal_cpu(wsi_chain->wsi)) {
++      if (!wsi_chain->wsi->sw)
++         wsi_chain->wsi->WaitForFences(wsi_chain->device, 1, &wsi_chain->fences[image_index], true, ~0ull);
+       wsi_metal_layer_blit_and_present(chain->blit_context,
+          &image->drawable,
+          image->base.cpu_map,
+@@ -782,7 +790,7 @@ wsi_metal_destroy_image(const struct wsi_metal_swapchain *metal_chain,
+    struct wsi_image *image = &metal_image->base;
+ 
+    /* Software backends can just call common and return */
+-   if (wsi->sw) {
++   if (wsi_metal_cpu(wsi)) {
+       wsi_destroy_image(chain, image);
+       return;
+    }
+@@ -823,7 +831,7 @@ wsi_metal_create_image(const struct wsi_metal_swapchain *metal_chain,
+    VkResult result = wsi_create_image(chain, info, image);
+ 
+    /* Software backends can just call common and return */
+-   if (wsi->sw || result != VK_SUCCESS)
++   if (wsi_metal_cpu(wsi) || result != VK_SUCCESS)
+       return result;
+ 
+    /* We perform blit through rendering */
+@@ -856,7 +864,7 @@ wsi_metal_swapchain_destroy(struct wsi_swapchain *wsi_chain,
+          wsi_metal_destroy_image(chain, image);
+    }
+ 
+-   if (chain->base.wsi->sw)
++   if (wsi_metal_cpu(chain->base.wsi))
+       wsi_destroy_metal_layer_blit_context(chain->blit_context);
+ 
+    wsi_metal_release_present_info(chain->present_info);
+@@ -899,8 +907,8 @@ wsi_metal_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+     * be blitting to the drawable, which means rendering, we can
+     * set the framebuffer only usage.
+     */
+-   const bool layer_opaque = opaque_composition && wsi_device->sw;
+-   const bool framebuffer_only = !wsi_device->sw;
++   const bool layer_opaque = opaque_composition && wsi_metal_cpu(wsi_device);
++   const bool framebuffer_only = !wsi_metal_cpu(wsi_device);
+ 
+    VkResult result = wsi_metal_layer_configure(metal_surface->pLayer,
+       pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
+@@ -920,7 +928,7 @@ wsi_metal_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+     * Metal backend that uses MTLTexture as render target. The software path
+     * will render to a CPU texture, and blit it to the presentation MTLTexture
+     * at the last moment. */
+-   const bool is_sw_driver = wsi_device->sw;
++   const bool is_sw_driver = wsi_metal_cpu(wsi_device);
+    struct wsi_cpu_image_params cpu_params = {
+       .base.image_type = WSI_IMAGE_TYPE_CPU,
+    };
+-- 
+2.55.0
+

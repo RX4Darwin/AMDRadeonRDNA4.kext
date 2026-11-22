@@ -99,4 +99,19 @@ uint64_t Heap::lengthOf(uint64_t offset) const {
 	return static_cast<uint64_t>(n) * gran;
 }
 
+bool Heap::nextUsed(uint64_t &cursor, uint64_t &offset, uint64_t &bytes) const {
+	uint64_t g = cursor > start ? (cursor - start + gran - 1) / gran : 0;
+	while (g < count && map[g] == Free)
+		g++;
+	if (g >= count)
+		return false;
+	uint64_t end = g;
+	while (end < count && map[end] != Free)
+		end++;
+	offset = start + g * gran;
+	bytes = (end - g) * gran;
+	cursor = start + end * gran;
+	return true;
+}
+
 } // namespace GpuHeap

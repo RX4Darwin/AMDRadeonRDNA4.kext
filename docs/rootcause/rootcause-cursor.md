@@ -7,7 +7,7 @@ Path prefixes:
 - `dc:` = `~/src/linux-amd/drivers/gpu/drm/amd/display/dc/`
 - `dmub:` = `.../display/dmub/inc/`
 - `hdr:` = `.../include/asic_reg/dcn/dcn_4_1_0_{offset,sh_mask}.h`
-- `log:` = `premetal/hw-logs/rdna4fb-diag-2026092x-`
+- `log:` = `rdna4fb-diag-2026092x-`
 
 ## 0. Bottom line
 

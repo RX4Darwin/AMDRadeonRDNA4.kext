@@ -37,9 +37,9 @@ static uint64_t vramLeaf(const Policy &pol, uint64_t va, uint64_t end, uint64_t 
 	return GpuVm::encodePte(phys, flags, fragment64k);
 }
 
-static uint64_t hostLeaf(const Policy &pol, uint64_t bus, bool executable) {
+static uint64_t hostLeaf(const Policy &pol, uint64_t bus, bool executable, bool readOnly) {
 	uint64_t flags = GpuVm::kSystem | GpuVm::kSnooped | GpuVm::kValid |
-	                 GpuVm::kReadable | GpuVm::kWritable | (pol.isPteOff ? 0 : GpuVm::kIsPte);
+	                 GpuVm::kReadable | (readOnly ? 0 : GpuVm::kWritable) | (pol.isPteOff ? 0 : GpuVm::kIsPte);
 	if (executable || !pol.execOff)
 		flags |= GpuVm::kExecutable;
 	/* Cached GTT on gfx12.0 uses MTYPE_NC, encoded as zero. */
@@ -57,7 +57,13 @@ void denseRoot(uint64_t *shadow, uint64_t rootPhys) {
 
 bool mapVram(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t va, uint64_t end, uint64_t physical, bool executable, Span &out) {
 	out = Span {};
-	if (end > GpuVm::kVaStart + denseVa(tableBytes))
+	if (!a.entry || !a.phys || end < va ||
+	    ((va | end | physical) & (GpuVm::kPageBytes - 1)) ||
+	    va < GpuVm::kVaStart || end > GpuVm::kVaStart + denseVa(tableBytes) ||
+	    physical > GpuVm::kPhysicalMask)
+		return false;
+	const uint64_t pageCount = (end - va) / GpuVm::kPageBytes;
+	if (pageCount && pageCount - 1 > (GpuVm::kPhysicalMask - physical) / GpuVm::kPageBytes)
 		return false;
 
 	for (uint64_t at = va, phys = physical; at < end;
@@ -85,15 +91,23 @@ bool mapVram(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 	return true;
 }
 
-bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable, Span &out) {
+bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable, Span &out, bool readOnly) {
 	out = Span {};
-	if (end > GpuVm::kVaStart + denseVa(tableBytes))
+	if (!a.entry || !a.phys || !pageBuses || end < va ||
+	    ((va | end) & (GpuVm::kPageBytes - 1)) ||
+	    va < GpuVm::kVaStart || end > GpuVm::kVaStart + denseVa(tableBytes))
 		return false;
+
+	/* Validate the complete bus-page list before touching a PTE. A bad page
+	 * late in the range must not leave earlier pages mapped in the shadow. */
+	const uint64_t pageCount = (end - va) / GpuVm::kPageBytes;
+	for (uint64_t page = 0; page < pageCount; page++)
+		if ((pageBuses[page] & (GpuVm::kPageBytes - 1)) ||
+		    pageBuses[page] > GpuVm::kPhysicalMask)
+			return false;
 
 	uint64_t page = 0;
 	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes, page++) {
-		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
-			return false;
 		if (at < GpuVm::kVaStart || at >= GpuVm::kVaStart + denseVa(tableBytes))
 			return false;
 		const uint64_t ptOff = densePt(at);
@@ -112,7 +126,7 @@ bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 		if (out.firstPt == ~0ull)
 			out.firstPt = ptOff;
 		out.lastPt = ptOff;
-		*pte = hostLeaf(pol, pageBuses[page], executable);
+		*pte = hostLeaf(pol, pageBuses[page], executable, readOnly);
 	}
 	return true;
 }
@@ -159,15 +173,29 @@ static bool treePath(const Tree &t, uint64_t at, bool create, uint64_t *&ptEntri
 }
 
 bool treeMapVram(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, uint64_t physical, bool executable) {
+	if (!t.page || !t.dirty || end < va ||
+	    ((va | end | physical) & (GpuVm::kPageBytes - 1)) ||
+	    va < GpuVm::kVaStart || end > GpuVm::kVaEnd ||
+	    physical > GpuVm::kPhysicalMask)
+		return false;
+	const uint64_t pageCount = (end - va) / GpuVm::kPageBytes;
+	if (pageCount && pageCount - 1 > (GpuVm::kPhysicalMask - physical) / GpuVm::kPageBytes)
+		return false;
+
 	uint64_t *pt = nullptr;
 	uint32_t ptId = 0;
 	uint64_t ptKey = ~0ull;
+	/* The complete VA interval was checked above, before treePath can allocate
+	 * directories. Keep the mapping loop free of late range failures. */
 	for (uint64_t at = va, phys = physical; at < end; at += GpuVm::kPageBytes, phys += GpuVm::kPageBytes) {
-		if (at < GpuVm::kVaStart || at >= GpuVm::kVaEnd)
-			return false;
 		if ((at >> 21) != ptKey) {
-			if (!treePath(t, at, true, pt, ptId))
+			if (!treePath(t, at, true, pt, ptId)) {
+				/* A quota/allocation failure must not leave the prefix mapped.
+				 * Keep empty directory pages: they are harmless and remain owned
+				 * by the client, while a later map can retry safely. */
+				treeUnmap(t, va, at);
 				return false;
+			}
 			ptKey = at >> 21;
 		}
 		pt[GpuVm::index(at, 3)] = vramLeaf(pol, va, end, at, phys, executable);
@@ -176,22 +204,36 @@ bool treeMapVram(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, ui
 	return true;
 }
 
-bool treeMapHost(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable) {
+bool treeMapHost(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable, bool readOnly) {
+	if (!t.page || !t.dirty || !pageBuses || end < va ||
+	    ((va | end) & (GpuVm::kPageBytes - 1)) ||
+	    va < GpuVm::kVaStart || end > GpuVm::kVaEnd)
+		return false;
+
+	/* Do not allocate directories or write leaves until every host bus page
+	 * has passed alignment validation. */
+	const uint64_t pageCount = (end - va) / GpuVm::kPageBytes;
+	for (uint64_t page = 0; page < pageCount; page++)
+		if ((pageBuses[page] & (GpuVm::kPageBytes - 1)) ||
+		    pageBuses[page] > GpuVm::kPhysicalMask)
+			return false;
+
 	uint64_t *pt = nullptr;
 	uint32_t ptId = 0;
 	uint64_t ptKey = ~0ull;
 	uint64_t page = 0;
 	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes, page++) {
-		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
-			return false;
-		if (at < GpuVm::kVaStart || at >= GpuVm::kVaEnd)
-			return false;
 		if ((at >> 21) != ptKey) {
-			if (!treePath(t, at, true, pt, ptId))
+			if (!treePath(t, at, true, pt, ptId)) {
+				/* A quota/allocation failure must not leave the prefix mapped.
+				 * Keep empty directory pages: they are harmless and remain owned
+				 * by the client, while a later map can retry safely. */
+				treeUnmap(t, va, at);
 				return false;
+			}
 			ptKey = at >> 21;
 		}
-		pt[GpuVm::index(at, 3)] = hostLeaf(pol, pageBuses[page], executable);
+		pt[GpuVm::index(at, 3)] = hostLeaf(pol, pageBuses[page], executable, readOnly);
 		t.dirty(t.context, ptId);
 	}
 	return true;

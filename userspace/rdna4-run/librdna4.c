@@ -9,7 +9,20 @@
 
 #include <mach/mach.h>
 #include <mach/mach_error.h>
+#include <stdio.h>
 #include <string.h>
+
+/* The kext's runtime ABI against the one this library was built for: a kext of another release is refused here, with both versions
+ * named, rather than failing later in ways that do not say why (docs/packaging-plan.md). A kext that does not answer passes. */
+static kern_return_t checkAbi(rdna4_t *dev, kern_return_t opened) {
+	rdna4_info_t info;
+	if (opened != KERN_SUCCESS || rdna4_info(dev, &info) != KERN_SUCCESS || info.abi == RDNA4_COMPUTE_ABI)
+		return opened;
+	fprintf(stderr, "librdna4: the kext's runtime ABI is %llu, this library's %u: install the kext and the driver of the same release\n",
+	        (unsigned long long)info.abi, RDNA4_COMPUTE_ABI);
+	rdna4_close(dev);
+	return kIOReturnUnsupported;
+}
 
 kern_return_t rdna4_open(rdna4_t *dev) {
 	dev->conn = IO_OBJECT_NULL;
@@ -20,7 +33,12 @@ kern_return_t rdna4_open(rdna4_t *dev) {
 		return kIOReturnNotFound;
 	kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &dev->conn);
 	IOObjectRelease(svc);
-	return kr;
+	return checkAbi(dev, kr);
+}
+
+kern_return_t rdna4_open_accelerator(rdna4_t *dev, io_service_t accelerator) {
+	dev->conn = IO_OBJECT_NULL;
+	return checkAbi(dev, IOServiceOpen(accelerator, mach_task_self(), RDNA4_NATIVE_UC_TYPE, &dev->conn));
 }
 
 void rdna4_close(rdna4_t *dev) {
@@ -86,7 +104,12 @@ kern_return_t rdna4_alloc(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out) {
 
 kern_return_t rdna4_alloc_host(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out,
                                 void **cpu) {
-	const uint64_t in[2] = { bytes, 0 };
+	return rdna4_alloc_host_flags(dev, bytes, 0, out, cpu);
+}
+
+kern_return_t rdna4_alloc_host_flags(rdna4_t *dev, uint64_t bytes, uint64_t flags, rdna4_buffer_t *out,
+                                      void **cpu) {
+	const uint64_t in[2] = { bytes, flags };
 	uint64_t o[3] = { 0 };
 	uint32_t n = 3;
 	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodAllocHost,
@@ -99,6 +122,35 @@ kern_return_t rdna4_alloc_host(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out
 			*cpu = (void *)(uintptr_t)o[2];
 	}
 	return kr;
+}
+
+kern_return_t rdna4_translate(rdna4_t *dev, const void *air, uint64_t airBytes, const char *name, void *out, uint64_t room,
+                              uint64_t *bytes, uint32_t *buffers) {
+	const uint64_t in[5] = { (uint64_t)(uintptr_t)air, airBytes, (uint64_t)(uintptr_t)name, (uint64_t)(uintptr_t)out, room };
+	uint64_t o[2] = { 0 };
+	uint32_t n = 2;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodTranslate, in, 5, o, &n);
+	*bytes = kr == KERN_SUCCESS ? o[0] : 0;
+	*buffers = (uint32_t)o[1];
+	return kr;
+}
+
+kern_return_t rdna4_import_host(rdna4_t *dev, void *address, uint64_t bytes, uint64_t flags, rdna4_buffer_t *out) {
+	const uint64_t in[3] = { (uint64_t)(uintptr_t)address, bytes, flags };
+	uint64_t o[2] = { 0 };
+	uint32_t n = 2;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodImportHost, in, 3, o, &n);
+	if (kr == KERN_SUCCESS) {
+		out->handle = o[0];
+		out->gpu = o[1];
+		out->bytes = bytes;
+	}
+	return kr;
+}
+
+kern_return_t rdna4_present_source(rdna4_t *dev, uint32_t surface, const rdna4_buffer_t *buf) {
+	const uint64_t in[2] = { surface, buf ? buf->handle : 0 };
+	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodPresentSource, in, 2, NULL, NULL);
 }
 
 kern_return_t rdna4_free(rdna4_t *dev, const rdna4_buffer_t *buf) {

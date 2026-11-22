@@ -24,9 +24,9 @@ OSXKVM=${OSXKVM:-$HOME/OSX-KVM}
 QEMU_SRC=${QEMU_SRC:-$HOME/qemu-10.0.13}
 QEMU=${QEMU_BIN:-$QEMU_SRC/build/qemu-system-x86_64}
 OC_IMAGE=${OC_IMAGE:-OpenCore-emu.qcow2}
-ROM=$HERE/Build/emu/rdna4.rom
-STATE=$HERE/emu/qemu/gop-state.txt
-FLASH=$HERE/firmware/Sapphire.RX9070XT.16384.241213.rom
+ROM=${ROM:-$HERE/Build/emu/rdna4.rom}
+STATE=${STATE:-$HERE/emu/qemu/gop-state.txt}
+FLASH=${FLASH:-$HERE/firmware/Sapphire.RX9070XT.16384.241213.rom}   # an RX 9060 XT: its VBIOS + IP discovery, with chip=navi44
 MONITOR=${MONITOR:-$HOME/tahoe-monitor.sock}
 SERIAL_LOG=${SERIAL_LOG:-$HOME/tahoe-serial.log}
 OVMF_CODE=${OVMF_CODE:-OVMF_CODE_4M.fd}

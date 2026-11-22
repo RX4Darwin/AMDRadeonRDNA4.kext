@@ -157,6 +157,8 @@ public:
 	void powerWillSleep();
 	void powerSleepRequest();   // P7: setPowerState(0) / the debug sleep selector call this first, without rtLock (src/pmidle.cpp)
 	void powerDidWake();
+	// A user client's call during a sleep or the wake's bring-up waits for the runtime (at most 30 s awake) instead of failing.
+	void waitAwake();
 	// Breadcrumb in NVRAM (Lilu vendor GUID, key rdna4-trail), written and
 	// flushed before each step that could hang the GPU (also the display
 	// side's, RDNA4Device::breadcrumb), so the step a hard
@@ -258,6 +260,20 @@ private:
 	void endBringup();
 	bool bringupStepAllowed(const char *step);
 	void resetRuntimeForResume();
+	void discardRuntimeLocked();   // every buffer, program, heap and VM context gone, the clients aborted (a wake without a save)
+	// A system sleep with the clients kept (rdna4-vmshared=2): the memory of both heaps' allocations copied to host memory before
+	// the card loses its power, the clients, buffers, programs and page tables left as they were, and the memory copied back at
+	// the same VRAM addresses when the wake's runtime is published. The native Metal device's clients, WindowServer among them,
+	// go on after the wake (before, each was aborted and WindowServer died, 2026-11-22). rdna4-sleepkeep=0: discarded as before.
+	struct SleepRun { uint64_t mc, bytes, at; };   // a VRAM range and where its bytes are in sleepCopy
+	IOBufferMemoryDescriptor *sleepCopy { nullptr };
+	SleepRun *sleepRuns { nullptr };
+	uint32_t  sleepRunCount { 0 };
+	bool      sleepKept { false };     // saved: the wake keeps the clients, publishRuntime copies the memory back
+	bool sleepSaveLocked();
+	bool sleepRestoreLocked();
+	void sleepDropSave();
+	bool sleepCopyRun(const SleepRun &r, bool toGpu);
 
 	// The pre-Metal features past the compute stages (W1-W5) name their
 	// trail steps "<feature>: ..." (gfx, ih, vm, flip). If the previous
@@ -694,6 +710,8 @@ public:
 	const void *idleFreeOwner { nullptr };
 	bool runtimeReady() const { return rtReady; }   // the bring-up reached a dispatching stage
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
+	// The client runs in a GPU address space of its own (rdna4-vm=1): what a client that is not root needs (userclient.cpp).
+	bool rtClientIsolated(const void *owner);
 	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
 	IOReturn rtSensorsEx(const void *owner, RDNA4SensorsEx &out);
 	// GRBM perf counters 0 and 1 counting GFX clocks (GRBM_PERF_SEL_COUNT) and busy clocks (GUI_ACTIVE): the counts since the call
@@ -733,9 +751,15 @@ public:
 	                     uint64_t &handle, uint64_t &gpu, uint64_t &user);
 	// Pages that are not the runtime's (the paravirtual host's guest memory, pvgpu.cpp) at a fresh GPU VA of the client, by bus address; rtFree
 	// unmaps them. The caller keeps the pages alive meanwhile.
+	// A page-aligned range of the client's own memory into its GPU address space (an IOSurface's: the native Metal device's drawables).
+	IOReturn rtImportHost(const void *owner, task_t task, uint64_t address, uint64_t bytes, uint64_t flags, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtMapPages(const void *owner, const uint64_t *pageBuses, uint64_t pages, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtFree(const void *owner, uint64_t handle);
 	IOReturn rtMapVram(const void *owner, uint64_t barPhys, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
+	// `client`'s VRAM buffer `clientHandle` mapped into `owner`'s GPU address space too (the paravirtual host presenting the native Metal
+	// device's frames): a handle of `owner`'s (freed with rtFree, the VRAM stays the client's), its VA and bytes.
+	IOReturn rtMapClientVram(const void *owner, const void *client, uint64_t clientHandle, uint64_t &handle, uint64_t &gpu, uint64_t &bytes);
+	IOReturn mapMcLocked(const void *owner, uint64_t mc, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	// The paravirtual displays' frames flipped at vblank (pvgpu.cpp, presentOnCard): the HUBP showing a head's scanout at `barPhys` and
 	// the scanout's MC address; a VRAM runtime buffer's MC address (0 for another); a flip requested; what the HUBP was asked to show
 	// and what it reads now (Flip::shown).
@@ -768,8 +792,8 @@ public:
 	IOReturn rtRestore(const void *owner);
 	void     rtRelease(const void *owner);
 
-	// The Vulkan interface (src/n48nkext.cpp, docs/vulkan-port.md): one client at a time, in an address space of
-	// its own. `owner` is its user client.
+	// The Vulkan interface (src/n48nkext.cpp, docs/vulkan-port.md): up to kN48nSessions clients, each in an address
+	// space of its own. `owner` is its user client.
 	IOReturn n48nOpen(const void *owner);
 	void     n48nClose(const void *owner);
 	IOReturn n48nCall(const void *owner, uint32_t selector, IOExternalMethodArguments *args);
@@ -778,26 +802,37 @@ public:
 private:
 	friend struct N48nBackend;
 	struct N48nState;
-	N48nState *n48n { nullptr };
-	void     n48nDiscard();        // the card lost its memory under the client (sleep): forget it, write nothing
+	// ponytail: 3, as each pins an address space of the 8 the desktop's clients share (rdna4-vmshared=2); more if that proves roomy.
+	static constexpr uint32_t kN48nSessions = 3;
+	N48nState *n48n[kN48nSessions] {};
+	uint32_t   n48nRingDwords { 0 };   // what all of them have on the graphics ring (N48nBackend::submit)
+	N48nState *n48nOf(const void *owner) const;
+	void n48nReleaseVmid(N48nState *s);
+	void     n48nDiscard();        // the card lost its memory under the clients (sleep): forget them, write nothing
+	void     n48nDrop(N48nState *s);
 	struct N48nView;
 	N48nView *n48nViews { nullptr };   // what processes map of the pool heap's buffers (n48nMemory), kept for the boot
 	bool     n48nRetire(uint64_t offset);   // a freed buffer's memory waits for its mappings: true if it has a view
 	void     n48nSweep();          // memory whose mappings are all gone back to the heap
 	void     n48nKeep();           // a heap made anew: memory still mapped is taken out of it again
-	IOReturn n48nCopyTest(uint64_t source, uint64_t destination, uint64_t bytes);
+	IOReturn n48nCopyTest(N48nState &s, uint64_t source, uint64_t destination, uint64_t bytes);
 	// The pool past kHeapOffset is the CPU-visible heap (code, and buffers
 	// when there is no DMA). With DMA, buffers come from the device heap:
 	// VRAM past the BAR, which the CPU never touches.
 	static constexpr uint32_t kHeapOffset  = 32u << 20;
 	// The legacy global caps (modes 0 and 1). Buffers as many as there are slots: the paravirtual host alone keeps hundreds (mappings,
 	// shadows), and with 256 its allocations failed once those were made.
-	static constexpr uint32_t kMaxBuffers  = 1024;
+	// 4096: WindowServer on the native Metal device (a buffer per texture, IOSurface and pipeline beside the host's hundreds) ran out at 1024;
+	// 16384: and at 4096 after a login that brought 11 apps back (2803 allocations and the windows' imports, 2026-11-20). Handles hold 16 bits.
+	static constexpr uint32_t kMaxBuffers  = 16384;
 	static constexpr uint32_t kMaxPrograms = 32;
-	static constexpr uint32_t kBufferSlots  = 1024;        // rdna4-vmshared=2: array sizes; the cap is per client (accounting), not global
-	static constexpr uint32_t kProgramSlots = 256;
-	static constexpr uint32_t kClientBuffers  = 128;
-	static constexpr uint32_t kClientPrograms = 16;
+	static constexpr uint32_t kBufferSlots  = 16384;       // rdna4-vmshared=2: array sizes; the cap is per client (accounting), not global
+	static constexpr uint32_t kProgramSlots = 1024;
+	// Per client in mode 2: a share, not the whole table. 128 buffers and 16 programs fitted the bench, not a desktop: WindowServer on the
+	// native device keeps thousands of buffers (a texture, IOSurface or pipeline each) and loads a kernel pair per render pipeline, and
+	// with our own accelerator every app with Metal is a client (eight static VMIDs were all taken before Metalterm asked, 2026-11-21).
+	static constexpr uint32_t kClientBuffers  = 8192;
+	static constexpr uint32_t kClientPrograms = 256;
 	uint32_t bufferCap() const { return vmShared == 2 ? kBufferSlots : kMaxBuffers; }
 	// The paravirtual host's compiler service (PVGPU builds) loads a vertex and a fragment kernel for every render pipeline WindowServer
 	// makes: dozens. Its code takes heap space, which is checked on its own.
@@ -835,7 +870,8 @@ private:
 	static constexpr uint64_t kHostMaxClient = 1ull << 30;
 	static constexpr uint64_t kHostMaxTotal = 4ull << 30;
 	static constexpr uint32_t kMaxIbOutstanding = 16;
-	static constexpr uint32_t kMaxGfxIbOutstanding = 64;   // a client's gfx IBs in flight: the paravirtual host submits draws without waiting
+	static constexpr uint32_t kMaxGfxIbOutstanding = 128;  // a client's gfx IBs in flight: the paravirtual host submits draws without waiting,
+	                                                       // the native device up to 64 (its draws' slots)
 	struct RtBuffer  {
 		const void *owner { nullptr };
 		uint64_t    offset { 0 }, bytes { 0 }; // heap offset (pool or VRAM), size
@@ -845,7 +881,8 @@ private:
 		bool        host { false };
 		bool        foreign { false };         // VRAM that is not the runtime's (rtMapVram): only the VA is given back
 		bool        mapped { false };          // rtMapPages: pages the runtime did not allocate, not counted in the host quota
-		IOBufferMemoryDescriptor *hostMemory { nullptr };
+		IOMemoryDescriptor *hostMemory { nullptr };
+		bool        hostImported { false };   // rtImportHost: the client's own range, prepared (wired) here
 		IODMACommand *hostDma { nullptr };
 		IOMemoryMap *hostMap { nullptr };
 		uint64_t    hostUser { 0 };
@@ -856,7 +893,6 @@ private:
 	struct SparseTables {
 		PtPages::Sparse s;
 	};
-	static constexpr uint32_t kVaHoles = 32;
 	struct RtClient {
 		const void *owner { nullptr };
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
@@ -890,10 +926,6 @@ private:
 		Pm4::Queue pm4;
 		bool active { false };
 		bool aborted { false };
-		// VA given back by freed buffers, 64 KiB granules, reused before nextVa grows: the dense tables reach only 1 GiB above
-		// kVaStart, which a buffer a draw passes through without reuse.
-		struct VaHole { uint64_t va, bytes; } vaHoles[kVaHoles] {};
-		uint32_t vaHoleCount { 0 };
 		bool vaBitsReady { false };   // vaBits[this slot] set up (vaBitsOf)
 		uint32_t ibSlot { kBufferSlots };   // rtSubmitGfxIb: the buffer that held the last IB
 	};
@@ -917,7 +949,8 @@ private:
 	bool           queueUsed[4][8] {};
 	RtClient       clients[kClientSlots] {};
 	static constexpr uint32_t kVaGranules = GpuVmTable::kDenseVaBytes >> 16;   // the dense tables' 4 GiB, 64 KiB each
-	uint64_t      *vaBits[kClientSlots] {};   // kVaGranules bits each, made on first use
+	static constexpr uint32_t kSparseVaGranules = (16ull << 30) >> 16;         // a sparse client's VA: 16 GiB from kVaStart
+	uint64_t      *vaBits[kClientSlots] {};   // kSparseVaGranules bits each (32 KiB), made on first use
 	GpuHeap::Heap  heap;
 	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
 	RtBuffer       buffers[kBufferSlots] {};
@@ -1098,13 +1131,16 @@ private:
 	bool vmMap(RtClient &client, uint64_t va, uint64_t mc, uint64_t bytes, bool executable);
 	bool vmSyncCpu(RtClient &client, uint64_t va, uint64_t end);
 	bool vmMapHost(RtClient &client, uint64_t va, const uint64_t *pageBuses,
-	               uint64_t bytes, bool executable);
+	               uint64_t bytes, bool executable, bool readOnly = false);   // readOnly: RDNA4_HOST_READ_ONLY, no WRITEABLE
 	void vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
 	bool vmContextInit(RtClient &client);
 	bool vmInvalidate(uint32_t vmid, const char *tag);
 	bool vmInvalidateOwned(RtClient &c, const char *tag);
 	void logClientFault(RtClient &client, const char *tag);
 	void scrubFaultPage();
+	IOReturn hostChecks(const void *owner, uint64_t bytes, uint64_t flags, bool counted = true);   // counted: against the host quotas
+	IOReturn mapHostLocked(const void *owner, IOMemoryDescriptor *memory, IOMemoryMap *map, uint64_t userAddress, bool imported, uint64_t bytes,
+	                       uint64_t flags, uint64_t &handle, uint64_t &gpu, uint64_t &user);
 	void releaseHost(RtBuffer &buffer);
 	void leakHost(RtBuffer &buffer);
 	void retireIbFences(RtClient &client);
@@ -1112,7 +1148,7 @@ private:
 	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the
 	// bring-up thread with bringupRunning set and do NOT take rtLock; client submissions take rtLock and refuse while bringupRunning,
 	// so the two never use the ring at the same time. Everything below runs under rtLock.
-	static constexpr uint32_t kMaxGfxOutstanding = 64;     // submissions in the ring across all clients (15 dwords each, 22 with the pool's ring fence: 1408 of 4096)
+	static constexpr uint32_t kMaxGfxOutstanding = 128;    // submissions in the ring across all clients (15 dwords each, 22 with the pool's ring fence: 2816 of 4096)
 	static constexpr uint32_t kGfxFenceSlot = 0x40;        // bytes into the client's fence page
 	bool     gfxWedged { false };                          // a client gfx IB timed out: the gfx ring is given up until the next bring-up
 	bool     gfxParked { false };                          // gfxPark halted PFP/ME (probe boots)
@@ -1120,7 +1156,8 @@ private:
 	IOReturn gfxClientReady() const;                       // kIOReturnSuccess when a client may use the ring now
 	void     gfxClientRetire(RtClient &client);
 	IOReturn gfxClientEmit(RtClient &client, uint64_t ibVa, uint32_t dwords, uint32_t &fence);
-	bool     gfxClientWait(RtClient &client, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why, bool pause = false);
+	bool     gfxClientWait(RtClient &client, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why, bool pause = false,
+	                       uint32_t firstPoll = 0);   // firstPoll: the busy polls already made (rtWaitGfxFence's, unlocked)
 	bool     pauseUnlocked(const RtClient &client, const void *owner);
 	void     gfxClientWedge(const char *why);
 	bool     gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why);   // end one address space's hung work

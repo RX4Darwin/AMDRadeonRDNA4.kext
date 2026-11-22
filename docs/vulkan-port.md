@@ -181,7 +181,7 @@ carries the calls and maps a buffer into the process. One connection at a time.
 
 | What the engine asks for | What stands behind it |
 |---|---|
-| The connection | `RDNA4ComputeService::newUserClient`: type `'N48N'` gets an `RDNA4VulkanClient`, any other type the compute client as before. Root only. One at a time: a second open answers "exclusive access", which Mesa waits out |
+| The connection | `RDNA4ComputeService::newUserClient`: type `'N48N'` gets an `RDNA4VulkanClient`, any other type the compute client as before. Root only. One at a time: a second open answers "exclusive access", which Mesa waits out (since 2026-11-21: the console user too, and three at a time, each in an address space of its own; one of them at a time has the display) |
 | VRAM the CPU reaches | the runtime's pool heap behind BAR0 (about 96 MiB), zeroed by the CPU |
 | VRAM it does not | the device heap past the BAR; a buffer that allows it goes there first, because the other pool is small |
 | System memory | wired pages, zeroed, with the address the card reaches each page by (as the runtime's host buffers) |

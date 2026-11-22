@@ -7,7 +7,7 @@ Sources:
 - umr @ 8438c15 (shallow clone in the session scratchpad).
 - tinygrad @ 7bfaa18 (sparse clone, `tinygrad/runtime/support/am`).
 - Kext: `AMDRadeonRDNA4-int` @ 5651214 (contains merge e7817ce).
-- Card logs: `premetal/hw-logs/rdna4fb-diag-20260929-081555.txt` ("L" below) and -013433.
+- Card logs: `rdna4fb-diag-20260929-081555.txt` ("L" below) and -013433.
 
 ## Verdict: **LIKELY**, about 85%
 

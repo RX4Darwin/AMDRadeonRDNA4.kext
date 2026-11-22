@@ -19,6 +19,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+class IOService;
+
 namespace PvScanout
 {
 
@@ -37,6 +39,13 @@ void decided(bool on);
 
 /* Whether the heads are the paravirtual displays this boot (plugin.cpp). */
 bool enabled();
+
+/* Whether framebuffer `fb` is one of ours with a monitor: the boot head's, or an extra head's that is connected (or lit once the
+ * display clocks are up). What our accelerator shows WindowServer (rdna4accel.cpp). */
+bool framebufferLit(IOService *fb);
+
+/* The port of framebuffer `fb` (0 the boot head's, 1.. the extra heads' as count() numbers them), -1 when it is no head's. */
+int portOf(IOService *fb);
 
 /* Whether decided() has been told yet. */
 bool known();
@@ -111,6 +120,8 @@ bool copySurface(uint32_t sid, uint8_t *dst, uint32_t pitch, uint32_t width, uin
 bool cursorReady(uint32_t port);
 bool cursorImage(uint32_t port, const uint32_t *argb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t hotX, uint32_t hotY);
 bool cursorMove(uint32_t port, int32_t x, int32_t y, bool visible);
+/* cursorImage of the part of a larger image that is not transparent (with its hot spot). */
+bool cursorArgb(uint32_t port, const uint32_t *argb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t hotX, uint32_t hotY);
 
 } /* namespace PvScanout */
 

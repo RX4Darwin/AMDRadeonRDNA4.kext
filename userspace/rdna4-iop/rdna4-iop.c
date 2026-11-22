@@ -46,6 +46,19 @@ static int pvHeads(void)
 	return 0;
 }
 
+/* Whether this boot's WindowServer is to run on our own accelerator (rdna4-accel=4, the driver's default: src/trial.cpp): its displays
+ * present through our display pipes, which only IOPresentment drives too. Without it CoreDisplay took the framebuffers' legacy path
+ * and composited the login window's display in software, where Core Animation's flatten path asserted (2026-11-21). */
+static int ownAccelerator(void)
+{
+	char args[1024] = "";
+	size_t len = sizeof(args) - 1;
+
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0))
+		return 0;
+	return !strstr(args, "rdna4-accel=") || strstr(args, "rdna4-accel=4");
+}
+
 /* useIOP now: 1 true, 0 false, -1 not set. */
 static int current(void)
 {
@@ -97,22 +110,25 @@ int main(int argc, char **argv)
 {
 	const int dryRun = argc > 1 && !strcmp(argv[1], "-n");
 	const int heads = pvHeads();
+	const int own = ownAccelerator();
+	const int want = heads || own;
 	const int now = current();
 
 	metalErrorMode(heads, dryRun);
 
-	/* the paravirtual displays need it on; every other boot the default (unset) */
-	if ((heads && now == 1) || (!heads && now == -1)) {
-		printf("rdna4-iop: useIOP %s, as this boot needs\n", heads ? "on" : "unset");
+	/* the paravirtual displays and our own accelerator's need it on; every other boot the default (unset) */
+	if ((want && now == 1) || (!want && now == -1)) {
+		printf("rdna4-iop: useIOP %s, as this boot needs\n", want ? "on" : "unset");
 		return 0;
 	}
 
-	printf("rdna4-iop: the heads are%s the paravirtual displays: useIOP %s -> %s%s\n", heads ? "" : " not",
-	       now == 1 ? "on" : now == 0 ? "off" : "unset", heads ? "on" : "unset", dryRun ? " (not changed: -n)" : "");
+	printf("rdna4-iop: the heads are%s the paravirtual displays%s: useIOP %s -> %s%s\n", heads ? "" : " not",
+	       own ? ", our own accelerator serves WindowServer" : "", now == 1 ? "on" : now == 0 ? "off" : "unset", want ? "on" : "unset",
+	       dryRun ? " (not changed: -n)" : "");
 	if (dryRun)
 		return 0;
 
-	CFPreferencesSetValue(kKey, heads ? kCFBooleanTrue : NULL, kDomain, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+	CFPreferencesSetValue(kKey, want ? kCFBooleanTrue : NULL, kDomain, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
 	if (!CFPreferencesSynchronize(kDomain, kCFPreferencesAnyUser, kCFPreferencesCurrentHost)) {
 		fprintf(stderr, "rdna4-iop: the preference could not be written\n");
 		return 1;

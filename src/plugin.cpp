@@ -20,6 +20,7 @@
 
 #include <Headers/plugin_start.hpp>
 #include "klog.hpp"
+#include "sku.hpp"
 #include "trial.hpp"
 #include "vrambench.hpp"
 #include <Headers/kern_api.hpp>
@@ -29,6 +30,7 @@
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>   // header-only types for IOMacOSVideo.h
+#include <IOKit/graphics/IOFramebuffer.h>     // (convertCursorImage: a virtual call, no IOGraphics symbol)
 #include <IOKit/ndrvsupport/IOMacOSTypes.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include <IOKit/ndrvsupport/IONDRVLibraries.h>
@@ -37,8 +39,10 @@
 #include <mach/kmod.h>
 
 #include "accelcensus.hpp"
+#include "rdna4accel.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
+#include "iosurface.hpp"
 #include "pvhooks.hpp"
 #include "pvscanout.hpp"
 #endif
@@ -227,7 +231,7 @@ bool isOurDevice(IOService *provider) {
 		return false;
 	uint32_t vd = pci->configRead32(kIOPCIConfigVendorID);
 	uint16_t vendor = vd & 0xffff, device = static_cast<uint16_t>(vd >> 16);
-	if (vendor == 0x1002 && (device == 0x7550 || device == 0x7551))
+	if (vendor == 0x1002 && (device == Sku::kNavi48 || device == Sku::kNavi48Pro || device == Sku::kNavi44))
 		return true;
 #ifdef AMDRadeonRDNA4_VM_TEST
 	if (vendor == 0x15ad && device == 0x0405)
@@ -774,6 +778,7 @@ void coldStartHeads(RDNA4Device &dev) {
 		      mode ? ", its modes set up" : "", h->surface.width, h->surface.height, h->surface.physBase);
 	}
 	dev.selectExtra(0);
+	dev.coldStartPending = false;   // the second pipes' power requests act again
 }
 
 void fillHeads(RDNA4Device &dev) {
@@ -1048,6 +1053,102 @@ IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSOb
 	return ret;
 }
 
+#ifdef AMDRadeonRDNA4_PVGPU
+// Our framebuffers' hardware cursor while our own accelerator serves WindowServer: the heads' cursor planes (PvScanout::cursorArgb,
+// cursorMove) as AppleParavirtFramebuffer does it, which WindowServer takes: the image converted for a 128x128 32-bit cursor (its
+// descriptor byte for byte; at 64x64 WindowServer drew the pointer itself), cropped onto the 64x64 plane. IOFramebuffer's first call
+// is its test (convertCursorImage records the descriptor in IOFBCursorInfo and returns false). Otherwise IONDRV's own.
+mach_vm_address_t orgSetCursorImage { 0 }, orgSetCursorState { 0 }, orgFbGetAttribute { 0 };
+constexpr uint32_t kCursorAnnounced = 128;
+uint32_t gCursorHot[8][2];   // each head's image's hot spot: IOFramebuffer moves the image's corner, cursorMove takes the hot spot
+bool gAccelCursor;           // rdna4-accel=4, read where the routes are made
+
+int cursorPort(void *fb)
+{
+	// (the boot-arg, not RDNA4Accel::framebuffersDecided: IOFramebuffer tests the boot display's cursor at its first open, ~7 s before
+	// WindowServer is let go; WindowServer takes a hardware cursor only when every display has one)
+	const int port = gAccelCursor ? PvScanout::portOf(static_cast<IOService *>(fb)) : -1;
+	return port >= 0 && PvScanout::cursorReady(static_cast<uint32_t>(port)) ? port : -1;
+}
+
+IOReturn wrapSetCursorImage(void *fb, void *image)
+{
+	const int port = cursorPort(fb);
+	if (port < 0)
+		return FunctionCast(wrapSetCursorImage, orgSetCursorImage)(fb, image);
+
+	IOHardwareCursorDescriptor desc {};
+	desc.majorVersion = 1;   // (AppleParavirtFramebuffer's IOFBCursorInfo)
+	desc.minorVersion = 1;
+	desc.width = desc.height = kCursorAnnounced;
+	desc.bitDepth = 32;
+	desc.supportedSpecialEncodings = 4;
+	desc.specialEncodings[1] = 0x00ffffff;
+	auto *pixels = static_cast<uint32_t *>(IOMalloc(kCursorAnnounced * kCursorAnnounced * 4));
+	IOHardwareCursorInfo info {};
+	info.majorVersion = kHardwareCursorInfoMajorVersion;
+	info.minorVersion = kHardwareCursorInfoMinorVersion;
+	info.hardwareCursorData = reinterpret_cast<UInt8 *>(pixels);
+	const bool ok = pixels && static_cast<IOFramebuffer *>(fb)->convertCursorImage(image, &desc, &info) &&
+	                // (rows packed tightly, the image's width a row: as AppleParavirtFramebuffer's glyphs, "32 bytes a row" for 8x8; read at
+	                // the descriptor's 128 they were a block of garbage on both displays, 2026-11-21)
+	                PvScanout::cursorArgb(static_cast<uint32_t>(port), pixels, info.cursorWidth, info.cursorHeight, info.cursorWidth,
+	                                      info.cursorHotSpotX, info.cursorHotSpotY);
+	if (ok && port < 8) {
+		gCursorHot[port][0] = info.cursorHotSpotX;
+		gCursorHot[port][1] = info.cursorHotSpotY;
+	}
+	if (!ok)   // IOFramebuffer draws this one itself: the plane's image before must not stay beside it (two pointers)
+		(void)PvScanout::cursorMove(static_cast<uint32_t>(port), 0, 0, false);
+	static uint32_t logged;
+	if (logged++ < 6)
+		FBLOG("cursor: our accelerator's: port %d: image %ux%u, hot spot %u,%u: %s", port, info.cursorWidth, info.cursorHeight,
+		      info.cursorHotSpotX, info.cursorHotSpotY, ok ? "on the head's plane" : "not converted (IOFramebuffer's test, or too large)");
+	if (pixels)
+		IOFree(pixels, kCursorAnnounced * kCursorAnnounced * 4);
+	return ok ? kIOReturnSuccess : kIOReturnUnsupported;
+}
+
+// IOFramebuffer::open asks kIOHardwareCursorAttribute before it uses a hardware cursor at all (+0x19e); IONDRV asks the NDRV, which
+// does not have one for each head.
+IOReturn wrapFbGetAttribute(void *fb, IOSelect attribute, uintptr_t *value)
+{
+	if (attribute == kIOHardwareCursorAttribute && value && cursorPort(fb) >= 0) {
+		*value = 1;
+		return kIOReturnSuccess;
+	}
+	return FunctionCast(wrapFbGetAttribute, orgFbGetAttribute)(fb, attribute, value);
+}
+
+IOReturn wrapSetCursorState(void *fb, SInt32 x, SInt32 y, bool visible)
+{
+	const int port = cursorPort(fb);
+	if (port < 0)
+		return FunctionCast(wrapSetCursorState, orgSetCursorState)(fb, x, y, visible);
+	const uint32_t *hot = port < 8 ? gCursorHot[port] : gCursorHot[0];
+	const uint64_t from = mach_absolute_time();
+	const bool ok = PvScanout::cursorMove(static_cast<uint32_t>(port), x + static_cast<int32_t>(hot[0]), y + static_cast<int32_t>(hot[1]),
+	                                      visible);
+	// (diagnostic, the pointer lagged) how many moves and how long each took, the lock wait included: a line every 10 s with moves
+	static uint64_t windowAt, moves, worst, total;
+	uint64_t now = mach_absolute_time(), ns = 0;
+	absolutetime_to_nanoseconds(now - from, &ns);
+	moves++;
+	total += ns;
+	worst = ns > worst ? ns : worst;
+	uint64_t sinceNs = 0;
+	absolutetime_to_nanoseconds(now - windowAt, &sinceNs);
+	if (sinceNs >= 10000000000ull) {
+		if (windowAt)
+			FBLOG("cursor: our accelerator's: %llu moves in %llu s, %llu us on average, the longest %llu us", moves, sinceNs / 1000000000ull,
+			      total / moves / 1000, worst / 1000);
+		windowAt = now;
+		moves = total = worst = 0;
+	}
+	return ok ? kIOReturnSuccess : kIOReturnUnsupported;
+}
+#endif
+
 // Head 0's framebuffer: on the GPU itself, or on a "display" nub IONDRVSupport hangs under it (the B550 board of 2026-11:
 // there, missing it left the head refused for good, its pipe scanning stale VRAM). The heads' own nubs are skipped; of
 // several, the oldest: the boot display's comes first, other "display" nubs' framebuffers only once the device is up.
@@ -1214,7 +1315,7 @@ void attach(FbEntry &e) {
 		RDNA4PvNub::publish(pci, pvGpu);
 	if (pvGpu && dev.isAmd && pvDelay)
 		RDNA4PvNub::setLateParent(pci);
-	if (pvGpu && dev.isAmd)
+	if (dev.isAmd)   // (the host's; without rdna4-pvgpu our accelerator's display host, pvPresent)
 		RDNA4PvNub::setCompute(&st->compute);
 #endif
 
@@ -1392,6 +1493,22 @@ uint8_t *fbController(IOService *fb) {
 	return priv ? *reinterpret_cast<uint8_t **>(priv) : nullptr;
 }
 
+// The controller's 'wsup' bit of framebuffer `fb` cleared (see wrapFbOpen): for one WindowServer never opens. Returns the controller's
+// bits before, or -1 without a controller or slot.
+int clearServerUpBit(IOService *fb) {
+	uint8_t *ctl = fb && fb->metaCast("IONDRVFramebuffer") ? fbController(fb) : nullptr;
+	if (!ctl)
+		return -1;
+	auto *const *table = reinterpret_cast<IOService *const *>(ctl + 0x18);
+	for (uint32_t slot = 0; slot < 8; slot++)
+		if (table[slot] == fb) {
+			const uint8_t was = ctl[0x1b4];
+			__atomic_fetch_and(ctl + 0x1b4, static_cast<uint8_t>(~(1u << slot)), __ATOMIC_SEQ_CST);
+			return was;
+		}
+	return -1;
+}
+
 // The paravirtual GPU's framebuffer (Apple's driver, on our nub).
 bool isParavirtFb(IOService *fb) {
 	const OSMetaClass *meta = fb ? fb->getMetaClass() : nullptr;
@@ -1450,6 +1567,10 @@ IOReturn wrapFbOpen(IOService *fb) {
 		      fb->getName(), fb->getRegistryEntryID(), ctl[0x1b4]);
 		ctl[0x1b4] = 0;
 	}
+	// On the native desktop (rdna4-accel=4) the bare ones are hidden from WindowServer the same way (RDNA4Accel::isBareFramebuffer):
+	// one opened after that was decided is marked up here, the ones before when it is (ndrvServerNeverOpens).
+	if (ctl && r == kIOReturnSuccess && RDNA4Accel::framebuffersDecided() && RDNA4Accel::isBareFramebuffer(fb))
+		ndrvServerNeverOpens(fb);
 	return r;
 }
 
@@ -1552,6 +1673,47 @@ IOReturn wrapFbSetPowerState(IOService *fb, unsigned long state, IOService *devi
 	return FunctionCast(wrapFbSetPowerState, orgFbSetPowerState)(fb, state, device);
 }
 
+// WebKit's GPU process may read /Library/GPUBundles but its sandbox (com.apple.WebKit.GPUProcess.sb) denies
+// file-map-executable there: Apple's own GPU drivers live in /System/Library/Extensions, which it allows, so Apple never
+// needs the exec-map of a third-party bundle. The result is that the GPU process can read our Metal driver but not run it,
+// and WebGL/Metal in Safari fall back or fail. This turns a *denied* executable mmap into an allow, only for a WebKit
+// process mapping a file inside our own bundle; every other mmap decision is left to the system policy. It is free on the
+// common path (the vnode/path/name work runs only after the policy already said no). Opt out with rdna4-webkitgpu=0.
+// Resolved by solveSymbol at patcher load, called through these: fg_get_vnode is not a KPI export, so calling it directly
+// would leave an unresolved kernel symbol and stop the kext loading. proc_best_name gives p_name when set (the full
+// "com.apple.WebKit.GPU", not p_comm's 16 chars).
+void *(*gFgGetVnode)(void *fg) = nullptr;                 // the fileglob's vnode, or null for a non-vnode file
+int (*gVnGetpath)(void *vp, char *buf, int *len) = nullptr;
+const char *(*gProcBestName)(void *proc) = nullptr;
+void *(*gCurrentProc)(void) = nullptr;
+
+mach_vm_address_t orgMacFileCheckMmap;
+
+int wrapMacFileCheckMmap(void *cred, void *fg, int prot, int flags, unsigned long long offset, int *maxprot) {
+	const int r = FunctionCast(wrapMacFileCheckMmap, orgMacFileCheckMmap)(cred, fg, prot, flags, offset, maxprot);
+	if (r == 0 || !fg)   // allowed already, or no file: the overwhelmingly common path, no further work
+		return r;
+	void *vp = gFgGetVnode(fg);
+	if (!vp)
+		return r;
+	char path[1024];
+	int len = sizeof(path);
+	if (gVnGetpath(vp, path, &len) != 0)
+		return r;
+	static const char kBundle[] = "/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/";
+	if (strncmp(path, kBundle, sizeof(kBundle) - 1) != 0)
+		return r;
+	const char *name = gProcBestName(gCurrentProc());
+	if (!name || strncmp(name, "com.apple.WebKit", 16) != 0)   // WebKit's GPU (and other WebKit) processes only
+		return r;
+	static uint32_t logged = 0;
+	if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 4)
+		FBLOG("sandbox: %s may map %s (the sandbox had denied the executable mapping)", name, path);
+	if (maxprot)
+		*maxprot |= 0x4;   // VM_PROT_EXECUTE: the policy cleared it; the map is allowed to be executable
+	return 0;
+}
+
 void processGraphics(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	if (index != kextIOGraphics.loadIndex)
 		return;
@@ -1583,9 +1745,30 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index, mach_vm_addre
 }
 
 bool ndrvRouted = false;   // processKext ran: by Lilu's load notice, or by lateNdrvCheck
+bool lateRouting = false;  // processKext is lateNdrvCheck's (the rdna4-ndrvdelay test hook leaves it be)
+// (test) rdna4-ndrvdelay=<ms>: Lilu's notice of IONDRVSupport acted on that much later, on a thread call: the boot framebuffer then starts
+// before our routes, as when another kext loads IONDRVSupport ahead of the notice (the race lateNdrvCheck has to win).
+struct DelayedRoute { KernelPatcher *patcher; size_t index; mach_vm_address_t address; size_t size; } gDelayedRoute;
+thread_call_t gDelayedRouteCall = nullptr;
+void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+void delayedRoute(thread_call_param_t, thread_call_param_t) {
+	FBLOG("ndrv: (test) rdna4-ndrvdelay: routing IONDRVSupport now");
+	processKext(nullptr, *gDelayedRoute.patcher, gDelayedRoute.index, gDelayedRoute.address, gDelayedRoute.size);
+}
 
 void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address,
                  size_t size) {
+	uint32_t delayMs = 0;
+	if (index == kextIONDRVSupport.loadIndex && !gDelayedRouteCall && !lateRouting &&
+	    PE_parse_boot_argn("rdna4-ndrvdelay", &delayMs, sizeof(delayMs)) && delayMs &&
+	    (gDelayedRouteCall = thread_call_allocate(delayedRoute, nullptr))) {   // (never freed: once a boot)
+		gDelayedRoute = { &patcher, index, address, size };
+		uint64_t deadline;
+		clock_interval_to_deadline(delayMs, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gDelayedRouteCall, deadline);
+		FBLOG("ndrv: (test) rdna4-ndrvdelay=%u: IONDRVSupport routed %u ms late", delayMs, delayMs);
+		return;
+	}
 	if (index != kextIONDRVSupport.loadIndex || __atomic_exchange_n(&ndrvRouted, true, __ATOMIC_SEQ_CST))
 		return;
 	KernelPatcher::RouteRequest request {
@@ -1628,6 +1811,20 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 			      "will not map the second head", patcher.getError());
 		patcher.clearError();
 	}
+#ifdef AMDRadeonRDNA4_PVGPU
+	{   // (pass-through unless our accelerator serves WindowServer)
+		uint32_t accel = 0;
+		gAccelCursor = Trial::bootArg("rdna4-accel", accel) && accel == 4;
+		KernelPatcher::RouteRequest cursor[] {
+			{ "__ZN17IONDRVFramebuffer14setCursorImageEPv", wrapSetCursorImage, orgSetCursorImage },
+			{ "__ZN17IONDRVFramebuffer14setCursorStateEiib", wrapSetCursorState, orgSetCursorState },
+			{ "__ZN17IONDRVFramebuffer12getAttributeEjPm", wrapFbGetAttribute, orgFbGetAttribute },
+		};
+		if (!patcher.routeMultiple(index, cursor, 3, address, size))
+			FBLOG("cursor: no IONDRVFramebuffer::setCursorImage/setCursorState/getAttribute routes (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+#endif
 	// Both kinds of hot-plug start their HPD poll when IOFramebuffer opens.
 	uint32_t hotplug = second >= 2 ? 2 : 0, dptrain = 0;
 	if (second >= 2)
@@ -1689,53 +1886,52 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	patcher.clearError();
 }
 
-// Boots where IONDRVSupport is loaded where Lilu does not see it: SimpleHDA loads it itself the moment the system kext collection is ready
-// (2026-10-22: at 18 s, the framebuffer published 0.4 s later; Lilu's first load notice of the boot at 21 s). Lilu then never calls
-// processKext, IONDRVFramebuffer starts without our routes and is gone, and the card is never brought up (only the firmware's picture).
-// From 30 s on (by then the boot's kexts have loaded; on other boots processKext has run long before): if processKext has not run and
-// IONDRVSupport is in the kernel's kext list, run it with that kext's address, then register the GPU again so that IONDRVFramebuffer matches
-// again, now through our routes. Tried every 2 s until 120 s.
+// Boots where IONDRVSupport is loaded where Lilu does not see it in time: SimpleHDA loads it itself the moment the system kext collection is
+// ready (2026-10-22: at 18 s, the framebuffer published 0.4 s later; Lilu's first load notice of the boot at 21 s). Then IONDRVFramebuffer
+// starts without our routes and is gone, and the card is never brought up (only the firmware's picture): lateNdrvCheck below.
 KernelPatcher *gPatcher = nullptr;
 thread_call_t gLateNdrv = nullptr;
-
+// IONDRVSupport routed from the kernel's kext list when Lilu has not told us of its load: polled every 20 ms from 1 s on (every 2 s from 60
+// s, until 120 s), so the routes are in before its framebuffers match. SimpleHDA loads IONDRVSupport itself inside the catalog hook and
+// holds its personalities until its own linking is done (~0.5 s on the rig); Lilu's notice came after the boot framebuffer had started in
+// some boots, which used up the boot display's NDRV for good: the card never came up. Matching the framebuffers again afterwards (the
+// framebuffers terminated, the display nubs or the GPU registered again) did not bring it back on the card (2026-11-21): be in time.
+// Card: with Lilu's notice held back 3 s (rdna4-ndrvdelay=3000) routed at 9.8 s from the list, the card up as on a normal boot.
 void lateNdrvCheck(thread_call_param_t, thread_call_param_t) {
-	if (__atomic_load_n(&ndrvRouted, __ATOMIC_SEQ_CST) || !gPatcher)
-		return;
-	kmod_info_t *ndrv = nullptr;
-	if (auto **kmods = reinterpret_cast<kmod_info_t **>(gPatcher->solveSymbol(KernelPatcher::KernelID, "_kmod")))
-		for (kmod_info_t *k = *kmods; k && !ndrv; k = k->next)   // as Lilu walks it (kern_patcher.cpp processAlreadyLoadedKexts)
-			if (!strncmp(k->name, kextIONDRVSupport.id, KMOD_MAX_NAME))
-				ndrv = k;
-	gPatcher->clearError();
 	uint64_t up = 0;
 	absolutetime_to_nanoseconds(mach_absolute_time(), &up);
-	if (!ndrv) {
-		if (up < 120ull * NSEC_PER_SEC) {
-			uint64_t deadline;
-			clock_interval_to_deadline(2, kSecondScale, &deadline);
-			thread_call_enter_delayed(gLateNdrv, deadline);
-		} else {
+	auto again = [](uint64_t ms) {
+		uint64_t deadline;
+		clock_interval_to_deadline(static_cast<uint32_t>(ms), kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gLateNdrv, deadline);
+	};
+	if (__atomic_load_n(&ndrvRouted, __ATOMIC_SEQ_CST))   // Lilu told us in time
+		return;
+	static kmod_info_t **kmods;
+	if (!kmods && gPatcher) {
+		kmods = reinterpret_cast<kmod_info_t **>(gPatcher->solveSymbol(KernelPatcher::KernelID, "_kmod"));
+		gPatcher->clearError();
+	}
+	kmod_info_t *ndrv = nullptr;
+	for (kmod_info_t *k = kmods ? *kmods : nullptr; k && !ndrv; k = k->next)   // as Lilu walks it (kern_patcher.cpp processAlreadyLoadedKexts)
+		if (!strncmp(k->name, kextIONDRVSupport.id, KMOD_MAX_NAME))
+			ndrv = k;
+	static uint32_t seen;   // polls that found it: Lilu's own notice gets one more poll, and the load its end
+	if (!ndrv || ++seen < 2) {
+		if (up < 120ull * NSEC_PER_SEC)
+			again(up < 60ull * NSEC_PER_SEC ? 20 : 2000);
+		else
 			FBLOG("ndrv: IONDRVSupport never loaded and Lilu never reported it: the card is not brought up");
-		}
 		return;
 	}
-	FBLOG("ndrv: Lilu did not report IONDRVSupport's load (another kext loaded it); routing it now, at %llu s", up / NSEC_PER_SEC);
+	FBLOG("ndrv: Lilu has not reported IONDRVSupport's load (another kext loaded it); routing it from the kext list at %llu ms",
+	      up / NSEC_PER_MSEC);
 	// As Lilu before its load callbacks (kern_api.cpp processKextLoadCallbacks): the kext's running symbols, and its whole size (a kmod's is
 	// only __TEXT since 11.0). Without this its symbols cannot be solved ("no loaded symbols buffer found", seen on the rig 2026-10-22).
 	const size_t size = gPatcher->updateRunningInfo(kextIONDRVSupport.loadIndex, ndrv->address, ndrv->size);
 	gPatcher->clearError();
+	lateRouting = true;
 	processKext(nullptr, *gPatcher, kextIONDRVSupport.loadIndex, ndrv->address, size);
-	// The GPU again: IONDRVFramebuffer matches again (its first instance did not start without our routes).
-	OSDictionary *match = IOService::serviceMatching("IOPCIDevice");
-	OSIterator *it = match ? IOService::getMatchingServices(match) : nullptr;
-	OSSafeReleaseNULL(match);
-	while (OSObject *o = it ? it->getNextObject() : nullptr)
-		if (auto *pci = OSDynamicCast(IOPCIDevice, o))
-			if (pci->configRead16(kIOPCIConfigVendorID) == 0x1002 && pci->configRead8(kIOPCIConfigClassCode + 2) == 0x03) {
-				FBLOG("ndrv: registering %s again for IONDRVFramebuffer", pci->getName());
-				pci->registerService();
-			}
-	OSSafeReleaseNULL(it);
 }
 
 void pluginStart() {
@@ -1765,7 +1961,7 @@ void pluginStart() {
 		pvGpu = 0;
 	// A VM without the emulated RDNA4 device never reaches attach(). rdna4-pvgpu-delay: on the rig the default 25 s falls into the system volume's snapshot
 	// remount (~26 s), where freeze-watch.sh cannot write; a later publish comes after login, where a live kernel log over ssh sees what follows.
-	PE_parse_boot_argn("rdna4-pvgpu-delay", &pvDelay, sizeof(pvDelay));
+	(void)Trial::bootArg("rdna4-pvgpu-delay", pvDelay);
 	if (pvGpu)
 		RDNA4PvNub::publishLater(pvGpu, pvDelay ? pvDelay * 1000 : 25000);
 #endif
@@ -1774,33 +1970,53 @@ void pluginStart() {
 	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "", pvGpu ? ", FAKE PARAVIRT GPU (VM only)" : "");
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
 	lilu.onKextLoadForce(&kextIOGraphics, 1, processGraphics, nullptr);
+	RDNA4Accel::start();   // our own accelerator: nothing published unless debug.rdna4_accel=1 (rdna4accel.cpp)
 #ifdef AMDRadeonRDNA4_PVGPU
 	// whether this boot has the fake GPU is only known once NVRAM is (rdna4-trial): the functions are resolved in any case
 	lilu.onKextLoadForce(&kextIOSurface, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 		if (index != kextIOSurface.loadIndex)
 			return;
-		// In the order of pvgpu.cpp's gSurfaceFns.
-		static const char *const names[RDNA4PvNub::kSurfaceFunctions] = {
+		// In the order of iosurface.hpp's IOSurfaceFunctions.
+		static const char *const names[kSurfaceFunctions] = {
 			"__ZN13IOSurfaceRoot13lookupSurfaceEjP4task", "__ZNK9IOSurface19getMemoryDescriptorEv", "__ZNK9IOSurface14getBytesPerRowEv",
 			"__ZNK9IOSurface8getWidthEv", "__ZNK9IOSurface9getHeightEv", "__ZNK9IOSurface14getPixelFormatEv", "__ZNK9IOSurface13getBaseOffsetEv",
 			"__ZNK9IOSurface12getSurfaceIDEv", "__ZNK9IOSurface13getPlaneCountEv", "__ZNK9IOSurface14getPlaneOffsetEj",
 			"__ZNK9IOSurface19getPlaneBytesPerRowEj", "__ZNK9IOSurface13getPlaneWidthEj", "__ZNK9IOSurface14getPlaneHeightEj",
 			"__ZNK9IOSurface11getLockSeedEv", "__ZNK9IOSurface13getUnlockSeedEv"};
-		mach_vm_address_t fn[RDNA4PvNub::kSurfaceFunctions];
+		mach_vm_address_t fn[kSurfaceFunctions];
 		unsigned found = 0;
-		for (unsigned k = 0; k < RDNA4PvNub::kSurfaceFunctions; k++)
+		for (unsigned k = 0; k < kSurfaceFunctions; k++)
 			found += (fn[k] = patcher.solveSymbol(index, names[k], address, size)) != 0;
 		patcher.clearError();
-		if (found == RDNA4PvNub::kSurfaceFunctions)
-			RDNA4PvNub::setSurfaceFunctions(fn);
-		FBLOG("pvgpu: IOSurface: %u of %u functions found%s", found, RDNA4PvNub::kSurfaceFunctions,
-		      found == RDNA4PvNub::kSurfaceFunctions ? "" : ": no IOSurface textures");
+		if (found == kSurfaceFunctions)
+			setSurfaceFunctions(fn);
+		FBLOG("pvgpu: IOSurface: %u of %u functions found%s", found, kSurfaceFunctions,
+		      found == kSurfaceFunctions ? "" : ": no IOSurface textures");
 	}, nullptr);
 	PvHooks::start();
 	PvScanout::start();
 #endif
 	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
 		gPatcher = &patcher;
+		uint32_t webkit = 1;   // default on; rdna4-webkitgpu=0 opts out
+		if (!Trial::bootArg("rdna4-webkitgpu", webkit) || webkit) {
+			gFgGetVnode = reinterpret_cast<decltype(gFgGetVnode)>(patcher.solveSymbol(KernelPatcher::KernelID, "_fg_get_vnode"));
+			gVnGetpath = reinterpret_cast<decltype(gVnGetpath)>(patcher.solveSymbol(KernelPatcher::KernelID, "_vn_getpath"));
+			gProcBestName = reinterpret_cast<decltype(gProcBestName)>(patcher.solveSymbol(KernelPatcher::KernelID, "_proc_best_name"));
+			gCurrentProc = reinterpret_cast<decltype(gCurrentProc)>(patcher.solveSymbol(KernelPatcher::KernelID, "_current_proc"));
+			patcher.clearError();
+			if (gFgGetVnode && gVnGetpath && gProcBestName && gCurrentProc) {
+				KernelPatcher::RouteRequest wk {
+					"_mac_file_check_mmap", wrapMacFileCheckMmap, orgMacFileCheckMmap,
+				};
+				const bool routed = patcher.routeMultiple(KernelPatcher::KernelID, &wk, 1);
+				FBLOG("sandbox: mac_file_check_mmap %s: WebKit's GPU process may run /Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle",
+				      routed ? "routed" : "NOT routed");
+				patcher.clearError();
+			} else {
+				FBLOG("sandbox: not hooking mac_file_check_mmap: a helper symbol was not found (WebKit GPU map left to the system)");
+			}
+		}
 		if (RDNA4Device::systemSleepWanted()) {
 			KernelPatcher::RouteRequest power {
 				"__ZN9IOService19registerPowerDriverEPS_P14IOPMPowerStatem", wrapRegisterPowerDriver,
@@ -1824,7 +2040,7 @@ void pluginStart() {
 	});
 	if ((gLateNdrv = thread_call_allocate(lateNdrvCheck, nullptr))) {   // ponytail: never freed, it lives for the boot
 		uint64_t deadline;
-		clock_interval_to_deadline(30, kSecondScale, &deadline);
+		clock_interval_to_deadline(1, kSecondScale, &deadline);   // (the poll: lateNdrvCheck)
 		thread_call_enter_delayed(gLateNdrv, deadline);
 	}
 }
@@ -1832,6 +2048,16 @@ void pluginStart() {
 const char *bootargDebug[] { "-rdna4dbg" };
 
 } // namespace
+
+// rdna4accel.cpp, as WindowServer is let go: framebuffer `fb` is bare and hidden from it, so WindowServer never tells its controller
+// it is up ('wsup'); without this the controller's state kept bit 0x8 and every system sleep waited 90 s for it (gIOGNotifyTO:
+// "PM priority notification timeout (com.apple.iokit.IOGraphicsFamily)", 2026-11-22).
+void ndrvServerNeverOpens(IOService *fb) {
+	const int was = clearServerUpBit(fb);
+	if (was >= 0)
+		FBLOG("ndrv: %s %llx (bare, hidden from WindowServer): marked up for WindowServer (controller's bits 0x%02x before)",
+		      fb->getName(), fb->getRegistryEntryID(), was);
+}
 
 PluginConfiguration ADDPR(config) {
 	xStringify(PRODUCT_NAME),
@@ -1847,6 +2073,16 @@ PluginConfiguration ADDPR(config) {
 
 #ifdef AMDRadeonRDNA4_PVGPU
 // --- the heads as the paravirtual displays (pvscanout.hpp) ---------------------
+
+bool PvScanout::framebufferLit(IOService *fb)
+{
+	if (Head2 *h = headFor(fb))
+		return h->connected || h->waitClocks;
+	for (const auto &e : fbTable)
+		if (e.fb == fb)
+			return e.state && e.state == bootState;
+	return false;
+}
 
 bool PvScanout::enabled()
 {
@@ -1879,6 +2115,21 @@ uint32_t PvScanout::count()
 	}
 
 	return 1 + pvPortCount;
+}
+
+int PvScanout::portOf(IOService *fb)
+{
+	(void)PvScanout::count();   // (numbers the ports)
+	if (Head2 *h = headFor(fb)) {
+		for (uint32_t i = 0; i < pvPortCount; i++)
+			if (pvPorts[i] == h)
+				return static_cast<int>(i) + 1;
+		return -1;
+	}
+	for (const auto &e : fbTable)
+		if (e.fb == fb)
+			return e.state && e.state == bootState ? 0 : -1;
+	return -1;
 }
 
 bool PvScanout::mode(uint32_t port, uint32_t &width, uint32_t &height)
@@ -2220,10 +2471,14 @@ static bool pvOnCursorPipe(uint32_t port, Call call)
 
 	if (!dev)
 		return false;
+
+	// held for the boot head as well: the device's cursor state is one for both heads, and our accelerator's framebuffers call from
+	// their own threads at once (the paravirtual host from its one work loop): a boot-head move in the middle of the second head's
+	// image went to the wrong pipe
+	RDNA4Device::ExtraHold hold(*dev);
 	if (!extra)
 		return call(*dev);
 
-	RDNA4Device::ExtraHold hold(*dev);
 	dev->selectExtra(extra->slot);
 	dev->setCursorPipe(dev->xp().pipe);
 	const bool ok = call(*dev);
@@ -2237,6 +2492,27 @@ bool PvScanout::cursorImage(uint32_t port, const uint32_t *argb, uint32_t width,
 	return pvOnCursorPipe(port, [&](RDNA4Device &dev) {
 		return dev.setCursorPixels(argb, width, height, pitch, hotX, hotY) == kIOReturnSuccess;
 	});
+}
+
+// A cursor image larger than the plane (macOS's are announced at 128x128): what it covers (alpha above 0) and its hot spot onto the
+// plane, when that fits.
+bool PvScanout::cursorArgb(uint32_t port, const uint32_t *argb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t hotX, uint32_t hotY)
+{
+	if (!argb || !width || !height)
+		return false;
+
+	uint32_t x0 = hotX < width ? hotX : width - 1, y0 = hotY < height ? hotY : height - 1, x1 = x0, y1 = y0;
+
+	for (uint32_t y = 0; y < height; y++)
+		for (uint32_t x = 0; x < width; x++)
+			if (argb[y * pitch + x] >> 24) {
+				x0 = x < x0 ? x : x0;
+				x1 = x > x1 ? x : x1;
+				y0 = y < y0 ? y : y0;
+				y1 = y > y1 ? y : y1;
+			}
+
+	return cursorImage(port, argb + y0 * pitch + x0, x1 - x0 + 1, y1 - y0 + 1, pitch, hotX - x0, hotY - y0);
 }
 
 // x, y: the hot spot's position (what the guest's page holds); drawHardwareCursor takes the image's top-left corner.

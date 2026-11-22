@@ -1,7 +1,7 @@
 # Metal spike: what Apple's AMD stack is, which routes lead to a Metal driver for gfx1201, and what "ready to start" means
 
 Written 2026-09-30 for hub-task-352. **Read-only research: no GPU was used, no kext code was written, the stick was not touched.**
-Builds on `docs/spike-hardware-acceleration.md` (2026-09-27, compute/Vulkan/Metal verdicts) and `docs/metal-readiness.md` (branch `premetal/metal-ready`).
+Builds on `docs/spike-hardware-acceleration.md` (2026-09-27, compute/Vulkan/Metal verdicts) and `docs/metal-readiness.md`.
 
 Evidence tags, used strictly:
 
@@ -106,7 +106,7 @@ What must be true: Apple's `AMDRadeonX6000MTLDriver` runs in user space against 
 
 **ISA differences that break byte-copying** (sub-agent run with `llvm-mc` 22.1.8, plus my re-checks):
 
-- The same bytes decode as different instructions. [MEASURED by me] gfx1030 `s_endpgm` `BF810000` is `s_setkill 0` on gfx1201 (this is the bug fixed in `vmtest.cpp` on `premetal/w13`); `s_barrier` `BF8A0000` is `s_wait_idle`; `BE800301` (`s_mov_b32`) is `s_cmov_b64`; `s_barrier` does not assemble for gfx1201 (`s_barrier_signal -1` + `s_barrier_wait -1`); `v_fma_f32` is `D54B0000` on gfx1030 and `D6130000` on gfx1201.
+- The same bytes decode as different instructions. [MEASURED by me] gfx1030 `s_endpgm` `BF810000` is `s_setkill 0` on gfx1201 (this is the bug fixed in `vmtest.cpp` on `w13`); `s_barrier` `BF8A0000` is `s_wait_idle`; `BE800301` (`s_mov_b32`) is `s_cmov_b64`; `s_barrier` does not assemble for gfx1201 (`s_barrier_signal -1` + `s_barrier_wait -1`); `v_fma_f32` is `D54B0000` on gfx1030 and `D6130000` on gfx1201.
 - [SOURCED/measured, agent] Opcodes renumbered: SOP1 62 of 63, SOPP 23 of 24, VOPC 142 of 162, VOP3 169 of 300 differ; VOP1 and DS do not. Removed: SDWA, `s_waitcnt_vscnt`, the `s_cmpk_*` family, VINTRP (replaced by `ds_param_load` + `v_interp_p10/p2`), `exp param*`, `glc/slc/dlc` (now SCOPE/TH), several hwregs. Counters split into `s_wait_loadcnt/storecnt/samplecnt/bvhcnt/kmcnt/dscnt`; legacy `s_waitcnt` still assembles but is "wait for idle". Memory encodings grow (global load 8 -> 12 bytes, MUBUF -> VBUFFER, MIMG -> VIMAGE/VSAMPLE), so **every branch offset changes**.
 - [SOURCED/measured, agent] On five small gfx1030 OpenCL kernels 96 % (564/586) of wave32 instructions assembled unchanged for gfx1201 and code grew 3.2 %: the mnemonic layer is easy. The failures were `s_barrier`, SDWA and FLAT_SCR setreg. **The corpus has no graphics, image or scratch code: it says nothing about the hard layers.**
 - Compute ABI: gfx10.3 passes workgroup ids in SGPRs after the user SGPRs, plus a tg_size SGPR; gfx12 passes them in `TTMP7/8/9` and packs local ids into `v0` ({Z,Y,X} 10 bits each) ([RDNA4 ISA pp. 43-44](https://gpuopen.com/download/rdna4-instruction-set-architecture.pdf)). A launch shim must unpack them into the registers the old kernel expects (needs free registers: register-allocation knowledge).
@@ -351,7 +351,7 @@ MetalCyan is a **strong existence proof that Apple's own AMD Metal stack (kernel
 
 ## 11. E1 result: the impostor `IOAccelerator` in the emulated Recovery (hub-task-354, runs by Kiln as hub-task-356 and hub-task-419)
 
-**What ran.** Kext built from `premetal/metal-spike` at `e4975d4` (loads in the boot collection, see 9.7), Recovery of macOS 26.6.2 (25G83) in Kiln's emulator loop, boot-args `rdna4-accelcensus=1` (every user-client call refused, `kIOReturnUnsupported`) and `=2` (every call succeeds with zeroed outputs); no GPU, no card. The in-guest tool `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-census` (`tools/metal/accelcensus/census.m`) enumerates the registry, calls `MTLCopyAllDevices()` / `MTLCreateSystemDefaultDevice()` and opens the service with user-client types 0, 1, 2, 4-9, 256. Run directories (outside git): `~/work/tools/emu/runs/20261001-181426-boot1-census1b` and `...-181622-boot1-census2b`. Evidence in git: `docs/e1-census/level{1,2}-tool.txt` (what the tool saw), `level{1,2}-kernel.log` (every property read and user-client call the kext saw, per process), `level{1,2}-ioreg-node.txt` (the published node).
+**What ran.** Kext built from `metal-spike` at `e4975d4` (loads in the boot collection, see 9.7), Recovery of macOS 26.6.2 (25G83) in Kiln's emulator loop, boot-args `rdna4-accelcensus=1` (every user-client call refused, `kIOReturnUnsupported`) and `=2` (every call succeeds with zeroed outputs); no GPU, no card. The in-guest tool `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-census` (`tools/metal/accelcensus/census.m`) enumerates the registry, calls `MTLCopyAllDevices()` / `MTLCreateSystemDefaultDevice()` and opens the service with user-client types 0, 1, 2, 4-9, 256. Run directories (outside git): `~/work/tools/emu/runs/20261001-181426-boot1-census1b` and `...-181622-boot1-census2b`. Evidence in git: `docs/e1-census/level{1,2}-tool.txt` (what the tool saw), `level{1,2}-kernel.log` (every property read and user-client call the kext saw, per process), `level{1,2}-ioreg-node.txt` (the published node).
 
 ### 11.1 Measured
 

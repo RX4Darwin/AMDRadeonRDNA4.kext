@@ -1,0 +1,69 @@
+# Builds the kext (plain, PVGPU, DEBUG), the user-space tools and the native Metal bundle, and runs the host tests, on every push and
+# pull request. No card here: a green run says it builds and the host checks pass, not that it works on an RX 9070 XT. Nothing is
+# published: releases stay manual (CONTRIBUTING.md).
+name: CI
+
+on:
+  push:
+    branches: [main, next, "devel/**", "premetal/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain
+        run: |
+          sw_vers; xcodebuild -version; uname -m
+          # Homebrew's llvm (23): what the committed shader headers were made with (check-isa compares them with a fresh assembly;
+          # LLVM 19 encodes an unused VOP3 operand differently and cannot decode nggfill's VOP3 literals)
+          brew install llvm
+          echo "LLVM_MC=$(brew --prefix llvm)/bin/llvm-mc" >> "$GITHUB_ENV"
+          # Xcode 26 ships the Metal compiler as a separate component (the bundle's probe.metallib)
+          xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+
+      - name: Kext, plain
+        run: make all PVGPU=0
+
+      - name: Kext, PVGPU (what the release zips are)
+        run: make all PVGPU=1
+
+      - name: Kext, PVGPU, DEBUG
+        run: make all PVGPU=1 CONFIG=DEBUG
+
+      - name: "Host tests (no ROM dump, no firmware: those checks say they are left out)"
+        run: make test
+
+      - name: Native Metal bundle and mtlprobe
+        run: |
+          sh tools/metal/native/build.sh
+          clang -arch x86_64 -mmacosx-version-min=11.0 -fobjc-arc tools/metal/m1/mtlprobe.m -framework Foundation -framework Metal \
+            -framework IOSurface -framework AppKit -framework QuartzCore -framework IOKit -o Build/mtlprobe
+
+  firmware:
+    # The checks that need AMD's linux-firmware blobs (fetched from upstream, so upstream can break this job without us)
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Fetch firmware
+        run: tools/build/fetch-firmware.sh
+      - name: Host tests with firmware
+        run: make test
+      - name: Kext with firmware embedded
+        run: make all PVGPU=1

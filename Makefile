@@ -12,6 +12,7 @@
 # Everything that is built goes to Build/:
 #
 #   Build/AMDRadeonRDNA4-<version>-<CONFIG>/AMDRadeonRDNA4.kext
+#   Build/AMDRadeonRDNA4-<version>-<CONFIG>/AMDRadeonRDNA4MTLDriver.bundle   `make metal-driver`: the Metal driver and its user space
 #   Build/AMDRadeonRDNA4-<version>-<CONFIG>/bin/     rdna4-run, n48nprobe, cgmodes, the rig's scripts, and with Mesa built
 #                                                   (`make mesa`) libvulkan_radeon.dylib, vkprobe and swapprobe;
 #                                                   `make vkcube` adds Khronos's vkcube and loader
@@ -36,7 +37,7 @@ PRODUCT      = AMDRadeonRDNA4
 # The one place the version is written (CONTRIBUTING.md says when it changes). It goes into the bundle's Info.plist,
 # the kext's kmod_info and the name of the product directory. The commit a build was made from ("-dirty": with
 # uncommitted changes) goes into the kernel log and the registry (AMDRadeonRDNA4,Build) beside it.
-VERSION      = 0.3.3
+VERSION      = 0.4.0
 
 # RELEASE: -Os, what every card test up to 0.1.0 ran. DEBUG: -O0 and DEBUG defined (Lilu's DBGLOG lines).
 CONFIG       ?= RELEASE
@@ -47,10 +48,12 @@ CONFIG       ?= RELEASE
 # skipped there because the device has no BAR5.
 VMTEST       ?= 0
 
-# PVGPU=1: the fake Apple paravirtual GPU of M0 (src/pvgpu.cpp, rdna4-pvgpu; docs/m0-pvgpu.md) is built in. Left out
-# otherwise: on Tahoe, with it merely in the kext (its classes registered, no instance, even with rdna4-off=1), Restart
-# and Shut Down from the Apple menu froze the whole machine (2026-10-14, cause inside macOS unknown).
-PVGPU        ?= 0
+# PVGPU: the paravirtual GPU (src/pvgpu.cpp; docs/m0-pvgpu.md) and what the native accelerator shares with it (src/pvhooks.cpp,
+# the translator helper's slot, the heads as displays) are built in; each only runs when its boot-arg says so (rdna4-pvgpu=1,
+# rdna4-accel=4), off otherwise. PVGPU=0 leaves them out. It was the default until 2026-11-21: on Tahoe, with the paravirtual code
+# merely in the kext, Restart and Shut Down from the Apple menu once froze the machine (2026-10-14, cause inside macOS unknown);
+# every release and the rig have run PVGPU=1 builds since. To re-test with the paravirtual GPU off, then remove this flag.
+PVGPU        ?= 1
 
 ARCH         = x86_64
 DEPLOY       = 11.0
@@ -79,15 +82,23 @@ LILU_SHIM    = $(BUILD)/liluhdr
 LILU_STAMP   = $(LILU_SHIM)/.stamp
 
 # AMD firmware for the compute bring-up (src/compute.cpp, stage 2+): the
-# linux-firmware blobs in firmware/amdgpu/ (tools/build/fetch-firmware.sh) are
-# embedded when all are present; otherwise the kext builds without them and
-# those stages report it.
+# linux-firmware blobs in firmware/amdgpu/ (tools/build/fetch-firmware.sh).
+# There is one set a chip (src/fwset.hpp), and the display microcontroller's
+# firmware, which both chips take. A set is embedded when all of it and the
+# display firmware are present; with no set the kext builds without firmware
+# and those stages report it.
 FW_DIR       = firmware/amdgpu
-FW_BLOBS     = $(FW_DIR)/psp_14_0_3_sos.bin $(FW_DIR)/smu_14_0_3.bin \
+FW_COMMON    = $(FW_DIR)/dcn_4_0_1_dmcub.bin
+FW_NAVI48    = $(FW_DIR)/psp_14_0_3_sos.bin $(FW_DIR)/smu_14_0_3.bin \
                $(FW_DIR)/sdma_7_0_1.bin $(FW_DIR)/gc_12_0_1_pfp.bin \
                $(FW_DIR)/gc_12_0_1_me.bin $(FW_DIR)/gc_12_0_1_mec.bin \
                $(FW_DIR)/gc_12_0_1_uni_mes.bin $(FW_DIR)/gc_12_0_1_imu.bin \
-               $(FW_DIR)/gc_12_0_1_rlc.bin $(FW_DIR)/dcn_4_0_1_dmcub.bin
+               $(FW_DIR)/gc_12_0_1_rlc.bin
+FW_NAVI44    = $(FW_DIR)/psp_14_0_2_sos.bin $(FW_DIR)/smu_14_0_2.bin \
+               $(FW_DIR)/sdma_7_0_0.bin $(FW_DIR)/gc_12_0_0_pfp.bin \
+               $(FW_DIR)/gc_12_0_0_me.bin $(FW_DIR)/gc_12_0_0_mec.bin \
+               $(FW_DIR)/gc_12_0_0_uni_mes.bin $(FW_DIR)/gc_12_0_0_imu.bin \
+               $(FW_DIR)/gc_12_0_0_rlc.bin
 
 # A dump of the card's ROM, which the host tests parse and the emulator's option ROM is made from. It is the card
 # vendor's and not in the repository (firmware/README.md): without it `make test` leaves the ROM checks out.
@@ -105,7 +116,7 @@ RUN          = userspace/rdna4-run
 VULKAN       = userspace/vulkan
 CENSUS       = tools/metal/accelcensus
 
-.PHONY: all kext tools userspace n48nprobe mesa metal-helper vulkan-products vkcube census-tool census-stub census-pathlog \
+.PHONY: all kext tools userspace metal-driver package n48nprobe mesa metal-helper vulkan-products vkcube census-tool census-stub census-pathlog \
         test atomdump check-isa check-config product-dir clean distclean
 
 all: check-config kext tools
@@ -130,8 +141,11 @@ kext: check-config $(LILU_STAMP)
 	cmp -s $(OBJDIR)/buildrev.h.new $(OBJDIR)/buildrev.h || { cp $(OBJDIR)/buildrev.h.new $(OBJDIR)/buildrev.h; \
 		rm -f $(OBJDIR)/plugin.o $(OBJDIR)/device.o $(OBJDIR)/kmod_info.o; }; \
 	rm -f $(OBJDIR)/buildrev.h.new
-	@missing=; for f in $(FW_BLOBS); do [ -f $$f ] || missing=1; done; \
-	{ if [ -n "$$missing" ]; then echo "#define AMDRadeonRDNA4_NO_FIRMWARE 1"; else cksum $(FW_BLOBS) | sed 's|^|// |'; fi; \
+	@n48=1; for f in $(FW_COMMON) $(FW_NAVI48); do [ -f $$f ] || n48=; done; \
+	n44=1; for f in $(FW_COMMON) $(FW_NAVI44); do [ -f $$f ] || n44=; done; \
+	{ if [ -z "$$n48$$n44" ]; then echo "#define AMDRadeonRDNA4_NO_FIRMWARE 1"; else cksum $(FW_COMMON) | sed 's|^|// |'; fi; \
+	  if [ -n "$$n48" ]; then echo "#define AMDRadeonRDNA4_FW_NAVI48 1"; cksum $(FW_NAVI48) | sed 's|^|// |'; fi; \
+	  if [ -n "$$n44" ]; then echo "#define AMDRadeonRDNA4_FW_NAVI44 1"; cksum $(FW_NAVI44) | sed 's|^|// |'; fi; \
 	  if [ "$(PVGPU)" = 1 ]; then echo "#define AMDRadeonRDNA4_PVGPU 1"; fi; } > $(OBJDIR)/fwconfig.h.new; \
 	cmp -s $(OBJDIR)/fwconfig.h.new $(OBJDIR)/fwconfig.h || { cp $(OBJDIR)/fwconfig.h.new $(OBJDIR)/fwconfig.h; \
 		rm -f $(OBJDIR)/*.o; }; \
@@ -218,7 +232,7 @@ mesa:
 	@$(MAKE) vulkan-products
 	@otool -l $(RADV_LIB) | grep -A4 LC_BUILD_VERSION | grep -q 'minos $(DEPLOY)' || \
 		{ echo "$(RADV_LIB) is not built for macOS $(DEPLOY)" >&2; exit 1; }
-	@echo "Built $(RADV_LIB), $(BIN)/vkprobe and $(BIN)/swapprobe for $(ARCH) (min macOS $(DEPLOY))"
+	@echo "Built $(RADV_LIB), $(BIN)/vkprobe, $(BIN)/swapprobe and $(BIN)/winprobe for $(ARCH) (min macOS $(DEPLOY))"
 
 vulkan-products:
 	@[ -f $(RADV_BUILT) ] || exit 0; \
@@ -229,7 +243,22 @@ vulkan-products:
 			echo "$(CXX) -x c ... $(VULKAN)/$$p.c -o $(BIN)/$$p"; \
 			$(CXX) -x c $(USER_FLAGS) -I$(RADV_DIR)/mesa/include -I$(VULKAN) $(VULKAN)/$$p.c -o $(BIN)/$$p || exit 1; \
 		fi; \
-	done
+	done; \
+	if [ ! -f $(BIN)/winprobe ] || [ $(VULKAN)/winprobe.m -nt $(BIN)/winprobe ]; then \
+		echo "$(CXX) -x objective-c ... $(VULKAN)/winprobe.m -o $(BIN)/winprobe"; \
+		$(CXX) -x objective-c $(USER_FLAGS) -fno-objc-arc -I$(RADV_DIR)/mesa/include -I$(VULKAN) $(VULKAN)/winprobe.m -o $(BIN)/winprobe \
+			-framework Cocoa -framework QuartzCore || exit 1; \
+	fi
+
+# The Metal driver bundle with the driver's whole user space in it (tools/metal/native/build.sh; docs/packaging-plan.md): librdna4 and
+# RADV in Contents/Frameworks, the translator and the programs in Contents/Helpers.
+metal-driver:
+	sh tools/metal/native/build.sh
+
+# One installer for the driver bundle and its daemons (tools/package/package.sh): AMDRadeonRDNA4-<version>.pkg in the product dir. Needs
+# the translator (make metal-helper) and RADV (make mesa) built first; the kext is not in it.
+package: metal-driver
+	sh tools/package/package.sh $(PRODUCT_DIR) $(VERSION)
 
 # The Metal kernel translator's run-time helper for the rig (M3, docs/m1-stream.md s.5b); builds LLVM for x86_64 the first time.
 metal-helper:
@@ -240,7 +269,7 @@ metal-helper:
 # into $(BUILD)/vk-app the first time; needs cmake). docs/todo-vulkantest.md has the commands.
 vkcube: mesa
 	$(VULKAN)/build-app.sh $(BUILD)/vk-app $(RADV_BUILT) $(BIN)
-	@echo "Built $(BIN)/vkcube with libvulkan.dylib and vulkan/icd.d/radeon_icd.json beside it"
+	@echo "Built $(BIN)/vkcube with libvulkan.dylib and vulkan/icd.d/radeon_icd.json beside it, and $(BIN)/vkcube.app"
 
 # E1 trigger (docs/metal-spike.md): Objective-C, runs in Recovery next to rdna4-run.
 $(BIN)/rdna4-census: $(CENSUS)/census.m

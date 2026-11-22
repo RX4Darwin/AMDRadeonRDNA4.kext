@@ -3,6 +3,104 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
+## 0.4.0 (2026-11-22)
+
+**In short** (all on the RX 9070 XT, macOS Tahoe 26.6.2; the sections below and the commits have the details)
+- **The native desktop is the default**: WindowServer composes on the driver's own Metal device, through the driver's own
+  accelerator (an `IOGraphicsAccelerator2` derived at run time), its display pipes and a hardware cursor on both displays; not
+  Apple's paravirtual GPU any more (`rdna4-accel=0 rdna4-pvgpu=1` brings that back). No boot-args are needed: the options the
+  accelerated desktop needs are built in (`src/trial.cpp`). Updating from 0.3.3: README, "Updating from 0.3.3".
+- **OpenGL on the native device** (Apple's GL-on-Metal renderer, `rdna4-accelgl`, on by default): kitty, Sublime Text, Mixxx.
+- **Apps and games on the native device**: Safari and Chrome (WebGL), Maps, iTerm2/Metalterm, App Store and Finder icons, System
+  Settings' Displays pane, the Dock and Liquid Glass; vkQuake through MoltenVK (argument buffers); MetalQuake and Quake II
+  (BeauBender's `ref_metal`) with ray-traced shadows and effects (instance acceleration structures, ray queries in shaders, up to
+  128 textures through handles); Daggerfall Unity and OpenMW (shadow maps, depth-only passes, several colour attachments, BC
+  textures, depth views); plugin windows in Logic, Ableton Live 12 (Waves) and Cubase 11 (older AIR forms the translator now reads).
+- **Vulkan**: RADV in windows on the accelerated desktop (`VK_EXT_metal_surface`), three RADV clients at a time.
+- **One installer**: `AMDRadeonRDNA4-0.4.0.pkg` installs one driver bundle, `AMDRadeonRDNA4MTLDriver.bundle` (the Metal driver,
+  `librdna4`, RADV, the shader translator and the helpers inside), its daemons and `rdna4-run`; it replaces 0.3's scripts.
+- **System sleep on the native desktop**: both displays and the session come back (the runtime's clients and their VRAM kept
+  across the sleep), about 30 s from Sleep to S3.
+- **Navi 44 (RX 9060 XT)**: matched and given its firmware set; not run on a card.
+
+**Navi 44 (RX 9060 XT), a first step: not run on a card**
+- One kext for both chips: it carries the Navi 48 firmware set and the Navi 44 one (PSP 14.0.2, SMU 14.0.2, SDMA 7.0.0, GC 12.0.0),
+  each when its files are in `firmware/amdgpu/`, and takes the set of the GC version the card's IP discovery table gives
+  (`src/fwset.hpp`), as amdgpu names its files. `tools/build/fetch-firmware.sh` fetches both.
+- The card is matched (`1002:7590`) and named, and a code object built for gfx1200 is taken as one built for gfx1201 is: LLVM 23
+  gives every kernel in `src/shaders/` the same code for both.
+- Host test (`make test`): the Navi 44 set goes through the firmware parsers (its sOS package has 9 parts, no RAS driver and no RL,
+  where Navi 48's has 11; the same 19 images for the RLC autoload). The IP versions are from an RX 9060 XT 16 GB under Linux.
+- On an RX 9060 XT under Linux (Gigabyte, 2026-11-21): `make test ROM=` passes on its VBIOS and IP discovery table (two DisplayPort
+  paths and one HDMI); the IP register bases and `GB_ADDR_CONFIG` are the RX 9070 XT's, and 36 of the 37 GC registers of
+  `src/linuxref.hpp` read the same; `tools/linux/linux-replay/run.sh` draws the kext's triangle through amdgpu, 8192 px in all
+  seven variants, and the G4 colour triangle (`REPLAY_DRAW=col`) is right there too: 8192 px, every channel within 0.50 of the
+  barycentric colour, centroid `0xff555654`, the RX 9070 XT's figures.
+- The emulator can be an RX 9060 XT (`chip=navi44`) and can refuse a blob that is not from the chip's firmware set (`fwdir=`),
+  `docs/emu-linux.md`. Emulated boots 1, 3 and 8 with that card's VBIOS give the RX 9070 XT's rows.
+- The emulator draws the colour triangle (the attribute-ring path: `buffer_store_b128`, `ds_param_load`, `v_interp`) and its SMU's
+  activity and power follow the model's state, so `gfx-col`, `gfx-app-tricol` and `post-idle` are no longer FAIL by construction:
+  boots 3 and 8 have no FAIL row. Written from Mesa and `docs/g4-colour.md`, not from a card (`docs/emu-linux.md`).
+- `tools/linux/linux-capture.sh` must not be run on an RX 9060 XT: the machine froze on its register sweep, and again when the
+  same list was read one register at a time, at the read of `ODM_MEM_PWR_CTRL2` (`docs/emu-linux.md`).
+- Not looked at: the display paths of a Navi 44 board driven on a card (the second display's sequences are the RX 9070 XT's), power
+  management, the paravirtual GPU on two shader engines.
+
+**Native Metal (spike, `docs/native-metal-spike.md`)**
+- Apps, not only root: `rdna4-client-policy=local` lets the logged-in user open the kext's runtime client, only in a GPU address
+  space of its own and only with what a graphics client needs (no display, sensors, sleep test or quiesce). Card (Tahoe 26.6.2,
+  2026-11-19): the native device's compute, render and ray-query checks pass as a normal user; `rdna4-run sensors` is refused.
+- Libraries from Metal source on the native device: Metal's own compiler makes them, and the device translates their AIR. Card
+  (2026-11-19): `mtlprobe nativesrc` compiles a kernel from source and runs it, all right.
+- On the screen: an app's window drawn by the native device through `CAMetalLayer`. The kext maps an app's own memory (its
+  IOSurfaces, `newBufferWithBytesNoCopy:`) into its GPU address space (`rdna4_import_host`). Card (2026-11-19): `mtlprobe
+  nativewin` draws a window at 60 frames a second, composited by WindowServer beside the rest of the desktop.
+- 3D on the native device: depth buffers and the depth test, textures and samplers in shaders, indexed and instanced draws.
+  Card (2026-11-19): `mtlprobe nativespin` shows nine lit, textured, depth-tested cubes in a window at 1920x1200 and 60 frames
+  a second.
+- A real queue on the native device: `commit` returns at once, command buffers complete in order on a work thread, draws go out
+  without waiting for each other, and a blit encoder. Card (2026-11-19): four command buffers in flight complete in order and right,
+  1000 draws in one command buffer at 64 us each, `nativespin` still at 60 frames a second.
+- WindowServer on the native device (`rdna4-nativews=3`, Tahoe): both displays' menu bars show the app's menus; command buffers
+  run in enqueue order (no more flashing or stale parts of windows); no more logouts to the login window (a texture leak and
+  shaders that did not translate aborted WindowServer); about 3.5x the frames a second while windows move (draws written in
+  place, a draw's own target copied on the card). Card (2026-11-20): 11 apps open, windows moved on both displays, no crash.
+- Native WindowServer: no more torn frames while a window moves (a command buffer counts as scheduled once its draws are done);
+  draws that read their own target copy only the rows they cover (the translator records the textures a shader uses and a
+  matrix-times-attribute vertex position), and the wallpaper's video frame is no longer copied on the CPU every frame.
+- Native WindowServer: a moving window's display at about 59 frames a second, not 30: IOSurface imports kept and shared between the
+  textures made of them every frame, and freed host memory reused (each import, allocation and free was a kext call of about 1 ms).
+- Native WindowServer: render-pass clears filled on the card in order with the draws, not by the CPU after waiting for all of them.
+- Native WindowServer, `rdna4-nativeheld=1` (off by default): the displays' frames drawn in VRAM and presented from there (new runtime
+  call `PresentSource`, WindowServer only); with many apps open a moving window's display 74 % -> 98 % of frames on time.
+- Smoother cursor and frame pacing: a client's wait for its gfx fence no longer holds the runtime's lock while it polls, and the
+  paravirtual host keeps moving the cursor and raising VBL events while it waits for the card (VBLs 2 ms or more late 15 -> 1 in 5 s).
+- Native WindowServer: its main thread no longer waits for the card to finish each frame (a command buffer is scheduled once its draws
+  are on the ring; 128 draw slots; the runtime takes 128 gfx submissions in flight), and its draws go onto the ring 32 at a time in one
+  submit, not one kext call each.
+- Native Metal for apps: `debug.rdna4_nativeapps` / `rdna4-nativeapps` name processes that get the native device besides WindowServer
+  (Safari runs on it); sandboxed apps reach the runtime through the paravirtual accelerator; WebKit's GPU process gets Apple's Metal
+  plug-in again (it had none since the native desktop: the plug-in name is now answered per process).
+- Stencil and multisampling on the native device (ported from the paravirtual host): Depth32Float_Stencil8 and Stencil8
+  attachments, front and back stencil states and references, depth and stencil clears as fills on the card, 2x and 4x colour and
+  depth-stencil textures drawn with all their samples and resolved on the card (sRGB in linear light). Card (2026-11-20): `mtlprobe
+  nativestencil` passes stencil, depth and resolve at 1x and 4x; Maps runs on the native device (`Safari,Maps`), its map, labels and
+  pins as on Apple's paravirtual path.
+- The paravirtual host opens the runtime from its tick (from a draw, IOLog ran the timer thread's stack out: a double fault).
+- System sleep on the native desktop keeps the session: the runtime's clients, buffers, programs and page tables are kept, their
+  VRAM copied to host memory before the card loses its power and back after the wake; calls during the sleep wait instead of
+  failing. Before, WindowServer aborted at every sleep (the login window came back). `rdna4-sleepkeep=0` discards as before.
+  Card (Tahoe 26.6.2, 2026-11-22): 19 clients, 325 MiB saved in 90 ms and restored in 37 ms, WindowServer and the session kept
+  through two sleeps. Vulkan apps (`N48N`) still lose their session.
+- System sleep on the native desktop in about 30 s, not two minutes: the framebuffers hidden from WindowServer are marked up for it
+  in their IOGraphics controller, which otherwise held back the sleep's notification (WindowServer's 30 s ack, then a 90 s
+  IOGraphics wait). Card (2026-11-22): S3 0.8 s after the runtime's quiesce; the 30 s left is `wifip2pd`'s own timeout.
+- README: what to remove from the boot-args when updating from 0.3.3.
+- The display pipes take WindowServer's frames while a display sleeps (dropped; the family answered "offline" to each, about 1.4
+  failed submissions a second).
+- After a sleep, a main display at another mode than the boot one (2560x1440) comes back, and so does the second one.
+- `rdna4-pvgl` is off by default: OpenGL runs on the native accelerator (`rdna4-accelgl`); `rdna4-pvgl=1` for the paravirtual GPU.
+
 ## 0.3.3 (2026-11-19)
 
 **Metal (`make PVGPU=1`)**

@@ -6,8 +6,12 @@
  */
 
 #include "pvhooks.hpp"
+#include "rdna4accel.hpp"
 #include "klog.hpp"
 #include "pvscanout.hpp"
+#include "userclient.hpp"
+#include "accelcensus.hpp"
+#include "rdna4compute.h"
 #include "trial.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -46,10 +50,13 @@ constexpr const char kNdrvFramebuffer[] = "IONDRVFramebuffer";
 mach_vm_address_t orgDisable;
 mach_vm_address_t orgWait;
 mach_vm_address_t orgNewUserClient;
+mach_vm_address_t orgAccelNewUserClient;   /* IOGraphicsAccelerator2::newUserClient */
 mach_vm_address_t orgReadEdid;   /* IODisplay::readFramebufferEDID() */
 mach_vm_address_t fbOpen;   /* IOFramebuffer::open() */
 mach_vm_address_t orgMatchInternal;   /* IOService::matchInternal(OSDictionary *, UInt32, UInt32 *) */
 mach_vm_address_t orgServiceOpen;   /* is_io_service_open_extended */
+mach_vm_address_t orgObjectGetClass;   /* is_io_object_get_class */
+mach_vm_address_t orgPropertyBin;   /* is_io_registry_entry_get_property_bin_buf */
 void *ndrvVtable;   /* IONDRVFramebuffer's, once the heads are the paravirtual displays */
 mach_vm_address_t enable;
 uint32_t skipped;
@@ -142,7 +149,7 @@ void waitForParavirtDisplay()
 IOReturn wrapNewUserClient(void *fb, void *task, void *security, uint32_t type, void **handler)
 {
 	if (isClass(fb, kNdrvFramebuffer) && !PvScanout::known() && fbOpen) {
-		const IOReturn r = reinterpret_cast<IOReturn (*)(void *)>(fbOpen)(fb);
+		const IOReturn r = PvHooks::openFramebuffer(fb);
 
 		PLOG("opened framebuffer %p ahead of its first client (0x%x): the heads %s", fb, r,
 		     !PvScanout::known() ? "still undecided" : PvScanout::enabled() ? "are the paravirtual displays" : "are macOS's displays");
@@ -174,8 +181,36 @@ IOReturn wrapNewUserClient(void *fb, void *task, void *security, uint32_t type, 
  * every key, nor matchPassive, which a match by class alone does not call
  * (copyExistingServices: instanceMatch calls matchInternal).
  */
+// (diagnostic, rdna4-accel=4) which user-space matches reach our framebuffers: the process, the table's keys, the verdict
+void logFramebufferMatch(void *service, OSDictionary *table, bool hide)
+{
+	static uint32_t logged;
+	if (logged >= 60 || !table)
+		return;
+	logged++;
+	char name[32] = {}, keys[200] = {};
+	proc_selfname(name, sizeof(name));
+	size_t at = 0;
+	if (OSCollectionIterator *it = OSCollectionIterator::withCollection(table)) {
+		while (auto *k = OSDynamicCast(OSSymbol, it->getNextObject()))
+			at += snprintf(keys + at, at < sizeof(keys) ? sizeof(keys) - at : 0, "%s ", k->getCStringNoCopy());
+		it->release();
+	}
+	PLOG("match from %s on %s 0x%llx: keys %s-> %s", name, static_cast<IORegistryEntry *>(service)->getName(),
+	     static_cast<IORegistryEntry *>(service)->getRegistryEntryID(), keys, hide ? "hidden" : "found");
+}
+
 bool wrapMatchInternal(void *service, OSDictionary *table, uint32_t options, uint32_t *done)
 {
+	const bool hide = RDNA4Accel::hidesFromMatch(static_cast<IORegistryEntry *>(service), table);   // (false at once unless rdna4-accel=4)
+	if (current_task() != kernel_task && RDNA4Accel::framebuffersDecided() && isClass(service, kNdrvFramebuffer))
+		logFramebufferMatch(service, table, hide);
+	if (hide && current_task() != kernel_task) {
+		if (hidden++ < 8)
+			PLOG("framebuffer %p left out of a user-space match (our accelerator serves WindowServer: found by registry ID only)", service);
+
+		return false;
+	}
 	if (ndrvVtable && *static_cast<void **>(service) == ndrvVtable && current_task() != kernel_task && PvScanout::enabled()) {
 		if (hidden++ < 4)
 			PLOG("framebuffer %p left out of a user-space match: the heads are the paravirtual displays", service);
@@ -221,6 +256,40 @@ IOService *oldestNdrvFramebuffer()
  * QuartzCore (2026-11-14). Held here, no IOKit lock is taken yet. With it,
  * the first WindowServer of the boot lives (the rig, 2026-11-14).
  */
+/*
+ * is_io_registry_entry_get_property_bin_buf (IORegistryEntryCreateCFProperty, SearchCFProperty): a native process
+ * (accelNativeCaller) reading the paravirtual accelerator's MetalPluginName or MetalPluginClassName reads RDNA4MetalPluginName /
+ * ClassName, ours; every other process Apple's (its sandbox may not map our bundle: WebKit's GPU process).
+ */
+int wrapPropertyBin(void *entry, char *plane, char *name, uint32_t options, uint64_t buf, uint64_t *bufsize, void *properties,
+                    uint32_t *propertiesCnt)
+{
+	char ours[128];
+	if (entry && name && (!strcmp(name, "MetalPluginName") || !strcmp(name, "MetalPluginClassName")) && isParavirt(entry) &&
+	    accelNativeCaller()) {
+		snprintf(ours, sizeof(ours), "RDNA4%s", name);
+		name = ours;
+	}
+	return reinterpret_cast<int (*)(void *, char *, char *, uint32_t, uint64_t, uint64_t *, void *, uint32_t *)>(orgPropertyBin)(
+		entry, plane, name, options, buf, bufsize, properties, propertiesCnt);
+}
+
+/*
+ * is_io_object_get_class (IOObjectCopyClass): with our accelerator serving WindowServer, our lit IONDRV framebuffers named to user
+ * space as AMD's. CoreDisplay's GetGPUVendorForFramebufferService takes a framebuffer's vendor from its class name (AppleIntel-,
+ * AMD-, AppleParavirtFramebuffer); IONDRVFramebuffer is none of them, an "other" vendor that IOPresentment is never on for: the
+ * displays' surfaces were legacy ones, without IOSurfaces, composited in software (CompositorSW), 2026-11-21. Only the name user
+ * space reads: the objects and every kernel match stay as they are.
+ */
+int wrapObjectGetClass(void *object, char *className)
+{
+	const int r = reinterpret_cast<int (*)(void *, char *)>(orgObjectGetClass)(object, className);
+
+	if (!r && className && RDNA4Accel::namesAsAmd(static_cast<OSObject *>(object)))
+		strlcpy(className, "AMDRadeonRDNA4_AMDFramebuffer", 128);   // (io_name_t)
+	return r;
+}
+
 int wrapServiceOpen(void *service, void *task, uint32_t type, uint64_t ndr, void *properties, uint32_t propertiesCnt, int *result,
                     void *connection)
 {
@@ -237,7 +306,7 @@ int wrapServiceOpen(void *service, void *task, uint32_t type, uint64_t ndr, void
 			// this. Opened ahead here as wrapNewUserClient does for an undecided one, or the wait below would wait for itself.
 			if (!PvScanout::known() && fbOpen)
 				if (IOService *boot = oldestNdrvFramebuffer()) {
-					const IOReturn r = reinterpret_cast<IOReturn (*)(void *)>(fbOpen)(boot);
+					const IOReturn r = PvHooks::openFramebuffer(boot);
 					PLOG("opened the boot framebuffer %p ahead of WindowServer's GPU wrangler (0x%x)", boot, r);
 					boot->release();
 				}
@@ -245,6 +314,8 @@ int wrapServiceOpen(void *service, void *task, uint32_t type, uint64_t ndr, void
 			if (PvScanout::enabled()) {
 				PLOG("WindowServer opens the GPU wrangler: held for the paravirtual GPU");
 				waitForParavirtDisplay();
+			} else {
+				RDNA4Accel::waitForWindowServer();   // our own accelerator (rdna4-accel=4), if this boot makes one
 			}
 		}
 	}
@@ -363,9 +434,25 @@ void route(KernelPatcher &patcher, size_t index, mach_vm_address_t address,
 	patcher.clearError();
 }
 
+/* IOGraphicsAccelerator2::newUserClient: type RDNA4_NATIVE_UC_TYPE on the paravirtual accelerator, or on our own (rdna4-accel=4: every
+ * process is on the native device there), is the runtime's compute client (userclient.cpp rdna4AcceleratorClient), for the native Metal
+ * device in sandboxed apps (their sandbox allows IOAccelerator connections only). */
+IOReturn wrapAccelNewUserClient(void *accel, void *task, void *security, uint32_t type, void **handler)
+{
+	if (type == RDNA4_NATIVE_UC_TYPE && (isParavirt(accel) || RDNA4Accel::isOurs(accel)))
+		return rdna4AcceleratorClient(static_cast<IOService *>(accel), static_cast<task_t>(task), security,
+		                              reinterpret_cast<IOUserClient **>(handler));
+
+	return reinterpret_cast<IOReturn (*)(void *, void *, void *, uint32_t, void **)>(orgAccelNewUserClient)(accel, task, security, type,
+	                                                                                                     handler);
+}
+
 void processAccel(void *, KernelPatcher &patcher, size_t index,
 		  mach_vm_address_t address, size_t size)
 {
+	KernelPatcher::RouteRequest accelNewUserClient {
+		"__ZN22IOGraphicsAccelerator213newUserClientEP4taskPvjPP12IOUserClient", wrapAccelNewUserClient, orgAccelNewUserClient,
+	};
 	KernelPatcher::RouteRequest disable {
 		"__ZN22IOGraphicsAccelerator218disableAcceleratorEv", wrapDisable,
 		orgDisable,
@@ -387,6 +474,7 @@ void processAccel(void *, KernelPatcher &patcher, size_t index,
 	patcher.clearError();
 	route(patcher, index, address, size, disable);
 	route(patcher, index, address, size, wait);
+	route(patcher, index, address, size, accelNewUserClient);
 }
 
 void processGraphics(void *, KernelPatcher &patcher, size_t index,
@@ -408,6 +496,17 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index,
 	};
 
 	KernelPatcher::RouteRequest serviceOpen {"_is_io_service_open_extended", wrapServiceOpen, orgServiceOpen};
+	KernelPatcher::RouteRequest objectGetClass {"_is_io_object_get_class", wrapObjectGetClass, orgObjectGetClass};
+
+	if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &objectGetClass, 1))
+		PLOG("is_io_object_get_class not routed (error %d): our framebuffers keep their vendor unknown to CoreDisplay", patcher.getError());
+	patcher.clearError();
+	KernelPatcher::RouteRequest propertyBin {"_is_io_registry_entry_get_property_bin_buf", wrapPropertyBin, orgPropertyBin};
+
+	if (!patcher.routeMultiple(KernelPatcher::KernelID, &propertyBin, 1))
+		PLOG("is_io_registry_entry_get_property_bin_buf not routed (error %d): native processes get Apple's Metal plug-in", patcher.getError());
+
+	patcher.clearError();
 
 	if (!patcher.routeMultiple(KernelPatcher::KernelID, &serviceOpen, 1))
 		PLOG("is_io_service_open_extended not routed (error %d): WindowServer is not held for the paravirtual GPU", patcher.getError());
@@ -428,6 +527,11 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index,
 }
 
 } /* namespace */
+
+int PvHooks::openFramebuffer(void *fb)
+{
+	return fbOpen && fb ? reinterpret_cast<IOReturn (*)(void *)>(fbOpen)(fb) : kIOReturnNotReady;
+}
 
 void PvHooks::hideFramebuffers(void *fb)
 {

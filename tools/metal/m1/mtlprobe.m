@@ -9,6 +9,11 @@
 //   mtlprobe mix       out[i] = 3 * in[i] + 100000 * group + 1000 * thread in group + group size over 100 threads in groups of 32 (the
 //                      last group has 4, and Metal reports 4 as its size); a kernel that is not in the kext's table: it runs only if
 //                      translated at run time
+//   mtlprobe nativewin [S]  a window whose CAMetalLayer draws on our own device for S seconds (10): the colour triangle each frame
+//   mtlprobe nativespin [S]  spin on our own device (3D: depth test, a texture and sampler, indexed instanced draws)
+//   mtlprobe nativestencil [1|4]  stencil (Depth32Float_Stencil8) and 4x multisampling with a resolve on our own device
+//   mtlprobe nativeevent          a shared event: one queue waits for another queue's signal on our own device
+//   mtlprobe nativesrc a kernel compiled from source (Metal's own compiler) on our own device, run and checked (as native)
 //   mtlprobe dualsrc   dual-source blending: every pixel of a quad whose colour and second source depend on its parity, checked
 //   mtlprobe devices   every Metal device MTLCopyAllDevices returns, its class and registry ID (docs/native-metal-spike.md)
 //   mtlprobe native <probe.metallib>   the native-Metal spike on our own device (RDNA4MTLDevice; as root, RDNA4_NATIVE_MTL=1): gate 2,
@@ -70,12 +75,14 @@
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
 //
 // Build: clang -arch x86_64 -mmacosx-version-min=11.0 -fobjc-arc tools/metal/m1/mtlprobe.m -framework Foundation -framework Metal -framework IOSurface \
-//        -framework AppKit -framework QuartzCore -o mtlprobe
+//        -framework AppKit -framework QuartzCore -framework IOKit -o mtlprobe
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
-#import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/QuartzCore.h>
 #include <simd/simd.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
 #import <IOSurface/IOSurface.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -472,6 +479,147 @@ static void simd(id<MTLDevice> d, id<MTLCommandQueue> q) {
 			}
 	}
 	OUT("simd: %s, %d of %d results wrong (0 = executed)", ran ? "ran" : "NOT RUN", bad, N * 11 - 8);
+}
+
+// Stencil and multisampling on our own device (Maps' passes: Depth32Float_Stencil8, 4x BGRA8 sRGB resolved into the drawable): a 64x64
+// target, the left half marked in the stencil (ref 1, replace), then a full quad drawn where the stencil equals 1 (green). With `samples` 4
+// the target and the stencil are 4x and resolved into a 1x texture. Then a 4x white triangle on black: its edges' resolved pixels between.
+static BOOL stencilPass(id<MTLDevice> d, id<MTLCommandQueue> q, id<MTLLibrary> lib, NSUInteger samples, MTLPixelFormat format)
+{
+	NSError *err = nil;
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"st_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"st_f"];
+	pd.colorAttachments[0].pixelFormat = format;
+	pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	pd.rasterSampleCount = samples;
+	id<MTLRenderPipelineState> ps = [d newRenderPipelineStateWithDescriptor:pd error:&err];
+	MTLDepthStencilDescriptor *mark = [MTLDepthStencilDescriptor new], *test = [MTLDepthStencilDescriptor new];
+	mark.frontFaceStencil.stencilCompareFunction = MTLCompareFunctionAlways;
+	mark.frontFaceStencil.depthStencilPassOperation = MTLStencilOperationReplace;
+	mark.backFaceStencil = mark.frontFaceStencil;
+	mark.depthCompareFunction = MTLCompareFunctionLessEqual;   // tested, not written (z 0.5 against the cleared 1): stencil writes with Z on
+	test.frontFaceStencil.stencilCompareFunction = MTLCompareFunctionEqual;
+	test.backFaceStencil = test.frontFaceStencil;
+	id<MTLDepthStencilState> markState = [d newDepthStencilStateWithDescriptor:mark], testState = [d newDepthStencilStateWithDescriptor:test];
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	id<MTLTexture> one = [d newTextureWithDescriptor:td];
+	td.storageMode = MTLStorageModePrivate;
+	td.pixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	if (samples > 1) {
+		td.textureType = MTLTextureType2DMultisample;
+		td.sampleCount = samples;
+	}
+	id<MTLTexture> zs = [d newTextureWithDescriptor:td];
+	td.pixelFormat = format;
+	id<MTLTexture> many = samples > 1 ? [d newTextureWithDescriptor:td] : one;
+	if (!ps || !one || !zs || !many) {
+		OUT("nativestencil: %lux: FAIL: %s", (unsigned long)samples, ps ? "no textures" : err.localizedDescription.UTF8String);
+		return NO;
+	}
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = many;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+	rp.colorAttachments[0].storeAction = samples > 1 ? MTLStoreActionMultisampleResolve : MTLStoreActionStore;
+	rp.colorAttachments[0].resolveTexture = samples > 1 ? one : nil;
+	rp.depthAttachment.texture = rp.stencilAttachment.texture = zs;
+	rp.depthAttachment.loadAction = rp.stencilAttachment.loadAction = MTLLoadActionClear;
+	rp.stencilAttachment.clearStencil = 0;
+	const float left[8] = { -1, -1, 0, -1, -1, 1, 0, 1 }, all[8] = { -1, -1, 1, -1, -1, 1, 1, 1 }, red[4] = { 1, 0, 0, 1 }, green[4] = { 0, 1, 0, 1 };
+	const float half = 0.5f, more = 0.75f;
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	[re setVertexBytes:&half length:4 atIndex:1];
+	[re setDepthStencilState:markState];
+	[re setStencilReferenceValue:1];
+	[re setVertexBytes:left length:sizeof left atIndex:0];
+	[re setFragmentBytes:red length:sizeof red atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[re setDepthStencilState:testState];
+	[re setVertexBytes:all length:sizeof all atIndex:0];
+	[re setFragmentBytes:green length:sizeof green atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[re endEncoding];
+	run(cb, samples > 1 ? "nativestencil 4x" : "nativestencil 1x");
+	uint32_t px[64 * 64];
+	[one getBytes:px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+	int wrong = 0, wrongLeft = 0, first = -1, last = -1;
+	for (int i = 0; i < 64 * 64; i++)
+		if (px[i] != (i % 64 < 32 ? 0xff00ff00u : 0xff000000u)) {
+			wrong++;
+			wrongLeft += i % 64 < 32;
+			first = first < 0 ? i : first;
+			last = i;
+		}
+	OUT("nativestencil: %lux stencil %s: %d of 4096 pixels wrong (%d of them left; left green 0xff00ff00, right black), first (%d,%d) 0x%08x, "
+	    "last (%d,%d) 0x%08x", (unsigned long)samples, wrong ? "FAIL" : "PASS", wrong, wrongLeft, first % 64, first / 64, first < 0 ? 0 : px[first],
+	    last % 64, last / 64, last < 0 ? 0 : px[last]);
+	for (int y = 0; wrong && y < 64; y += 8) {   // where: g green, r red, . black, ? other (every 8th row)
+		char row[65];
+		for (int x = 0; x < 64; x++) {
+			const uint32_t v = px[y * 64 + x];
+			row[x] = v == 0xff00ff00u ? 'g' : v == 0xffff0000u ? 'r' : v == 0xff000000u ? '.' : '?';
+		}
+		row[64] = 0;
+		OUT("nativestencil: row %2d %s", y, row);
+	}
+	// the depth test beside the stencil: the left half at z 0.5 (written), then all at 0.75 where less (the right half, cleared to 1)
+	MTLDepthStencilDescriptor *zw = [MTLDepthStencilDescriptor new], *zt = [MTLDepthStencilDescriptor new];
+	zw.depthWriteEnabled = YES;
+	zt.depthCompareFunction = MTLCompareFunctionLess;
+	cb = [q commandBuffer];
+	re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	[re setDepthStencilState:[d newDepthStencilStateWithDescriptor:zw]];
+	[re setVertexBytes:left length:sizeof left atIndex:0];
+	[re setVertexBytes:&half length:4 atIndex:1];
+	[re setFragmentBytes:red length:sizeof red atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[re setDepthStencilState:[d newDepthStencilStateWithDescriptor:zt]];
+	[re setVertexBytes:all length:sizeof all atIndex:0];
+	[re setVertexBytes:&more length:4 atIndex:1];
+	[re setFragmentBytes:green length:sizeof green atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[re endEncoding];
+	run(cb, "nativestencil depth");
+	[one getBytes:px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+	int zwrong = 0;
+	for (int i = 0; i < 64 * 64; i++)
+		zwrong += px[i] != (i % 64 < 32 ? 0xffff0000u : 0xff00ff00u);
+	OUT("nativestencil: %lux depth %s: %d of 4096 pixels wrong (left red 0xffff0000, right green); (16,16) 0x%08x, (48,16) 0x%08x",
+	    (unsigned long)samples, zwrong ? "FAIL" : "PASS", zwrong, px[16 * 64 + 16], px[16 * 64 + 48]);
+	wrong += zwrong;
+	if (samples == 1)
+		return !wrong;
+	// a triangle's edges: their resolved pixels between black and white
+	const float tri[8] = { -0.9f, -0.9f, 0.9f, -0.7f, -0.2f, 0.9f, -0.2f, 0.9f }, white[4] = { 1, 1, 1, 1 };
+	rp.depthAttachment.texture = rp.stencilAttachment.texture = nil;
+	pd.depthAttachmentPixelFormat = pd.stencilAttachmentPixelFormat = MTLPixelFormatInvalid;
+	id<MTLRenderPipelineState> plain = [d newRenderPipelineStateWithDescriptor:pd error:&err];
+	cb = [q commandBuffer];
+	re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:plain];
+	[re setVertexBytes:tri length:sizeof tri atIndex:0];
+	[re setVertexBytes:&half length:4 atIndex:1];
+	[re setFragmentBytes:white length:sizeof white atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[re endEncoding];
+	run(cb, "nativestencil msaa");
+	[one getBytes:px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+	int lit = 0, between = 0;
+	for (int i = 0; i < 64 * 64; i++) {
+		const uint32_t g = px[i] >> 8 & 0xff;
+		lit += g == 255;
+		between += g && g != 255;
+	}
+	const BOOL ok = !wrong && plain && lit > 600 && between > 40;
+	OUT("nativestencil: 4x resolve %s: %d pixels white, %d between (edges; one sample: 0), centre 0x%08x", ok ? "PASS" : "FAIL", lit, between,
+	    px[32 * 64 + 28]);
+	return ok;
 }
 
 static void tri(id<MTLDevice> d, id<MTLCommandQueue> q) {
@@ -2298,6 +2446,194 @@ static float nativeRandom(uint32_t *seed)   // a fixed sequence (LCG), the same 
 // The native-Metal spike's gate 5: `kRays` rays from a grid at z = 0, tilted, against `kTris` random triangles at z 2-6 (a fixed seed), in
 // an acceleration structure; each ray's hit (distance, barycentrics, primitive id) against the nearest one by the CPU (Moller-Trumbore,
 // no structure). A distance within 1e-4 counts as the same hit (the primitive may then differ: two triangles at that distance).
+extern id<MTLDevice> MTLCopyDeviceForRegistryID(uint64_t registryID) NS_RETURNS_RETAINED;   // Metal's (CoreDisplay uses it)
+
+// A layer tree as an app's window has them: solid colours, rounded corners and borders, a gradient, text, an image, transparency.
+static CALayer *caScene(void)
+{
+	CALayer *root = [CALayer layer];
+	root.frame = CGRectMake(0, 0, 512, 512);
+	root.backgroundColor = CGColorCreateGenericRGB(0.95, 0.95, 0.97, 1);
+	CALayer *box = [CALayer layer];
+	box.frame = CGRectMake(32, 32, 200, 140);
+	box.backgroundColor = CGColorCreateGenericRGB(0.9, 0.2, 0.2, 1);
+	box.cornerRadius = 24;
+	box.borderWidth = 4;
+	box.borderColor = CGColorCreateGenericRGB(0.1, 0.2, 0.8, 1);
+	[root addSublayer:box];
+	CAGradientLayer *g = [CAGradientLayer layer];
+	g.frame = CGRectMake(270, 32, 210, 140);
+	g.colors = @[ (__bridge_transfer id)CGColorCreateGenericRGB(1, 0.8, 0, 1), (__bridge_transfer id)CGColorCreateGenericRGB(0, 0.6, 0.9, 1) ];
+	[root addSublayer:g];
+	CATextLayer *text = [CATextLayer layer];
+	text.frame = CGRectMake(32, 200, 448, 80);
+	text.string = @"RDNA4 native";
+	text.fontSize = 56;
+	text.foregroundColor = CGColorCreateGenericRGB(0.1, 0.1, 0.1, 1);
+	text.contentsScale = 1;
+	[root addSublayer:text];
+	CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
+	CGContextRef cg = CGBitmapContextCreate(NULL, 64, 64, 8, 256, rgb, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+	for (int y = 0; y < 8; y++)
+		for (int x = 0; x < 8; x++) {
+			CGContextSetRGBFillColor(cg, (x + y) & 1, 0.5, ((x + y) & 1) ^ 1, 1);
+			CGContextFillRect(cg, CGRectMake(8 * x, 8 * y, 8, 8));
+		}
+	CALayer *pic = [CALayer layer];
+	pic.frame = CGRectMake(32, 300, 180, 180);
+	pic.contents = (__bridge_transfer id)CGBitmapContextCreateImage(cg);
+	pic.magnificationFilter = kCAFilterNearest;
+	[root addSublayer:pic];
+	CGContextRelease(cg);
+	CGColorSpaceRelease(rgb);
+	if (getenv("NATIVECA_YUV")) {   // a 10-bit 4:2:0 YCbCr IOSurface as contents (the Tahoe wallpaper's kind): a luma ramp, chroma a fixed tint
+		NSDictionary *props = @{ (id)kIOSurfaceWidth : @256, (id)kIOSurfaceHeight : @256, (id)kIOSurfacePixelFormat : @('x420'),
+		                         (id)kIOSurfacePlaneInfo : @[ @{ (id)kIOSurfacePlaneWidth : @256, (id)kIOSurfacePlaneHeight : @256,
+		                                                         (id)kIOSurfacePlaneBytesPerElement : @2, (id)kIOSurfacePlaneBytesPerRow : @512 },
+		                                                      @{ (id)kIOSurfacePlaneWidth : @128, (id)kIOSurfacePlaneHeight : @128,
+		                                                         (id)kIOSurfacePlaneBytesPerElement : @4, (id)kIOSurfacePlaneBytesPerRow : @512 } ] };
+		IOSurfaceRef yuv = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		IOSurfaceLock(yuv, 0, NULL);
+		uint16_t *y = IOSurfaceGetBaseAddressOfPlane(yuv, 0), *c = IOSurfaceGetBaseAddressOfPlane(yuv, 1);
+		for (int j = 0; j < 256; j++)
+			for (int i = 0; i < 256; i++)
+				y[j * 256 + i] = (uint16_t)((64 + (i * 876) / 255) << 6);   // video range 64..940, MSB-aligned
+		for (int j = 0; j < 128; j++)
+			for (int i = 0; i < 128; i++) {
+				c[2 * (j * 128 + i)] = (uint16_t)(400 << 6);
+				c[2 * (j * 128 + i) + 1] = (uint16_t)(600 << 6);
+			}
+		IOSurfaceUnlock(yuv, 0, NULL);
+		CALayer *video = [CALayer layer];
+		video.frame = CGRectMake(250, 300, 230, 180);
+		video.contents = (__bridge id)yuv;
+		[root addSublayer:video];
+	}
+	if (getenv("NATIVECA_VIBRANT")) {   // the menu bar's titles: text composited with Core Animation's vibrancy filters (private CAFilter)
+		NSArray *types = [@(getenv("NATIVECA_VIBRANT")) componentsSeparatedByString:@","];
+		for (NSUInteger k = 0; k < types.count; k++) {
+			CATextLayer *t = [CATextLayer layer];
+			t.frame = CGRectMake(250, 300 + 40 * k, 250, 36);
+			t.string = types[k];
+			t.fontSize = 28;
+			t.foregroundColor = CGColorCreateGenericRGB(1, 1, 1, 1);
+			t.contentsScale = 1;
+			Class filter = NSClassFromString(@"CAFilter");
+			t.compositingFilter = [filter performSelector:@selector(filterWithType:) withObject:types[k]];
+			[root addSublayer:t];
+		}
+	}
+	CALayer *glass = [CALayer layer];
+	glass.frame = CGRectMake(150, 250, 300, 200);
+	glass.backgroundColor = CGColorCreateGenericRGB(0.1, 0.7, 0.3, 0.5);
+	glass.cornerRadius = 12;
+	[root addSublayer:glass];
+	return root;
+}
+
+// Gate 8: the queue. Command buffers committed without waiting complete in order; blits; many draws in one command buffer, timed.
+static BOOL nativeQueue(id<MTLDevice> d, id<MTLComputePipelineState> scale, id<MTLRenderPipelineState> rps, MTLRenderPassDescriptor *pass,
+                        id<MTLTexture> tex)
+{
+	enum { n = 4096, buffers = 4, draws = 1000 };
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	id<MTLBuffer> a = [d newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> b = [d newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+	float *pa = a.contents, *pb = b.contents;
+	for (int i = 0; i < n; i++)
+		pa[i] = i, pb[i] = -1;
+	static int order[buffers];
+	__block int done = 0;
+	const float two = 2;
+	const double t0 = CACurrentMediaTime();
+	id<MTLCommandBuffer> last = nil;
+	for (int k = 0; k < buffers; k++) {   // b = a, then b *= 2 four times, the first copy and the last fill by blits
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		if (!k) {
+			id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+			[bl copyFromBuffer:a sourceOffset:0 toBuffer:b destinationOffset:0 size:n * 4];
+			[bl endEncoding];
+		}
+		id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+		[e setComputePipelineState:scale];
+		[e setBuffer:b offset:0 atIndex:0];
+		[e setBytes:&two length:4 atIndex:1];
+		[e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+		[e endEncoding];
+		if (k == buffers - 1) {
+			id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+			[bl fillBuffer:b range:NSMakeRange(0, 4) value:0];
+			[bl endEncoding];
+		}
+		[cb addCompletedHandler:^(id<MTLCommandBuffer> c) { order[__atomic_fetch_add(&done, 1, __ATOMIC_SEQ_CST)] = k; }];
+		[cb commit];
+		last = cb;
+	}
+	const double committed = CACurrentMediaTime() - t0;
+	[last waitUntilCompleted];
+	int bad = pb[0] != 0, inOrder = done == buffers;
+	for (int i = 1; i < n; i++)
+		bad += pb[i] != 16.0f * i;
+	for (int k = 0; k < done; k++)
+		inOrder &= order[k] == k;
+	const BOOL asyncOk = !bad && inOrder && last.status == MTLCommandBufferStatusCompleted;
+	OUT("native: queue %s: %d buffers completed %s, %d of %d wrong, commits took %.2f ms, all done in %.2f ms", asyncOk ? "PASS" : "FAIL", done,
+	    inOrder ? "in order" : "OUT OF ORDER", bad, n, 1e3 * committed, 1e3 * (CACurrentMediaTime() - t0));
+
+	// many draws: the triangle 1000 times, then the texture read back through a blit into a buffer
+	const float pos[6] = { -0.5f, 0.5f, 0.5f, 0.5f, 0, -0.5f };
+	const float col[12] = { 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1 };
+	id<MTLBuffer> back = [d newBufferWithLength:256 * 1024 options:MTLResourceStorageModeShared];
+	id<MTLCommandBuffer> rb = [q commandBuffer];
+	id<MTLRenderCommandEncoder> re = [rb renderCommandEncoderWithDescriptor:pass];
+	[re setRenderPipelineState:rps];
+	[re setVertexBytes:pos length:sizeof pos atIndex:0];
+	[re setVertexBytes:col length:sizeof col atIndex:1];
+	for (int i = 0; i < draws; i++)
+		[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[re endEncoding];
+	id<MTLBlitCommandEncoder> bl = [rb blitCommandEncoder];
+	[bl copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(256, 256, 1) toBuffer:back
+	    destinationOffset:0 destinationBytesPerRow:1024 destinationBytesPerImage:256 * 1024];
+	[bl endEncoding];
+	const double t1 = CACurrentMediaTime();
+	[rb commit];
+	[rb waitUntilCompleted];
+	const double took = CACurrentMediaTime() - t1;
+	rdna4_tricol_result tr;
+	const BOOL drawsOk = rdna4_tricol_check(back.contents, &tr) && rb.status == MTLCommandBufferStatusCompleted;
+	OUT("native: draws %s: %d draws in %.1f ms (%.1f us each), %u px (want 8192), max channel error %.2f (status %ld%s%s)", drawsOk ? "PASS" : "FAIL",
+	    draws, 1e3 * took, 1e6 * took / draws, tr.covered, tr.maxChannelErr256 / 256.0, (long)rb.status, rb.error ? ", " : "",
+	    rb.error ? rb.error.localizedDescription.UTF8String : "");
+	return asyncOk && drawsOk;
+}
+
+// The nearest of `tris` triangles a ray meets within 100 (Moller-Trumbore, no structure): {distance, u, v, triangle}, or all -1.
+static void nearestHit(const float *o, const float *dd, const float *verts, int tris, float *hit)
+{
+	float best = 100;
+	hit[0] = hit[1] = hit[2] = hit[3] = -1;
+	for (int t = 0; t < tris; t++) {
+		const float *v = &verts[9 * t];
+		const float e1[3] = { v[3] - v[0], v[4] - v[1], v[5] - v[2] }, e2[3] = { v[6] - v[0], v[7] - v[1], v[8] - v[2] };
+		const float p[3] = { dd[1] * e2[2] - dd[2] * e2[1], dd[2] * e2[0] - dd[0] * e2[2], dd[0] * e2[1] - dd[1] * e2[0] };
+		const float det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+		if (fabsf(det) < 1e-12f)
+			continue;
+		const float inv = 1 / det, s[3] = { o[0] - v[0], o[1] - v[1], o[2] - v[2] };
+		const float u = (s[0] * p[0] + s[1] * p[1] + s[2] * p[2]) * inv;
+		const float q[3] = { s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0] };
+		const float w = (dd[0] * q[0] + dd[1] * q[1] + dd[2] * q[2]) * inv, dist = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
+		if (u < 0 || u > 1 || w < 0 || u + w > 1 || dist < 0 || dist > best)
+			continue;
+		best = dist;
+		hit[0] = dist;
+		hit[1] = u;
+		hit[2] = w;
+		hit[3] = t;
+	}
+}
+
 static BOOL nativeRays(id<MTLDevice> d, id<MTLLibrary> lib)
 {
 	enum { kTris = 300, kRays = 1024 };
@@ -2320,28 +2656,7 @@ static BOOL nativeRays(id<MTLDevice> d, id<MTLLibrary> lib)
 		dir[4 * i + 1] = 0.1f * rnd() - 0.05f;
 		dir[4 * i + 2] = 1;
 		dir[4 * i + 3] = 0;
-		float best = 100;
-		cpu[4 * i] = cpu[4 * i + 1] = cpu[4 * i + 2] = cpu[4 * i + 3] = -1;
-		const float *o = &org[4 * i], *dd = &dir[4 * i];
-		for (int t = 0; t < kTris; t++) {
-			const float *v = &verts[9 * t];
-			const float e1[3] = { v[3] - v[0], v[4] - v[1], v[5] - v[2] }, e2[3] = { v[6] - v[0], v[7] - v[1], v[8] - v[2] };
-			const float p[3] = { dd[1] * e2[2] - dd[2] * e2[1], dd[2] * e2[0] - dd[0] * e2[2], dd[0] * e2[1] - dd[1] * e2[0] };
-			const float det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
-			if (fabsf(det) < 1e-12f)
-				continue;
-			const float inv = 1 / det, s[3] = { o[0] - v[0], o[1] - v[1], o[2] - v[2] };
-			const float u = (s[0] * p[0] + s[1] * p[1] + s[2] * p[2]) * inv;
-			const float q[3] = { s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0] };
-			const float w = (dd[0] * q[0] + dd[1] * q[1] + dd[2] * q[2]) * inv, dist = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
-			if (u < 0 || u > 1 || w < 0 || u + w > 1 || dist < 0 || dist > best)
-				continue;
-			best = dist;
-			cpu[4 * i] = dist;
-			cpu[4 * i + 1] = u;
-			cpu[4 * i + 2] = w;
-			cpu[4 * i + 3] = t;
-		}
+		nearestHit(&org[4 * i], &dir[4 * i], verts, kTris, &cpu[4 * i]);
 	}
 	NSError *err = nil;
 	id<MTLComputePipelineState> rays = [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rays"] error:&err];
@@ -2399,6 +2714,155 @@ static BOOL nativeRays(id<MTLDevice> d, id<MTLLibrary> lib)
 	                     gpu[4 * firstBad + 2], gpu[4 * firstBad + 3]].UTF8String : "");
 	return !bad && cb.status == MTLCommandBufferStatusCompleted && hits > 0 && hits < kRays;
 #undef rnd
+}
+
+// Bindless textures (MetalQuake's static world): 128 textures of one texel each, n's colour (n, 255 - n, 2n, 255); a 4x1 target whose pixel x
+// reads texture 5, 20, 40 and 127 (the table's three ranges and its texture handles) from an array<texture2d, 128>.
+static BOOL nativeBindless(id<MTLDevice> d, id<MTLLibrary> lib)
+{
+	NSError *err = nil;
+	MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+	rd.vertexFunction = [lib newFunctionWithName:@"bindless_v"];
+	rd.fragmentFunction = [lib newFunctionWithName:@"bindless_f"];
+	rd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	id<MTLRenderPipelineState> rps = [d newRenderPipelineStateWithDescriptor:rd error:&err];
+	if (!rps) {
+		OUT("native: bindless FAIL: %s", err.localizedDescription.UTF8String);
+		return NO;
+	}
+	id<MTLTexture> textures[128];
+	MTLTextureDescriptor *one = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+	for (int n = 0; n < 128; n++) {
+		const uint8_t texel[4] = { (uint8_t)n, (uint8_t)(255 - n), (uint8_t)(2 * n), 255 };
+		textures[n] = [d newTextureWithDescriptor:one];
+		[textures[n] replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:texel bytesPerRow:4];
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:1 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	id<MTLTexture> target = [d newTextureWithDescriptor:td];
+	const uint32_t want[4] = { 5, 20, 40, 127 };
+	id<MTLBuffer> idx = [d newBufferWithBytes:want length:sizeof want options:MTLResourceStorageModeShared];
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = target;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	id<MTLCommandBuffer> cb = [[d newCommandQueue] commandBuffer];
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:pass];
+	[re setRenderPipelineState:rps];
+	[re setFragmentTextures:textures withRange:NSMakeRange(0, 128)];
+	[re setFragmentBuffer:idx offset:0 atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[re endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	uint8_t got[16] = {};
+	[target getBytes:got bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+	int bad = 0;
+	for (int x = 0; x < 4; x++) {
+		const uint32_t n = want[x];
+		bad += got[4 * x] != n || got[4 * x + 1] != 255 - n || got[4 * x + 2] != (uint8_t)(2 * n) || got[4 * x + 3] != 255;
+	}
+	const BOOL ok = !bad && cb.status == MTLCommandBufferStatusCompleted;
+	OUT("native: bindless %s: %d of 4 pixels wrong: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x (status %ld%s%s)",
+	    ok ? "PASS" : "FAIL", bad, got[0], got[1], got[2], got[3], got[4], got[5], got[6], got[7], got[8], got[9], got[10], got[11], got[12],
+	    got[13], got[14], got[15], (long)cb.status, cb.error ? ", " : "", cb.error ? cb.error.localizedDescription.UTF8String : "");
+	return ok;
+}
+
+// Instances (MetalQuake's shadow rays): the same rays against an instance structure of one instance of the triangles, turned 90 degrees
+// about z and moved 1 along z, queried as MetalQuake does (intersector<instancing>, no triangle data); each ray's distance and instance
+// against the nearest of the turned and moved triangles by the CPU.
+static BOOL nativeInstanceRays(id<MTLDevice> d, id<MTLLibrary> lib)
+{
+	enum { kTris = 300, kRays = 1024 };
+	static float verts[kTris * 9], moved[kTris * 9], org[kRays * 4], dir[kRays * 4], cpu[kRays * 4];
+	uint32_t seed = 54321;
+#define rnd() nativeRandom(&seed)
+	for (int t = 0; t < kTris; t++) {
+		const float cx = 2.4f * rnd() - 1.2f, cy = 2.4f * rnd() - 1.2f, cz = 2 + 4 * rnd();
+		for (int k = 0; k < 3; k++) {
+			float *v = &verts[9 * t + 3 * k], *w = &moved[9 * t + 3 * k];
+			v[0] = cx + 0.5f * rnd() - 0.25f;
+			v[1] = cy + 0.5f * rnd() - 0.25f;
+			v[2] = cz + 0.5f * rnd() - 0.25f;
+			w[0] = -v[1];   // (x, y, z) -> (-y, x, z + 1)
+			w[1] = v[0];
+			w[2] = v[2] + 1;
+		}
+	}
+	for (int i = 0; i < kRays; i++) {
+		org[4 * i] = 2.4f * (i % 32) / 31 - 1.2f;
+		org[4 * i + 1] = 2.4f * (i / 32) / 31 - 1.2f;
+		org[4 * i + 2] = org[4 * i + 3] = 0;
+		dir[4 * i] = 0.1f * rnd() - 0.05f;
+		dir[4 * i + 1] = 0.1f * rnd() - 0.05f;
+		dir[4 * i + 2] = 1;
+		dir[4 * i + 3] = 0;
+		nearestHit(&org[4 * i], &dir[4 * i], moved, kTris, &cpu[4 * i]);
+	}
+#undef rnd
+	NSError *err = nil;
+	id<MTLComputePipelineState> rays = [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rays_instanced"] error:&err];
+	id<MTLBuffer> vb = [d newBufferWithBytes:verts length:sizeof verts options:MTLResourceStorageModeShared];
+	id<MTLBuffer> ob = [d newBufferWithBytes:org length:sizeof org options:MTLResourceStorageModeShared];
+	id<MTLBuffer> db = [d newBufferWithBytes:dir length:sizeof dir options:MTLResourceStorageModeShared];
+	id<MTLBuffer> out = [d newBufferWithLength:sizeof cpu options:MTLResourceStorageModeShared];
+	MTLAccelerationStructureInstanceDescriptor inst = { .mask = 0xff, .options = MTLAccelerationStructureInstanceOptionOpaque };
+	inst.transformationMatrix.columns[0] = (MTLPackedFloat3){ 0, 1, 0 };    // x -> y
+	inst.transformationMatrix.columns[1] = (MTLPackedFloat3){ -1, 0, 0 };   // y -> -x
+	inst.transformationMatrix.columns[2] = (MTLPackedFloat3){ 0, 0, 1 };
+	inst.transformationMatrix.columns[3] = (MTLPackedFloat3){ 0, 0, 1 };
+	id<MTLBuffer> ib = [d newBufferWithBytes:&inst length:sizeof inst options:MTLResourceStorageModeShared];
+	if (!rays || !vb || !ob || !db || !out || !ib) {
+		OUT("native: instance rays FAIL: %s", rays ? "no buffers" : err.localizedDescription.UTF8String);
+		return NO;
+	}
+	MTLAccelerationStructureTriangleGeometryDescriptor *geo = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+	geo.vertexBuffer = vb;
+	geo.vertexStride = 12;
+	geo.triangleCount = kTris;
+	MTLPrimitiveAccelerationStructureDescriptor *blasDesc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+	blasDesc.geometryDescriptors = @[ geo ];
+	id<MTLAccelerationStructure> blas = [d newAccelerationStructureWithSize:[d accelerationStructureSizesWithDescriptor:blasDesc].accelerationStructureSize];
+	MTLInstanceAccelerationStructureDescriptor *tlasDesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
+	tlasDesc.instancedAccelerationStructures = @[ blas ];
+	tlasDesc.instanceCount = 1;
+	tlasDesc.instanceDescriptorBuffer = ib;
+	// sized before the primitive structure is built, as MetalQuake does
+	id<MTLAccelerationStructure> tlas = [d newAccelerationStructureWithSize:[d accelerationStructureSizesWithDescriptor:tlasDesc].accelerationStructureSize];
+	id<MTLBuffer> scratch = [d newBufferWithLength:4096 options:MTLResourceStorageModePrivate];
+	id<MTLCommandBuffer> cb = [[d newCommandQueue] commandBuffer];
+	id<MTLAccelerationStructureCommandEncoder> ae = [cb accelerationStructureCommandEncoder];
+	[ae buildAccelerationStructure:blas descriptor:blasDesc scratchBuffer:scratch scratchBufferOffset:0];
+	[ae buildAccelerationStructure:tlas descriptor:tlasDesc scratchBuffer:scratch scratchBufferOffset:0];
+	[ae endEncoding];
+	id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+	[ce setComputePipelineState:rays];
+	[ce setAccelerationStructure:tlas atBufferIndex:0];
+	[ce useResource:blas usage:MTLResourceUsageRead];
+	[ce setBuffer:ob offset:0 atIndex:1];
+	[ce setBuffer:db offset:0 atIndex:2];
+	[ce setBuffer:out offset:0 atIndex:3];
+	[ce dispatchThreads:MTLSizeMake(kRays, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	[ce endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	const float *gpu = out.contents;
+	int hits = 0, bad = 0, firstBad = -1;
+	for (int i = 0; i < kRays; i++) {
+		const BOOL hitCpu = cpu[4 * i] >= 0, hitGpu = gpu[4 * i] >= 0;
+		hits += hitCpu;
+		const BOOL same = hitCpu == hitGpu && (!hitCpu || (fabsf(cpu[4 * i] - gpu[4 * i]) < 1e-4f && gpu[4 * i + 1] == 0));
+		if (!same && !bad++)
+			firstBad = i;
+	}
+	const BOOL ok = !bad && cb.status == MTLCommandBufferStatusCompleted && hits > 0 && hits < kRays;
+	OUT("native: instance rays %s: %d of %d rays wrong, %d hit (CPU) (status %ld%s%s)%s", ok ? "PASS" : "FAIL", bad, kRays, hits, (long)cb.status,
+	    cb.error ? ", " : "", cb.error ? cb.error.localizedDescription.UTF8String : "",
+	    firstBad >= 0 ? [NSString stringWithFormat:@"; first wrong ray %d: CPU %g (triangle %g), GPU %g (instance %g, triangle %g)", firstBad,
+	                     cpu[4 * firstBad], cpu[4 * firstBad + 3], gpu[4 * firstBad], gpu[4 * firstBad + 1], gpu[4 * firstBad + 2]].UTF8String : "");
+	return ok;
 }
 
 int main(int argc, char **argv) {
@@ -2517,8 +2981,390 @@ int main(int argc, char **argv) {
 			    "near the vertices 0x%08x 0x%08x 0x%08x, pixel (0,0) 0x%08x (status %ld%s%s)", renderOk ? "PASS" : "FAIL", tr.covered, tr.minX, tr.maxX,
 			    tr.minY, tr.maxY, tr.maxChannelErr256 / 256.0, tr.maxSumErr, tr.centroid, tr.near0, tr.near1, tr.near2, img[0], (long)rb.status,
 			    rb.error ? ", " : "", rb.error ? rb.error.localizedDescription.UTF8String : "");
-			const BOOL raysOk = nativeRays(d, lib);
-			return computeOk && renderOk && raysOk ? 0 : 1;
+			const BOOL raysOk = nativeRays(d, lib) & nativeInstanceRays(d, lib) & nativeBindless(d, lib);   // (bindless: a render, here for its order)
+			const BOOL queueOk = nativeQueue(d, scale, rps, pass, tex);
+			return computeOk && renderOk && raysOk && queueOk ? 0 : 1;
+		}
+		if (!strcmp(mode, "nativestencil")) {   // stencil and 4x multisampling on our own device (stencilPass)
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			NSError *err = nil;
+			id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+			                                              "struct V { float4 pos [[position]]; };\n"
+			                                              "vertex V st_v(uint vid [[vertex_id]], constant float2 *p [[buffer(0)]], constant float &z [[buffer(1)]]) { V v; v.pos = float4(p[vid], z, 1); return v; }\n"
+			                                              "fragment float4 st_f(constant float4 &c [[buffer(0)]]) { return c; }"
+			                                     options:nil
+			                                       error:&err];
+			if (!lib) {
+				OUT("nativestencil: FAIL: %s", d ? err.localizedDescription.UTF8String : "no RDNA4MTLDevice");
+				return 1;
+			}
+			id<MTLCommandQueue> q = [d newCommandQueue];
+			const char *only = argc > 2 ? argv[2] : NULL;   // one of the passes alone: mtlprobe nativestencil 1 or 4
+			const BOOL ok = (only && atoi(only) == 4 ? YES : stencilPass(d, q, lib, 1, MTLPixelFormatBGRA8Unorm)) &
+			                (only && atoi(only) == 1 ? YES : stencilPass(d, q, lib, 4, MTLPixelFormatBGRA8Unorm));
+			return ok ? 0 : 1;
+		}
+		if (!strcmp(mode, "nativeevent")) {   // shared events on our own device: a queue's wait for another queue's signal (RDNA4MTLCommandBuffer)
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			id<MTLSharedEvent> e = [d newSharedEvent];
+			if (!e) {
+				OUT("nativeevent: FAIL: %s", d ? "no shared event" : "no RDNA4MTLDevice");
+				return 1;
+			}
+			id<MTLCommandQueue> q1 = [d newCommandQueue], q2 = [d newCommandQueue];
+			id<MTLCommandBuffer> waiter = [q1 commandBuffer], signaller = [q2 commandBuffer];
+			[waiter encodeWaitForEvent:e value:1];
+			[waiter commit];
+			usleep(100000);
+			const BOOL held = waiter.status < MTLCommandBufferStatusCompleted;   // still waiting: nobody signalled
+			const double t0 = CACurrentMediaTime();
+			[signaller encodeSignalEvent:e value:1];
+			[signaller commit];
+			[signaller waitUntilCompleted];
+			[waiter waitUntilCompleted];
+			const double ms = (CACurrentMediaTime() - t0) * 1e3;
+			const BOOL ok = held && e.signaledValue == 1 && ms < 500;   // the wait gives up after 1 s
+			OUT("nativeevent: %s: held before the signal %s, value %llu, the waiter done %.1f ms after the signal's commit", ok ? "PASS" : "FAIL",
+			    held ? "yes" : "NO", e.signaledValue, ms);
+			return ok ? 0 : 1;
+		}
+		if (!strcmp(mode, "nativespin")) {   // the native-Metal spike's gate 10: spin (3D: depth, textures, instances) on our own device
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			if (!d) {
+				OUT("nativespin: FAIL: no RDNA4MTLDevice");
+				return 1;
+			}
+			spin(d, [d newCommandQueue], argc > 2 ? atof(argv[2]) : 10);
+			return 0;
+		}
+		if (!strcmp(mode, "nativeargbuf")) {   // argument buffers on our own device: mtlprobe nativeargbuf <probe.metallib> (probe.metal's argbuf)
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			NSError *err = nil;
+			id<MTLLibrary> lib = d && argc > 2 ? [d newLibraryWithURL:[NSURL fileURLWithPath:@(argv[2])] error:&err] : nil;
+			id<MTLComputePipelineState> k = lib ? [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"argbuf"] error:&err] : nil;
+			if (!k) {
+				OUT("nativeargbuf: FAIL: %s", !d ? "no RDNA4MTLDevice" : err.localizedDescription.UTF8String ?: "usage: mtlprobe nativeargbuf <probe.metallib>");
+				return 1;
+			}
+			OUT("nativeargbuf: tier %d, Metal3 %d", (int)d.argumentBuffersSupport, [d supportsFamily:MTLGPUFamilyMetal3]);
+			MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:4 height:1 mipmapped:NO];
+			id<MTLTexture> tex = [d newTextureWithDescriptor:td];
+			float texels[16];
+			for (int i = 0; i < 16; i++)
+				texels[i] = (float)(i + 1);
+			[tex replaceRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0 withBytes:texels bytesPerRow:64];
+			MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+			sd.supportArgumentBuffers = YES;   // nearest, clamped
+			id<MTLSamplerState> smp = [d newSamplerStateWithDescriptor:sd];
+			id<MTLBuffer> out = [d newBufferWithLength:8 * 16 options:MTLResourceStorageModeShared];
+			id<MTLBuffer> args = [d newBufferWithLength:24 options:MTLResourceStorageModeShared];
+			uint64_t *a = args.contents;
+			if (argc > 3 && !strcmp(argv[3], "encoder")) {   // through an argument encoder (MoltenVK's way whatever the tier)
+				NSMutableArray *ds = [NSMutableArray array];
+				const MTLDataType types[3] = {MTLDataTypeTexture, MTLDataTypeSampler, MTLDataTypePointer};
+				for (int i = 0; i < 3; i++) {
+					MTLArgumentDescriptor *ad = [MTLArgumentDescriptor argumentDescriptor];
+					ad.dataType = types[i];
+					ad.index = (NSUInteger)i;
+					[ds addObject:ad];
+				}
+				id<MTLArgumentEncoder> enc = [d newArgumentEncoderWithArguments:ds];
+				OUT("nativeargbuf: encoder %s, %lu bytes", enc ? "made" : "NOT made", (unsigned long)enc.encodedLength);
+				[enc setArgumentBuffer:args offset:0];
+				[enc setTexture:tex atIndex:0];
+				[enc setSamplerState:smp atIndex:1];
+				[enc setBuffer:out offset:0 atIndex:2];
+			} else {
+				a[0] = tex.gpuResourceID._impl;
+				a[1] = smp.gpuResourceID._impl;
+				a[2] = out.gpuAddress;
+			}
+			OUT("nativeargbuf: handles 0x%llx 0x%llx 0x%llx", a[0], a[1], a[2]);
+			id<MTLCommandBuffer> cb = [[d newCommandQueue] commandBuffer];
+			id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+			[e setComputePipelineState:k];
+			[e setBuffer:args offset:0 atIndex:0];
+			[e useResource:tex usage:MTLResourceUsageRead];
+			[e useResource:out usage:MTLResourceUsageWrite];
+			[e dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
+			[e endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			const float *o = out.contents;
+			int bad = 0;
+			for (int i = 0; i < 32; i++)
+				bad += o[i] != texels[i % 16];
+			OUT("nativeargbuf: read %g %g %g %g .. %g, sampled %g %g %g %g .. %g: %s", o[0], o[1], o[2], o[3], o[15], o[16], o[17], o[18], o[19], o[31],
+			    cb.error ? cb.error.localizedDescription.UTF8String : bad ? "FAIL" : "PASS");
+			return bad || cb.error ? 1 : 0;
+		}
+		if (!strcmp(mode, "nativewin")) {   // the native-Metal spike's gate 9: a CAMetalLayer on our own device, on the screen
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			if (!d) {
+				OUT("nativewin: FAIL: no RDNA4MTLDevice");
+				return 1;
+			}
+			const double seconds = argc > 2 ? atof(argv[2]) : 10;
+			NSError *err = nil;
+			id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+			                                              "struct TriOut { float4 position [[position]]; float4 colour; };\n"
+			                                              "vertex TriOut tri_v(uint vid [[vertex_id]], device const float2 *pos [[buffer(0)]],"
+			                                              " device const float4 *colour [[buffer(1)]]) { TriOut o; o.position = float4(pos[vid], 0, 1);"
+			                                              " o.colour = colour[vid]; return o; }\n"
+			                                              "fragment float4 tri_f(TriOut in [[stage_in]]) { return in.colour; }"
+			                                     options:nil
+			                                       error:&err];
+			MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+			rd.vertexFunction = [lib newFunctionWithName:@"tri_v"];
+			rd.fragmentFunction = [lib newFunctionWithName:@"tri_f"];
+			rd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+			id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:rd error:&err] : nil;
+			if (!ps) {
+				OUT("nativewin: FAIL: %s", err.localizedDescription.UTF8String);
+				return 1;
+			}
+			[NSApplication sharedApplication];
+			[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+			NSWindow *w = [[NSWindow alloc] initWithContentRect:NSMakeRect(160, 160, 512, 512) styleMask:NSWindowStyleMaskTitled
+			                                            backing:NSBackingStoreBuffered defer:NO];
+			w.title = @"mtlprobe nativewin: RDNA4MTLDevice";
+			CAMetalLayer *layer = [CAMetalLayer layer];
+			layer.device = d;
+			layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+			w.contentView.wantsLayer = YES;
+			w.contentView.layer = layer;
+			[w makeKeyAndOrderFront:nil];
+			[NSApp activateIgnoringOtherApps:YES];
+			id<MTLCommandQueue> q = [d newCommandQueue];
+			const float pos[6] = { -0.5f, 0.5f, 0.5f, 0.5f, 0, -0.5f };
+			const float col[12] = { 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1 };
+			NSDate *start = [NSDate date];
+			int frames = 0, failed = 0;
+			while (-[start timeIntervalSinceNow] < seconds) {
+				@autoreleasepool {
+					NSEvent *ev;
+					while ((ev = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:nil inMode:NSDefaultRunLoopMode dequeue:YES]))
+						[NSApp sendEvent:ev];
+					const CGSize size = layer.drawableSize;
+					id<CAMetalDrawable> dr = [layer nextDrawable];
+					if (!dr) {
+						usleep(5000);
+						continue;
+					}
+					const double t = -[start timeIntervalSinceNow];
+					MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+					rp.colorAttachments[0].texture = dr.texture;
+					rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+					rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+					rp.colorAttachments[0].clearColor = MTLClearColorMake(0.1, 0.1 + 0.1 * sin(t), 0.25, 1);
+					id<MTLCommandBuffer> cb = [q commandBuffer];
+					id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+					[re setRenderPipelineState:ps];
+					[re setVertexBytes:pos length:sizeof pos atIndex:0];
+					[re setVertexBytes:col length:sizeof col atIndex:1];
+					[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+					[re endEncoding];
+					[cb presentDrawable:dr];
+					[cb commit];
+					[cb waitUntilCompleted];
+					failed += cb.status != MTLCommandBufferStatusCompleted;
+					if (!frames++)
+						OUT("nativewin: first frame: drawable %.0fx%.0f, texture %s %lux%lu, status %ld%s%s", size.width, size.height,
+						    NSStringFromClass([(id)dr.texture class]).UTF8String, (unsigned long)dr.texture.width, (unsigned long)dr.texture.height,
+						    (long)cb.status, cb.error ? ": " : "", cb.error ? cb.error.localizedDescription.UTF8String : "");
+				}
+			}
+			OUT("nativewin: %s: %d frames in %.1f s (%.1f a second), %d failed", frames && !failed ? "PASS (check the window)" : "FAIL", frames,
+			    -[start timeIntervalSinceNow], frames / -[start timeIntervalSinceNow], failed);
+			return failed || !frames;
+		}
+		if (!strcmp(mode, "features")) {   // the native desktop: every argument-free BOOL / integer query of MTLDevice(SPI), as a device answers it
+			for (id<MTLDevice> dev in MTLCopyAllDevices()) {
+				OUT("features: %s", NSStringFromClass([(id)dev class]).UTF8String);
+				const char *protos[2] = { "MTLDevice", "MTLDeviceSPI" };
+				for (int k = 0; k < 2; k++) {
+					Protocol *pr = objc_getProtocol(protos[k]);
+					for (int req = 0; req < 2 && pr; req++) {
+						unsigned n = 0;
+						struct objc_method_description *m = protocol_copyMethodDescriptionList(pr, req, YES, &n);
+						for (unsigned i = 0; i < n; i++) {
+							const char *t = m[i].types;
+							const char *name = sel_getName(m[i].name);
+							if (strchr(name, ':') || ![(id)dev respondsToSelector:m[i].name])
+								continue;
+							const char r = t[0];
+							NSMethodSignature *sig = [(id)dev methodSignatureForSelector:m[i].name];
+							if (!sig || sig.numberOfArguments != 2)
+								continue;
+							@try {
+								if (r == 'B' || r == 'c') {
+									BOOL v = ((BOOL(*)(id, SEL))objc_msgSend)((id)dev, m[i].name);
+									OUT("features:   %s = %d", name, v);
+								} else if (r == 'Q' || r == 'q' || r == 'I' || r == 'i' || r == 'L' || r == 'l') {
+									unsigned long long v = ((unsigned long long(*)(id, SEL))objc_msgSend)((id)dev, m[i].name);
+									OUT("features:   %s = %llu", name, v);
+								}
+							} @catch (NSException *e) {
+								OUT("features:   %s: throws", name);
+							}
+						}
+						free(m);
+					}
+				}
+				for (long f = 1001; f <= 1009; f++)
+					OUT("features:   supportsFamily(%ld) = %d", f, [dev supportsFamily:(MTLGPUFamily)f]);
+				for (long f = 2001; f <= 2002; f++)
+					OUT("features:   supportsFamily(%ld) = %d", f, [dev supportsFamily:(MTLGPUFamily)f]);
+				for (long f = 3001; f <= 3003; f++)
+					OUT("features:   supportsFamily(%ld) = %d", f, [dev supportsFamily:(MTLGPUFamily)f]);
+				OUT("features:   supportsFamily(5001 metal3) = %d, 5002 = %d", [dev supportsFamily:(MTLGPUFamily)5001], [dev supportsFamily:(MTLGPUFamily)5002]);
+			}
+			return 0;
+		}
+		if (!strcmp(mode, "nativecd")) {   // the native desktop: what CoreDisplay's CreateMetalDevice does with the display accelerator's device
+			io_service_t acc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleParavirtAccelerator"));
+			uint64_t rid = 0;
+			IORegistryEntryGetRegistryEntryID(acc, &rid);
+			id<MTLDevice> d = MTLCopyDeviceForRegistryID(rid);
+			OUT("nativecd: MTLCopyDeviceForRegistryID(0x%llx): %s", rid, d ? NSStringFromClass([(id)d class]).UTF8String : "nil");
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				OUT("nativecd: listed: %s, registry ID 0x%llx", NSStringFromClass([(id)dev class]).UTF8String, dev.registryID);
+			d = d ?: MTLCopyDeviceForRegistryID(rid);
+			OUT("nativecd: again: %s", d ? NSStringFromClass([(id)d class]).UTF8String : "nil");
+			NSError *err = nil;
+			id<MTLLibrary> lib = [d newLibraryWithFile:@"/System/Library/Frameworks/CoreDisplay.framework/Versions/A/Resources/default.metallib" error:&err];
+			OUT("nativecd: library %s %s", lib ? NSStringFromClass([(id)lib class]).UTF8String : "nil", err.localizedDescription.UTF8String ?: "");
+			id<MTLFunction> f[3] = { [lib newFunctionWithName:@"ViewportToNDC"], [lib newFunctionWithName:@"TextureCopy"], [lib newFunctionWithName:@"ColorFill"] };
+			OUT("nativecd: functions %p %p %p", f[0], f[1], f[2]);
+			for (int k = 1; k < 3; k++) {
+				MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+				rd.vertexFunction = f[0];
+				rd.fragmentFunction = f[k];
+				rd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+				id<MTLRenderPipelineState> ps = [d newRenderPipelineStateWithDescriptor:rd error:&err];
+				OUT("nativecd: pipeline %s: %s %s", k == 1 ? "TextureCopy" : "ColorFill", ps ? "made" : "NOT made", ps ? "" : err.localizedDescription.UTF8String);
+			}
+			return 0;
+		}
+		if (!strcmp(mode, "nativeca")) {   // the native desktop's first step: Core Animation's own Metal renderer (CARenderer) on our device
+			id<MTLDevice> mine = nil, pv = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					mine = dev;
+				else
+					pv = dev;
+			if (!mine || !pv) {
+				OUT("nativeca: FAIL: want RDNA4MTLDevice and the paravirtual device (have %s, %s)", mine ? "ours" : "-", pv ? "PV" : "-");
+				return 1;
+			}
+			const char *dir = argc > 2 ? argv[2] : ".";
+			uint32_t *img[2];
+			id<MTLDevice> devs[2] = { pv, mine };
+			for (int k = 0; k < 2; k++) {
+				CALayer *root = caScene();
+				MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:512 height:512 mipmapped:NO];
+				td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+				td.storageMode = MTLStorageModeShared;
+				id<MTLTexture> t = [devs[k] newTextureWithDescriptor:td];
+				id<MTLCommandQueue> q = [devs[k] newCommandQueue];
+				CARenderer *r = [CARenderer rendererWithMTLTexture:t options:@{ kCARendererMetalCommandQueue : q }];
+				r.layer = root;
+				r.bounds = CGRectMake(0, 0, 512, 512);
+				[CATransaction flush];
+				[r beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];
+				[r addUpdateRect:r.bounds];
+				[r render];
+				[r endFrame];
+				id<MTLCommandBuffer> cb = [q commandBuffer];   // behind CA's own command buffers on this queue
+				[cb commit];
+				[cb waitUntilCompleted];
+				img[k] = calloc(512 * 512, 4);
+				[t getBytes:img[k] bytesPerRow:2048 fromRegion:MTLRegionMake2D(0, 0, 512, 512) mipmapLevel:0];
+				NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:512 pixelsHigh:512 bitsPerSample:8
+				                                                           samplesPerPixel:4 hasAlpha:YES isPlanar:NO
+				                                                            colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:2048 bitsPerPixel:32];
+				for (int i = 0; i < 512 * 512; i++) {   // BGRA -> RGBA
+					const uint32_t v = img[k][i];
+					((uint32_t *)rep.bitmapData)[i] = (v & 0xff00ff00u) | (v >> 16 & 0xff) | (v & 0xff) << 16;
+				}
+				NSString *path = [NSString stringWithFormat:@"%s/ca-%s.png", dir, k ? "native" : "pv"];
+				[[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:path atomically:YES];
+				OUT("nativeca: %s: rendered (%s), pixel (256,256) 0x%08x -> %s", k ? "native" : "PV", NSStringFromClass([(id)devs[k] class]).UTF8String,
+				    img[k][256 * 512 + 256], path.UTF8String);
+			}
+			int off = 0, worst = 0, firstX = -1, firstY = -1;
+			for (int i = 0; i < 512 * 512; i++) {
+				int m = 0;
+				for (int c = 0; c < 32; c += 8)
+					m = MAX(m, abs((int)(img[0][i] >> c & 0xff) - (int)(img[1][i] >> c & 0xff)));
+				worst = MAX(worst, m);
+				if (m > 8 && !off++)
+					firstX = i % 512, firstY = i / 512;
+			}
+			OUT("nativeca: %s: %d of %d pixels differ by more than 8 (worst %d)%s", off < 512 ? "PASS" : "FAIL", off, 512 * 512, worst,
+			    off ? [NSString stringWithFormat:@"; first at (%d,%d): PV 0x%08x, native 0x%08x", firstX, firstY, img[0][firstY * 512 + firstX],
+			                                     img[1][firstY * 512 + firstX]].UTF8String : "");
+			return off < 512 ? 0 : 1;
+		}
+		if (!strcmp(mode, "nativesrc")) {   // the native-Metal spike's gate 7: does Metal's own compiler make a library for RDNA4MTLDevice?
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			if (!d) {
+				OUT("nativesrc: FAIL: no RDNA4MTLDevice");
+				return 1;
+			}
+			NSError *err = nil;
+			id<MTLLibrary> lib = [d newLibraryWithSource:@"kernel void add1(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] += 1; }"
+			                                     options:nil
+			                                       error:&err];
+			OUT("nativesrc: library %s (class %s)%s%s", lib ? "made" : "NOT made", lib ? NSStringFromClass([(id)lib class]).UTF8String : "-",
+			    err ? ": " : "", err ? err.localizedDescription.UTF8String : "");
+			if (!lib)
+				return 1;
+			OUT("nativesrc: functions %s", [lib.functionNames componentsJoinedByString:@", "].UTF8String);
+			id<MTLFunction> f = [lib newFunctionWithName:@"add1"];
+			OUT("nativesrc: function %s (class %s)", f ? "made" : "NOT made", f ? NSStringFromClass([(id)f class]).UTF8String : "-");
+			id<MTLComputePipelineState> ps = f ? [d newComputePipelineStateWithFunction:f error:&err] : nil;
+			enum { n = 256 };
+			id<MTLBuffer> b = [d newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+			if (!ps || !b) {
+				OUT("nativesrc: FAIL: %s", ps ? "no buffer" : err.localizedDescription.UTF8String);
+				return 1;
+			}
+			uint32_t *o = b.contents;
+			for (int i = 0; i < n; i++)
+				o[i] = 7 * i;
+			id<MTLCommandBuffer> cb = [[d newCommandQueue] commandBuffer];
+			id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+			[e setComputePipelineState:ps];
+			[e setBuffer:b offset:0 atIndex:0];
+			[e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+			[e endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			int bad = 0;
+			for (int i = 0; i < n; i++)
+				bad += o[i] != 7u * i + 1;
+			OUT("nativesrc: %s: a kernel compiled from source by Metal for the device, run on it: %d of %d wrong (status %ld)", bad ||
+			    cb.status != MTLCommandBufferStatusCompleted ? "FAIL" : "PASS", bad, n, (long)cb.status);
+			return bad ? 1 : 0;
 		}
 		if (!strcmp(mode, "devices")) {   // every Metal device, its class and registry ID (the native-Metal spike's gate 1)
 			NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();

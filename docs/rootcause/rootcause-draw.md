@@ -2,7 +2,7 @@
 
 Read-only review. Nothing edited, no VM run. Tags: **[F]** fact with a citation, **[I]** inference, **[G]** guess.
 Sources: kext `AMDRadeonRDNA4-int/src`. amdgpu `~/src/linux-amd/drivers/gpu/drm/amd` (d266640), paths relative to `amdgpu/` unless given.
-Mesa `~/src/mesa/src` (eda9ace). Logs `premetal/hw-logs/rdna4fb-diag-20260929-081934.txt` (**L4a**) and `-083603.txt` (**L4b**).
+Mesa `~/src/mesa/src` (eda9ace). Logs `rdna4fb-diag-20260929-081934.txt` (**L4a**) and `-083603.txt` (**L4b**).
 
 ## 0. Verdict
 
@@ -88,7 +88,7 @@ Each value is decoded against `gfx12.json` fields and compared with the Mesa sou
   - [I] So on real hardware the RLC/CP firmware applies that CSB to the contexts.
   - [G] The trigger is part of the path the kext skips: SRM enable and/or the MES queue map.
   - [F] Section 1 items 5-6: SRAM garbage is real, unwritten SH/context registers are garbage, and rolls copy it to every later draw.
-  - [F] The model treats unwritten registers as 0 (`premetal/gfx12-draw-notes.md` §6.2). That is exactly the leniency.
+  - [F] The model treats unwritten registers as 0 (`gfx12-draw-notes.md` §6.2). That is exactly the leniency.
 - **Why it could be wrong.**
   - [G] Mesa also leaves non-CSB registers unwritten (for example `SPI_TMPRING_SIZE`: `si_gfx_cs.c:563-564` only writes it with a scratch buffer). So those are either hardware-reset or harmless.
   - The CSB registers' effect on raster is undocumented.
