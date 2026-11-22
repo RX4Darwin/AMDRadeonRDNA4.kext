@@ -3374,6 +3374,11 @@ RDNA4_ANSWER_MISSING
 				                   pipeline.attributes[4 * i + 2], pipeline.attributes[4 * i + 3]];
 		RLOG(@"RDNA4MTL trace: %@", what);
 	}
+	// The target's copy current before it is drawn into, as the textures read: the whole copy goes back into the surface after the command
+	// buffer. A texture of a surface another texture or the CPU had drawn, drawn into with load (Core Animation's partial repaints of
+	// Safari's tiles), put its old copy, zeros, over the surface around what it drew: black under the menus (2026-11-22).
+	if (target.shadowed && target.iosurface && ![shadowed containsObject:target])
+		[shadowed addObject:target];
 	NSArray<RDNA4MTLTexture *> *late = [_commandBuffer refreshShadows:shadowed];
 	RDNA4MTLCommandBuffer *cb = _commandBuffer;
 	[_commandBuffer recordDraw:^NSError * {
