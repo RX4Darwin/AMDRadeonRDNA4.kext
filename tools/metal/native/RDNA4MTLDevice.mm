@@ -482,6 +482,7 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 - (void)dirty:(uint64_t)lo to:(uint64_t)hi;   // (work queue) bytes of the surface drawn in VRAM
 - (BOOL)writeBack:(NSError **)why;    // (work queue) the drawn bytes into the surface (on the card, not waited for): whether any were
 - (void)present:(BOOL)on;             // the kext presents the surface's frames from the VRAM copy (or from its memory again)
+@property (readonly) uint32_t surfaceID;
 - (void)cpuTouched;                   // the CPU may have written the surface: filled again before the next use
 @end
 static RDNA4Held *heldFor(IOSurfaceRef surface, BOOL make, RDNA4MTLDevice *device, RDNA4MTLBuffer *host);
@@ -2036,6 +2037,7 @@ static void deviceIdle(RDNA4MTLDevice *device)
 }
 
 - (uint64_t)gpu { return _vram.gpu; }
+- (uint32_t)surfaceID { return IOSurfaceGetID(_surface); }
 
 // The kext presents the surface's frames from the VRAM copy, or from the surface's memory again.
 - (void)present:(BOOL)on
@@ -2145,17 +2147,27 @@ static RDNA4Held *heldFor(IOSurfaceRef surface, BOOL make, RDNA4MTLDevice *devic
 
 // (work queue) What the card drew into every held surface written back into it, waited for: the frames are presented from VRAM, and the
 // surfaces' memory (what other processes and the CPU read) kept current when WindowServer goes idle and at least each second.
-static NSError *heldWriteBackAll(RDNA4MTLDevice *device)
+// `shownToo` NO: only those no display shows from VRAM (debug.rdna4_pvscanoutsids): their memory is all there is of them outside
+// WindowServer (a screenshot's surface).
+static NSError *heldWriteBackAll(RDNA4MTLDevice *device, BOOL shownToo = YES)
 {
 	NSArray<RDNA4Held *> *all;
 	@synchronized([RDNA4Held class]) {
 		all = gHeldAlive.objectEnumerator.allObjects;
 	}
+	uint32_t shown[32];
+	size_t len = sizeof shown;
+	if (shownToo || sysctlbyname("debug.rdna4_pvscanoutsids", shown, &len, NULL, 0))
+		len = 0;   // (an older kext: none known shown, all written back)
 	NSError *why = nil;
 	BOOL any = NO;
-	for (RDNA4Held *h in all)
-		if (!why)
+	for (RDNA4Held *h in all) {
+		BOOL skip = NO;
+		for (size_t i = 0; !shownToo && i < len / 4; i++)
+			skip |= shown[i] == h.surfaceID;
+		if (!why && !skip)
 			any |= [h writeBack:&why];
+	}
 	if (any && !why)
 		why = [device gpuBarrier:NULL count:0];   // the L2 written back (RELEASE_MEM) after the copies
 	return why ?: any ? [device drainGfx] : nil;
@@ -3869,6 +3881,10 @@ static void eventWait(id event, uint64_t value)
 		for (RDNA4MTLTexture *t in self->_drawnShadows)   // the draws done: their pixels into the surfaces
 			[t writeBack];
 		[self->_drawnShadows removeAllObjects];
+		// held surfaces the kext does not present (a screenshot's, read by screencaptureui as soon as this completes): their pixels into
+		// their memory now, not at the idle write-back (screenshots came out all transparent, 2026-11-22)
+		if (!self->_error && heldOn())
+			self->_error = heldWriteBackAll(device, NO);
 		if (shadowsDrawn)
 			scheduledNow();
 		const uint64_t done = nowUs();

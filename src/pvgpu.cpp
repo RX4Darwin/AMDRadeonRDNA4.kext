@@ -1227,6 +1227,26 @@ static int frameSysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_pvframe, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, frameSysctl, "S",
 	    "AMDRadeonRDNA4: the next presented frame at half size");
 
+// debug.rdna4_pvscanoutsids: the IOSurface IDs of the present sources (pvPresentSource) a display has shown from VRAM, u32 each. The native
+// device writes the others' pixels into their memory after each command buffer (a screenshot's surface, read by another process at once).
+// Not root only: WindowServer reads it.
+static int scanoutSidsSysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	uint32_t sids[kPresentSources], n = 0;
+
+	IOLockLock(gSourceLock);
+	for (const PresentSource &p : gSources)
+		if (p.sid && p.handle && !p.dead)
+			sids[n++] = p.sid;
+	IOLockUnlock(gSourceLock);
+
+	return SYSCTL_OUT(req, sids, n * sizeof(uint32_t));
+}
+
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_pvscanoutsids, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, scanoutSidsSysctl, "S",
+	    "AMDRadeonRDNA4: the surfaces displays show from the native device's VRAM");
+
 // Once: by the nub's publish and by the display host (startDisplay), whichever comes first.
 static void registerFrameSysctls()
 {
@@ -1237,6 +1257,7 @@ static void registerFrameSysctls()
 
 	sysctl_register_oid(&sysctl__debug_rdna4_pvframeport);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvframe);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvscanoutsids);
 }
 
 // debug.rdna4_pvnotrun: the draws the host could not run since the boot, by reason, the most first: "count reason (first function)".
