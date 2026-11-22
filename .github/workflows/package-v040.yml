@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: ["install/**"]
+    tags: ["v*"]
     paths:
       - ".github/workflows/package-v040.yml"
       - "Makefile"
