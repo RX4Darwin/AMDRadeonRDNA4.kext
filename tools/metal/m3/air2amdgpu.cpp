@@ -249,8 +249,8 @@ static Value *simdOp(IRBuilder<> &b, StringRef op, CallInst *c) {
 //  - air.* functions: LLVM intrinsics, fences and barriers, atomics.
 // A Metal sampler as gfx12's sampler descriptor (S#, SQ_IMG_SAMP_WORD0-3), from AIR's packed constexpr sampler state (measured against the
 // Metal compiler, 2026-10-22): address s [2:0], t [5:3], r [8:6] (0 zero/border, 1 edge, 2 repeat, 3 mirror), mag [9], min [11] linear, mip
-// [14:13] (0 none, 1 nearest, 2 linear), pixel coordinates [15], anisotropy [23:19] = 2n - 1, min / max LOD halves at [39:24] / [55:40],
-// border colour [57:56].
+// [14:13] (0 none, 1 nearest, 2 linear), pixel coordinates [15], compare function [19:16] (MSL's order: 1 less .. 7 always, 8 never and
+// the default), anisotropy [23:19] = 2n - 1, min / max LOD halves at [39:24] / [55:40], border colour [57:56].
 static uint32_t lod48(uint16_t half) {   // a half's value as gfx12's 4.8 fixed LOD, clamped to [0, 15.996]
 	const int e = (half >> 10) & 31, m = half & 1023;
 	if ((half & 0x8000) || !e)
@@ -260,9 +260,12 @@ static uint32_t lod48(uint16_t half) {   // a half's value as gfx12's 4.8 fixed 
 }
 static Constant *airSampler(LLVMContext &ctx, uint64_t st) {
 	static const uint32_t clamp[4] = {6, 2, 0, 1};   // zero -> CLAMP_BORDER, edge -> CLAMP_LAST_TEXEL, repeat -> WRAP, mirror -> MIRROR
+	// less, less_equal, greater, greater_equal, equal, not_equal, always, never -> SQ_TEX_DEPTH_COMPARE
+	static const uint32_t compare[16] = {0, 1, 3, 4, 6, 2, 5, 7, 0};
 	const uint32_t aniso = ((st >> 19) & 31) / 2 + 1, ratio = aniso >= 16 ? 4 : aniso >= 8 ? 3 : aniso >= 4 ? 2 : aniso >= 2 ? 1 : 0;
 	const uint32_t w[4] = {
-		clamp[st & 3] | clamp[(st >> 3) & 3] << 3 | clamp[(st >> 6) & 3] << 6 | ratio << 9 | uint32_t((st >> 15) & 1) << 15,
+		clamp[st & 3] | clamp[(st >> 3) & 3] << 3 | clamp[(st >> 6) & 3] << 6 | ratio << 9 | compare[(st >> 16) & 15] << 12 |
+			uint32_t((st >> 15) & 1) << 15,
 		lod48(uint16_t(st >> 24)) | lod48(uint16_t(st >> 40)) << 13,
 		uint32_t((st >> 9) & 1) << 20 | uint32_t((st >> 11) & 1) << 22 | uint32_t((st >> 13) & 3) << 26,
 		uint32_t((st >> 56) & 3) << 30};   // BORDER_COLOR_TYPE: 0 transparent black, 1 opaque black, 2 opaque white
@@ -696,6 +699,71 @@ static std::string legalize(Function &k) {
 				texel = b.CreateIntCast(b.CreateBitCast(texel, FixedVectorType::get(b.getInt32Ty(), 4)),
 				                        cast<StructType>(c->getType())->getElementType(0), tex.starts_with("read_texture_2d.s"));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+		} else if (tex.starts_with("sample_texture_2d_grad.v4f")) {
+			// (texture, sampler, float2 coord, float2 dPdx, float2 dPdy, float min LOD, i1, int2 offset, i32): explicit gradients
+			// (Unity's xlatMtlMain shaders, Daggerfall Unity) as image_sample_d: dsdh, dtdh = dPdx, dsdv, dtdv = dPdy.
+			auto *offset = dyn_cast<Constant>(c->getArgOperand(7));
+			if (!offset || !match(c->getArgOperand(5), m_AnyZeroFP()))
+				return f->getName().str() + " with a run-time offset or a minimum LOD is not supported yet";
+			uint32_t packed = 0;
+			for (unsigned i = 0; i < 2; i++)
+				if (auto *e = dyn_cast_or_null<ConstantInt>(offset->getAggregateElement(i)))
+					packed |= (static_cast<uint32_t>(e->getSExtValue()) & 0x3f) << (8 * i);
+			Value *t = descriptor(c->getArgOperand(0), 8);
+			Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
+			Value *xy = c->getArgOperand(2), *dx = c->getArgOperand(3), *dy = c->getArgOperand(4);
+			Type *ft = b.getFloatTy(), *v4f = FixedVectorType::get(ft, 4);
+			SmallVector<Value *, 13> args = {b.getInt32(15)};
+			if (packed)
+				args.push_back(b.getInt32(packed));
+			args.append({b.CreateExtractElement(dx, uint64_t(0)), b.CreateExtractElement(dx, 1), b.CreateExtractElement(dy, uint64_t(0)),
+			             b.CreateExtractElement(dy, 1), b.CreateExtractElement(xy, uint64_t(0)), b.CreateExtractElement(xy, 1), t, sm,
+			             b.getFalse(), b.getInt32(0), b.getInt32(0)});
+			Value *texel = b.CreateIntrinsic(packed ? Intrinsic::amdgcn_image_sample_d_o_2d : Intrinsic::amdgcn_image_sample_d_2d,
+			                                 {v4f, ft, ft, t->getType(), sm->getType()}, args);
+			if (tex.starts_with("sample_texture_2d_grad.v4f16"))
+				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);
+		} else if (tex.starts_with("sample_depth_2d.f32") || tex.starts_with("sample_compare_depth_2d.f32")) {
+			// depth2d: sample (texture, sampler, i32, float2 coord, i1, int2 offset, i1 level, float bias or LOD, float min LOD, i32) and
+			// sample_compare with the reference after the coordinates (the sampler's DEPTH_COMPARE_FUNC: ref OP texel, 1.0 or 0.0). The
+			// texture's T# is its depth as 32_FLOAT, 64KB_2D (RDNA4MTLTexture descriptor:). Shadow maps (Daggerfall Unity).
+			const bool compare = tex.starts_with("sample_compare");
+			const unsigned at = compare ? 5 : 4;   // the i1 after the coordinates (and the reference)
+			auto *offset = dyn_cast<Constant>(c->getArgOperand(at + 1));
+			auto *level = dyn_cast<ConstantInt>(c->getArgOperand(at + 2));
+			Value *value = c->getArgOperand(at + 3);
+			if (!offset || !level || !match(c->getArgOperand(at + 4), m_AnyZeroFP()))
+				return f->getName().str() + " with a run-time offset or level kind, or a minimum LOD, is not supported yet";
+			uint32_t packed = 0;
+			for (unsigned i = 0; i < 2; i++)
+				if (auto *e = dyn_cast_or_null<ConstantInt>(offset->getAggregateElement(i)))
+					packed |= (static_cast<uint32_t>(e->getSExtValue()) & 0x3f) << (8 * i);
+			const bool zero = match(value, m_AnyZeroFP()), lod = level->isOne(), bias = !lod && !zero;
+			if (bias)
+				return f->getName().str() + " with a LOD bias is not supported yet";
+			const bool quads = k.getCallingConv() == CallingConv::AMDGPU_PS;   // implicit LODs need pixel quads (as the 2D case)
+			const unsigned mode = !quads || (lod && zero) ? 3 : lod ? 2 : 0;   // plain, -, explicit LOD, LOD 0
+			static const Intrinsic::ID ids[2][2][4] = {   // [compare][offset][plain, -, lod, lod zero]
+				{{Intrinsic::amdgcn_image_sample_2d, Intrinsic::not_intrinsic, Intrinsic::amdgcn_image_sample_l_2d, Intrinsic::amdgcn_image_sample_lz_2d},
+				 {Intrinsic::amdgcn_image_sample_o_2d, Intrinsic::not_intrinsic, Intrinsic::amdgcn_image_sample_l_o_2d, Intrinsic::amdgcn_image_sample_lz_o_2d}},
+				{{Intrinsic::amdgcn_image_sample_c_2d, Intrinsic::not_intrinsic, Intrinsic::amdgcn_image_sample_c_l_2d, Intrinsic::amdgcn_image_sample_c_lz_2d},
+				 {Intrinsic::amdgcn_image_sample_c_o_2d, Intrinsic::not_intrinsic, Intrinsic::amdgcn_image_sample_c_l_o_2d, Intrinsic::amdgcn_image_sample_c_lz_o_2d}}};
+			Value *t = descriptor(c->getArgOperand(0), 8);
+			Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
+			Value *xy = c->getArgOperand(3);
+			Type *ft = b.getFloatTy();
+			SmallVector<Value *, 11> args = {b.getInt32(1)};
+			if (packed)
+				args.push_back(b.getInt32(packed));
+			if (compare)
+				args.push_back(c->getArgOperand(4));
+			args.append({b.CreateExtractElement(xy, uint64_t(0)), b.CreateExtractElement(xy, 1)});
+			if (mode == 2)
+				args.push_back(value);
+			args.append({t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+			Value *d = b.CreateIntrinsic(ids[compare][packed != 0][mode], {ft, ft, t->getType(), sm->getType()}, args);
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), d, 0), b.getInt8(0), 1);
 		} else if (tex.starts_with("sample_texture_cube.v4f")) {
 			// (texture, sampler, float3 direction, i1 level, float bias or LOD, float min LOD, i32): vkQuake's sky through MoltenVK
 			// (2026-11-21). The direction as the hardware's cube coordinates, as Mesa's ac_prepare_cube_coords: the face (cubeid) and

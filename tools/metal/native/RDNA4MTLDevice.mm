@@ -583,6 +583,7 @@ enum { kWrittenRanges = 8 };   // ranges kept apart (more: the two nearest merge
 - (instancetype)initWithBuffer:(RDNA4MTLBuffer *)buffer descriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset
                    bytesPerRow:(NSUInteger)bpr;
 @property (readonly) BOOL isDepth;        // Depth32Float, Stencil8 or both in VRAM, 64KB_2D (as the PV host's buffers), for the depth block only
+@property (readonly) BOOL sampleable;     // shaders may read it: a colour texture, or a depth texture's depth (not a Stencil8 one)
 @property (readonly) uint64_t depthBytes;    // a depth texture's depth (Depth32Float) from gpuBase, 0: none
 @property (readonly) uint64_t stencilBytes;  // its stencil (Stencil8) after the depth, 0: none
 @property (readonly) uint32_t samples;       // 2 or 4: a multisampled texture's samples, in VRAM, 64KB_2D (as the PV host's msaaSurface); else 1
@@ -885,8 +886,14 @@ static char gCopyKey;
 	statAdd(kStatShadowUs, nowUs() - t0);
 }
 
+- (BOOL)sampleable { return !_isDepth || _depthBytes; }
+
 - (void)descriptor:(uint32_t[8])t
 {
+	if (_isDepth) {   // its depth as the depth block wrote it: 32_FLOAT, 64KB_2D (Depth16Unorm is stored so too), read as (d, 0, 0, 1)
+		msaaImage(t, self.gpuBase, 22, 4 | 1u << 9, (uint32_t)_width, (uint32_t)_height, _samples == 4 ? 2 : _samples == 2 ? 1 : 0);
+		return;
+	}
 	if (_samples > 1) {   // its samples (64KB_2D, as the resolve's source)
 		msaaImage(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), (uint32_t)_width, (uint32_t)_height, _samples == 4 ? 2 : 1);
 		return;
@@ -1072,7 +1079,7 @@ static char gCopyKey;
 - (MTLResourceID)gpuResourceID
 {
 	uint32_t t[8];
-	if (self.isDepth || !self.gpuBase)   // as an unbound slot (the draw's and dispatch's tables): a depth T# or one at 0 could stall the unit
+	if (!self.sampleable || !self.gpuBase)   // as an unbound slot (the draw's and dispatch's tables): a stencil one or one at 0 could stall the unit
 		[_device spareImage:t];
 	else
 		[self descriptor:t];
@@ -2072,6 +2079,7 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 - (const rdna4_program_t *)resolveKernel:(BOOL)srgb;   // rdna4_resolve or rdna4_resolve_srgb, loaded on first use (NULL: not loaded)
 - (uint64_t)spareBuffer;             // what an unbound buffer slot points at: the zeroed spare buffer
 - (BOOL)drawnInFlight:(RDNA4MTLTexture *)t;   // a draw not yet waited for draws into it, a view of it or the texture it views
+- (void)drewDepth:(RDNA4MTLTexture *)t;      // (work queue) a draw wrote its depth: in flight as a draw's target is
 // On the card, before the next draw: a wait for the draws in flight, then the copies (none: the wait alone)
 - (NSError *)gpuBarrier:(const RDNA4Copy *)copies count:(uint32_t)count;
 // A kernel on the gfx ring behind the draws before it, not waited for (RDNA4_RINGDISPATCH=1); NO: not one it takes (scratch, other user data)
@@ -2492,7 +2500,8 @@ RDNA4_ANSWER_MISSING
 		return nil;
 	static const uint32_t clamp[8] = { 2, 3, 0, 1, 6, 6, 2, 2 };   // edge, mirror-clamp-to-edge, repeat, mirror, zero, border
 	_device = device;
-	_s[0] = clamp[d.sAddressMode & 7] | clamp[d.tAddressMode & 7] << 3 | clamp[d.rAddressMode & 7] << 6 | (d.normalizedCoordinates ? 0 : 1u << 15);
+	_s[0] = clamp[d.sAddressMode & 7] | clamp[d.tAddressMode & 7] << 3 | clamp[d.rAddressMode & 7] << 6 | (d.normalizedCoordinates ? 0 : 1u << 15) |
+	        ((uint32_t)d.compareFunction & 7) << 12;   // DEPTH_COMPARE_FUNC: SQ_TEX_DEPTH_COMPARE has MTLCompareFunction's order (sample_compare)
 	_s[1] = 0xfffu << 13;
 	_s[2] = (uint32_t)(d.magFilter & 3) << 20 | (uint32_t)(d.minFilter & 3) << 22 | (uint32_t)(d.mipFilter & 3) << 26;
 	_s[3] = 0;
@@ -3272,7 +3281,7 @@ RDNA4_ANSWER_MISSING
 		// Animation's target, left bound, was a copy of it for every draw of Vfx / Xc, 2026-11-20)
 		const uint32_t uses = _pipeline ? [_pipeline texturesOf:st] : 0xffff;
 		for (int i = 0; i < kTextures; i++) {
-			if ((uses >> i & 1) && [(id)_textures[st][i] isKindOfClass:[RDNA4MTLTexture class]] && !((RDNA4MTLTexture *)_textures[st][i]).isDepth) {
+			if ((uses >> i & 1) && [(id)_textures[st][i] isKindOfClass:[RDNA4MTLTexture class]] && ((RDNA4MTLTexture *)_textures[st][i]).sampleable) {
 				RDNA4MTLTexture *t = (RDNA4MTLTexture *)_textures[st][i];
 				[t descriptor:d.textures[st][i]];
 				for (NSUInteger l = 1; levelT && i < kStageTextures && l < 8; l++)   // (the helper refuses levels of textures 16-30)
@@ -3290,7 +3299,7 @@ RDNA4_ANSWER_MISSING
 			RDNA4MTLTexture *t = [(id)_textures[st][i] isKindOfClass:[RDNA4MTLTexture class]] ? (RDNA4MTLTexture *)_textures[st][i] : nil;
 			const uint64_t slot = t ? t.gpuResourceID._impl : 0;
 			((uint64_t *)handles.mutableBytes)[st * kHandleTextures + (i - kTextures)] = slot ?: [(RDNA4MTLDevice *)self.device spareHandle];
-			if (!t || t.isDepth)
+			if (!t || !t.sampleable)
 				continue;
 			if (t.shadowed)
 				[shadowed addObject:t];
@@ -3339,6 +3348,7 @@ RDNA4_ANSWER_MISSING
 		}
 	RDNA4MTLTexture *target = _targets[d.attachment];
 	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
+	RDNA4MTLTexture *depthTarget = _depth;   // (drewDepth: once the draw ran)
 	// A pass of depth (and stencil) only (Unity's shadow maps): as if into a stand-in of the depth's size, colour not written. Refused
 	// before: "a draw without ... a colour attachment", and the command buffer's later work with it (Daggerfall Unity, 2026-11-22).
 	if (!target && (_depth || _stencil) && (target = [device standInFor:_depth ?: _stencil]))
@@ -3451,6 +3461,8 @@ RDNA4_ANSWER_MISSING
 		why = [device draw:&dd pipeline:pipeline target:target];
 		if (!why)
 			[cb drewInto:target];
+		if (!why && dd.depthWrite)   // a draw sampling it next waits for it (a shadow map: drawn, then read in the same command buffer)
+			[device drewDepth:depthTarget];
 		statAdd(kStatDraws, 1);
 		statAdd(kStatDrawUs, nowUs() - t0);
 		return why;
@@ -4500,6 +4512,13 @@ static void abortStack(int sig)
 // By the root texture: a pass draws into a level's view (level:) or a view, the next draw samples the texture; by the object, that draw
 // missed the barrier and read texels not yet written: squares in every menu's glass blur, popping in and out (2026-11-22)
 - (BOOL)drawnInFlight:(RDNA4MTLTexture *)t { return [_drawnInFlight containsObject:t.root]; }
+- (void)drewDepth:(RDNA4MTLTexture *)t
+{
+	if (!t)
+		return;
+	_drawnInFlight = _drawnInFlight ?: [NSHashTable weakObjectsHashTable];
+	[_drawnInFlight addObject:t.root];
+}
 
 // ponytail: a whole BGRA8 texture per depth size that is never written (CB_TARGET_MASK 0); the colour block's registers only need
 // something of that size. Its memory could be skipped with a target of no format.
