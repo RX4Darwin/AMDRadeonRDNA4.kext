@@ -392,8 +392,27 @@ public:
 	}
 	// A transaction's first plane onto the pipe's head as the paravirtual displays' frames go (pvPresent: copied by the card into a
 	// buffer the head flips to at vblank, else by the CPU). ponytail: plane 0 only, no rects.
+	// The framebuffer powering off (display sleep): the family marks the pipe offline (+0x299), and transactionEnd answers every
+	// transaction of WindowServer's kIOReturnOffline. CoreDisplay retried them (~1.4 a second) and never finished its display sleep:
+	// WindowServer deferred its sleep ack (30 s) and IOGraphics' capability change waited for it (90 s), at every system sleep,
+	// 2026-11-22. Taken instead and dropped (performTransaction) until the framebuffer is on again.
+	bool displayOff = false;
+	uintptr_t framebuffer_will_power_off() APPLE_KEXT_OVERRIDE
+	{
+		const uintptr_t r = super::framebuffer_will_power_off();
+		displayOff = true;
+		reinterpret_cast<uint8_t *>(this)[0x299] = 0;
+		return r;
+	}
+	uintptr_t framebuffer_did_power_on() APPLE_KEXT_OVERRIDE
+	{
+		displayOff = false;
+		return super::framebuffer_did_power_on();
+	}
 	uintptr_t performTransaction(IOAccelDisplayPipeTransaction2 *t) APPLE_KEXT_OVERRIDE
 	{
+		if (displayOff)
+			return kIOReturnSuccess;   // nothing reaches a head that is off (and during a system sleep the card is going away)
 		const uintptr_t r = super::performTransaction(t);
 #ifdef AMDRadeonRDNA4_PVGPU
 		using PlaneSurface = const void *(*)(const IOAccelDisplayPipeTransaction2 *, unsigned int, unsigned int);
