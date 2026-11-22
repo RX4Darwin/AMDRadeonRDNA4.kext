@@ -979,7 +979,9 @@ static char gCopyKey;
 	if (!(self = [super init]))
 		return nil;
 	const NSUInteger l = levels.location, have = MAX(t->_levels, (NSUInteger)1);
-	_fm = textureFormat((uint32_t)format);
+	// a BC format as its texture keeps it, RGBA8 (sRGB for the sRGB ones): Apple's GL-on-Metal renderer views every texture it binds,
+	// and with none for BC it sampled zeros ("formats are not castable"): OpenMW's world black (2026-11-22)
+	_fm = textureFormat(bcBlockBytes(format) ? (format & 1 ? 71u : 70u) : (uint32_t)format);
 	if (t->_isDepth || !t->_fm || !_fm || _fm->bpp != t->_fm->bpp || l >= have || slices.location || t->_type == MTLTextureType3D) {
 		rdna4Error([NSString stringWithFormat:@"a view of format %lu, type %lu, levels %lu+%lu, slices %lu+%lu of a texture of format %lu: only colour "
 		                                      @"textures, the same size a pixel, from slice 0, not 3D, so far", (unsigned long)format,
