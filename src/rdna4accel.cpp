@@ -225,15 +225,20 @@ class RDNA4Resource : public IOAccelResource2 {
 	OSDeclareDefaultStructors(RDNA4Resource)
 	using super = IOAccelResource2;
 	uint32_t unplaced = 0;   // prepares the family could not place (below), each one undone by a complete
+	bool unplaceable = false;   // the family could not place it once: it is not asked again
 public:
 	// Prepared even when the family cannot place it: WindowServer's IOSurfaces are VRAM resources whose memory has no size (we report
 	// no device-cache VRAM), IOAccelTask::allocate cannot map 0 bytes ("failed to allocate GPU virtual address"), and every display pipe
 	// transaction carried 0xe00002be and was never performed (2026-11-21). Nothing reads a GPU address of ours: the pipe presents the
-	// plane by its IOSurface (performTransaction). ponytail: real VRAM placement once the family's command path draws.
+	// plane by its IOSurface (performTransaction). Asked once: the size never changes, and each refusal logged two kernel lines per
+	// display per frame (240 a second on the rig's two displays, 2026-11-22), which pushed everything else out of the kernel's log.
+	// ponytail: real VRAM placement once the family's command path draws.
 	uintptr_t prepare() APPLE_KEXT_OVERRIDE
 	{
-		if (!super::prepare())
+		if (unplaceable || !super::prepare()) {
+			unplaceable = true;
 			unplaced++;
+		}
 		return true;
 	}
 	uintptr_t complete() APPLE_KEXT_OVERRIDE
