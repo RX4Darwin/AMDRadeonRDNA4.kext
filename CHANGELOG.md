@@ -73,8 +73,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
   VRAM copied to host memory before the card loses its power and back after the wake; calls during the sleep wait instead of
   failing. Before, WindowServer aborted at every sleep (the login window came back). `rdna4-sleepkeep=0` discards as before.
   Card (Tahoe 26.6.2, 2026-11-22): 19 clients, 325 MiB saved in 90 ms and restored in 37 ms, WindowServer and the session kept
-  through two sleeps. Vulkan apps (`N48N`) still lose their session. Still slow: about two minutes from Sleep to S3 (WindowServer's
-  30 s ack and a 90 s IOGraphics wait).
+  through two sleeps. Vulkan apps (`N48N`) still lose their session.
+- System sleep on the native desktop in about 30 s, not two minutes: the framebuffers hidden from WindowServer are marked up for it
+  in their IOGraphics controller, which otherwise held back the sleep's notification (WindowServer's 30 s ack, then a 90 s
+  IOGraphics wait). Card (2026-11-22): S3 0.8 s after the runtime's quiesce; the 30 s left is `wifip2pd`'s own timeout.
+- README: what to remove from the boot-args when updating from 0.3.3.
 - The display pipes take WindowServer's frames while a display sleeps (dropped; the family answered "offline" to each, about 1.4
   failed submissions a second).
 - After a sleep, a main display at another mode than the boot one (2560x1440) comes back, and so does the second one.

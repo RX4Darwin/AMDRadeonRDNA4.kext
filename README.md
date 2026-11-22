@@ -189,6 +189,22 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 Keep a known-good copy of your EFI on a USB stick while testing. `rdna4-off=1` turns the plugin off and `-liluoff` all
 Lilu plugins; macOS then runs its stock framebuffer.
 
+### Updating from 0.3.3
+
+0.4.0 needs no boot-args: what 0.3 asked for is built in, and its desktop is now the driver's own accelerator
+(`rdna4-accel=4`), not Apple's paravirtual GPU. **Remove the driver's boot-args from 0.3** from `boot-args` in `config.plist`
+(`NVRAM → Add → 7C436110-AB2A-4BBB-A880-FE41995C9F82`), and keep `boot-args` listed under `NVRAM → Delete` for that GUID (or
+reset NVRAM) so the new value is used. In particular:
+
+- `rdna4-pvgpu=1`: left in, it brings Apple's paravirtual GPU up beside the native desktop.
+- `rdna4-compute=7`, `rdna4-gfx=2`, `rdna4-vm=1`, `rdna4-vmshared=…`, `rdna4-pvgpu-disp=…`, `rdna4-pvgpu-delay=…`, `rdna4-pvfast=1`,
+  `rdna4-pvgl=…`, `rdna4-accel=4`, `rdna4-nativews=…`, `rdna4-dmubload=1`, `rdna4-dcninit=1`, `rdna4-head2dp=1`,
+  `rdna4-syssleep=1`: now the defaults.
+
+Keep only a boot-arg that changes a default on purpose ([Boot arguments](#boot-arguments)), and the ones that are not the
+driver's (`amfi_get_out_of_my_way=0x1`, Lilu's). Then install the kext and the package of the same release (step 6 above
+replaces 0.3's per-component install scripts) and reboot.
+
 ### Metal, OpenGL and Vulkan
 
 `AMDRadeonRDNA4-<version>.pkg` (step 5 above) comes with each release; to build it: `make PVGPU=1 all metal-helper mesa
