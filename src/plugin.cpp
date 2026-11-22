@@ -1940,7 +1940,7 @@ void pluginStart() {
 	// involved in an early boot failure.
 	uint32_t off = 0;
 	if (PE_parse_boot_argn("rdna4-off", &off, sizeof(off)) && off) {
-		IOLog("AMDRadeonRDNA4: disabled by rdna4-off boot-arg\\n");
+		IOLog("AMDRadeonRDNA4: disabled by rdna4-off boot-arg\n");
 		return;
 	}
 	rdna4LogInit();
