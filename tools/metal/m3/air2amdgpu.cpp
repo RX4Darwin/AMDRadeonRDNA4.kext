@@ -2041,6 +2041,12 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 					if ((writes >> n & 1) && static_cast<unsigned>(memberOf[n]) != colourMember)
 						out = b.CreateSelect(b.CreateICmpEQ(sel, b.getInt32(n)), toVec4(b.CreateExtractValue(colour, static_cast<unsigned>(memberOf[n]))), out);
 			}
+			{   // alpha to coverage, one sample a pixel: kept when the table's flag is 0 or the alpha is at least 0.5
+				Value *at = b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(RDNA4_MTLC_TABLE_ALPHA_TO_COVERAGE)), PointerType::get(ctx, 4));
+				Value *on = b.CreateICmpNE(b.CreateAlignedLoad(i32, at, Align(4)), b.getInt32(0));
+				Value *alpha = b.CreateExtractElement(out, 3);
+				b.CreateIntrinsic(Intrinsic::amdgcn_kill, {}, {b.CreateOr(b.CreateNot(on), b.CreateFCmpOGE(alpha, ConstantFP::get(f32, 0.5)))});
+			}
 			if (dualMember >= 0 && colour->getType()->isStructTy()) {
 				// Both sources to the dual-source targets (21, 22), swizzled as gfx11+ wants them: Mesa's ac_build_dual_src_blend_swizzle (the
 				// first source's odd and even lanes swapped, the even lanes swapped between the sources, the first's lanes swapped back)

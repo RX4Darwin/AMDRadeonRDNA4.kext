@@ -2044,6 +2044,7 @@ enum { kRgfxMagic = 0x58464752u, kHead = 8, kTxrd = 0x44525854u, kPosm = 0x4d534
 @property (readonly) const uint32_t *inputCntl; // SPI_PS_INPUT_CNTL_0 .. ins - 1
 @property (readonly) BOOL sprite;               // a fragment input is the point's coordinate
 @property (readonly) BOOL exportsNothing;       // the fragment code has no export instruction (drawn as a shader without a colour)
+@property (readonly) BOOL alphaToCoverage;      // alphaToCoverageEnabled: fragments of alpha below 0.5 discarded (RDNA4_MTLC_TABLE_ALPHA_TO_COVERAGE)
 @property (readonly) uint64_t code;             // GPU address: VS at +0, PS at +RDNA4_TRI_PS_OFFSET
 @property (readonly) MTLPixelFormat format;     // colour attachment 0's
 - (const uint32_t *)blendOf:(NSUInteger)attachment;   // its blend state as the PV host reads it (pvdraw.hpp readBlendStates): [2] on,
@@ -2354,6 +2355,7 @@ static id<MTLFunction> noFragmentFunction(RDNA4MTLDevice *device)
 		                                             [(id)fn[1] class], [(id)fn[1].device class]], 0);
 	MTLRenderPipelineColorAttachmentDescriptor *a = desc.colorAttachments[0];
 	_format = a.pixelFormat;
+	_alphaToCoverage = desc.alphaToCoverageEnabled;
 	const MTLPixelFormat zf = desc.depthAttachmentPixelFormat, sf = desc.stencilAttachmentPixelFormat;
 	if ((zf != MTLPixelFormatInvalid && zf != MTLPixelFormatDepth32Float && zf != MTLPixelFormatDepth16Unorm && zf != MTLPixelFormatDepth32Float_Stencil8) ||
 	    (sf != MTLPixelFormatInvalid && sf != MTLPixelFormatStencil8 && sf != MTLPixelFormatDepth32Float_Stencil8))
@@ -4910,7 +4912,10 @@ static void abortStack(int sig)
 	// blend optimisation
 	const BOOL dualSource = (ps[7] >> 18 & 1) && !noColour;
 	const BOOL depthOut = ps[7] >> 19 & 1;   // the fragment shader exports its depth (MRTZ)
-	const uint32_t dbShader = noColour ? 0x600u : 0x10u;
+	// KILL_ENABLE: any fragment shader may discard (discard_fragment, alpha to coverage, a cut-out shadow caster); without it the depth
+	// block wrote the depth of fragments the shader then discarded (early Z): Daggerfall Unity's billboards white, their light falling on
+	// the depth of their transparent texels (2026-11-22)
+	const uint32_t dbShader = (noColour ? 0x600u : 0x10u) | 0x40u;
 	// Blending as the PV host's runDraw: the colour pass and, when alpha's equation differs and both are written, an alpha-only pass after it
 	// (the card ignores SEPARATE_ALPHA_BLEND). ponytail: a colour factor reading destination alpha sees the alpha from before the draw.
 	const uint32_t *blend = [p blendOf:d->attachment];
@@ -4985,6 +4990,7 @@ static void abortStack(int sig)
 		}
 	memcpy((uint8_t *)misc + 0x400 + RDNA4_MTLC_TABLE_ATTRIBUTES, p.attributes, 16 * 16);   // the vertex descriptor
 	((uint32_t *)misc)[(0x800 + RDNA4_MTLC_TABLE_ATTACHMENT) / 4] = d->attachment;
+	((uint32_t *)misc)[(0x800 + RDNA4_MTLC_TABLE_ALPHA_TO_COVERAGE) / 4] = p.alphaToCoverage;
 	// the target as an image, for shaders that read it (framebuffer fetch: RDNA4_MTLC_TABLE_FRAMEBUFFER). ponytail: a pixel the same draw
 	// covers twice reads its first write, not the value from before the draw (the PV host's reads a staged copy).
 	[t descriptor:(uint32_t *)((uint8_t *)misc + 0x800 + RDNA4_MTLC_TABLE_FRAMEBUFFER)];
