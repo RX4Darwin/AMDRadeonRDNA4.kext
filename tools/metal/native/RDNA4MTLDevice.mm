@@ -979,6 +979,31 @@ static char gCopyKey;
 	if (!(self = [super init]))
 		return nil;
 	const NSUInteger l = levels.location, have = MAX(t->_levels, (NSUInteger)1);
+	// A depth texture's depth viewed as a depth format (Apple's GL-on-Metal renderer views the depth it samples: OpenMW's water and soft
+	// particles read the scene's depth through 2300 refused views, 2026-11-22): its VRAM, level 0, slice 0. ponytail: no stencil views.
+	if (t->_isDepth) {
+		const BOOL depthFormat = format == MTLPixelFormatDepth32Float || format == MTLPixelFormatDepth32Float_Stencil8 ||
+		                         format == MTLPixelFormatDepth16Unorm;
+		if (!depthFormat || !t->_depthBytes || l || slices.location) {
+			rdna4Error([NSString stringWithFormat:@"a view of format %lu, levels %lu+%lu, slices %lu+%lu of a depth texture of format %lu: "
+			                                      @"its depth, level 0, slice 0, only", (unsigned long)format, (unsigned long)l,
+			                                      (unsigned long)levels.length, (unsigned long)slices.location, (unsigned long)slices.length,
+			                                      (unsigned long)t->_format], 0);
+			return nil;
+		}
+		_isDepth = YES;
+		_vram = t->_vram;
+		_depthBytes = t->_depthBytes;
+		_stencilBytes = format == MTLPixelFormatDepth32Float_Stencil8 ? t->_stencilBytes : 0;
+		_samples = t->_samples;
+		_device = t->_device;
+		_width = t->_width, _height = t->_height;
+		_format = format;
+		_usage = t->_usage;
+		_type = t->_type;
+		_parent = t;
+		return self;
+	}
 	// a BC format as its texture keeps it, RGBA8 (sRGB for the sRGB ones): Apple's GL-on-Metal renderer views every texture it binds,
 	// and with none for BC it sampled zeros ("formats are not castable"): OpenMW's world black (2026-11-22)
 	_fm = textureFormat(bcBlockBytes(format) ? (format & 1 ? 71u : 70u) : (uint32_t)format);
@@ -1238,7 +1263,7 @@ static char gCopyKey;
 {
 	gTexturesLive--;
 	[_device freeHandle:_handle];
-	if (_vram.handle)
+	if (_vram.handle && !_parent)   // (a view's is its parent's)
 		rdna4_free(_device.gpu, &_vram);
 }
 

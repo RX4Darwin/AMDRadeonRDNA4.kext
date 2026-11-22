@@ -1623,6 +1623,10 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			vars.push_back({k, fnv(mdString(o, 1)), false, 0});
 		else if (vertex && kind == "air.point_size")
 			continue;   // only triangles are drawn: a point's size is not used
+		// ponytail: clip distances dropped: what a user clip plane would cut is drawn (OpenMW's water reflection draws what is under the
+		// water too); the hardware's (POS1 export, PA_CL_VS_OUT_CNTL CLIP_DIST_ENA) when that shows
+		else if (vertex && kind == "air.clip_distance")
+			continue;
 		// ponytail: the layer is dropped: right for targets of one layer (MoltenVK's vtxCmdBlitImageLayered into vkQuake's 2D images),
 		// an array target's draws all land in its first layer; export it in the misc position (PA_CL_VS_OUT_CNTL) when one needs it
 		else if (vertex && kind == "air.render_target_array_index")
