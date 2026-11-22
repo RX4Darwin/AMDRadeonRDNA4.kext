@@ -1988,6 +1988,7 @@ typedef struct {
 	uint32_t depthWidth, depthHeight, depthCompare, depthWrite;
 	uint64_t stencilGpu;                // the pass's Stencil8 attachment (0: none; the size the depth's), the state's words, the references
 	uint32_t stencilDepthControl, stencilControl, stencilReadMask, stencilWriteMask, stencilRef;
+	uint32_t depthOnly;                 // the pass has no colour attachment: drawn into a stand-in (standInFor:), colour not written
 } RDNA4Draw;
 
 typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // GPU addresses; src 0: a fill with the pattern
@@ -1996,6 +1997,7 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 - (BOOL)gfx;   // the client may submit gfx IBs and the device's gfx buffers exist
 - (uint64_t)gfxRings;
 - (NSError *)draw:(const RDNA4Draw *)draw pipeline:(RDNA4MTLRenderPipeline *)pipeline target:(RDNA4MTLTexture *)target;
+- (RDNA4MTLTexture *)standInFor:(RDNA4MTLTexture *)depth;   // a BGRA8 target of the depth's size and samples, kept, never written
 - (NSError *)drainGfx;
 - (NSError *)flushBatch;   // the draws and barriers written so far onto the gfx ring (one submit)
 - (dispatch_queue_t)work;
@@ -2941,12 +2943,13 @@ RDNA4_ANSWER_MISSING
 	       (unsigned long)pass.colorAttachments[0].texture.pixelFormat, (unsigned long)pass.colorAttachments[0].texture.width,
 	       (unsigned long)pass.colorAttachments[0].texture.height, (unsigned long)pass.colorAttachments[0].loadAction,
 	       pass.colorAttachments[1].texture ? @"yes" : @"-", pass.depthAttachment.texture ? @"yes" : @"-");
-	_viewport = (MTLViewport){ 0, 0, (double)first.width, (double)first.height, 0, 1 };
-	_scissor = (MTLScissorRect){ 0, 0, first.width, first.height };
 	MTLRenderPassDepthAttachmentDescriptor *z = pass.depthAttachment;
 	MTLRenderPassStencilAttachmentDescriptor *sa = pass.stencilAttachment;
 	RDNA4MTLTexture *zt = [(id)z.texture isKindOfClass:[RDNA4MTLTexture class]] ? (RDNA4MTLTexture *)z.texture : nil;
 	RDNA4MTLTexture *st = [(id)sa.texture isKindOfClass:[RDNA4MTLTexture class]] ? (RDNA4MTLTexture *)sa.texture : nil;
+	first = first ?: zt ?: st;   // a pass of depth (and stencil) only: its size theirs (empty before: every draw outside the scissor)
+	_viewport = (MTLViewport){ 0, 0, (double)first.width, (double)first.height, 0, 1 };
+	_scissor = (MTLScissorRect){ 0, 0, first.width, first.height };
 	_depth = zt.isDepth && zt.depthBytes ? zt : nil;
 	_stencil = st.isDepth && st.stencilBytes ? st : nil;
 	// their clears on the card behind the draws before them, as the colour's (the depth's was the CPU's, a step that drained the draws)
@@ -3268,6 +3271,10 @@ RDNA4_ANSWER_MISSING
 		}
 	RDNA4MTLTexture *target = _targets[d.attachment];
 	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
+	// A pass of depth (and stencil) only (Unity's shadow maps): as if into a stand-in of the depth's size, colour not written. Refused
+	// before: "a draw without ... a colour attachment", and the command buffer's later work with it (Daggerfall Unity, 2026-11-22).
+	if (!target && (_depth || _stencil) && (target = [device standInFor:_depth ?: _stencil]))
+		d.depthOnly = 1;
 	memcpy(d.covered, d.scissor, sizeof d.covered);
 	if (pipeline)
 		[self bound:&d pipeline:pipeline indices:indexBuffer offset:indexOffset type:indexType];
@@ -4280,6 +4287,7 @@ RDNA4_ANSWER_MISSING
 	RDNA4MTLRenderPipeline *_slotPipe[kSlots];   // what each slot's draw is (pipeline, vertices, instances, target size and format): a hang
 	uint32_t _slotWhat[kSlots][5];               // names the draws in flight (described then: formatted for each draw, 4000 a second, it cost)
 	NSHashTable *_drawnInFlight;               // the targets of the draws since the last drainGfx (work queue only)
+	NSMutableDictionary<NSString *, RDNA4MTLTexture *> *_standIns;   // standInFor:, by size and samples
 	BOOL _drawsInFlight;                       // a draw since the last drainGfx: drainGfx checks _lastSlot's stream fence word
 	uint32_t _slot, _lastSlot;
 	uint32_t _batchFirst, _batchCount;   // the slots written and not yet submitted (queueSlot, flushBatch): consecutive, from _batchFirst
@@ -4419,6 +4427,32 @@ static void abortStack(int sig)
 // By the root texture: a pass draws into a level's view (level:) or a view, the next draw samples the texture; by the object, that draw
 // missed the barrier and read texels not yet written: squares in every menu's glass blur, popping in and out (2026-11-22)
 - (BOOL)drawnInFlight:(RDNA4MTLTexture *)t { return [_drawnInFlight containsObject:t.root]; }
+
+// ponytail: a whole BGRA8 texture per depth size that is never written (CB_TARGET_MASK 0); the colour block's registers only need
+// something of that size. Its memory could be skipped with a target of no format.
+- (RDNA4MTLTexture *)standInFor:(RDNA4MTLTexture *)depth
+{
+	const NSUInteger samples = MAX(depth.samples, 1u);
+	NSString *key = [NSString stringWithFormat:@"%lux%lux%lu", (unsigned long)depth.width, (unsigned long)depth.height, (unsigned long)samples];
+	@synchronized(self) {
+		RDNA4MTLTexture *t = _standIns[key];
+		if (t)
+			return t;
+		MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:depth.width
+		                                                                             height:depth.height mipmapped:NO];
+		d.usage = MTLTextureUsageRenderTarget;
+		d.storageMode = MTLStorageModePrivate;
+		if (samples > 1)
+			d.textureType = MTLTextureType2DMultisample, d.sampleCount = samples;
+		t = (RDNA4MTLTexture *)[self newTextureWithDescriptor:d];
+		if ([t isKindOfClass:[RDNA4MTLTexture class]]) {
+			_standIns = _standIns ?: [NSMutableDictionary dictionary];
+			_standIns[key] = t;
+			return t;
+		}
+		return nil;
+	}
+}
 
 // A slot's IB onto the gfx ring; again while the ring is full (kIOReturnBusy: every client's submissions in it at once, at most 128;
 // kIOReturnNoResources: no room for the packets), for up to 2 s.
@@ -4725,7 +4759,7 @@ static void abortStack(int sig)
 {
 	if (d->type > 4 || !d->count || !d->instances || d->count > (1u << 24))
 		return rdna4Error([NSString stringWithFormat:@"a draw of %u vertices, type %u, %u instances: not run", d->count, d->type, d->instances], 0);
-	if ([p formatOf:d->attachment] != t.pixelFormat)
+	if (!d->depthOnly && [p formatOf:d->attachment] != t.pixelFormat)
 		return rdna4Error([NSString stringWithFormat:@"the pipeline's colour attachment %u format %lu is not the target's %lu", d->attachment,
 		                                             (unsigned long)[p formatOf:d->attachment], (unsigned long)t.pixelFormat], 0);
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];   // built here and copied into the slot's pages: draws are made on the work queue only
@@ -4734,11 +4768,19 @@ static void abortStack(int sig)
 	NSError *taken = [self takeSlot:&slot];
 	if (taken)
 		return taken;
+	// A slot taken and left out (a return below before queueSlot) is queued as NOPs: a batch is its slots' pages one after the other, and
+	// the card ran the page left in the run (zeros) and hung the gfx ring for good (a depth-only pass's empty scissor, 2026-11-22).
+	struct Pad {
+		__unsafe_unretained RDNA4MTLDevice *device;
+		uint32_t slot;
+		bool queued;
+		~Pad() { if (!queued) [device queueSlot:slot dwords:0]; }
+	} pad = { self, slot, false };
 	uint64_t t0 = nowUs();
 	kern_return_t kr = KERN_SUCCESS;
 	const uint64_t miscGpu = _misc.gpu + (uint64_t)slot * kMiscBytes, ibOffset = (uint64_t)slot * RDNA4_TRIRUN_PAGE;
 	const uint32_t *vs = p.vs, *ps = p.ps, outs = p.outs, ins = p.ins;
-	const BOOL noColour = (ps[7] >> 31) || p.exportsNothing;
+	const BOOL noColour = (ps[7] >> 31) || p.exportsNothing || d->depthOnly;
 	// dual-source blending (the fragment header's bit 18: the colour and its [[color(0), index(1)]]; Sublime Text's subpixel text through
 	// Apple's GL-on-Metal renderer), as the PV host: both exports in the colour's format and in CB_SHADER_MASK, DISABLE_DUAL_QUAD, no SX
 	// blend optimisation
@@ -4933,6 +4975,7 @@ static void abortStack(int sig)
 	if (kr)
 		return rdna4Error([NSString stringWithFormat:@"a draw of %u vertices (%u dwords)", d->count, total], kr);
 	[self queueSlot:slot dwords:total];
+	pad.queued = true;
 	_lastSlot = slot;
 	_drawsInFlight = YES;
 	const uint32_t cx = d->covered[0], cy = d->covered[1], cx2 = MIN(cx + d->covered[2], (uint32_t)t.width), cy2 = MIN(cy + d->covered[3], (uint32_t)t.height);
