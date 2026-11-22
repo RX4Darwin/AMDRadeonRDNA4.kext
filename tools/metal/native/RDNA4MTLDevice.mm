@@ -658,7 +658,9 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 	_samples = (uint32_t)MAX(d.sampleCount, (NSUInteger)1);
 	const uint64_t pixels = (uint64_t)((d.width + 255) & ~(NSUInteger)255) * ((d.height + 255) & ~(NSUInteger)255) * _samples;
 	_depthBytes = d.pixelFormat == MTLPixelFormatStencil8 ? 0 : pixels * 4;
-	_stencilBytes = d.pixelFormat == MTLPixelFormatDepth32Float ? 0 : pixels;
+	// Depth16Unorm (Dawn's, Chrome's compositor) stored as Depth32Float: the same values in [0, 1], finer; ponytail: a CPU or blit copy would see
+	// 4 bytes a pixel, none so far (depth textures have no CPU copy)
+	_stencilBytes = d.pixelFormat == MTLPixelFormatDepth32Float || d.pixelFormat == MTLPixelFormatDepth16Unorm ? 0 : pixels;
 	const kern_return_t kr = rdna4_alloc(device.gpu, _depthBytes + _stencilBytes, &_vram);
 	if (kr) {
 		rdna4Error([NSString stringWithFormat:@"a %lux%lu depth texture", (unsigned long)d.width, (unsigned long)d.height], kr);
@@ -1163,8 +1165,21 @@ static char gCopyKey;
 	return self.bytes + _levelOffset[level] + z * _slicePitch + y * (level ? _levelRow[level] : _rowBytes) + x * self.bpp;
 }
 
+// In VRAM only (depth, multisample): no CPU copy, CPU reads and writes are ignored. ponytail: ANGLE's zero fill of a new renderbuffer, which
+// its passes clear anyway; a GPU blit if contents matter.
+- (BOOL)vramOnly
+{
+	if (_memory.contents)
+		return NO;
+	RTRACE(8, @"CPU access to a %lux%lu texture of format %lu, %u samples, in VRAM only: ignored", (unsigned long)_width, (unsigned long)_height,
+	       (unsigned long)_format, _samples);
+	return YES;
+}
+
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr
 {
+	if (self.vramOnly)
+		return;
 	[self wroteAll];
 	for (NSUInteger y = 0; [self fits:r level:level] && y < r.size.height; y++)
 		memcpy([self at:level x:r.origin.x y:r.origin.y + y z:r.origin.z], (const uint8_t *)bytes + y * bpr, r.size.width * self.bpp);
@@ -1197,6 +1212,8 @@ static char gCopyKey;
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes
           bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
 {
+	if (self.vramOnly)
+		return;
 	if (_type == MTLTextureType1DArray && slice < _layers && !level && r.origin.x + r.size.width <= _width)   // a layer is a row
 		memcpy(self.bytes + slice * _rowBytes + r.origin.x * self.bpp, bytes, r.size.width * self.bpp);
 	else if (_slices && slice < _slices && !level && [self fits:r level:0])   // an array's or cube's image: a slice
@@ -1213,6 +1230,8 @@ static char gCopyKey;
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level
            slice:(NSUInteger)slice
 {
+	if (self.vramOnly)
+		return;
 	if (_slices && slice < _slices && !level && [self fits:r level:0])
 		for (NSUInteger y = 0; y < r.size.height; y++)
 			memcpy((uint8_t *)bytes + y * bpr, [self at:0 x:r.origin.x y:r.origin.y + y z:slice], r.size.width * self.bpp);
@@ -1222,6 +1241,8 @@ static char gCopyKey;
 
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level
 {
+	if (self.vramOnly)
+		return;
 	for (NSUInteger y = 0; [self fits:r level:level] && y < r.size.height; y++)
 		memcpy((uint8_t *)bytes + y * bpr, [self at:level x:r.origin.x y:r.origin.y + y z:r.origin.z], r.size.width * self.bpp);
 }
@@ -1509,9 +1530,8 @@ RDNA4_ANSWER_MISSING
 // `function` translated by the translator in file mode ($RDNA4_AIR2AMDGPU, the bundle's Contents/Helpers/air2amdgpu, or /usr/local/libexec/rdna4-air2amdgpu): a kernel's code
 // object, or a vertex or fragment function's RGFX blob (tools/metal/m3/air2amdgpu.cpp), and a kernel's count of buffer addresses.
 // A process that may not start programs (WindowServer's sandbox): the kext's translator helper does it (rdna4_translate).
-static NSError *translateByKext(rdna4_t *gpu, NSString *input, NSString *name, NSData **blob, uint32_t *buffers)
+static NSError *translateByKext(rdna4_t *gpu, NSData *air, NSString *name, NSData **blob, uint32_t *buffers)
 {
-	NSData *air = [NSData dataWithContentsOfFile:input];
 	NSMutableData *out = [NSMutableData dataWithLength:RDNA4_MTLC_MAX_ELF];
 	uint64_t bytes = 0;
 	const kern_return_t kr = air && gpu ? rdna4_translate(gpu, air.bytes, air.length, name.UTF8String, out.mutableBytes, out.length, &bytes, buffers)
@@ -1683,15 +1703,20 @@ static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFun
 	NSString *out = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"rdna4mtl-%d-%@.bin", getpid(), fileName]];
 	// The input: our library's metallib, or the AIR bitcode of a function Metal's own compiler made (newLibraryWithSource: and the other
 	// library calls _MTLDevice answers: an _MTLFunctionInternal, its -bitcodeData)
+	// A sandbox (WebKit's and Chrome's GPU processes) may refuse the temporary files and the helper: then the AIR goes through the kext.
+	RDNA4MTLDevice *device = (RDNA4MTLDevice *)(function.device ?: gGlDevice);
 	NSString *input = nil, *scratch = nil;
+	NSData *air = nil;
 	if ([(id)function isKindOfClass:[RDNA4MTLFunction class]]) {
 		input = ((RDNA4MTLFunction *)function).library.path;
-	} else if (NSData *bitcode = functionAir(function)) {
+	} else if ((air = functionAir(function))) {
 		scratch = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"rdna4mtl-%d-%@.bc", getpid(), fileName]];
-		if ([bitcode writeToFile:scratch atomically:NO])
+		if ([air writeToFile:scratch atomically:NO])
 			input = scratch;
+		else if (!linked.count)
+			return translateByKext(device.gpu, air, function.name, blob, buffers);
 	}
-	if (!input) {
+	if (!input && !air) {
 		// (diagnostic) what such a function has instead: Core Image's (2026-11-21, icons without their layers on our accelerator)
 		id f = function;
 		auto has = ^NSString *(NSString *sel) {
@@ -1711,15 +1736,18 @@ static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFun
 		NSMutableData *box = [NSMutableData dataWithBytes:"RDLK" length:4];
 		const uint32_t count = (uint32_t)linked.count + 1;
 		[box appendBytes:&count length:4];
-		BOOL ok = appendLinkEntry(box, function.name, [NSData dataWithContentsOfFile:input]);
+		BOOL ok = appendLinkEntry(box, function.name, air ?: [NSData dataWithContentsOfFile:input]);
 		for (id<MTLFunction> f in linked)
 			ok = ok && appendLinkEntry(box, f.name, functionAir(f));
 		NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"rdna4mtl-%d-%@.rdlk", getpid(), fileName]];
 		if (scratch)
 			[NSFileManager.defaultManager removeItemAtPath:scratch error:nil];
-		if (!ok || ![box writeToFile:path atomically:NO])
+		if (!ok)
 			return rdna4Error([NSString stringWithFormat:@"%@: a linked function (%@) without AIR", function.name, [linked valueForKey:@"name"]], 0);
+		if (![box writeToFile:path atomically:NO])
+			return translateByKext(device.gpu, box, function.name, blob, buffers);
 		input = scratch = path;
+		air = box;
 	}
 	// posix_spawn and waitpid, not NSTask: -waitUntilExit runs the calling thread's run loop while it waits, and on an app's main thread
 	// that ran the app's own sources, which came back into OpenGL under the context's lock (kitty hung for good, 2026-11-21)
@@ -1740,7 +1768,7 @@ static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFun
 			close(fds[0]);
 	}
 	if (!started) {   // not allowed to (a sandbox): through the kext
-		NSError *why = translateByKext(((RDNA4MTLDevice *)(function.device ?: gGlDevice)).gpu, input, function.name, blob, buffers);
+		NSError *why = translateByKext(device.gpu, air ?: [NSData dataWithContentsOfFile:input], function.name, blob, buffers);
 		if (scratch)
 			[NSFileManager.defaultManager removeItemAtPath:scratch error:nil];
 		return why;
@@ -2138,9 +2166,9 @@ static id<MTLFunction> noFragmentFunction(RDNA4MTLDevice *device)
 	MTLRenderPipelineColorAttachmentDescriptor *a = desc.colorAttachments[0];
 	_format = a.pixelFormat;
 	const MTLPixelFormat zf = desc.depthAttachmentPixelFormat, sf = desc.stencilAttachmentPixelFormat;
-	if ((zf != MTLPixelFormatInvalid && zf != MTLPixelFormatDepth32Float && zf != MTLPixelFormatDepth32Float_Stencil8) ||
+	if ((zf != MTLPixelFormatInvalid && zf != MTLPixelFormatDepth32Float && zf != MTLPixelFormatDepth16Unorm && zf != MTLPixelFormatDepth32Float_Stencil8) ||
 	    (sf != MTLPixelFormatInvalid && sf != MTLPixelFormatStencil8 && sf != MTLPixelFormatDepth32Float_Stencil8))
-		return rdna4Error([NSString stringWithFormat:@"depth format %lu, stencil format %lu: Depth32Float, Stencil8 and "
+		return rdna4Error([NSString stringWithFormat:@"depth format %lu, stencil format %lu: Depth32Float, Depth16Unorm, Stencil8 and "
 		                                             @"Depth32Float_Stencil8 only so far", (unsigned long)zf, (unsigned long)sf], 0);
 	for (NSUInteger i = 0; i < 8; i++) {   // each attachment's format and blend state (a draw goes into one of them: the PV host's choice)
 		MTLRenderPipelineColorAttachmentDescriptor *c = desc.colorAttachments[i];
@@ -4130,6 +4158,14 @@ RDNA4_ANSWER_MISSING
 
 static NSString *serviceString(io_service_t service, CFStringRef key);
 
+// Our own accelerator: by its class, which a sandbox lets a process see where it refuses the properties (WebKit's GPU process,
+// iokit-get-properties), else by its property
+static bool isOurAccelerator(io_service_t service)
+{
+	io_name_t cls = "";
+	return (!IOObjectGetClass(service, cls) && !strcmp(cls, "RDNA4Accelerator")) || serviceString(service, CFSTR("RDNA4Accelerator"));
+}
+
 + (void)load
 {
 	Protocol *spi = objc_getProtocol("MTLDeviceSPI");   // Metal's private protocol, also asserted by MTLAddDevice
@@ -4152,7 +4188,7 @@ static void abortStack(int sig)
 
 - (instancetype)initWithAcceleratorPort:(io_service_t)service
 {
-	if (serviceString(service, CFSTR("RDNA4Accelerator")) && !strcmp(getprogname(), "WindowServer") && !gAbortStack) {
+	if (isOurAccelerator(service) && !strcmp(getprogname(), "WindowServer") && !gAbortStack) {
 		gAbortStack = true;
 		// kept as SIGABRT's handler over WindowServer's own from a timer too, for 2 minutes (it may abort before its first commit)
 		static dispatch_source_t keep;
@@ -4169,7 +4205,7 @@ static void abortStack(int sig)
 		dispatch_resume(keep);
 	}
 	// always on our own accelerator (rdna4accel.cpp: no other device there), else only with RDNA4_NATIVE_MTL
-	if (!getenv("RDNA4_NATIVE_MTL") && !serviceString(service, CFSTR("RDNA4Accelerator"))) {
+	if (!getenv("RDNA4_NATIVE_MTL") && !isOurAccelerator(service)) {
 		self = [super init];   // before the nil return: _MTLDevice's dealloc expects its init to have run
 		return nil;
 	}
@@ -4831,7 +4867,8 @@ static void abortStack(int sig)
 // answers; ray tracing and the buffer size limit are our own.
 // Tier 2 and Metal3: MoltenVK then writes its descriptor sets' argument buffers itself (gpuAddress, gpuResourceID), no encoder (which we lack)
 - (MTLArgumentBuffersTier)argumentBuffersSupport { return MTLArgumentBuffersTier2; }
-- (BOOL)supportsFamily:(MTLGPUFamily)family { return family == 2001 || family == 3001 || family == 3002 || family == MTLGPUFamilyMetal3; }   // Mac1, Common1, Common2: Apple's device's
+// Mac2 as well, as every Metal 2 Mac GPU answers: ANGLE (Chrome's and WebKit's WebGL) has no Metal renderer without it
+- (BOOL)supportsFamily:(MTLGPUFamily)family { return family == 2001 || family == 2002 || family == 3001 || family == 3002 || family == MTLGPUFamilyMetal3; }   // Mac1, Mac2, Common1, Common2
 - (uint64_t)dedicatedMemorySize { return 1073741824ull; }
 - (uint64_t)deviceLinearReadOnlyTextureAlignmentBytes { return 256ull; }
 - (uint64_t)deviceLinearTextureAlignmentBytes { return 256ull; }
@@ -4997,7 +5034,7 @@ static void abortStack(int sig)
 {
 	const MTLPixelFormat f = descriptor.pixelFormat;
 	const NSUInteger n = descriptor.sampleCount;
-	if ((f == MTLPixelFormatDepth32Float || f == MTLPixelFormatStencil8 || f == MTLPixelFormatDepth32Float_Stencil8) &&
+	if ((f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatStencil8 || f == MTLPixelFormatDepth32Float_Stencil8) &&
 	    ((descriptor.textureType == MTLTextureType2D && n == 1) || (descriptor.textureType == MTLTextureType2DMultisample && (n == 2 || n == 4))) &&
 	    descriptor.width && descriptor.height && descriptor.width <= 16384 && descriptor.height <= 16384)
 		return [[RDNA4MTLTexture alloc] initDepthWithDevice:self descriptor:descriptor];
@@ -5027,8 +5064,12 @@ static void abortStack(int sig)
 	return [self newLibraryWithURL:[NSURL fileURLWithPath:path] error:error];
 }
 
+// Metal's own parser first: its functions carry their AIR, no file needed (a sandboxed GPU process, ANGLE's library, cannot write one)
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error
 {
+	id<MTLLibrary> lib = [super newLibraryWithData:data error:error];
+	if (lib)
+		return lib;
 	NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
 	                                             [NSString stringWithFormat:@"rdna4mtl-%d-%@.metallib", getpid(), NSUUID.UUID.UUIDString]];
 	if (![(NSData *)data writeToFile:path atomically:NO]) {
@@ -5036,9 +5077,8 @@ static void abortStack(int sig)
 			*error = rdna4Error([NSString stringWithFormat:@"cannot write %@", path], 0);
 		return nil;
 	}
-	id<MTLLibrary> lib = [super newLibraryWithData:data error:error];
-	if (lib)
-		return lib;
+	if (error)
+		*error = nil;
 	return [[RDNA4MTLLibrary alloc] initWithDevice:self path:path];
 }
 

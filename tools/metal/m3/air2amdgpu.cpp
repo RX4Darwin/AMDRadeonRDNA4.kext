@@ -918,6 +918,21 @@ static std::string legalize(Function &k) {
 				if (!v->getType()->isIntegerTy(1))
 					args.push_back(v);
 			r = b.CreateIntrinsic(same.at(op.str()), {c->getType()}, args);
+		} else if (op == "get_num_samples") {   // ANGLE's (WebGL): ponytail: 1, as [[sample_id]] is 0 (no per-sample shading); the pass's count when that comes
+			r = ConstantInt::get(c->getType(), 1);
+		} else if (op == "acos" || op == "asin") {
+			// acos(|x|) = sqrt(1 - |x|) * p(|x|), Abramowitz and Stegun 4.4.46 (error 2e-8), pi minus it for x < 0; asin = pi/2 - acos (Dawn's)
+			static const double a[] = {1.5707963050, -0.2145988016, 0.0889789874, -0.0501743046, 0.0308918810, -0.0170881256, 0.0066700901, -0.0012624911};
+			Type *t = c->getType();
+			Value *x = c->getArgOperand(0), *ax = b.CreateUnaryIntrinsic(Intrinsic::fabs, x), *p = ConstantFP::get(t, a[7]);
+			for (int k = 6; k >= 0; k--)
+				p = b.CreateFAdd(b.CreateFMul(p, ax), ConstantFP::get(t, a[k]));
+			Value *pos = b.CreateFMul(b.CreateUnaryIntrinsic(Intrinsic::sqrt, b.CreateFSub(ConstantFP::get(t, 1.0), ax)), p);
+			r = b.CreateSelect(b.CreateFCmpOLT(x, ConstantFP::get(t, 0.0)), b.CreateFSub(ConstantFP::get(t, M_PI), pos), pos);
+			if (op == "asin")
+				r = b.CreateFSub(ConstantFP::get(t, M_PI / 2), r);
+		} else if (op == "ldexp") {   // (x, n): x * 2^n (Dawn's, Chrome's compositor)
+			r = b.CreateIntrinsic(Intrinsic::ldexp, {c->getType(), c->getArgOperand(1)->getType()}, {c->getArgOperand(0), c->getArgOperand(1)});
 		} else if (op == "clz" || op == "ctz") {   // (x, is zero poison)
 			r = b.CreateIntrinsic(op == "clz" ? Intrinsic::ctlz : Intrinsic::cttz, {c->getType()}, {c->getArgOperand(0), b.getFalse()});
 		} else if (name.starts_with("get_width_texture_2d") || name.starts_with("get_height_texture_2d")) {
