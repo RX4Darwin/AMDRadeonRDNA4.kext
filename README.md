@@ -160,20 +160,26 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 4. *(Optional)* The card's full 2 MiB flash dump as `ATY,bin_image` under the GPU's PciRoot path in `DeviceProperties`.
    Without it the driver reads IP discovery from VRAM and the VBIOS from the PCI expansion ROM (`Discovery,Source` in
    ioreg says which).
+5. Install the user-space driver (Metal, OpenGL, Vulkan) from `AMDRadeonRDNA4-<version>.pkg` of the **same release** as
+   the kext, then reboot:
+
+   ```bash
+   sudo installer -pkg AMDRadeonRDNA4-0.4.0.pkg -target /
+   ```
+
+   Or double-click it; the package is not signed, so the first time Finder refuses it: Control-click it and choose
+   **Open**. It needs SIP's filesystem protection off (`csr-active-config` bit 1) and AMFI relaxed
+   (`amfi_get_out_of_my_way=0x1` in `boot-args`), as the driver bundle is signed ad hoc. What it installs:
+   [Metal, OpenGL and Vulkan](#metal-opengl-and-vulkan).
 
 Keep a known-good copy of your EFI on a USB stick while testing. `rdna4-off=1` turns the plugin off and `-liluoff` all
 Lilu plugins; macOS then runs its stock framebuffer.
 
 ### Metal, OpenGL and Vulkan
 
-Install `AMDRadeonRDNA4-<version>.pkg` from the release of the kext you put on the EFI (or build it: `make PVGPU=1 all
-metal-helper mesa package`; the shader translator builds LLVM for x86_64 in `Build/llvm` the first time, which takes a while):
-
-```bash
-sudo installer -pkg AMDRadeonRDNA4-0.4.0.pkg -target /
-```
-
-Then reboot. It installs:
+`AMDRadeonRDNA4-<version>.pkg` (step 5 above) comes with each release; to build it: `make PVGPU=1 all metal-helper mesa
+package` (the shader translator builds LLVM for x86_64 in `Build/llvm` the first time, which takes a while). In the
+installer's **Customize** pane the boot logs and Vulkan can be left out. It installs:
 
 | Choice | What |
 |--------|------|
