@@ -82,7 +82,8 @@ jobs:
             "$bundle/Contents/Helpers/rdna4-run" \
             "$bundle/Contents/Helpers/rdna4-iop" \
             "$bundle/Contents/Helpers/rdna4-logd" \
-            "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Versions/A/AMDRadeonRDNA4" \\
+            "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Versions/A/AMDRadeonRDNA4" \
+ \\
             "$bundle/Contents/Frameworks/libvulkan_radeon.dylib"; do
             test -x "$executable" || { echo "Missing or non-executable required file: $executable" >&2; exit 1; }
           done
