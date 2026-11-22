@@ -10,9 +10,10 @@ onto Navi 48 (its command streams are another architecture's). AMDRadeonRDNA4 dr
 - **Displays**: up to four, on DisplayPort and HDMI, with every mode the monitor offers, mode switching, hot-plug,
   display sleep and system sleep. The display controller (DCN 4.01) is programmed by the kext, after `amdgpu`'s
   display core.
-- **Metal, OpenGL and Vulkan** for the desktop and apps: macOS's own paravirtual GPU driver runs on the card, and the
-  kext carries out its work on the RX 9070's hardware (build with `make PVGPU=1`). WindowServer composites on the
-  card; Metal apps, OpenGL apps and Vulkan apps (through MoltenVK) draw on it.
+- **Metal, OpenGL and Vulkan** for the desktop and apps: the driver carries its own Metal driver for the card, on its
+  own accelerator, so WindowServer composites on the card and Metal, OpenGL and Vulkan apps (through MoltenVK) draw on
+  it — by default, with no virtual GPU (build with `make PVGPU=1`). macOS's paravirtual GPU driver is kept as an
+  alternative (`rdna4-accel=0 rdna4-pvgpu=1`).
 - **Compute**: the GFX12 command processor, its rings, memory management and a compute runtime for gfx1201 kernels,
   written from scratch.
 
@@ -44,7 +45,7 @@ froze the machine at `ODM_MEM_PWR_CTRL2`; the kext never reads it, and `docs/emu
 | macOS | Status |
 |---|---|
 | **Tahoe 26.6.2** | **Tested**: the main test system. Everything in *Features* runs here, Metal, OpenGL and Vulkan included. |
-| Tahoe 26.0 - 26.6.1, 26.7 and later | **Needs testing.** The displays and compute should run as on 26.6.2. OpenGL on the card needs Tahoe 26.6.2's renderer (the kext patches it as it loads; any other version stays in software), and the paravirtual GPU's IOSurface lookup follows 26.6.2's IOSurface internals. |
+| Tahoe 26.0 - 26.6.1, 26.7 and later | **Needs testing.** The displays and compute should run as on 26.6.2. OpenGL on the card needs Tahoe 26.6.2's renderer (the kext patches it as it loads; any other version stays in software), and the driver's IOSurface lookup follows 26.6.2's IOSurface internals. |
 | **Sequoia 15.8.2** | **Tested** by a contributor (Jan Claußen, PR 6): the Metal desktop through the paravirtual GPU. OpenGL stays in software. |
 | Sequoia 15.0 - 15.7 | **Needs testing.** |
 | Sonoma 14, Ventura 13, Monterey 12 | **Needs testing.** The kext builds for macOS 11 and later; the paravirtual GPU path has not been tried on them. |
@@ -76,32 +77,40 @@ Lilu **1.7.1 or newer** is needed on macOS 26 (older Lilu turns itself off there
 
 ### Metal
 
-macOS has a Metal driver for one GPU Apple does not make: the paravirtual GPU of Apple's virtual machines
-(`AppleParavirtGPU`, `AppleParavirtGPUMetal.bundle`). With `make PVGPU=1` the kext publishes such a device on the card
-and plays its host: Apple's driver and Metal run unchanged, and the kext carries out their command stream on the
-RX 9070 (`src/pvgpu.cpp`). Shaders arrive as Apple's AIR and are translated to gfx1201 by a helper
-(`tools/metal/m3/air2amdgpu.cpp`, LLVM).
+The driver has its own Metal driver for the card: a Metal plug-in (`AMDRadeonRDNA4MTLDriver.bundle`) that Apple's
+Metal.framework loads, running on the driver's own accelerator and command submission — Metal natively, no virtual GPU.
+WindowServer and apps use it by default (`src/trial.cpp`; `rdna4-accel`, `rdna4-nativews`). Shaders arrive as Apple's
+AIR and are translated to gfx1201 by a helper (`tools/metal/m3/air2amdgpu.cpp`, LLVM).
 
-- The desktop: WindowServer composites on the card, the paravirtual GPU's displays scanned out by the card's display
-  engine. The login window, the Dock, Liquid Glass with its blurred glass, apps' windows, the animated wallpapers.
+- The desktop: WindowServer composites on the card, scanned out by the card's display engine. The login window, the
+  Dock, Liquid Glass with its blurred glass, apps' windows, the animated wallpapers.
 - Compute and blits; draws of every form (indexed, instanced, indirect, primitive restart), vertex descriptors, up to
   eight colour attachments, blending (dual-source blending too), the depth and stencil tests, 2x and 4x multisampling,
   sRGB, textures with mip levels, texture views and arrays, 3D textures, IOSurfaces.
+- **Ray tracing**: acceleration structures (primitive and instance) and ray queries in shaders — MetalQuake's
+  ray-traced shadows.
 - 3D games: MetalQuake at 3840x1878 in HDR at 60 frames a second.
-- WebGL in Safari (`rdna4-pvmac2=1`).
-- `tools/metal/m1/mtlprobe.m` checks it (`mtlprobe all`); `sysctl debug.rdna4_pvnotrun` lists the draws that could
-  not run since the boot, by reason.
+- WebGL in Safari and Chrome (Safari's sandboxed GPU process is allowed to load the bundle by `rdna4-webkitgpu`, on by
+  default).
+- `tools/metal/m1/mtlprobe.m` checks it (`mtlprobe all`).
+
+**Apple's paravirtual GPU** (the default before 0.4.0; now `rdna4-accel=0 rdna4-pvgpu=1`) is kept as an alternative:
+macOS ships a Metal driver for the paravirtual GPU of its virtual machines (`AppleParavirtGPU`), and with `make PVGPU=1`
+the kext plays its host on the card (`src/pvgpu.cpp`), running Apple's command stream on the RX 9070. It has no ray
+tracing, Metal heaps, argument buffers or indirect command buffers, and gives shaders at most 16 textures a stage, so
+some apps (Chrome's WebGL via Dawn) do not run on it.
 
 ### OpenGL
 
-macOS's OpenGL 4.1 runs on Metal (`AppleMetalOpenGLRenderer`), and on the card through the paravirtual GPU, so
-OpenGL programs draw on the card unchanged: kitty, Mixxx, Sublime Text. Tahoe 26.6.2's renderer only.
+macOS's OpenGL 4.1 runs on Metal (`AppleMetalOpenGLRenderer`), and so on the card through the driver's Metal device
+(`rdna4-accelgl`, on by default), so OpenGL programs draw on the card unchanged: kitty, Mixxx, Sublime Text. Tahoe
+26.6.2's renderer only (the kext patches it as it loads).
 
 ### Vulkan
 
 - **Through MoltenVK** on Metal: Vulkan apps and games run as on any Mac (vkQuake at 3840x2160, about 44 frames a
-  second). On Apple's paravirtual driver, `userspace/moltenvk/install.sh` (once per user) turns MoltenVK's Metal argument
-  buffers off, which that driver does not have; the driver's own Metal device has them.
+  second). The driver's own Metal device has Metal argument buffers, so MoltenVK runs on it unchanged; on Apple's
+  paravirtual driver (which lacks them) `userspace/moltenvk/install.sh` (once per user) turns them off.
 - **RADV**, Mesa's Vulkan driver, built for macOS (`make mesa`, `userspace/vulkan/`): Vulkan on the card without
   Metal, in windows (`VK_EXT_metal_surface`), up to three programs at once. Programs that use Khronos's loader find it
   through the manifest in the driver bundle (below); `userspace/vulkan/radv-app.sh` makes a copy of an app built
@@ -121,16 +130,10 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 
 ### Not implemented yet
 
-- **A Metal driver of our own** in place of the paravirtual one. Work on it has started
-  (`docs/native-metal-spike.md`): macOS loads our own Metal bundle for the card, which runs compute, render passes and
-  ray queries (acceleration structures) on it, so far only for programs run as root that ask for it.
-- **Ray tracing** in apps: the paravirtual Metal driver has no acceleration structures (the native driver above has
-  them).
-- What the paravirtual Metal driver lacks: Metal heaps, argument buffers, indirect command buffers, texture swizzles.
-  Its shaders get at most 16 textures and samplers a stage and no scratch memory: Chrome's WebGL (Dawn) does not run
-  yet, which is why `rdna4-pvmac2` is off by default.
-- Apps started before the paravirtual GPU is published (about 15 s after boot) draw on the CPU until restarted.
-- A display plugged in after boot gets no paravirtual display (they are counted at boot).
+- Apps started before the driver's accelerator is ready (a few seconds after boot) draw on the CPU until restarted.
+- A display plugged in after boot gets no accelerated display for it (they are counted at boot).
+- In the paravirtual mode (`rdna4-pvgpu=1`): no ray tracing, Metal heaps, argument buffers or indirect command buffers,
+  and at most 16 textures a stage (so Chrome's WebGL via Dawn does not run). The native driver (the default) has these.
 - Display Stream Compression (DSC): 3840x2160 at 120 and 144 Hz.
 - Variable refresh (FreeSync), DisplayPort MST, HDR output to the monitor.
 - Audio over HDMI and DisplayPort.
@@ -231,7 +234,7 @@ default).
 | `rdna4-modeset=0` | Only the boot mode; no mode switching. |
 | `rdna4-head2=0` | No displays beside the boot display. |
 | `rdna4-heads=<n>` | How many displays beside the boot display (1-3; default one per connector). |
-| `rdna4-head2dp=0` | No displays on DisplayPort beside the boot display (one plugged in after boot gets no paravirtual display). |
+| `rdna4-head2dp=0` | No displays on DisplayPort beside the boot display (one plugged in after boot gets no accelerated display). |
 | `rdna4-hotplug=0` | No hot-plug of the second display (`1`: only log its pin). |
 | `rdna4-syssleep=0` | macOS refuses system sleep (as for any unsupported card). |
 | `rdna4-nosleep=1` | Display sleep does nothing (the screen stays on). |
@@ -240,6 +243,7 @@ default).
 | `rdna4-dpdual-khz=<kHz>` | The TMDS clock a passive DP++ adapter is taken to carry. |
 | `rdna4-accel=0` | WindowServer not on the driver's own accelerator (default 4; after a boot where it did not survive, the next boot leaves it out). |
 | `rdna4-accelgl=0` | OpenGL in software on the driver's own accelerator (default 1: Apple's GL-on-Metal renderer on the driver's Metal device; `sysctl debug.rdna4_accelgl` switches it for apps started afterwards). |
+| `rdna4-webkitgpu=0` | Leave Safari's sandboxed GPU process to the system policy (default on: it is allowed to load the driver bundle, so WebGL runs on the card). |
 | `rdna4-compute=<0-7>` | The compute bring-up stage (default 7, with the runtime; 3: the power-management firmware and the display clocks only; `0` off). |
 | `rdna4-gfx=0`, `rdna4-vm=0` | No graphics ring; no address space per client (both needed for Metal). |
 | `rdna4-pvgpu=1` | The paravirtual GPU on the card (`make PVGPU=1` builds): Metal, OpenGL, Vulkan through MoltenVK (with `rdna4-accel=0`). |
@@ -284,9 +288,12 @@ through `IONDRVFramebuffer::doDriverIO`.
    `src/dptrain.cpp`).
 5. **Compute** (`src/compute.cpp`, `src/runtime.cpp`): the PSP loads the firmware, then the SMU, the graphics and
    compute engines, the copy engines and the GPU's page tables come up.
-6. **Paravirtual GPU** (`src/pvgpu.cpp`, `make PVGPU=1`): a PCI device Apple's `AppleParavirtGPU` matches, whose
-   command stream the kext reads and runs on the card; its displays are scanned out by the display engine
-   (`src/pvscanout.hpp`).
+6. **Metal** (`make PVGPU=1`): by default the kext publishes its own accelerator (`src/rdna4accel.cpp`,
+   `src/ioaccel_thunks.cpp`) and names its Metal driver bundle to Metal, and WindowServer and apps run on it, with the
+   command stream submitted through the kext's runtime (`src/n48nkext.cpp`) and shaders translated from AIR by
+   `air2amdgpu`. With `rdna4-accel=0 rdna4-pvgpu=1` the kext instead plays host to Apple's `AppleParavirtGPU`
+   (`src/pvgpu.cpp`), running its command stream on the card. Either way the displays are scanned out by the card's
+   display engine (`src/pvscanout.hpp`).
 
 What each layer found is published in the registry (`AtomBIOS,*`, `Discovery,*`, `Pipe,*`, `Modes,Count`,
 `VRAM,TotalMB`, ...), visible with `ioreg`.
@@ -328,7 +335,7 @@ Clone with the submodules (`git clone --recursive`, or `git submodule update --i
 ```sh
 tools/build/fetch-firmware.sh   # once: AMD's firmware for the compute bring-up (both chips' sets), into firmware/amdgpu/
 make                            # the kext and the programs (x86_64, macOS 11 and later)
-make PVGPU=1                    # with the paravirtual GPU (Metal, OpenGL, Vulkan through MoltenVK)
+make PVGPU=1                    # the Metal path: the driver's own Metal driver by default (OpenGL, Vulkan via MoltenVK), paravirtual with rdna4-pvgpu=1
 make PVGPU=1 metal-helper       # the shader translator for it
 make mesa && make vkcube        # RADV and Khronos's vkcube
 make metal-driver               # AMDRadeonRDNA4MTLDriver.bundle: the Metal driver with librdna4, RADV and the helpers
