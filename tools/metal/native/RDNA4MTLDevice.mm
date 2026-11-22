@@ -45,7 +45,7 @@
  *
  * Gate 5: ray queries. Acceleration structures of triangle geometry are the device's own format (a stackless BVH, built by the CPU
  * as a command buffer's step, below); a kernel's intersect is translated into tools/metal/m3/rtlib.c's traversal of it.
- * ponytail: primitive structures only (no instances), no refit, compaction, masks, cull modes or intersection functions.
+ * Instances since 4b18ea6; a refit is a build afresh. ponytail: no compaction, cull modes or intersection functions.
  *
  * The device exists only in processes started with RDNA4_NATIVE_MTL=1 (the init returns nil elsewhere, which Metal skips): published
  * for every process, it was made in ControlCenter and the like, which crashed on the first missing message (2026-11-19).
@@ -464,7 +464,7 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 {
 	switch (f) {
 	case 70: case 71: case 80: case 81: case 115: case 110: case 65: case 10: case 25: case 90: case 94: case 103: case 104: case 63: case 53:
-	case 55: case 105: case 125: case 92: case 30:
+	case 55: case 105: case 125: case 92: case 30: case 13:
 		return YES;
 	default: return NO;
 	}
@@ -2099,6 +2099,7 @@ typedef struct {
 	uint32_t textures[2][kTextures][8], samplers[2][kStageTextures][4];   // per stage, T#s and S#s (0: unbound)
 	uint32_t type, start, count, instances, baseInstance;
 	float viewport[4];                  // x, y, width, height in pixels
+	float depthRange[2];                // the viewport's znear and zfar (Quake II's view weapon: 0 to 0.3)
 	uint32_t scissor[4];                // x, y, width, height in pixels (the whole target when none was set)
 	uint32_t covered[4];                // what of it the draw can write: its vertices' bounds where those are known (bound:), else the scissor
 	uint32_t attachment;                // the colour attachment the draw goes into (RDNA4_MTLC_TABLE_ATTACHMENT)
@@ -2874,7 +2875,8 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 		uint8_t table[0x400] = {};
 		BOOL anyTexture = NO;
 		for (int i = 0; i < 16; i++) {
-			if ([(id)_textures[i] isKindOfClass:[RDNA4MTLTexture class]] && !((RDNA4MTLTexture *)_textures[i]).isDepth) {
+			// a depth texture as its depth (descriptor:; Quake II's ray-traced effects read the G-buffer's)
+			if ([(id)_textures[i] isKindOfClass:[RDNA4MTLTexture class]] && ((RDNA4MTLTexture *)_textures[i]).sampleable) {
 				RDNA4MTLTexture *t = (RDNA4MTLTexture *)_textures[i];
 				[t descriptor:(uint32_t *)(table + RDNA4_MTLC_TABLE_TEXTURES + 32 * i)];
 				[held addObject:t];
@@ -2901,7 +2903,7 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 			uint32_t spare[8];
 			[(RDNA4MTLDevice *)self.device spareImage:spare];
 			for (int i = 0; i < 16; i++)   // unbound slots: the spare texel (an all-zero T# can stall the texture unit)
-				if (![(id)_textures[i] isKindOfClass:[RDNA4MTLTexture class]] || ((RDNA4MTLTexture *)_textures[i]).isDepth)
+				if (![(id)_textures[i] isKindOfClass:[RDNA4MTLTexture class]] || !((RDNA4MTLTexture *)_textures[i]).sampleable)
 					memcpy(table + RDNA4_MTLC_TABLE_TEXTURES + 32 * i, spare, 32);
 			id<MTLBuffer> t = [self.device newBufferWithBytes:table length:sizeof table options:MTLResourceStorageModeShared];
 			const uint64_t at = t.gpuAddress;
@@ -3319,6 +3321,7 @@ RDNA4_ANSWER_MISSING
 		RDNA4Draw d = { .type = (uint32_t)type, .start = (uint32_t)start, .count = (uint32_t)count, .instances = (uint32_t)instances,
 			            .baseInstance = (uint32_t)baseInstance,
 			            .viewport = { (float)_viewport.originX, (float)_viewport.originY, (float)_viewport.width, (float)_viewport.height },
+			            .depthRange = { (float)_viewport.znear, (float)_viewport.zfar },
 			            .scissor = { (uint32_t)_scissor.x, (uint32_t)_scissor.y, (uint32_t)_scissor.width, (uint32_t)_scissor.height } };
 		memcpy(d.blendColour, _blendColour, sizeof d.blendColour);
 		memcpy(d.table, _addresses, sizeof d.table);
@@ -3526,11 +3529,13 @@ RDNA4_ANSWER_MISSING
 			why = [device draw:&dd pipeline:pipeline target:target];
 			if (!why)
 				[cb drewInto:target];
-			// the others: the same pixels (depth equal to what the first wrote, not written again; stencil tested, not written)
+			// the others: the same pixels (depth equal to what the first wrote, not written again; or, when it wrote none, the same test against
+			// the same depth: Quake II's view weapon, drawn without depth writes, was left out of its motion pass's colour; stencil tested, not
+			// written)
 			for (NSUInteger i = 0; i < more.count && !why; i++) {
 				RDNA4Draw again = dd;
 				again.attachment = more[i].unsignedIntValue;
-				if (again.depthGpu)
+				if (again.depthGpu && again.depthWrite)
 					again.depthCompare = MTLCompareFunctionEqual, again.depthWrite = 0;
 				again.stencilWriteMask = 0;
 				RDNA4MTLTexture *t = moreTargets[i];
@@ -3635,6 +3640,22 @@ RDNA4_ANSWER_MISSING
 			return rdna4Error(@"an acceleration structure of another device", 0);
 		return [(RDNA4MTLAccelerationStructure *)as build:d];
 	}];
+}
+
+// A refit is a build afresh (the build is the CPU's, in order with the GPU work before it: Quake II's lerped models). ponytail: whole
+// rebuilds; keep the tree and recompute its boxes when refits show up in a profile.
+- (void)refitAccelerationStructure:(id<MTLAccelerationStructure>)source descriptor:(MTLAccelerationStructureDescriptor *)descriptor
+                       destination:(id<MTLAccelerationStructure>)destination scratchBuffer:(id<MTLBuffer>)scratch
+               scratchBufferOffset:(NSUInteger)offset
+{
+	[self buildAccelerationStructure:destination ?: source descriptor:descriptor scratchBuffer:scratch scratchBufferOffset:offset];
+}
+
+- (void)refitAccelerationStructure:(id<MTLAccelerationStructure>)source descriptor:(MTLAccelerationStructureDescriptor *)descriptor
+                       destination:(id<MTLAccelerationStructure>)destination scratchBuffer:(id<MTLBuffer>)scratch
+               scratchBufferOffset:(NSUInteger)offset options:(MTLAccelerationStructureRefitOptions)options
+{
+	[self refitAccelerationStructure:source descriptor:descriptor destination:destination scratchBuffer:scratch scratchBufferOffset:offset];
 }
 
 - (void)endEncoding { }
@@ -5082,9 +5103,10 @@ static void abortStack(int sig)
 		if (d->stencilGpu)   // DB_STENCIL_REF, DB_STENCIL_OPVAL (1: the increments' step), DB_STENCIL_READ_MASK, DB_STENCIL_WRITE_MASK
 			PUT(0xc0046900u), PUT(0x022), PUT(d->stencilRef), PUT(0x101), PUT(d->stencilReadMask), PUT(d->stencilWriteMask);
 	}
-	if (d->depthGpu) {   // Metal's 0..1 depth range
-		PUT(0xc0026900u), PUT(0x113), PUT(0x3f800000u), PUT(0);   // PA_CL_VPORT_ZSCALE 1, ZOFFSET 0: z = ndc z (Metal's 0..1)
-		PUT(0xc0026900u), PUT(0x115), PUT(0), PUT(0x3f800000u);   // PA_SC_VPORT_ZMIN_0, ZMAX_0
+	if (d->depthGpu) {   // the viewport's depth range: z = znear + ndc z (Metal's 0..1) * (zfar - znear), kept between the two
+		const float zn = d->depthRange[0], zf = d->depthRange[1];
+		PUT(0xc0026900u), PUT(0x113), PUT(floatBits(zf - zn)), PUT(floatBits(zn));   // PA_CL_VPORT_ZSCALE, ZOFFSET
+		PUT(0xc0026900u), PUT(0x115), PUT(floatBits(fminf(zn, zf))), PUT(floatBits(fmaxf(zn, zf)));   // PA_SC_VPORT_ZMIN_0, ZMAX_0
 		PUT(0xc0016900u), PUT(0x204), PUT(1u << 24 | 1u << 19);   // PA_CL_CLIP_CNTL: DX_LINEAR_ATTR_CLIP_ENA, DX_CLIP_SPACE_DEF
 	}
 	PUT(0xc0046900u), PUT(0x105);   // CB_BLEND_RED .. ALPHA

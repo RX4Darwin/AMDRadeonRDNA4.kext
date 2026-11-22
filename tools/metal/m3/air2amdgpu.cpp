@@ -40,6 +40,7 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
@@ -215,6 +216,10 @@ static Value *simdOp(IRBuilder<> &b, StringRef op, CallInst *c) {
 		return b.CreateICmpNE(ballot(x), b.getInt32(0));
 	if (what == "all")
 		return b.CreateICmpEQ(ballot(x), ballot(b.getTrue()));
+	if (what == "is_first")   // the lowest active lane (Quake II's per-group atomics)
+		return b.CreateICmpEQ(b.CreateBinaryIntrinsic(Intrinsic::cttz, ballot(b.getTrue()), b.getTrue()), lane);
+	if (what == "broadcast_first" && t->getPrimitiveSizeInBits() == 32)   // the lowest active lane's value
+		return b.CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {t}, {x});
 	if (what == "prefix_inclusive_sum" || what == "prefix_exclusive_sum") {
 		Value *sum = x;
 		for (unsigned k = 1; k < 32; k <<= 1) {
@@ -407,34 +412,41 @@ static void lowerTables(Function &k) {
 	}
 }
 
-// Metal's ray query (air.intersect.triangle_data or air.intersect.instancing: origin, direction, minimum and maximum distance, the acceleration
-// structure, ..., accept any intersection as the last i1) as a call of rtlib.c's rdna4_rt_intersect, which linkRayQueries links in after
-// retargeting; its eight floats into AIR's result {i32 type, float distance, i32 primitive id, i32 geometry index, ptr primitive data (null),
-// <2 x float> barycentrics, i1 front facing}, or with instancing and no triangle data {..., ptr primitive data, i32 instance id, i32 user
-// instance id (the same)}. Null when the call is not of either shape.
-static Value *rayQuery(IRBuilder<> &b, CallInst *c) {
+// Metal's ray query (air.intersect.triangle_data, air.intersect.instancing[.triangle_data[.world_space_data]]: origin, direction, minimum
+// and maximum distance, the acceleration structure, with instancing the mask, ..., accept any intersection as the last i1) as a call of
+// rtlib.c's rdna4_rt_intersect, which linkRayQueries links in after retargeting; its eight floats into AIR's result {i32 type, float
+// distance, i32 primitive id, i32 geometry index, ptr primitive data (null)}, then with instancing {i32 instance id, i32 user instance id
+// (the same)}, with triangle data {<2 x float> barycentrics, i1 front facing}, with world space data the hit instance's world-to-object and
+// object-to-world transforms as 4 + 4 float3 columns (rdna4_rt_world_to_object, rdna4_rt_object_to_world). Null for another shape.
+static Value *rayQuery(IRBuilder<> &b, CallInst *c, StringRef name) {
 	Module &m = *c->getModule();
 	LLVMContext &ctx = m.getContext();
 	Type *f32 = b.getFloatTy(), *i32 = b.getInt32Ty();
 	auto *st = dyn_cast<StructType>(c->getType());
-	auto *v3 = FixedVectorType::get(f32, 3);
-	const bool instances = st && st->getNumElements() == 7 && st->getElementType(5) == i32 && st->getElementType(6) == i32;
-	if (!st || st->getNumElements() != 7 || st->getElementType(0) != i32 || st->getElementType(1) != f32 || !st->getElementType(4)->isPointerTy() ||
-	    (!instances && (st->getElementType(5) != FixedVectorType::get(f32, 2) || !st->getElementType(6)->isIntegerTy(1))) || c->arg_size() < 6 ||
+	auto *v2 = FixedVectorType::get(f32, 2), *v3 = FixedVectorType::get(f32, 3);
+	const bool instances = name.starts_with("intersect.instancing"), triangles = name.contains("triangle_data"),
+	           world = name.ends_with(".world_space_data");
+	const unsigned at = instances ? 7 : 5;   // the triangle data's first field
+	const unsigned fields = at + (triangles ? 2 : 0) + (world ? 8 : 0);
+	if (!st || st->getNumElements() != fields || st->getElementType(0) != i32 || st->getElementType(1) != f32 || !st->getElementType(4)->isPointerTy() ||
+	    (instances && (st->getElementType(5) != i32 || st->getElementType(6) != i32)) ||
+	    (triangles && (st->getElementType(at) != v2 || !st->getElementType(at + 1)->isIntegerTy(1))) || c->arg_size() < 7 ||
 	    c->getArgOperand(0)->getType() != v3 || c->getArgOperand(1)->getType() != v3 || !c->getArgOperand(4)->getType()->isPointerTy() ||
-	    !c->getArgOperand(c->arg_size() - 1)->getType()->isIntegerTy(1))
+	    (instances && c->getArgOperand(5)->getType() != i32) || !c->getArgOperand(c->arg_size() - 1)->getType()->isIntegerTy(1))
 		return nullptr;
+	for (unsigned i = at + (triangles ? 2 : 0); i < fields; i++)
+		if (st->getElementType(i) != v3)
+			return nullptr;
 	Type *global = PointerType::get(ctx, 1);
 	FunctionCallee fn = m.getOrInsertFunction("rdna4_rt_intersect", FunctionType::get(FixedVectorType::get(f32, 8),
-	                                                                                 {f32, f32, f32, f32, f32, f32, f32, f32, global, i32}, false));
-	SmallVector<Value *, 10> args;
+	                                                                                 {f32, f32, f32, f32, f32, f32, f32, f32, global, i32, i32}, false));
+	Value *as = b.CreatePointerCast(c->getArgOperand(4), global);
+	SmallVector<Value *, 11> args;
 	for (unsigned v = 0; v < 2; v++)
 		for (unsigned i = 0; i < 3; i++)
 			args.push_back(b.CreateExtractElement(c->getArgOperand(v), i));
-	args.push_back(c->getArgOperand(2));
-	args.push_back(c->getArgOperand(3));
-	args.push_back(b.CreatePointerCast(c->getArgOperand(4), global));
-	args.push_back(b.CreateZExt(c->getArgOperand(c->arg_size() - 1), i32));
+	args.append({c->getArgOperand(2), c->getArgOperand(3), as, b.CreateZExt(c->getArgOperand(c->arg_size() - 1), i32),
+	             instances ? c->getArgOperand(5) : b.getInt32(~0u)});
 	Value *h = b.CreateCall(fn, args);
 	auto lane = [&](unsigned i) { return b.CreateExtractElement(h, i); };
 	auto bitsOf = [&](unsigned i) { return b.CreateBitCast(lane(i), i32); };
@@ -445,10 +457,21 @@ static Value *rayQuery(IRBuilder<> &b, CallInst *c) {
 	r = b.CreateInsertValue(r, bitsOf(3), 3);
 	r = b.CreateInsertValue(r, ConstantPointerNull::get(cast<PointerType>(st->getElementType(4))), 4);
 	if (instances)   // the instance hit (lane 7), as its id and its user id
-		return b.CreateInsertValue(b.CreateInsertValue(r, bitsOf(7), 5), bitsOf(7), 6);
-	Value *bary = b.CreateInsertElement(b.CreateInsertElement(PoisonValue::get(st->getElementType(5)), lane(4), uint64_t(0)), lane(5), 1);
-	r = b.CreateInsertValue(r, bary, 5);
-	return b.CreateInsertValue(r, b.CreateTrunc(bitsOf(6), b.getInt1Ty()), 6);
+		r = b.CreateInsertValue(b.CreateInsertValue(r, bitsOf(7), 5), bitsOf(7), 6);
+	if (triangles) {
+		Value *bary = b.CreateInsertElement(b.CreateInsertElement(PoisonValue::get(v2), lane(4), uint64_t(0)), lane(5), 1);
+		r = b.CreateInsertValue(b.CreateInsertValue(r, bary, at), b.CreateTrunc(bitsOf(6), b.getInt1Ty()), at + 1);
+	}
+	if (world) {
+		auto *v16 = FixedVectorType::get(f32, 16);
+		const char *names[2] = {"rdna4_rt_world_to_object", "rdna4_rt_object_to_world"};
+		for (unsigned t = 0; t < 2; t++) {
+			Value *mat = b.CreateCall(m.getOrInsertFunction(names[t], FunctionType::get(v16, {global, i32}, false)), {as, bitsOf(7)});
+			for (unsigned col = 0; col < 4; col++)
+				r = b.CreateInsertValue(r, b.CreateShuffleVector(mat, {int(3 * col), int(3 * col + 1), int(3 * col + 2)}), at + 2 + 4 * t + col);
+		}
+	}
+	return r;
 }
 
 // rtlib.c into a module that calls it (rayQuery), as gfx1201 bitcode of the same LLVM; the optimiser inlines it. "" or the reason.
@@ -465,15 +488,19 @@ static std::string linkRayQueries(Module &m) {
 	if (Linker::linkModules(m, std::move(lib), Linker::LinkOnlyNeeded))
 		return "the ray query library does not link";
 	// inlined here and gone: a shader is one function, its entry at the start of its code (fragment shadow rays, MetalQuake)
-	Function *linked = m.getFunction("rdna4_rt_intersect");
-	for (User *u : make_early_inc_range(linked->users()))
-		if (auto *call = dyn_cast<CallBase>(u)) {
-			InlineFunctionInfo info;
-			if (InlineResult done = InlineFunction(*call, info); !done.isSuccess())
-				return std::string("a ray query does not inline: ") + done.getFailureReason();
-		}
-	if (linked->use_empty())
-		linked->eraseFromParent();
+	for (const char *name : {"rdna4_rt_intersect", "rdna4_rt_world_to_object", "rdna4_rt_object_to_world"}) {
+		Function *linked = m.getFunction(name);
+		if (!linked)
+			continue;
+		for (User *u : make_early_inc_range(linked->users()))
+			if (auto *call = dyn_cast<CallBase>(u)) {
+				InlineFunctionInfo info;
+				if (InlineResult done = InlineFunction(*call, info); !done.isSuccess())
+					return std::string("a ray query does not inline: ") + done.getFailureReason();
+			}
+		if (linked->use_empty())
+			linked->eraseFromParent();
+	}
 	return "";
 }
 
@@ -575,8 +602,8 @@ static std::string legalize(Function &k) {
 			gone.push_back(c);
 			continue;
 		}
-		if (name == "intersect.triangle_data" || name == "intersect.instancing") {
-			Value *hit = rayQuery(b, c);
+		if (name == "intersect.triangle_data" || name.starts_with("intersect.instancing")) {
+			Value *hit = rayQuery(b, c, name);
 			if (!hit)
 				return f->getName().str() + " of a form not supported yet";
 			c->replaceAllUsesWith(hit);
@@ -768,6 +795,22 @@ static std::string legalize(Function &k) {
 				types.push_back(ft);   // the bias's own overload
 			types.append({ft, t->getType(), sm->getType()});
 			Value *d = b.CreateIntrinsic(ids[compare][packed != 0][mode], types, args);
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), d, 0), b.getInt8(0), 1);
+		} else if (tex.starts_with("read_depth_2d.f32")) {
+			// depth2d read (texture, sampler, i32, uint2 or ushort2, int2 offset, lod, i32): its depth as 32_FLOAT (as the sample
+			// above) through image_load(_mip). G-buffer depth in Quake II's ray-traced effects (BeauBender/quake2's ref_metal).
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(3), *offset = c->getArgOperand(4), *lod = c->getArgOperand(5);
+			Value *x = b.CreateZExt(b.CreateExtractElement(xy, uint64_t(0)), b.getInt32Ty());
+			Value *y = b.CreateZExt(b.CreateExtractElement(xy, 1), b.getInt32Ty());
+			if (!isa<ConstantAggregateZero>(offset)) {
+				x = b.CreateAdd(x, b.CreateSExtOrTrunc(b.CreateExtractElement(offset, uint64_t(0)), b.getInt32Ty()));
+				y = b.CreateAdd(y, b.CreateSExtOrTrunc(b.CreateExtractElement(offset, 1), b.getInt32Ty()));
+			}
+			Value *d = match(lod, m_Zero())
+			               ? b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2d, {b.getFloatTy(), b.getInt32Ty(), t->getType()},
+			                                   {b.getInt32(1), x, y, t, b.getInt32(0), b.getInt32(0)})
+			               : b.CreateIntrinsic(Intrinsic::amdgcn_image_load_mip_2d, {b.getFloatTy(), b.getInt32Ty(), t->getType()},
+			                                   {b.getInt32(1), x, y, b.CreateZExtOrTrunc(lod, b.getInt32Ty()), t, b.getInt32(0), b.getInt32(0)});
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), d, 0), b.getInt8(0), 1);
 		} else if (tex.starts_with("sample_texture_cube.v4f")) {
 			// (texture, sampler, float3 direction, i1 level, float bias or LOD, float min LOD, i32): vkQuake's sky through MoltenVK
@@ -1054,15 +1097,24 @@ static std::string legalize(Function &k) {
 			else
 				r = b.CreateIntCast(v, to, k[3] == "s");
 		} else if (name.consume_front("atomic.global.") || name.consume_front("atomic.local.")) {
-			// (pointer, value, memory order, scope, volatile): Metal's are relaxed; device or threadgroup scope by the memory.
-			auto it = rmw.find(name.rsplit('.').first.str());   // "add.u" -> "add"/"min.u"
-			if (it == rmw.end())
-				it = rmw.find(name.rsplit('.').first.rsplit('.').first.str());
-			if (it == rmw.end())
-				return f->getName().str() + " is not supported yet";
-			const bool local = f->getName().contains(".local.");
-			r = b.CreateAtomicRMW(it->second, c->getArgOperand(0), c->getArgOperand(1), MaybeAlign(), AtomicOrdering::Monotonic,
-			                      ctx.getOrInsertSyncScopeID(local ? "workgroup" : "agent"));
+			// (pointer, value, memory order, scope, volatile), a load without the value: Metal's are relaxed; device or threadgroup scope by
+			// the memory.
+			const SyncScope::ID scope = ctx.getOrInsertSyncScopeID(f->getName().contains(".local.") ? "workgroup" : "agent");
+			if (name.starts_with("load.")) {   // (Quake II's water lists)
+				LoadInst *l = b.CreateAlignedLoad(c->getType(), c->getArgOperand(0), Align(c->getType()->getPrimitiveSizeInBits() / 8));
+				l->setAtomic(AtomicOrdering::Monotonic, scope);
+				r = l;
+			} else if (name.starts_with("store.")) {
+				Value *v = c->getArgOperand(1);
+				b.CreateAlignedStore(v, c->getArgOperand(0), Align(v->getType()->getPrimitiveSizeInBits() / 8))->setAtomic(AtomicOrdering::Monotonic, scope);
+			} else {
+				auto it = rmw.find(name.rsplit('.').first.str());   // "add.u" -> "add"/"min.u"
+				if (it == rmw.end())
+					it = rmw.find(name.rsplit('.').first.rsplit('.').first.str());
+				if (it == rmw.end())
+					return f->getName().str() + " is not supported yet";
+				r = b.CreateAtomicRMW(it->second, c->getArgOperand(0), c->getArgOperand(1), MaybeAlign(), AtomicOrdering::Monotonic, scope);
+			}
 		} else if (same.count(op.str())) {
 			SmallVector<Value *, 3> args;   // one to three operands of the call's type; AIR's i1 flags have no counterpart
 			for (Value *v : c->args())
@@ -1086,15 +1138,20 @@ static std::string legalize(Function &k) {
 			r = b.CreateIntrinsic(Intrinsic::ldexp, {c->getType(), c->getArgOperand(1)->getType()}, {c->getArgOperand(0), c->getArgOperand(1)});
 		} else if (op == "clz" || op == "ctz") {   // (x, is zero poison)
 			r = b.CreateIntrinsic(op == "clz" ? Intrinsic::ctlz : Intrinsic::cttz, {c->getType()}, {c->getArgOperand(0), b.getFalse()});
-		} else if (name.starts_with("get_width_texture_2d") || name.starts_with("get_height_texture_2d")) {
-			// (texture, lod): from the T# the host wrote (src/pvgpu.cpp): width - 1 in word1 [31:30] and word2 [13:0] << 2, height - 1 in
-			// word2 [27:14]; then >> lod, at least 1.
+		} else if (name.starts_with("get_width_texture_2d") || name.starts_with("get_height_texture_2d") || name.starts_with("get_width_depth_2d") ||
+		           name.starts_with("get_height_depth_2d")) {
+			// (texture, lod), a depth texture's too (the same fields): from the T# the host wrote (src/pvgpu.cpp): width - 1 in word1 [31:30]
+			// and word2 [13:0] << 2, height - 1 in word2 [27:14]; then >> lod, at least 1.
 			Value *t = descriptor(c->getArgOperand(0), 8), *w1 = b.CreateExtractElement(t, 1), *w2 = b.CreateExtractElement(t, 2);
 			Value *size = name.starts_with("get_width") ? b.CreateOr(b.CreateLShr(w1, 30), b.CreateShl(b.CreateAnd(w2, 0x3fff), 2))
 			                                            : b.CreateAnd(b.CreateLShr(w2, 14), 0x3fff);
 			// a multisampled texture's (get_width_texture_2d_ms) has no LOD: level 0
 			Value *lod = c->arg_size() > 1 ? c->getArgOperand(1) : b.getInt32(0);
 			r = b.CreateIntrinsic(Intrinsic::umax, {b.getInt32Ty()}, {b.CreateLShr(b.CreateAdd(size, b.getInt32(1)), lod), b.getInt32(1)});
+		} else if (name.starts_with("get_array_size_texture_1d_array") || name.starts_with("get_array_size_texture_2d_array")) {
+			// (texture): the T#'s layers - 1 in word4 [13:0] (pvdraw.hpp linearArray1d / linearArray2d), plus one (Quake II's water)
+			Value *t = descriptor(c->getArgOperand(0), 8);
+			r = b.CreateAdd(b.CreateAnd(b.CreateExtractElement(t, 4), 0x3fff), b.getInt32(1));
 		} else if (name.starts_with("get_num_samples_texture_2d_ms")) {
 			// (texture): 1 << LAST_LEVEL, which holds a multisampled image's log2 of its samples (word3 [19:15], as Mesa's
 			// ac_build_gfx12_texture_descriptor)
@@ -1364,6 +1421,23 @@ static std::string compile(Module &m, Function *entry, Function *air, bool pal, 
 	for (Function &f : m)
 		if (&f != entry && !f.isDeclaration())
 			f.setLinkage(GlobalValue::InternalLinkage);
+
+	// A local struct of 32-bit fields and arrays of them (Quake II's shadow lights: {float key[4]; uint idx[4]}) as an array of i32s:
+	// AMDGPU's promotion takes arrays only, and a struct written at an index known only at run time stays in scratch otherwise. The
+	// accesses are byte offsets on an opaque pointer, so only the alloca's type changes.
+	std::function<bool(Type *)> words = [&](Type *t) {
+		if (t->isFloatTy() || t->isIntegerTy(32))
+			return true;
+		if (auto *a = dyn_cast<ArrayType>(t))
+			return words(a->getElementType());
+		auto *s = dyn_cast<StructType>(t);
+		return s && !s->isPacked() && all_of(s->elements(), words);
+	};
+	for (Function &f : m)
+		for (Instruction &i : make_early_inc_range(instructions(f)))
+			if (auto *a = dyn_cast<AllocaInst>(&i); a && a->getAllocatedType()->isStructTy() && a->isStaticAlloca() &&
+			                                        words(a->getAllocatedType()))
+				a->setAllocatedType(ArrayType::get(Type::getInt32Ty(m.getContext()), m.getDataLayout().getTypeAllocSize(a->getAllocatedType()) / 4));
 
 	// Optimise (inlines the AIR function), then refuse what AMDGPU cannot take as AIR leaves it.
 	LoopAnalysisManager lam;
@@ -2626,6 +2700,10 @@ int main(int argc, char **argv) {
 	InitializeAllTargetMCs();
 	InitializeAllAsmPrinters();
 	InitializeAllAsmParsers();   // the inline asm of translateShader()
+	// A local array is never moved into LDS: that slices it by the work-group size, read from the dispatch packet, which the kext's
+	// dispatches do not give (kernelFits refuses a kernel asking for it). It goes into registers, or scratch, instead (Quake II's shadows).
+	const char *llvmArgs[] = {"air2amdgpu", "-disable-promote-alloca-to-lds"};
+	cl::ParseCommandLineOptions(2, llvmArgs);
 	if (argc == 2 && StringRef(argv[1]) == "--serve")
 		return serve();
 	if (argc != 4)

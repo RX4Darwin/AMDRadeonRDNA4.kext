@@ -58,6 +58,7 @@ static inline uint32_t colourInfo(uint32_t format, bool swap) {
 	case 104: return 0x0003050bu;   // RG32Sint
 	case 63: return 0x00030405u;    // RG16Uint: 16_16 UINT, BLEND_BYPASS (WindowServer's brim_init_lpf at 4K, Tahoe)
 	case 53: return 0x00030404u;    // R32Uint: 32 UINT, BLEND_BYPASS (clearOnCard's fills: the bits as exported)
+	case 13: return 0x00030401u;    // R8Uint: 8 UINT, BLEND_BYPASS (Quake II's G-buffer materials, ref_metal)
 	case 55: return 0x00020704u;    // R32Float: 32 float (MoltenVK's, vkQuake)
 	case 105: return 0x0002070bu;   // RG32Float: 32_32 float
 	case 125: return 0x0002070eu;   // RGBA32Float: 32_32_32_32 float
@@ -163,6 +164,14 @@ static inline bool clearPattern(uint32_t format, const uint64_t rgba[4], uint32_
 		if (!wholeDouble(rgba[0], x) || !wholeDouble(rgba[1], y) || x != y || (format == 103 && x < 0))
 			return false;
 		pattern = static_cast<uint32_t>(x);
+		return true;
+	}
+	case 13: {   // R8Uint: a whole number that fits, in each byte
+		int64_t x;
+		pattern = 0;
+		if (!wholeDouble(rgba[0], x) || x < 0 || x > 0xff)
+			return false;
+		pattern = static_cast<uint32_t>(x) * 0x01010101u;
 		return true;
 	}
 	case 63: {   // RG16Uint: two 16-bit halves, each a whole number that fits
