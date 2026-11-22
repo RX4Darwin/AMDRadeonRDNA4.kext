@@ -76,7 +76,11 @@ cp "$dir/$bundle/Contents/Resources/radeon_icd.json" "$r/usr/local/share/vulkan/
 # scripts: preinstall stops and removes the old pieces and this component's daemons, postinstall starts them
 script() {
 	mkdir -p "$w/$1-scripts"
-	printf '#!/bin/sh\n# %s %s (tools/package/package.sh)\n%s\nexit 0\n' "$1" "$2" "$3" > "$w/$1-scripts/$2"
+	{
+		printf '#!/bin/sh\n# %s %s (tools/package/package.sh)\n' "$1" "$2"
+		printf '%b\n' "$3"
+		printf 'exit 0\n'
+	} > "$w/$1-scripts/$2"
 	chmod 755 "$w/$1-scripts/$2"
 }
 script core preinstall '
