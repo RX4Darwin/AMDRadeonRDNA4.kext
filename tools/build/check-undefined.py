@@ -11,7 +11,8 @@ import sys
 
 # Lilu's API (lib/Lilu): its classes and functions as our objects reference them
 LILU_PREFIXES = ('__ZN13KernelPatcher', '__ZN7LiluAPI', '_lilu', '__ZN6FileIO', '__ZN8MachInfo', '__ZN6WIOKit', '__ZN11UserPatcher',
-                 '__ZN7CPUInfo', '__ZN9NVStorage', '__ZN6Crypto', '__ZN11Compression', '__ZN12Disassembler')
+                 '__ZN7CPUInfo', '__ZN9NVStorage', '__ZN6Crypto', '__ZN11Compression', '__ZN12Disassembler',
+                 '__ZN4Page')   # (Page: kern_util.hpp, its EXPORT members; a DEBUG build keeps LookupStorage::deleter, which calls one)
 LILU_NAMES = {'__Z6strstrPKcS0_m', '____chkstk_darwin'}   # (Lilu's strstr overload; the stack probe the kernel resolves)
 
 
