@@ -3,6 +3,8 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
+## After 0.4.0 (on `next`, no number yet)
+
 ## 0.4.0 (2026-11-22)
 
 **In short** (all on the RX 9070 XT, macOS Tahoe 26.6.2; the sections below and the commits have the details)
