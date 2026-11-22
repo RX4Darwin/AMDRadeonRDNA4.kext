@@ -69,6 +69,16 @@ otherwise). The newest version is on top. How versions and branches work is in `
   nativestencil` passes stencil, depth and resolve at 1x and 4x; Maps runs on the native device (`Safari,Maps`), its map, labels and
   pins as on Apple's paravirtual path.
 - The paravirtual host opens the runtime from its tick (from a draw, IOLog ran the timer thread's stack out: a double fault).
+- System sleep on the native desktop keeps the session: the runtime's clients, buffers, programs and page tables are kept, their
+  VRAM copied to host memory before the card loses its power and back after the wake; calls during the sleep wait instead of
+  failing. Before, WindowServer aborted at every sleep (the login window came back). `rdna4-sleepkeep=0` discards as before.
+  Card (Tahoe 26.6.2, 2026-11-22): 19 clients, 325 MiB saved in 90 ms and restored in 37 ms, WindowServer and the session kept
+  through two sleeps. Vulkan apps (`N48N`) still lose their session. Still slow: about two minutes from Sleep to S3 (WindowServer's
+  30 s ack and a 90 s IOGraphics wait).
+- The display pipes take WindowServer's frames while a display sleeps (dropped; the family answered "offline" to each, about 1.4
+  failed submissions a second).
+- After a sleep, a main display at another mode than the boot one (2560x1440) comes back, and so does the second one.
+- `rdna4-pvgl` is off by default: OpenGL runs on the native accelerator (`rdna4-accelgl`); `rdna4-pvgl=1` for the paravirtual GPU.
 
 ## 0.3.3 (2026-11-19)
 

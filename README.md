@@ -250,7 +250,7 @@ default).
 | `rdna4-pvgpu-disp=<0-7>` | Which of the displays are the paravirtual GPU's (default 7: all; WindowServer composites on the card). |
 | `rdna4-pvgpu-delay=<s>` | Publish the paravirtual GPU this many seconds after the plugin starts (default 5). |
 | `rdna4-pvcursor=0` | No hardware cursor (WindowServer draws the pointer into each frame). |
-| `rdna4-pvgl=0` | OpenGL in software. |
+| `rdna4-pvgl=1` | OpenGL on the paravirtual GPU's device (default off: on the native desktop OpenGL runs on the driver's own accelerator, `rdna4-accelgl`). |
 | `rdna4-pvmac2=1` | The paravirtual device reports Mac GPU family 2: WebGL in Safari (Chrome's does not run yet). |
 | `rdna4-pvscaled=0` | No scaled modes larger than the monitor. |
 | `rdna4-pvfast=0` | Each size at the refresh nearest 60 Hz, not its fastest. |

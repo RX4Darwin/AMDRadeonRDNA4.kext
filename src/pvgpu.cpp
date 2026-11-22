@@ -157,9 +157,10 @@ void pvPause() {
 }
 #define PVCALL(name) do { static uint32_t calls_; if (__atomic_fetch_add(&calls_, 1u, __ATOMIC_RELAXED) < 3) { pvlog("call: %s", name); pvPause(); } } while (0)
 
-// OpenGL on the card, on unless rdna4-pvgl=0.
+// OpenGL on the paravirtual device, with rdna4-pvgl=1. Off by default since 2026-11-22: the native desktop is the default
+// (rdna4-accel=4), where OpenGL runs on the driver's own accelerator (rdna4-accelgl).
 static bool glWanted() {
-	uint32_t gl = 1;
+	uint32_t gl = 0;
 
 	(void)PE_parse_boot_argn("rdna4-pvgl", &gl, sizeof(gl));
 	return gl != 0;
