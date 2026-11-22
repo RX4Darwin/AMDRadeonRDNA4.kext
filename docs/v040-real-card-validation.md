@@ -28,23 +28,30 @@ Check that the kext is loaded, the reported build and compute ABI match the inst
 
 ## 3. Metal functional tests
 
-Use the `mtlprobe` built by the CI build job. Start with:
+Use the `mtlprobe` built from the same source revision as the installed bundle. First identify which Metal device the process sees:
 
 ```sh
+mtlprobe devices
 mtlprobe info
-mtlprobe all
 ```
 
-Keep the full output. A pass requires every probe to report its expected result and every child process to exit successfully. Do not treat a window appearing as proof that its rendered pixels are correct.
+`mtlprobe all` runs the legacy paravirtual-device probe set. It is useful only when that paravirtual path is deliberately enabled; it is **not** a complete validation of the native `RDNA4MTLDevice` path. Do not enable the paravirtual path just to make this test pass.
 
-Pay particular attention to runtime shader translation and newer feature coverage:
+For the native device, run the native probes individually after confirming that `RDNA4MTLDevice` is listed:
 
-- `mix`: runtime translation of a kernel not already in the kext's table.
-- `nativesrc`: Metal source compilation and execution on the native device.
-- `coverage2`, `ctex`, `fbfetch` and `varyings`: Core Animation-style shader features, texture operations, framebuffer fetch and interpolated varyings.
-- `nativespin` and `nativestencil`: depth, textures, indexed/instanced drawing, stencil and multisampling.
+```sh
+mtlprobe nativesrc
+mtlprobe nativespin
+mtlprobe nativestencil
+mtlprobe nativeevent
+mtlprobe nativeargbuf
+mtlprobe nativecd
+mtlprobe nativeca
+```
 
-Use the exact probe names supported by the checked-out `mtlprobe); do not copy binaries from a different commit.
+Run `mtlprobe native <probe.metallib>` only when the matching probe metallib has been built and supplied. `nativewin` is a visual/window stability check, not a substitute for pixel-checked tests. Preserve each command's exit status and complete output; a pass requires the expected checks to pass, not merely a window to appear.
+
+The separate `all` set includes `mix` (runtime translation of a kernel not already in the table), `coverage2`, `ctex`, `fbfetch` and `varyings`. Those probes are useful for the paravirtual stream path, but must not be reported as native-device validation. Use the exact probe names supported by the checked-out source and never mix binaries from different commits.
 
 ## 4. OpenGL application checks
 
