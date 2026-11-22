@@ -70,6 +70,29 @@ jobs:
       - name: Build complete user-space bundle and installer
         run: make package
 
+      - name: Validate generated installer scripts and daemon plists
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$(make -s product-dir CONFIG=RELEASE)"
+          for script in \
+            "$dir/pkg/core-scripts/preinstall" \
+            "$dir/pkg/core-scripts/postinstall" \
+            "$dir/pkg/logd-scripts/preinstall" \
+            "$dir/pkg/logd-scripts/postinstall"; do
+            test -s "$script"
+            sh -n "$script"
+          done
+          for plist in \
+            "$dir/pkg/core-root/Library/LaunchDaemons/org.rdna4.air2amdgpu.plist" \
+            "$dir/pkg/core-root/Library/LaunchDaemons/org.rdna4.iop.plist" \
+            "$dir/pkg/logd-root/Library/LaunchDaemons/org.rdna4.logd.plist"; do
+            plutil -lint "$plist"
+          done
+          grep -Fq '/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/Contents/Helpers/air2amdgpu' "$dir/pkg/core-root/Library/LaunchDaemons/org.rdna4.air2amdgpu.plist"
+          grep -Fq '/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/Contents/Helpers/rdna4-iop' "$dir/pkg/core-root/Library/LaunchDaemons/org.rdna4.iop.plist"
+          grep -Fq '/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/Contents/Helpers/rdna4-logd' "$dir/pkg/logd-root/Library/LaunchDaemons/org.rdna4.logd.plist"
+
       - name: Validate package contents and assemble release archive
         shell: bash
         run: |
