@@ -82,7 +82,12 @@ jobs:
             "$dir/pkg/logd-scripts/postinstall"; do
             test -s "$script"
             sh -n "$script"
+            grep -Fq 'exit 0' "$script"
           done
+          grep -Fq 'launchctl bootout system/$l' "$dir/pkg/core-scripts/preinstall"
+          grep -Fq 'launchctl bootstrap system /Library/LaunchDaemons/$l.plist' "$dir/pkg/core-scripts/postinstall"
+          grep -Fq 'launchctl bootout system/org.rdna4.logd' "$dir/pkg/logd-scripts/preinstall"
+          grep -Fq 'launchctl bootstrap system/org.rdna4.logd' "$dir/pkg/logd-scripts/postinstall"
           for plist in \
             "$dir/pkg/core-root/Library/LaunchDaemons/org.rdna4.air2amdgpu.plist" \
             "$dir/pkg/core-root/Library/LaunchDaemons/org.rdna4.iop.plist" \
