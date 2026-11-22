@@ -404,18 +404,20 @@ static void lowerTables(Function &k) {
 	}
 }
 
-// Metal's ray query (air.intersect.triangle_data: origin, direction, minimum and maximum distance, the acceleration structure, the
-// intersection function table, a payload, ..., accept any intersection as the last i1) as a call of rtlib.c's rdna4_rt_intersect, which
-// linkRayQueries links in after retargeting; its eight floats into AIR's result {i32 type, float distance, i32 primitive id, i32
-// geometry index, ptr primitive data (null), <2 x float> barycentrics, i1 front facing}. Null when the call is not of that shape.
+// Metal's ray query (air.intersect.triangle_data or air.intersect.instancing: origin, direction, minimum and maximum distance, the acceleration
+// structure, ..., accept any intersection as the last i1) as a call of rtlib.c's rdna4_rt_intersect, which linkRayQueries links in after
+// retargeting; its eight floats into AIR's result {i32 type, float distance, i32 primitive id, i32 geometry index, ptr primitive data (null),
+// <2 x float> barycentrics, i1 front facing}, or with instancing and no triangle data {..., ptr primitive data, i32 instance id, i32 user
+// instance id (the same)}. Null when the call is not of either shape.
 static Value *rayQuery(IRBuilder<> &b, CallInst *c) {
 	Module &m = *c->getModule();
 	LLVMContext &ctx = m.getContext();
 	Type *f32 = b.getFloatTy(), *i32 = b.getInt32Ty();
 	auto *st = dyn_cast<StructType>(c->getType());
 	auto *v3 = FixedVectorType::get(f32, 3);
+	const bool instances = st && st->getNumElements() == 7 && st->getElementType(5) == i32 && st->getElementType(6) == i32;
 	if (!st || st->getNumElements() != 7 || st->getElementType(0) != i32 || st->getElementType(1) != f32 || !st->getElementType(4)->isPointerTy() ||
-	    st->getElementType(5) != FixedVectorType::get(f32, 2) || !st->getElementType(6)->isIntegerTy(1) || c->arg_size() < 6 ||
+	    (!instances && (st->getElementType(5) != FixedVectorType::get(f32, 2) || !st->getElementType(6)->isIntegerTy(1))) || c->arg_size() < 6 ||
 	    c->getArgOperand(0)->getType() != v3 || c->getArgOperand(1)->getType() != v3 || !c->getArgOperand(4)->getType()->isPointerTy() ||
 	    !c->getArgOperand(c->arg_size() - 1)->getType()->isIntegerTy(1))
 		return nullptr;
@@ -433,13 +435,15 @@ static Value *rayQuery(IRBuilder<> &b, CallInst *c) {
 	Value *h = b.CreateCall(fn, args);
 	auto lane = [&](unsigned i) { return b.CreateExtractElement(h, i); };
 	auto bitsOf = [&](unsigned i) { return b.CreateBitCast(lane(i), i32); };
-	Value *bary = b.CreateInsertElement(b.CreateInsertElement(PoisonValue::get(st->getElementType(5)), lane(4), uint64_t(0)), lane(5), 1);
 	Value *r = PoisonValue::get(st);
 	r = b.CreateInsertValue(r, bitsOf(0), 0);
 	r = b.CreateInsertValue(r, lane(1), 1);
 	r = b.CreateInsertValue(r, bitsOf(2), 2);
 	r = b.CreateInsertValue(r, bitsOf(3), 3);
 	r = b.CreateInsertValue(r, ConstantPointerNull::get(cast<PointerType>(st->getElementType(4))), 4);
+	if (instances)   // the instance hit (lane 7), as its id and its user id
+		return b.CreateInsertValue(b.CreateInsertValue(r, bitsOf(7), 5), bitsOf(7), 6);
+	Value *bary = b.CreateInsertElement(b.CreateInsertElement(PoisonValue::get(st->getElementType(5)), lane(4), uint64_t(0)), lane(5), 1);
 	r = b.CreateInsertValue(r, bary, 5);
 	return b.CreateInsertValue(r, b.CreateTrunc(bitsOf(6), b.getInt1Ty()), 6);
 }
@@ -455,7 +459,19 @@ static std::string linkRayQueries(Module &m) {
 		return "the ray query library does not load: " + diag.getMessage().str();
 	lib->setTargetTriple(m.getTargetTriple());
 	lib->setDataLayout(m.getDataLayout());
-	return Linker::linkModules(m, std::move(lib), Linker::LinkOnlyNeeded) ? "the ray query library does not link" : "";
+	if (Linker::linkModules(m, std::move(lib), Linker::LinkOnlyNeeded))
+		return "the ray query library does not link";
+	// inlined here and gone: a shader is one function, its entry at the start of its code (fragment shadow rays, MetalQuake)
+	Function *linked = m.getFunction("rdna4_rt_intersect");
+	for (User *u : make_early_inc_range(linked->users()))
+		if (auto *call = dyn_cast<CallBase>(u)) {
+			InlineFunctionInfo info;
+			if (InlineResult done = InlineFunction(*call, info); !done.isSuccess())
+				return std::string("a ray query does not inline: ") + done.getFailureReason();
+		}
+	if (linked->use_empty())
+		linked->eraseFromParent();
+	return "";
 }
 
 static std::string legalize(Function &k) {
@@ -556,7 +572,7 @@ static std::string legalize(Function &k) {
 			gone.push_back(c);
 			continue;
 		}
-		if (name == "intersect.triangle_data") {
+		if (name == "intersect.triangle_data" || name == "intersect.instancing") {
 			Value *hit = rayQuery(b, c);
 			if (!hit)
 				return f->getName().str() + " of a form not supported yet";
@@ -1396,7 +1412,9 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			from[index] = 4;   // colour attachment 0 as it is (programmable blending): read at the pixel from the host's staged target
 		// An argument buffer (air.indirect_buffer; MoltenVK's descriptor sets) is a buffer of 8-byte handles: a buffer's address, a texture's or
 		// sampler's gpuResourceID = the address of its T# or S# (RDNA4MTLDevice), which the shader loads and passes on as handles.
-		else if ((kind == "air.buffer" || kind == "air.indirect_buffer") && !unused) {
+		// An acceleration structure (ray queries in a fragment shader: MetalQuake's shadow rays) by its address, as a buffer.
+		else if ((kind == "air.buffer" || kind == "air.indirect_buffer" || kind == "air.primitive_acceleration_structure" ||
+		          kind == "air.instance_acceleration_structure") && !unused) {
 			int location = -1;
 			bool writes = false;
 			for (unsigned k = 2; k < a->getNumOperands(); k++) {
@@ -2093,7 +2111,8 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 		if (kind == "air.buffer" && index < air->arg_size() && air->getArg(index)->getType() == PointerType::get(ctx, 3)) {
 			roles[index] = {GroupBuffer, -1};   // threadgroup memory the app sizes at dispatch (setThreadgroupMemoryLength): LDS below
 			groupBuffers++;
-		} else if (kind == "air.buffer" || kind == "air.indirect_buffer" || kind == "air.primitive_acceleration_structure") {   // the latter: its address, as a buffer's
+		} else if (kind == "air.buffer" || kind == "air.indirect_buffer" || kind == "air.primitive_acceleration_structure" ||
+		           kind == "air.instance_acceleration_structure") {   // the structures: their address, as a buffer's
 			int location = -1;
 			bool writes = false;
 			for (unsigned k = 2; k < a->getNumOperands(); k++) {

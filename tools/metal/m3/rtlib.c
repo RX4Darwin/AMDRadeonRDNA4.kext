@@ -27,7 +27,8 @@ static float bits(unsigned u) { return __builtin_bit_cast(float, u); }
 static float lesser(float a, float b) { return a < b ? a : b; }
 static float greater(float a, float b) { return a > b ? a : b; }
 
-float8 rdna4_rt_intersect(float ox, float oy, float oz, float dx, float dy, float dz, float tmin, float tmax, guint *as, int any)
+// A primitive acceleration structure ('RAS1') as above. Inlined: a shader is one function, its entry at the start of its code.
+static __attribute__((always_inline)) float8 primitive(float ox, float oy, float oz, float dx, float dy, float dz, float tmin, float tmax, guint *as, int any)
 {
 	float8 r = { 0, 0, 0, 0, 0, 0, 0, 0 };
 
@@ -80,6 +81,34 @@ float8 rdna4_rt_intersect(float ox, float oy, float oz, float dx, float dy, floa
 				return r;
 		}
 		i = tris ? escape : i + 1;
+	}
+	return r;
+}
+
+// An instance acceleration structure ('RAS2', RDNA4MTLDevice.mm buildInstances): +0 u32 magic, u32 instance count, u32 0, u32 0; then per instance
+// 64 bytes: f32 the world-to-object transform as 3 rows of 4 (x' = m0 x + m1 y + m2 z + m3, ...), u64 the address of its primitive structure,
+// u32 its mask, u32 0. The ray goes into each instance's space unnormalised, so a hit's distance is the world's; the closest hit (or the
+// first with `any`) wins, with its instance's index in lane 7. ponytail: masks, and front facing under a mirroring transform, not looked at.
+float8 rdna4_rt_intersect(float ox, float oy, float oz, float dx, float dy, float dz, float tmin, float tmax, guint *as, int any)
+{
+	if (!as || as[0] != 0x32534152u)   // 'RAS2'
+		return primitive(ox, oy, oz, dx, dy, dz, tmin, tmax, as, any);
+	float8 r = { 0, 0, 0, 0, 0, 0, 0, 0 };
+	float best = tmax;
+	for (unsigned i = 0, count = as[1]; i < count; i++) {
+		guint *rec = as + 4 + 16 * i;
+		gfloat *m = (gfloat *)rec;
+		guint *blas = (guint *)(((unsigned long)rec[13] << 32) | rec[12]);
+		const float8 h = primitive(m[0] * ox + m[1] * oy + m[2] * oz + m[3], m[4] * ox + m[5] * oy + m[6] * oz + m[7],
+		                           m[8] * ox + m[9] * oy + m[10] * oz + m[11], m[0] * dx + m[1] * dy + m[2] * dz,
+		                           m[4] * dx + m[5] * dy + m[6] * dz, m[8] * dx + m[9] * dy + m[10] * dz, tmin, best, blas, any);
+		if (__builtin_bit_cast(unsigned, h[0]) != 1)
+			continue;
+		r = h;
+		r[7] = bits(i);
+		best = h[1];
+		if (any)
+			break;
 	}
 	return r;
 }

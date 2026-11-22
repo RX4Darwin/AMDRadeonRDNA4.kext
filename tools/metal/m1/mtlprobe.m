@@ -2608,6 +2608,32 @@ static BOOL nativeQueue(id<MTLDevice> d, id<MTLComputePipelineState> scale, id<M
 	return asyncOk && drawsOk;
 }
 
+// The nearest of `tris` triangles a ray meets within 100 (Moller-Trumbore, no structure): {distance, u, v, triangle}, or all -1.
+static void nearestHit(const float *o, const float *dd, const float *verts, int tris, float *hit)
+{
+	float best = 100;
+	hit[0] = hit[1] = hit[2] = hit[3] = -1;
+	for (int t = 0; t < tris; t++) {
+		const float *v = &verts[9 * t];
+		const float e1[3] = { v[3] - v[0], v[4] - v[1], v[5] - v[2] }, e2[3] = { v[6] - v[0], v[7] - v[1], v[8] - v[2] };
+		const float p[3] = { dd[1] * e2[2] - dd[2] * e2[1], dd[2] * e2[0] - dd[0] * e2[2], dd[0] * e2[1] - dd[1] * e2[0] };
+		const float det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+		if (fabsf(det) < 1e-12f)
+			continue;
+		const float inv = 1 / det, s[3] = { o[0] - v[0], o[1] - v[1], o[2] - v[2] };
+		const float u = (s[0] * p[0] + s[1] * p[1] + s[2] * p[2]) * inv;
+		const float q[3] = { s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0] };
+		const float w = (dd[0] * q[0] + dd[1] * q[1] + dd[2] * q[2]) * inv, dist = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
+		if (u < 0 || u > 1 || w < 0 || u + w > 1 || dist < 0 || dist > best)
+			continue;
+		best = dist;
+		hit[0] = dist;
+		hit[1] = u;
+		hit[2] = w;
+		hit[3] = t;
+	}
+}
+
 static BOOL nativeRays(id<MTLDevice> d, id<MTLLibrary> lib)
 {
 	enum { kTris = 300, kRays = 1024 };
@@ -2630,28 +2656,7 @@ static BOOL nativeRays(id<MTLDevice> d, id<MTLLibrary> lib)
 		dir[4 * i + 1] = 0.1f * rnd() - 0.05f;
 		dir[4 * i + 2] = 1;
 		dir[4 * i + 3] = 0;
-		float best = 100;
-		cpu[4 * i] = cpu[4 * i + 1] = cpu[4 * i + 2] = cpu[4 * i + 3] = -1;
-		const float *o = &org[4 * i], *dd = &dir[4 * i];
-		for (int t = 0; t < kTris; t++) {
-			const float *v = &verts[9 * t];
-			const float e1[3] = { v[3] - v[0], v[4] - v[1], v[5] - v[2] }, e2[3] = { v[6] - v[0], v[7] - v[1], v[8] - v[2] };
-			const float p[3] = { dd[1] * e2[2] - dd[2] * e2[1], dd[2] * e2[0] - dd[0] * e2[2], dd[0] * e2[1] - dd[1] * e2[0] };
-			const float det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
-			if (fabsf(det) < 1e-12f)
-				continue;
-			const float inv = 1 / det, s[3] = { o[0] - v[0], o[1] - v[1], o[2] - v[2] };
-			const float u = (s[0] * p[0] + s[1] * p[1] + s[2] * p[2]) * inv;
-			const float q[3] = { s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0] };
-			const float w = (dd[0] * q[0] + dd[1] * q[1] + dd[2] * q[2]) * inv, dist = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
-			if (u < 0 || u > 1 || w < 0 || u + w > 1 || dist < 0 || dist > best)
-				continue;
-			best = dist;
-			cpu[4 * i] = dist;
-			cpu[4 * i + 1] = u;
-			cpu[4 * i + 2] = w;
-			cpu[4 * i + 3] = t;
-		}
+		nearestHit(&org[4 * i], &dir[4 * i], verts, kTris, &cpu[4 * i]);
 	}
 	NSError *err = nil;
 	id<MTLComputePipelineState> rays = [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rays"] error:&err];
@@ -2709,6 +2714,101 @@ static BOOL nativeRays(id<MTLDevice> d, id<MTLLibrary> lib)
 	                     gpu[4 * firstBad + 2], gpu[4 * firstBad + 3]].UTF8String : "");
 	return !bad && cb.status == MTLCommandBufferStatusCompleted && hits > 0 && hits < kRays;
 #undef rnd
+}
+
+// Instances (MetalQuake's shadow rays): the same rays against an instance structure of one instance of the triangles, turned 90 degrees
+// about z and moved 1 along z, queried as MetalQuake does (intersector<instancing>, no triangle data); each ray's distance and instance
+// against the nearest of the turned and moved triangles by the CPU.
+static BOOL nativeInstanceRays(id<MTLDevice> d, id<MTLLibrary> lib)
+{
+	enum { kTris = 300, kRays = 1024 };
+	static float verts[kTris * 9], moved[kTris * 9], org[kRays * 4], dir[kRays * 4], cpu[kRays * 4];
+	uint32_t seed = 54321;
+#define rnd() nativeRandom(&seed)
+	for (int t = 0; t < kTris; t++) {
+		const float cx = 2.4f * rnd() - 1.2f, cy = 2.4f * rnd() - 1.2f, cz = 2 + 4 * rnd();
+		for (int k = 0; k < 3; k++) {
+			float *v = &verts[9 * t + 3 * k], *w = &moved[9 * t + 3 * k];
+			v[0] = cx + 0.5f * rnd() - 0.25f;
+			v[1] = cy + 0.5f * rnd() - 0.25f;
+			v[2] = cz + 0.5f * rnd() - 0.25f;
+			w[0] = -v[1];   // (x, y, z) -> (-y, x, z + 1)
+			w[1] = v[0];
+			w[2] = v[2] + 1;
+		}
+	}
+	for (int i = 0; i < kRays; i++) {
+		org[4 * i] = 2.4f * (i % 32) / 31 - 1.2f;
+		org[4 * i + 1] = 2.4f * (i / 32) / 31 - 1.2f;
+		org[4 * i + 2] = org[4 * i + 3] = 0;
+		dir[4 * i] = 0.1f * rnd() - 0.05f;
+		dir[4 * i + 1] = 0.1f * rnd() - 0.05f;
+		dir[4 * i + 2] = 1;
+		dir[4 * i + 3] = 0;
+		nearestHit(&org[4 * i], &dir[4 * i], moved, kTris, &cpu[4 * i]);
+	}
+#undef rnd
+	NSError *err = nil;
+	id<MTLComputePipelineState> rays = [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rays_instanced"] error:&err];
+	id<MTLBuffer> vb = [d newBufferWithBytes:verts length:sizeof verts options:MTLResourceStorageModeShared];
+	id<MTLBuffer> ob = [d newBufferWithBytes:org length:sizeof org options:MTLResourceStorageModeShared];
+	id<MTLBuffer> db = [d newBufferWithBytes:dir length:sizeof dir options:MTLResourceStorageModeShared];
+	id<MTLBuffer> out = [d newBufferWithLength:sizeof cpu options:MTLResourceStorageModeShared];
+	MTLAccelerationStructureInstanceDescriptor inst = { .mask = 0xff, .options = MTLAccelerationStructureInstanceOptionOpaque };
+	inst.transformationMatrix.columns[0] = (MTLPackedFloat3){ 0, 1, 0 };    // x -> y
+	inst.transformationMatrix.columns[1] = (MTLPackedFloat3){ -1, 0, 0 };   // y -> -x
+	inst.transformationMatrix.columns[2] = (MTLPackedFloat3){ 0, 0, 1 };
+	inst.transformationMatrix.columns[3] = (MTLPackedFloat3){ 0, 0, 1 };
+	id<MTLBuffer> ib = [d newBufferWithBytes:&inst length:sizeof inst options:MTLResourceStorageModeShared];
+	if (!rays || !vb || !ob || !db || !out || !ib) {
+		OUT("native: instance rays FAIL: %s", rays ? "no buffers" : err.localizedDescription.UTF8String);
+		return NO;
+	}
+	MTLAccelerationStructureTriangleGeometryDescriptor *geo = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+	geo.vertexBuffer = vb;
+	geo.vertexStride = 12;
+	geo.triangleCount = kTris;
+	MTLPrimitiveAccelerationStructureDescriptor *blasDesc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+	blasDesc.geometryDescriptors = @[ geo ];
+	id<MTLAccelerationStructure> blas = [d newAccelerationStructureWithSize:[d accelerationStructureSizesWithDescriptor:blasDesc].accelerationStructureSize];
+	MTLInstanceAccelerationStructureDescriptor *tlasDesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
+	tlasDesc.instancedAccelerationStructures = @[ blas ];
+	tlasDesc.instanceCount = 1;
+	tlasDesc.instanceDescriptorBuffer = ib;
+	// sized before the primitive structure is built, as MetalQuake does
+	id<MTLAccelerationStructure> tlas = [d newAccelerationStructureWithSize:[d accelerationStructureSizesWithDescriptor:tlasDesc].accelerationStructureSize];
+	id<MTLBuffer> scratch = [d newBufferWithLength:4096 options:MTLResourceStorageModePrivate];
+	id<MTLCommandBuffer> cb = [[d newCommandQueue] commandBuffer];
+	id<MTLAccelerationStructureCommandEncoder> ae = [cb accelerationStructureCommandEncoder];
+	[ae buildAccelerationStructure:blas descriptor:blasDesc scratchBuffer:scratch scratchBufferOffset:0];
+	[ae buildAccelerationStructure:tlas descriptor:tlasDesc scratchBuffer:scratch scratchBufferOffset:0];
+	[ae endEncoding];
+	id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+	[ce setComputePipelineState:rays];
+	[ce setAccelerationStructure:tlas atBufferIndex:0];
+	[ce useResource:blas usage:MTLResourceUsageRead];
+	[ce setBuffer:ob offset:0 atIndex:1];
+	[ce setBuffer:db offset:0 atIndex:2];
+	[ce setBuffer:out offset:0 atIndex:3];
+	[ce dispatchThreads:MTLSizeMake(kRays, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	[ce endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	const float *gpu = out.contents;
+	int hits = 0, bad = 0, firstBad = -1;
+	for (int i = 0; i < kRays; i++) {
+		const BOOL hitCpu = cpu[4 * i] >= 0, hitGpu = gpu[4 * i] >= 0;
+		hits += hitCpu;
+		const BOOL same = hitCpu == hitGpu && (!hitCpu || (fabsf(cpu[4 * i] - gpu[4 * i]) < 1e-4f && gpu[4 * i + 1] == 0));
+		if (!same && !bad++)
+			firstBad = i;
+	}
+	const BOOL ok = !bad && cb.status == MTLCommandBufferStatusCompleted && hits > 0 && hits < kRays;
+	OUT("native: instance rays %s: %d of %d rays wrong, %d hit (CPU) (status %ld%s%s)%s", ok ? "PASS" : "FAIL", bad, kRays, hits, (long)cb.status,
+	    cb.error ? ", " : "", cb.error ? cb.error.localizedDescription.UTF8String : "",
+	    firstBad >= 0 ? [NSString stringWithFormat:@"; first wrong ray %d: CPU %g (triangle %g), GPU %g (instance %g, triangle %g)", firstBad,
+	                     cpu[4 * firstBad], cpu[4 * firstBad + 3], gpu[4 * firstBad], gpu[4 * firstBad + 1], gpu[4 * firstBad + 2]].UTF8String : "");
+	return ok;
 }
 
 int main(int argc, char **argv) {
@@ -2827,7 +2927,7 @@ int main(int argc, char **argv) {
 			    "near the vertices 0x%08x 0x%08x 0x%08x, pixel (0,0) 0x%08x (status %ld%s%s)", renderOk ? "PASS" : "FAIL", tr.covered, tr.minX, tr.maxX,
 			    tr.minY, tr.maxY, tr.maxChannelErr256 / 256.0, tr.maxSumErr, tr.centroid, tr.near0, tr.near1, tr.near2, img[0], (long)rb.status,
 			    rb.error ? ", " : "", rb.error ? rb.error.localizedDescription.UTF8String : "");
-			const BOOL raysOk = nativeRays(d, lib);
+			const BOOL raysOk = nativeRays(d, lib) & nativeInstanceRays(d, lib);
 			const BOOL queueOk = nativeQueue(d, scale, rps, pass, tex);
 			return computeOk && renderOk && raysOk && queueOk ? 0 : 1;
 		}

@@ -1416,9 +1416,12 @@ static NSError *rtTriangles(MTLPrimitiveAccelerationStructureDescriptor *d, NSMu
 
 @interface RDNA4MTLAccelerationStructure : NSObject <MTLAccelerationStructure>
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device size:(NSUInteger)size;
-- (NSError *)build:(MTLPrimitiveAccelerationStructureDescriptor *)descriptor;
+- (NSError *)build:(MTLAccelerationStructureDescriptor *)descriptor;
 @property (readonly) RDNA4MTLBuffer *memory;
 @end
+
+// A structure's memory, bound as a buffer (the translator's acceleration structure arguments: their address); nil for another device's
+static RDNA4MTLBuffer *structureMemory(id<MTLAccelerationStructure> as);
 
 @implementation RDNA4MTLAccelerationStructure {
 	RDNA4MTLDevice *_device;
@@ -1434,10 +1437,66 @@ static NSError *rtTriangles(MTLPrimitiveAccelerationStructureDescriptor *d, NSMu
 	return _memory ? self : nil;
 }
 
-- (NSError *)build:(MTLPrimitiveAccelerationStructureDescriptor *)d
+// An instance structure ('RAS2', rtlib.c): per instance its world-to-object transform (3 rows of 4 floats), the address of its primitive
+// structure and its mask; the instances' structures are read when a ray reaches them, so they may be built after this one. Instance
+// descriptors of the default and the user-ID types (the user ID is not kept: the instance's index stands for it).
+- (NSError *)buildInstances:(MTLInstanceAccelerationStructureDescriptor *)d
 {
-	if (![d isKindOfClass:[MTLPrimitiveAccelerationStructureDescriptor class]])
-		return rdna4Error(@"only primitive acceleration structures so far (no instances)", 0);
+	const MTLAccelerationStructureInstanceDescriptorType type = d.instanceDescriptorType;
+	if (type != MTLAccelerationStructureInstanceDescriptorTypeDefault && type != MTLAccelerationStructureInstanceDescriptorTypeUserID)
+		return rdna4Error([NSString stringWithFormat:@"instance descriptors of type %lu: the default and user-ID ones only so far", (unsigned long)type], 0);
+	const NSUInteger size = type == MTLAccelerationStructureInstanceDescriptorTypeDefault ? sizeof(MTLAccelerationStructureInstanceDescriptor)
+	                                                                                      : sizeof(MTLAccelerationStructureUserIDInstanceDescriptor);
+	const NSUInteger stride = d.instanceDescriptorStride ?: size, count = d.instanceCount;
+	id<MTLBuffer> in = d.instanceDescriptorBuffer;
+	if (![(id)in isKindOfClass:[RDNA4MTLBuffer class]] || (count && d.instanceDescriptorBufferOffset + (count - 1) * stride + size > in.length))
+		return rdna4Error(@"instance descriptors in a buffer of another device, or past its end", 0);
+	if (16 + 64 * count > _memory.length)
+		return rdna4Error([NSString stringWithFormat:@"%lu instances do not fit an acceleration structure of %lu bytes", (unsigned long)count,
+		                                             (unsigned long)_memory.length], 0);
+	uint32_t *head = (uint32_t *)_memory.contents;
+	for (NSUInteger i = 0; i < count; i++) {
+		const MTLAccelerationStructureInstanceDescriptor *inst =
+			(const MTLAccelerationStructureInstanceDescriptor *)((const uint8_t *)in.contents + d.instanceDescriptorBufferOffset + i * stride);
+		float *rec = (float *)(head + 4 + 16 * i);
+		memset(rec, 0, 64);
+		id blas = inst->accelerationStructureIndex < d.instancedAccelerationStructures.count ? d.instancedAccelerationStructures[inst->accelerationStructureIndex] : nil;
+		// world = A obj + t (A's columns: the matrix's first three); object = A^-1 (world - t)
+		const MTLPackedFloat3 *c = inst->transformationMatrix.columns;
+		const float a[3][3] = { { c[0].x, c[1].x, c[2].x }, { c[0].y, c[1].y, c[2].y }, { c[0].z, c[1].z, c[2].z } };
+		const float det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+		                  a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+		if (![blas isKindOfClass:[RDNA4MTLAccelerationStructure class]] || fabsf(det) < 1e-20f)
+			continue;   // no structure, or a degenerate transform: an instance no ray meets (address 0)
+		float inv[3][3];
+		for (int r = 0; r < 3; r++)
+			for (int k = 0; k < 3; k++) {   // the adjugate's (r, k): the cofactor of (k, r)
+				const int r1 = (k + 1) % 3, r2 = (k + 2) % 3, c1 = (r + 1) % 3, c2 = (r + 2) % 3;
+				inv[r][k] = (a[r1][c1] * a[r2][c2] - a[r1][c2] * a[r2][c1]) / det;
+			}
+		const float t[3] = { c[3].x, c[3].y, c[3].z };
+		for (int r = 0; r < 3; r++) {
+			for (int k = 0; k < 3; k++)
+				rec[4 * r + k] = inv[r][k];
+			rec[4 * r + 3] = -(inv[r][0] * t[0] + inv[r][1] * t[1] + inv[r][2] * t[2]);
+		}
+		const uint64_t address = ((RDNA4MTLAccelerationStructure *)blas).memory.gpuAddress;
+		memcpy(rec + 12, &address, 8);
+		((uint32_t *)rec)[14] = inst->mask;
+	}
+	head[0] = 0x32534152u;   // 'RAS2'
+	head[1] = (uint32_t)count;
+	head[2] = head[3] = 0;
+	return nil;
+}
+
+- (NSError *)build:(MTLAccelerationStructureDescriptor *)descriptor
+{
+	if ([descriptor isKindOfClass:[MTLInstanceAccelerationStructureDescriptor class]])
+		return [self buildInstances:(MTLInstanceAccelerationStructureDescriptor *)descriptor];
+	if (![descriptor isKindOfClass:[MTLPrimitiveAccelerationStructureDescriptor class]])
+		return rdna4Error(@"only primitive and instance acceleration structures so far", 0);
+	MTLPrimitiveAccelerationStructureDescriptor *d = (MTLPrimitiveAccelerationStructureDescriptor *)descriptor;
 	NSMutableData *tris = [NSMutableData data];
 	NSError *why = rtTriangles(d, tris);
 	const uint32_t count = (uint32_t)(tris.length / sizeof(RtTri));
@@ -1468,6 +1527,11 @@ static NSError *rtTriangles(MTLPrimitiveAccelerationStructureDescriptor *d, NSMu
 
 RDNA4_ANSWER_MISSING
 @end
+
+static RDNA4MTLBuffer *structureMemory(id<MTLAccelerationStructure> as)
+{
+	return [(id)as isKindOfClass:[RDNA4MTLAccelerationStructure class]] ? ((RDNA4MTLAccelerationStructure *)as).memory : nil;
+}
 
 // ---- libraries and functions
 
@@ -2609,8 +2673,7 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 
 - (void)setAccelerationStructure:(id<MTLAccelerationStructure>)as atBufferIndex:(NSUInteger)index
 {
-	[self setBuffer:[(id)as isKindOfClass:[RDNA4MTLAccelerationStructure class]] ? ((RDNA4MTLAccelerationStructure *)as).memory : nil offset:0
-	        atIndex:index];
+	[self setBuffer:structureMemory(as) offset:0 atIndex:index];
 }
 
 - (void)record:(MTLSize)groups groupSize:(MTLSize)groupSize grid:(MTLSize)grid
@@ -3018,6 +3081,14 @@ RDNA4_ANSWER_MISSING
 
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { [self bind:0 buffer:b offset:o index:i]; }
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { [self bind:1 buffer:b offset:o index:i]; }
+- (void)setVertexAccelerationStructure:(id<MTLAccelerationStructure>)as atBufferIndex:(NSUInteger)i
+{
+	[self bind:0 buffer:structureMemory(as) offset:0 index:i];
+}
+- (void)setFragmentAccelerationStructure:(id<MTLAccelerationStructure>)as atBufferIndex:(NSUInteger)i
+{
+	[self bind:1 buffer:structureMemory(as) offset:0 index:i];
+}
 
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
@@ -3339,7 +3410,7 @@ RDNA4_ANSWER_MISSING
 	[_commandBuffer record:^NSError * {
 		if (![(id)as isKindOfClass:[RDNA4MTLAccelerationStructure class]])
 			return rdna4Error(@"an acceleration structure of another device", 0);
-		return [(RDNA4MTLAccelerationStructure *)as build:(MTLPrimitiveAccelerationStructureDescriptor *)d];
+		return [(RDNA4MTLAccelerationStructure *)as build:d];
 	}];
 }
 
@@ -4985,6 +5056,9 @@ static void abortStack(int sig)
 
 - (MTLAccelerationStructureSizes)accelerationStructureSizesWithDescriptor:(MTLAccelerationStructureDescriptor *)d
 {
+	if ([d isKindOfClass:[MTLInstanceAccelerationStructureDescriptor class]])   // 'RAS2': a header and 64 bytes an instance
+		return (MTLAccelerationStructureSizes){ .accelerationStructureSize = 16 + 64 * ((MTLInstanceAccelerationStructureDescriptor *)d).instanceCount,
+		                                        .buildScratchBufferSize = 16 };
 	NSUInteger triangles = 0;
 	if ([d isKindOfClass:[MTLPrimitiveAccelerationStructureDescriptor class]])
 		for (MTLAccelerationStructureGeometryDescriptor *g in ((MTLPrimitiveAccelerationStructureDescriptor *)d).geometryDescriptors)
