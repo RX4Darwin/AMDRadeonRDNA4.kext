@@ -77,7 +77,7 @@ jobs:
           for executable in \
             "$kext/Contents/MacOS/AMDRadeonRDNA4" \
             "$bundle/Contents/MacOS/AMDRadeonRDNA4MTLDriver" \
-            "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Versions/A/AMDRadeonRD4" \
+            "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Versions/A/AMDRadeonRDNA4" \
             "$bundle/Contents/Helpers/air2amdgpu" \
             "$bundle/Contents/Helpers/rdna4-run" \
             "$bundle/Contents/Helpers/rdna4-iop" \
