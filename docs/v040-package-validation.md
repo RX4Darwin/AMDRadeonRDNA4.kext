@@ -52,6 +52,7 @@ Review the generated component scripts as well as the package payload:
 - Core postinstall bootstraps the two core daemons.
 - Logd preinstall and postinstall stop and start only the log collection daemon.
 - The Vulkan choice installs only the RADV ICD manifest and does not silently alter unrelated Vulkan installations.
+- Generated preinstall and postinstall scripts for core and logd pass `sh -n`.
 - LaunchDaemon plists point to helpers inside the installed bundle, use the intended labels, and pass `plutil -lint`.
 - The core choice remains required; log collection and Vulkan remain independently selectable.
 
