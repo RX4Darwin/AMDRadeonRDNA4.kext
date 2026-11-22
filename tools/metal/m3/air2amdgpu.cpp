@@ -740,29 +740,34 @@ static std::string legalize(Function &k) {
 				if (auto *e = dyn_cast_or_null<ConstantInt>(offset->getAggregateElement(i)))
 					packed |= (static_cast<uint32_t>(e->getSExtValue()) & 0x3f) << (8 * i);
 			const bool zero = match(value, m_AnyZeroFP()), lod = level->isOne(), bias = !lod && !zero;
-			if (bias)
-				return f->getName().str() + " with a LOD bias is not supported yet";
 			const bool quads = k.getCallingConv() == CallingConv::AMDGPU_PS;   // implicit LODs need pixel quads (as the 2D case)
-			const unsigned mode = !quads || (lod && zero) ? 3 : lod ? 2 : 0;   // plain, -, explicit LOD, LOD 0
-			static const Intrinsic::ID ids[2][2][4] = {   // [compare][offset][plain, -, lod, lod zero]
-				{{Intrinsic::amdgcn_image_sample_2d, Intrinsic::not_intrinsic, Intrinsic::amdgcn_image_sample_l_2d, Intrinsic::amdgcn_image_sample_lz_2d},
-				 {Intrinsic::amdgcn_image_sample_o_2d, Intrinsic::not_intrinsic, Intrinsic::amdgcn_image_sample_l_o_2d, Intrinsic::amdgcn_image_sample_lz_o_2d}},
-				{{Intrinsic::amdgcn_image_sample_c_2d, Intrinsic::not_intrinsic, Intrinsic::amdgcn_image_sample_c_l_2d, Intrinsic::amdgcn_image_sample_c_lz_2d},
-				 {Intrinsic::amdgcn_image_sample_c_o_2d, Intrinsic::not_intrinsic, Intrinsic::amdgcn_image_sample_c_l_o_2d, Intrinsic::amdgcn_image_sample_c_lz_o_2d}}};
+			// plain, bias (GL's shadow lookups through Apple's GL-on-Metal renderer: OpenMW's shadows), explicit LOD, LOD 0
+			const unsigned mode = !quads || (lod && zero) ? 3 : bias ? 1 : lod ? 2 : 0;
+			static const Intrinsic::ID ids[2][2][4] = {   // [compare][offset][plain, bias, lod, lod zero]
+				{{Intrinsic::amdgcn_image_sample_2d, Intrinsic::amdgcn_image_sample_b_2d, Intrinsic::amdgcn_image_sample_l_2d, Intrinsic::amdgcn_image_sample_lz_2d},
+				 {Intrinsic::amdgcn_image_sample_o_2d, Intrinsic::amdgcn_image_sample_b_o_2d, Intrinsic::amdgcn_image_sample_l_o_2d, Intrinsic::amdgcn_image_sample_lz_o_2d}},
+				{{Intrinsic::amdgcn_image_sample_c_2d, Intrinsic::amdgcn_image_sample_c_b_2d, Intrinsic::amdgcn_image_sample_c_l_2d, Intrinsic::amdgcn_image_sample_c_lz_2d},
+				 {Intrinsic::amdgcn_image_sample_c_o_2d, Intrinsic::amdgcn_image_sample_c_b_o_2d, Intrinsic::amdgcn_image_sample_c_l_o_2d, Intrinsic::amdgcn_image_sample_c_lz_o_2d}}};
 			Value *t = descriptor(c->getArgOperand(0), 8);
 			Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
 			Value *xy = c->getArgOperand(3);
 			Type *ft = b.getFloatTy();
-			SmallVector<Value *, 11> args = {b.getInt32(1)};
+			SmallVector<Value *, 12> args = {b.getInt32(1)};
 			if (packed)
 				args.push_back(b.getInt32(packed));
+			if (mode == 1)   // (LLVM's order: offset, bias, compare value, coordinates)
+				args.push_back(value);
 			if (compare)
 				args.push_back(c->getArgOperand(4));
 			args.append({b.CreateExtractElement(xy, uint64_t(0)), b.CreateExtractElement(xy, 1)});
 			if (mode == 2)
 				args.push_back(value);
 			args.append({t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
-			Value *d = b.CreateIntrinsic(ids[compare][packed != 0][mode], {ft, ft, t->getType(), sm->getType()}, args);
+			SmallVector<Type *, 5> types = {ft};
+			if (mode == 1)
+				types.push_back(ft);   // the bias's own overload
+			types.append({ft, t->getType(), sm->getType()});
+			Value *d = b.CreateIntrinsic(ids[compare][packed != 0][mode], types, args);
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), d, 0), b.getInt8(0), 1);
 		} else if (tex.starts_with("sample_texture_cube.v4f")) {
 			// (texture, sampler, float3 direction, i1 level, float bias or LOD, float min LOD, i32): vkQuake's sky through MoltenVK
