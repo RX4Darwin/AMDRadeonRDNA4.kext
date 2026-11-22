@@ -3813,6 +3813,21 @@ static int testGpuHeap() {
 	h.free(b);
 	h.free(c);
 	failures += check(h.free(base + 8 * G) && h.freeBytes() == h.size(), "heap: a taken range is freed like an allocation");
+	// nextUsed: allocated ranges in order, adjacent allocations as one, the last granule included.
+	{
+		uint64_t cur = 0, off = 0, n = 0, p = 0, q = 0, r = 0, s = 0;
+		bool walk = !h.nextUsed(cur, off, n);   // empty heap
+		walk = walk && h.alloc(2 * G, p) && h.alloc(G, q) && h.alloc(G, r) && h.free(q) && h.take(base + 63 * G, G);
+		s = base + 63 * G;
+		cur = 0;
+		walk = walk && h.nextUsed(cur, off, n) && off == p && n == 2 * G && h.nextUsed(cur, off, n) && off == r && n == G &&
+		       h.nextUsed(cur, off, n) && off == s && n == G && !h.nextUsed(cur, off, n);
+		failures += check(walk, "heap: nextUsed walks the allocated ranges (off 0x%llx n 0x%llx)", (unsigned long long)off,
+		                  (unsigned long long)n);
+		h.free(p);
+		h.free(r);
+		h.free(s);
+	}
 
 	// The device heap's shape: gigabytes in 64 KiB granules, the map cut
 	// short by its capacity, and allocations far from the base.

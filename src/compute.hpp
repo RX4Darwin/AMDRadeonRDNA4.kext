@@ -157,6 +157,8 @@ public:
 	void powerWillSleep();
 	void powerSleepRequest();   // P7: setPowerState(0) / the debug sleep selector call this first, without rtLock (src/pmidle.cpp)
 	void powerDidWake();
+	// A user client's call during a sleep or the wake's bring-up waits for the runtime (at most 30 s awake) instead of failing.
+	void waitAwake();
 	// Breadcrumb in NVRAM (Lilu vendor GUID, key rdna4-trail), written and
 	// flushed before each step that could hang the GPU (also the display
 	// side's, RDNA4Device::breadcrumb), so the step a hard
@@ -258,6 +260,20 @@ private:
 	void endBringup();
 	bool bringupStepAllowed(const char *step);
 	void resetRuntimeForResume();
+	void discardRuntimeLocked();   // every buffer, program, heap and VM context gone, the clients aborted (a wake without a save)
+	// A system sleep with the clients kept (rdna4-vmshared=2): the memory of both heaps' allocations copied to host memory before
+	// the card loses its power, the clients, buffers, programs and page tables left as they were, and the memory copied back at
+	// the same VRAM addresses when the wake's runtime is published. The native Metal device's clients, WindowServer among them,
+	// go on after the wake (before, each was aborted and WindowServer died, 2026-11-22). rdna4-sleepkeep=0: discarded as before.
+	struct SleepRun { uint64_t mc, bytes, at; };   // a VRAM range and where its bytes are in sleepCopy
+	IOBufferMemoryDescriptor *sleepCopy { nullptr };
+	SleepRun *sleepRuns { nullptr };
+	uint32_t  sleepRunCount { 0 };
+	bool      sleepKept { false };     // saved: the wake keeps the clients, publishRuntime copies the memory back
+	bool sleepSaveLocked();
+	bool sleepRestoreLocked();
+	void sleepDropSave();
+	bool sleepCopyRun(const SleepRun &r, bool toGpu);
 
 	// The pre-Metal features past the compute stages (W1-W5) name their
 	// trail steps "<feature>: ..." (gfx, ih, vm, flip). If the previous

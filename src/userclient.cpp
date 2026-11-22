@@ -200,6 +200,9 @@ IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodA
 		return kIOReturnUnsupported;
 	if (!privileged && !(kLocalSelectors >> selector & 1))
 		return kIOReturnNotPrivileged;
+	// During a system sleep and the wake's bring-up: held, not refused. WindowServer's Metal device took a refused allocation as
+	// a failed pipeline and aborted at every sleep (2026-11-22); with the clients kept across it (sleepKept) the call goes on after.
+	compute->waitAwake();
 
 	IOLockLock(gate);
 	if (closed) {

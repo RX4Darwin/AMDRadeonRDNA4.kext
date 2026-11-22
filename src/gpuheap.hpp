@@ -41,6 +41,10 @@ public:
 	// Length of the allocation starting at `offset` (0 if none).
 	uint64_t lengthOf(uint64_t offset) const;
 
+	// The next range of allocated granules at or after `cursor` (adjacent allocations as one), `cursor` moved past it; false
+	// when there is none. What a sleep saves of the heap's memory (runtime.cpp sleepSaveLocked).
+	bool nextUsed(uint64_t &cursor, uint64_t &offset, uint64_t &bytes) const;
+
 	uint64_t base() const { return start; }
 	uint32_t granule() const { return gran; }
 	uint64_t size() const { return static_cast<uint64_t>(count) * gran; }

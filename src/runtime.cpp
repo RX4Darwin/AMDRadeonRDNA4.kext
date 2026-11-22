@@ -401,6 +401,13 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 		return;
 	}
 	IOLockLock(rtLock);
+	// After a sleep that kept the clients: their memory back first (else discarded, and the heaps made anew).
+	if (sleepKept && !sleepRestoreLocked() && !initRuntimeHeap()) {
+		IOLockUnlock(rtLock);
+		RLOG("not published: no heap after the discarded wake");
+		publishResult("runtime", "FAIL runtime heap");
+		return;
+	}
 	rtStage = stage;
 	rtReady = true;
 	IOLockUnlock(rtLock);
@@ -759,19 +766,24 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 bool RDNA4Compute::initRuntimeHeap() {
 	if (!rtLock || !poolCpu || pool.size <= kHeapOffset)
 		return false;
-	if (heap.size())
+	// Heaps kept across a sleep (sleepKept) still need the wake's DMA; a heap discarded after a failed restore is made anew.
+	if (heap.size() && (dmaReady || !sleepKept))
 		return true;
 	/* DMA first: its self-test drives SDMA directly, before any client can;
 	 * then the interrupts (W1), off for one boot if the last one hung in
 	 * "ih: ...". */
-	if (dmaInit()) {
+	const bool dmaNew = !dmaReady && dmaInit();
+	if (dmaReady && !devHeap.size())
 		devHeapInit();
+	if (dmaNew) {
 		faultPageToSystem();
 		if (featureAllowed("ih"))
 			ihInit();
 	}
-	heap.init(kHeapOffset, pool.size - kHeapOffset, 4096, heapMap, sizeof(heapMap));
-	n48nKeep();   // after a sleep: pool memory a process still maps stays out of the new heap
+	if (!heap.size()) {
+		heap.init(kHeapOffset, pool.size - kHeapOffset, 4096, heapMap, sizeof(heapMap));
+		n48nKeep();   // after a sleep: pool memory a process still maps stays out of the new heap
+	}
 	return heap.size() != 0;
 }
 
@@ -4308,6 +4320,7 @@ void RDNA4Compute::powerWillSleep() {
 	gfxSleepDrain();            // P7: give client gfx IBs 100 ms, then drop them (no wedge), BEFORE PFP/ME are halted
 	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
 	wr(IpDiscovery::HwGc, CpMecRs64Cntl, rdGc(CpMecRs64Cntl) | kRs64Halt);
+	sleepKept = sleepSaveLocked();   // while the copy engine still runs
 	dmaTeardown("system sleep");
 	RLOG("power: quiesce complete; compute engines halted");
 }
@@ -4316,6 +4329,42 @@ void RDNA4Compute::resetRuntimeForResume() {
 	if (!rtLock)
 		return;
 	Locked g(rtLock);
+	if (!sleepKept) {
+		discardRuntimeLocked();
+		return;
+	}
+	// The clients kept (sleepSaveLocked): their buffers, programs, page tables (shadows in host memory, pages in the saved VRAM)
+	// and VA stay; what ran on the card is gone. Nothing in flight comes back: publishRuntime marks their fences reached.
+	for (RtClient &c : clients) {
+		if (!c.active)
+			continue;
+		c.vmid = 0;          // pooled: bound again at the next job
+		c.ibOutstanding = 0;
+		c.gfxOutstanding = 0;
+	}
+	if (gfxRings) {        // the wake's gfx stage makes the GE rings anew
+		devHeap.free(gfxRings);
+		gfxRings = 0;
+	}
+	bzero(vmidUsed, sizeof(vmidUsed));
+	bzero(queueUsed, sizeof(queueUsed));
+	for (SharedQueue &q : sharedQ)
+		q.up = q.wedged = false;
+	sharedInit = false;
+	vmPool.unbindAll();
+	// ponytail: the Vulkan (N48N) sessions are still dropped across a sleep; what they held in the kept heaps stays taken
+	// until the next boot. Keep them too if a Vulkan app has to survive a sleep.
+	n48nDiscard();
+	dropPendingPresentsLocked(kIOReturnAborted);
+	presentActive = false;
+	presentOwner = nullptr;
+	rtWedged = false;
+	rtReady = false;
+	rtGeneration++;
+	RLOG("power: clients, buffers, programs and page tables kept across the sleep; their memory goes back when the runtime is up");
+}
+
+void RDNA4Compute::discardRuntimeLocked() {
 	for (RtBuffer &b : buffers) {
 		if (!b.owner)
 			continue;
@@ -4376,6 +4425,135 @@ void RDNA4Compute::resetRuntimeForResume() {
 	rtReady = false;
 	rtGeneration++;
 	RLOG("power: old runtime buffers, heaps and VM contexts discarded; client objects retained as aborted");
+}
+
+// One saved range through the bounce buffer, 16 MiB at a time (the cache flushes as dmaCopy's). rtLock held, dmaReady.
+bool RDNA4Compute::sleepCopyRun(const SleepRun &r, bool toGpu) {
+	auto *copy = static_cast<uint8_t *>(sleepCopy->getBytesNoCopy());
+	for (uint64_t done = 0; done < r.bytes;) {
+		const uint32_t n = static_cast<uint32_t>(r.bytes - done < kBounceBytes ? r.bytes - done : kBounceBytes);
+		if (toGpu) {
+			memcpy(bounceVa, copy + r.at + done, n);
+			bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
+			if (!bounceCopy(r.mc + done, 0, n, true))
+				return false;
+		} else {
+			bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
+			if (!bounceCopy(r.mc + done, 0, n, false))
+				return false;
+			bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
+			memcpy(copy + r.at + done, bounceVa, n);
+		}
+		done += n;
+	}
+	return true;
+}
+
+void RDNA4Compute::sleepDropSave() {
+	OSSafeReleaseNULL(sleepCopy);
+	if (sleepRuns)
+		IOFree(sleepRuns, sleepRunCount * sizeof(SleepRun));
+	sleepRuns = nullptr;
+	sleepRunCount = 0;
+}
+
+// powerWillSleep, rtLock held, the engines drained, SDMA still running: what both heaps hold, copied to host memory. False
+// (nothing kept: the wake discards as before) without a pooled client, without the copy engine, or without the memory.
+bool RDNA4Compute::sleepSaveLocked() {
+	uint32_t keep = 1;
+	(void)PE_parse_boot_argn("rdna4-sleepkeep", &keep, sizeof(keep));
+	uint32_t live = 0;
+	for (const RtClient &c : clients)
+		live += c.active && !c.aborted;
+	if (!keep || !live || !vmEnabled || vmShared != 2 || !dmaReady || !bounce) {
+		RLOG("power: sleep: clients not kept (%s)", !keep ? "rdna4-sleepkeep=0" : !live ? "none open" : !dmaReady ? "no copy engine"
+		     : "needs rdna4-vmshared=2");
+		return false;
+	}
+	sleepDropSave();
+	const uint64_t from = mach_absolute_time();
+	GpuHeap::Heap *const heaps[2] = { &heap, &devHeap };
+	uint64_t total = 0, cursor, offset, bytes;
+	uint32_t runs = 0;
+	for (const GpuHeap::Heap *h : heaps)
+		for (cursor = 0; h->nextUsed(cursor, offset, bytes); runs++)
+			total += bytes;
+	if (runs)
+		sleepRuns = static_cast<SleepRun *>(IOMalloc(runs * sizeof(SleepRun)));
+	sleepRunCount = runs;
+	sleepCopy = total ? IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryPageable, total, page_size)
+	                  : nullptr;
+	if (!runs || !sleepRuns || !sleepCopy || !sleepCopy->getBytesNoCopy()) {
+		RLOG("power: sleep: clients not kept: no host memory for %llu MiB in %u range(s)", total >> 20, runs);
+		sleepDropSave();
+		return false;
+	}
+	uint64_t at = 0;
+	uint32_t i = 0;
+	for (const GpuHeap::Heap *h : heaps)
+		for (cursor = 0; i < runs && h->nextUsed(cursor, offset, bytes); i++) {
+			sleepRuns[i] = SleepRun { h == &heap ? poolMc(offset) : vramMc(offset), bytes, at };
+			at += bytes;
+			if (!sleepCopyRun(sleepRuns[i], false)) {
+				RLOG("power: sleep: clients not kept: the copy of range %u (MC 0x%llx, %llu KiB) failed", i, sleepRuns[i].mc, bytes >> 10);
+				sleepDropSave();
+				return false;
+			}
+		}
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - from, &ns);
+	RLOG("power: sleep: %u client(s) kept: %llu MiB of VRAM in %u range(s) saved to host memory in %llu ms", live, total >> 20, runs,
+	     ns / 1000000);
+	return true;
+}
+
+// publishRuntime, rtLock held, the wake's bring-up done (DMA, shared queues' VMIDs): the saved memory back at its addresses, the
+// shared queues up, every kept client's fences at the last value handed out (what ran at the sleep is not run again).
+bool RDNA4Compute::sleepRestoreLocked() {
+	sleepKept = false;
+	bool ok = dmaReady && bounce && sleepCopy;
+	const uint64_t from = mach_absolute_time();
+	for (uint32_t i = 0; ok && i < sleepRunCount; i++)
+		ok = sleepCopyRun(sleepRuns[i], true);
+	ok = ok && vmSharedEnsure();
+	uint32_t kept = 0;
+	for (RtClient &c : clients) {
+		if (!ok || !c.active || !c.shared)
+			continue;
+		c.pipe = sharedQ[c.sq].pipe;
+		c.queue = sharedQ[c.sq].queue;
+		c.doorbell = sharedQ[c.sq].doorbell;
+		if (c.fenceCpu)
+			*c.fenceCpu = c.fence;
+		if (c.gfxFenceCpu)
+			*c.gfxFenceCpu = c.gfxFence;
+		kept++;
+	}
+	flushHdp();
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - from, &ns);
+	sleepDropSave();
+	if (!ok) {
+		RLOG("power: wake: the kept clients' memory could not go back (%s): discarded, the clients aborted",
+		     !dmaReady ? "no copy engine" : "copy or shared queues failed");
+		discardRuntimeLocked();
+		return false;
+	}
+	RLOG("power: wake: %u kept client(s) back, their memory restored in %llu ms", kept, ns / 1000000);
+	return true;
+}
+
+void RDNA4Compute::waitAwake() {
+	if (!rtLock)
+		return;
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(30, kSecondScale, &deadline);   // awake time: the clock stands still while the machine sleeps
+	// Until the wake's bring-up has ended (resumePending): before, its gfx ring refuses client work (gfxClientReady).
+	IOLockLock(rtLock);
+	while ((powerSleeping || resumePending) && !shutdownQuiesced)
+		if (IOLockSleepDeadline(rtLock, &resumePending, deadline, THREAD_ABORTSAFE) != THREAD_AWAKENED)
+			break;
+	IOLockUnlock(rtLock);
 }
 
 // ---------------------------------------------------------------------------

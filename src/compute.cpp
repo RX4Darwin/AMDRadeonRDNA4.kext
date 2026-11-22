@@ -636,6 +636,7 @@ void RDNA4Compute::resumeMain(void *arg, wait_result_t) {
 		if (!self->rtReady)
 			self->powerSleeping = false;
 		self->powerSleepClear();
+		IOLockWakeup(self->rtLock, &self->resumePending, false);   // the user clients' calls held by waitAwake
 		IOLockUnlock(self->rtLock);
 	}
 	thread_terminate(current_thread());
