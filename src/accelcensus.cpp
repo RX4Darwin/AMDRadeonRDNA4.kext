@@ -141,8 +141,8 @@ bool RDNA4AccelCensus::publish(IOService *provider, uint32_t level) {
 	svc->setName(level == 3 ? "RDNA4NativeMetal" : "RDNA4AccelCensus");
 	svc->setProperty("IOUserClientClass", "RDNA4AccelCensusClient");
 	svc->setProperty("IOMatchCategory", "IOAccelerator");
-	if (level == 3) {   // Metal's loader: gpu_bundle_find_trusted("AMDRadeonRDNA4Metal"), the class a subclass of _MTLDevice (docs/native-metal-spike.md)
-		svc->setProperty("MetalPluginName", "AMDRadeonRDNA4Metal");
+	if (level == 3) {   // Metal's loader: gpu_bundle_find_trusted("AMDRadeonRDNA4MTLDriver"), the class a subclass of _MTLDevice (docs/native-metal-spike.md)
+		svc->setProperty("MetalPluginName", "AMDRadeonRDNA4MTLDriver");
 		svc->setProperty("MetalPluginClassName", "RDNA4MTLDevice");
 	} else {
 		svc->setProperty("MetalPluginName", "RDNA4CensusMTLDriver");
@@ -192,10 +192,10 @@ void routePv(IOService *acc, int route)
 	}
 	// Route 3: the plug-in only for the native processes (accelNativeCaller, pvhooks.cpp): set for every process, it was ours in WebKit's GPU
 	// process too, whose sandbox maps code only from the system volume: no Metal there at all, Safari's pages without the GPU (2026-11-20).
-	acc->setProperty("RDNA4MetalPluginName", "AMDRadeonRDNA4Metal");
+	acc->setProperty("RDNA4MetalPluginName", "AMDRadeonRDNA4MTLDriver");
 	acc->setProperty("RDNA4MetalPluginClassName", "RDNA4MTLRouter");
 	if (route == 2) {   // every process through the router (RDNA4_NATIVE_MTL=router picks ours)
-		acc->setProperty("MetalPluginName", "AMDRadeonRDNA4Metal");
+		acc->setProperty("MetalPluginName", "AMDRadeonRDNA4MTLDriver");
 		acc->setProperty("MetalPluginClassName", "RDNA4MTLRouter");
 	} else {   // Apple's (route 3: ours for the native processes alone)
 		if (OSObject *name = acc->getProperty("RDNA4AppleMetalPluginName"))

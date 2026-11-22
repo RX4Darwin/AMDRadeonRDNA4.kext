@@ -3,7 +3,7 @@
  * AMDRadeonRDNA4
  *
  * The native-Metal spike's driver bundle (docs/native-metal-spike.md): the class Metal makes for our IOAccelerator service
- * (src/accelcensus.cpp, level 3: MetalPluginName "AMDRadeonRDNA4Metal", MetalPluginClassName "RDNA4MTLDevice").
+ * (src/accelcensus.cpp, level 3: MetalPluginName "AMDRadeonRDNA4MTLDriver", MetalPluginClassName "RDNA4MTLDevice").
  *
  * Metal's loader (Tahoe 26.6.2, x86_64, read from the shared cache): getMetalPluginClassForService reads MetalPluginName,
  * gpu_bundle_find_trusted (libsystem_sandbox) finds <name>.bundle in /Library/GPUBundles (trusted: SIP filesystem protection off) or
@@ -1506,7 +1506,7 @@ RDNA4_ANSWER_MISSING
 
 // ---- translation
 
-// `function` translated by the translator in file mode ($RDNA4_AIR2AMDGPU, the bundle's own, or /usr/local/libexec/rdna4-air2amdgpu): a kernel's code
+// `function` translated by the translator in file mode ($RDNA4_AIR2AMDGPU, the bundle's Contents/Helpers/air2amdgpu, or /usr/local/libexec/rdna4-air2amdgpu): a kernel's code
 // object, or a vertex or fragment function's RGFX blob (tools/metal/m3/air2amdgpu.cpp), and a kernel's count of buffer addresses.
 // A process that may not start programs (WindowServer's sandbox): the kext's translator helper does it (rdna4_translate).
 static NSError *translateByKext(rdna4_t *gpu, NSString *input, NSString *name, NSData **blob, uint32_t *buffers)
@@ -1670,8 +1670,9 @@ static NSError *translateFunction(id<MTLFunction> function, NSArray<id<MTLFuncti
 
 static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFunction>> *linked, NSData **blob, uint32_t *buffers)
 {
-	// the bundle's own (build.sh: the translator these functions need, ray queries say), else the paravirtual GPU's helper
-	NSString *own = [[NSBundle bundleForClass:[RDNA4MTLFunction class]] pathForResource:@"air2amdgpu" ofType:nil];
+	// the bundle's own (Contents/Helpers: the translator these functions need, ray queries say), else the paravirtual GPU's helper
+	static NSString *const helper = [[NSBundle bundleForClass:[RDNA4MTLFunction class]].bundlePath stringByAppendingPathComponent:@"Contents/Helpers/air2amdgpu"];
+	NSString *own = [NSFileManager.defaultManager isExecutableFileAtPath:helper] ? helper : nil;
 	NSString *tool = NSProcessInfo.processInfo.environment[@"RDNA4_AIR2AMDGPU"] ?: own ?: @"/usr/local/libexec/rdna4-air2amdgpu";
 	// (a short stand-in for long names in file names: Core Image's stitched kernels' run to hundreds of characters, past a file name's 255)
 	NSString *stem = function.name.length < 100 ? function.name : [NSString stringWithFormat:@"h%lx", (unsigned long)function.name.hash];

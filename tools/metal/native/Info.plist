@@ -3,17 +3,17 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleExecutable</key>
-	<string>AMDRadeonRDNA4Metal</string>
+	<string>AMDRadeonRDNA4MTLDriver</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.rx4darwin.AMDRadeonRDNA4Metal</string>
+	<string>com.rx4darwin.AMDRadeonRDNA4MTLDriver</string>
 	<key>CFBundleName</key>
-	<string>AMDRadeonRDNA4Metal</string>
+	<string>AMDRadeonRDNA4MTLDriver</string>
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.0.1</string>
+	<string>@VERSION@</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>@VERSION@</string>
 	<key>NSPrincipalClass</key>
 	<string>RDNA4MTLDevice</string>
 </dict>

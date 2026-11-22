@@ -94,11 +94,12 @@ OpenGL programs draw on the card unchanged: kitty, Mixxx, Sublime Text. Tahoe 26
 ### Vulkan
 
 - **Through MoltenVK** on Metal: Vulkan apps and games run as on any Mac (vkQuake at 3840x2160, about 44 frames a
-  second). Once per user, `userspace/moltenvk/install.sh` turns MoltenVK's Metal argument buffers off, which the
-  paravirtual driver does not have.
+  second). On Apple's paravirtual driver, `userspace/moltenvk/install.sh` (once per user) turns MoltenVK's Metal argument
+  buffers off, which that driver does not have; the driver's own Metal device has them.
 - **RADV**, Mesa's Vulkan driver, built for macOS (`make mesa`, `userspace/vulkan/`): Vulkan on the card without
-  Metal, for programs run as root. Compute and rendering, swapchains shown on the boot display, Khronos's loader and
-  `vkcube` (`make vkcube`).
+  Metal, in windows (`VK_EXT_metal_surface`), up to three programs at once. Programs that use Khronos's loader find it
+  through the manifest in the driver bundle (below); `userspace/vulkan/radv-app.sh` makes a copy of an app built
+  against MoltenVK that runs on RADV (vkQuake at 3840x2160, about 84 frames a second).
 
 ### Compute
 
@@ -159,17 +160,34 @@ Lilu plugins; macOS then runs its stock framebuffer.
 ### Metal, OpenGL and Vulkan
 
 The release zips' `README.txt` says what each file is; unzipped into the `Build/` folder of a checkout of the same tag,
-the commands below work as written. To build it yourself: `make PVGPU=1 all userspace metal-helper` (the shader
+the commands below work as written. To build it yourself: `make PVGPU=1 all metal-helper mesa metal-driver` (the shader
 translator builds LLVM for x86_64 in `Build/llvm` the first time, which takes a while).
+
+The user-space driver is one bundle, `AMDRadeonRDNA4MTLDriver.bundle`, installed in `/Library/GPUBundles`, the only place
+Metal loads a third-party driver from:
+
+| In `Contents/` | What |
+|----------------|------|
+| `MacOS/AMDRadeonRDNA4MTLDriver` | the Metal driver; the kext names it to Metal (`MetalPluginName`) |
+| `Frameworks/AMDRadeonRDNA4.framework` | `librdna4`, the kext's runtime client, with its headers and the kext ABI it was built for |
+| `Frameworks/libvulkan_radeon.dylib` | RADV; `Resources/radeon_icd.json` is its manifest for Khronos's Vulkan loader |
+| `Helpers/` | the shader translator `air2amdgpu`, `rdna4-run`, `rdna4-iop`, `rdna4-logd` |
+
+Everything stays inside the bundle: WindowServer's sandbox does not let it map libraries from `/Library/Frameworks`. Metal
+loads a bundle from `/Library/GPUBundles` only with SIP's filesystem protection off (`csr-active-config` bit 1). The kext
+and the bundle must come from the same release (0.4.0 renamed the bundle from `AMDRadeonRDNA4Metal.bundle`).
 
 On the Mac with the card, from the repository:
 
 ```bash
-sudo tools/metal/m3/install-helper.sh Build/m3/x86_64/air2amdgpu   # the shader translator (log: /var/log/rdna4-air2amdgpu.log)
+sudo tools/metal/native/install.sh Build/AMDRadeonRDNA4-0.4.0-RELEASE/AMDRadeonRDNA4MTLDriver.bundle   # the driver (and removes 0.3's)
+sudo tools/metal/m3/install-helper.sh Build/m3/x86_64/air2amdgpu   # the shader translator for WindowServer (log: /var/log/rdna4-air2amdgpu.log)
 sudo userspace/rdna4-iop/install.sh                                # sets CoreDisplay up for each boot (log: /var/log/rdna4-iop.log)
 sudo userspace/rdna4-logd/install.sh                               # optional: each boot's kernel log in /var/log/rdna4
-userspace/moltenvk/install.sh                                      # as yourself, for Vulkan apps through MoltenVK
 ```
+
+Then reboot. For a Vulkan program that uses Khronos's loader:
+`VK_DRIVER_FILES=/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/Contents/Resources/radeon_icd.json`.
 
 No boot-args are needed: the driver's defaults (`src/trial.cpp`) are the accelerated desktop, WindowServer and Metal on the driver's
 own accelerator. For Apple's paravirtual GPU on the card instead (the desktop before 0.4.0), set `rdna4-accel=0 rdna4-pvgpu=1`.
@@ -285,12 +303,13 @@ make                            # the kext and the programs (x86_64, macOS 11 an
 make PVGPU=1                    # with the paravirtual GPU (Metal, OpenGL, Vulkan through MoltenVK)
 make PVGPU=1 metal-helper       # the shader translator for it
 make mesa && make vkcube        # RADV and Khronos's vkcube
+make metal-driver               # AMDRadeonRDNA4MTLDriver.bundle: the Metal driver with librdna4, RADV and the helpers
 make CONFIG=DEBUG               # unoptimised, with DEBUG defined
 make test                       # host-side tests: parsers, EDID fixtures, the display engines' plans against Linux's
 make clean                      # what make built (make distclean: all of Build/)
 ```
 
-The results go to `Build/AMDRadeonRDNA4-<version>-<RELEASE|DEBUG>/` (the kext, and `bin/` with the programs);
+The results go to `Build/AMDRadeonRDNA4-<version>-<RELEASE|DEBUG>/` (the kext, the driver bundle, and `bin/` with the programs);
 `make product-dir` prints that directory. The `Makefile` works with the GNU make 3.81 macOS ships and with BSD make;
 `AMDRadeonRDNA4.xcodeproj` is a front for it.
 

@@ -935,7 +935,7 @@ int accelTo(int value)
 		gDisplays = true;
 	}
 	if (value == 4 && !gFamilyClients) {
-		gAccel->setProperty("MetalPluginName", "AMDRadeonRDNA4Metal");   // as the native spike's service (accelcensus.cpp, level 3)
+		gAccel->setProperty("MetalPluginName", "AMDRadeonRDNA4MTLDriver");   // as the native spike's service (accelcensus.cpp, level 3)
 		gAccel->setProperty("MetalPluginClassName", "RDNA4MTLDevice");
 		// as Apple's paravirtual accelerator (its AcceleratorProperties): CoreDisplay presents through display pipe transactions when
 		// these say so; without them it took the older surface path

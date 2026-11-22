@@ -12,6 +12,7 @@
 # Everything that is built goes to Build/:
 #
 #   Build/AMDRadeonRDNA4-<version>-<CONFIG>/AMDRadeonRDNA4.kext
+#   Build/AMDRadeonRDNA4-<version>-<CONFIG>/AMDRadeonRDNA4MTLDriver.bundle   `make metal-driver`: the Metal driver and its user space
 #   Build/AMDRadeonRDNA4-<version>-<CONFIG>/bin/     rdna4-run, n48nprobe, cgmodes, the rig's scripts, and with Mesa built
 #                                                   (`make mesa`) libvulkan_radeon.dylib, vkprobe and swapprobe;
 #                                                   `make vkcube` adds Khronos's vkcube and loader
@@ -107,7 +108,7 @@ RUN          = userspace/rdna4-run
 VULKAN       = userspace/vulkan
 CENSUS       = tools/metal/accelcensus
 
-.PHONY: all kext tools userspace n48nprobe mesa metal-helper vulkan-products vkcube census-tool census-stub census-pathlog \
+.PHONY: all kext tools userspace metal-driver n48nprobe mesa metal-helper vulkan-products vkcube census-tool census-stub census-pathlog \
         test atomdump check-isa check-config product-dir clean distclean
 
 all: check-config kext tools
@@ -237,6 +238,11 @@ vulkan-products:
 		$(CXX) -x objective-c $(USER_FLAGS) -fno-objc-arc -I$(RADV_DIR)/mesa/include -I$(VULKAN) $(VULKAN)/winprobe.m -o $(BIN)/winprobe \
 			-framework Cocoa -framework QuartzCore || exit 1; \
 	fi
+
+# The Metal driver bundle with the driver's whole user space in it (tools/metal/native/build.sh; docs/packaging-plan.md): librdna4 and
+# RADV in Contents/Frameworks, the translator and the programs in Contents/Helpers.
+metal-driver:
+	sh tools/metal/native/build.sh
 
 # The Metal kernel translator's run-time helper for the rig (M3, docs/m1-stream.md s.5b); builds LLVM for x86_64 the first time.
 metal-helper:

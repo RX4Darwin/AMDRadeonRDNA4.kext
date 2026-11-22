@@ -31,7 +31,7 @@ class RDNA4AccelCensus : public IOService {
 public:
 	RDNA4AccelCensus();
 	// Publish the service under `provider` (the GPU's IOPCIDevice). `level`: 1 = refuse every call, 2 = succeed with zeroed outputs, 3 = the
-	// native-Metal spike (docs/native-metal-spike.md): the plug-in properties name our own bundle (/Library/GPUBundles/AMDRadeonRDNA4Metal.bundle,
+	// native-Metal spike (docs/native-metal-spike.md): the plug-in properties name our own bundle (/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle,
 	// class RDNA4MTLDevice), every call refused. Once per boot.
 	static bool publish(IOService *provider, uint32_t level);
 	// The GPU the native spike publishes under, and its switch: sysctl debug.rdna4_nativemtl=1 publishes level 3 then, after WindowServer chose its

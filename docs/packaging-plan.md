@@ -1,6 +1,7 @@
 # Packaging and installation plan
 
-Status: proposal (2026-11-21), nothing of it built yet; the open points are decided provisionally at the end. It replaces the per-component `install.sh` scripts with one layout and one
+Status: proposal (2026-11-21); migration steps 1 and 2 built on 2026-11-22 (`make metal-driver`: `AMDRadeonRDNA4MTLDriver.bundle` with
+the framework, RADV and the helpers inside, the kext's new `MetalPluginName`; card-verified), the rest not yet. The open points are decided provisionally at the end. It replaces the per-component `install.sh` scripts with one layout and one
 installer, modelled on how Apple ships its AMD drivers.
 
 ## What ships today
@@ -39,7 +40,11 @@ Apple links against that code.
 3. **The kext stays injected by OpenCore.** As a Lilu plugin it must route IONDRVSupport before the framebuffers start (the 20 ms
    kext-list poll, `src/plugin.cpp lateNdrvCheck`); loaded from `/Library/Extensions` it would come up in the auxiliary kext collection,
    too late.
-4. **Code signing.** The Metal bundle is loaded into every Metal process. Hardened processes with library validation refuse a plug-in not
+4. **The Metal driver links nothing from `/Library/Frameworks`.** It is loaded into WindowServer and into sandboxed apps, and
+   WindowServer's sandbox refuses to map a library there ("file system sandbox blocked mmap()" of the framework's dylib): with the driver
+   linked against the framework the desktop did not come up (2026-11-22). A library inside the driver's own bundle is mapped:
+   the framework is embedded in the bundle's `Contents/Frameworks`.
+5. **Code signing.** The Metal bundle is loaded into every Metal process. Hardened processes with library validation refuse a plug-in not
    signed by Apple or their own team, so the rig runs `amfi_get_out_of_my_way=0x1`. A Developer ID signature and notarization make the
    installer and the framework trusted, but do not lift library validation for Apple's own apps. This is a stated requirement of the
    driver, not something packaging solves.
@@ -47,41 +52,36 @@ Apple links against that code.
 ## The layout
 
 ```
-/Library/Frameworks/AMDRadeonRDNA4.framework/
-    AMDRadeonRDNA4 -> Versions/Current/AMDRadeonRDNA4
-    Headers        -> Versions/Current/Headers
-    Resources      -> Versions/Current/Resources
-    Helpers        -> Versions/Current/Helpers
-    Versions/
-        Current -> A
-        A/
-            AMDRadeonRDNA4          librdna4 as the framework's dylib (install name
-                                    /Library/Frameworks/AMDRadeonRDNA4.framework/Versions/A/AMDRadeonRDNA4)
-            Headers/                AMDRadeonRDNA4.h (umbrella), librdna4.h, rdna4compute.h (the user-space ABI), rdna4vulkan.h
-            Helpers/                air2amdgpu, rdna4-iop, rdna4-logd, rdna4-run
-            Resources/              Info.plist (version, the kext ABI it needs), libvulkan_radeon.dylib, radeon_icd.json,
-                                    the LaunchDaemon and LaunchAgent plist templates, uninstall.sh
-/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle     the Metal driver, renamed after Apple's convention; links the framework
-/Library/LaunchDaemons/org.rdna4.air2amdgpu.plist      -> .../Helpers/air2amdgpu --serve
-/Library/LaunchDaemons/org.rdna4.iop.plist             -> .../Helpers/rdna4-iop
-/Library/LaunchDaemons/org.rdna4.logd.plist            -> .../Helpers/rdna4-logd (on by default for now)
-/usr/local/share/vulkan/icd.d/radeon_icd.json          -> .../Resources/libvulkan_radeon.dylib (the Khronos loader's search path)
-/usr/local/bin/rdna4-run                               symlink -> .../Helpers/rdna4-run
+/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/Contents/      the whole user space of the driver (built: `make metal-driver`)
+    MacOS/AMDRadeonRDNA4MTLDriver           the Metal driver, named after Apple's convention; links the framework below (@rpath)
+    Frameworks/AMDRadeonRDNA4.framework/    librdna4 (install name @rpath/AMDRadeonRDNA4.framework/Versions/A/AMDRadeonRDNA4),
+                                            Headers/ (AMDRadeonRDNA4.h umbrella, librdna4.h, rdna4compute.h, rdna4vulkan.h),
+                                            Resources/Info.plist (version, RDNA4ComputeABI)
+    Frameworks/libvulkan_radeon.dylib       RADV
+    Helpers/                                air2amdgpu, rdna4-run, rdna4-iop, rdna4-logd
+    Resources/                              rdna4.metallib (the driver's own functions), radeon_icd.json (RADV's manifest, absolute
+                                            path into the bundle); later: the LaunchDaemon plists, uninstall.sh
+/Library/LaunchDaemons/org.rdna4.air2amdgpu.plist      -> .../Helpers/air2amdgpu --serve          (not yet: still /usr/local/libexec)
+/Library/LaunchDaemons/org.rdna4.iop.plist             -> .../Helpers/rdna4-iop                     (not yet)
+/Library/LaunchDaemons/org.rdna4.logd.plist            -> .../Helpers/rdna4-logd (on by default)    (not yet)
+/usr/local/share/vulkan/icd.d/radeon_icd.json          -> the bundle's manifest (the Khronos loader's search path) (not yet)
+/usr/local/bin/rdna4-run                               symlink -> .../Helpers/rdna4-run             (not yet)
 EFI/OC/Kexts/AMDRadeonRDNA4.kext                       by the user, from the release zip
 ```
 
-Why a framework, unlike Apple: we do have consumers outside the driver. `rdna4-run`, the Metal bundle, the translator and test programs
-talk to the kext's runtime client through `librdna4`, and `rdna4compute.h` is the documented user-space ABI. A framework gives that one
-copy, a stable install name, headers next to the library, and a version. `rdna4mtlc.h` (the kext ↔ translator protocol) and the
-kext-internal headers stay private.
+Why one bundle: the driver is loaded into WindowServer and sandboxed apps, which map libraries from `/Library/GPUBundles` but
+not from `/Library/Frameworks` (constraint 4); the framework lives inside the bundle as an embedded framework instead. One
+directory to install and remove, one copy of `librdna4` for the driver, and the framework still gives its headers and version.
+`rdna4-run` keeps its own copy of `librdna4` (statically linked) so it also runs where the bundle is not installed (Recovery).
+`rdna4mtlc.h` (the kext ↔ translator protocol) and the kext-internal headers stay private.
 
 The MoltenVK LaunchAgent (`MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0`) exists for Apple's paravirtual Metal driver, which aborts in
-`newIndirectArgumentEncoderWithLayout:`. On our own Metal device it may not be needed; it ships as an optional component until that is
-checked.
+`newIndirectArgumentEncoderWithLayout:`. The driver's own Metal device has argument buffers (2026-11-21): the agent ships as an
+optional component for the paravirtual configuration only.
 
-Not chosen: one `/Library/Extensions/AMDRadeonRDNA4.bundle` holding everything. The Metal driver cannot live there (constraint 1), and
-`/Library/Extensions` is the directory kext management scans: a non-kext bundle there draws warnings and gains nothing over the
-framework.
+Not chosen: a framework in `/Library/Frameworks` (tried 2026-11-22: WindowServer could not load the driver, no desktop), and one
+`/Library/Extensions/AMDRadeonRDNA4.bundle` holding everything (the Metal driver cannot live there, constraint 1, and
+`/Library/Extensions` is the directory kext management scans).
 
 ## Versions
 
@@ -100,7 +100,7 @@ framework.
     agent offered but not chosen, a macOS version check (Tahoe 26.x),
   - signed with a Developer ID Installer identity when one is configured (`SIGN_INSTALLER=...`), unsigned otherwise; notarized in the
     release workflow.
-- The Metal bundle and the helpers link the framework (`-F`/`-framework AMDRadeonRDNA4`) instead of compiling `librdna4.c` in.
+- The Metal driver links the embedded framework (`-F`/`-framework AMDRadeonRDNA4`, rpath `@loader_path/../Frameworks`).
 - The release zip (today's GitHub release assets) holds the `.pkg`, `AMDRadeonRDNA4.kext` (RELEASE and DEBUG), and `INSTALL.md`.
 
 ## Installing
@@ -124,11 +124,11 @@ and reminds the user to remove the kext and its config.plist entry from the EFI.
 
 ## Migration from today's scripts
 
-1. Framework: build `librdna4` as `AMDRadeonRDNA4.framework`; link `rdna4-run`, the Metal bundle and `air2amdgpu` against it. The old
-   install scripts keep working meanwhile.
-2. Paths: daemons and their plists point into the framework; the Metal bundle is renamed `AMDRadeonRDNA4MTLDriver` (the accelerator's
-   `MetalPluginName` in `src/rdna4accel.cpp` and `src/accelcensus.cpp` changes with it, and the bundle's copy of `air2amdgpu` in
-   `Resources/` goes). The postinstall removes the old `/usr/local/libexec/rdna4-*` files and `AMDRadeonRDNA4Metal.bundle`.
+1. Framework: build `librdna4` as `AMDRadeonRDNA4.framework`, embedded in the driver bundle (done: `make metal-driver`,
+   `tools/metal/native/build.sh`). `rdna4-run` keeps its own copy, so it runs where the bundle is not installed (Recovery).
+2. Paths: daemons and their plists point into the framework; the Metal bundle is renamed `AMDRadeonRDNA4MTLDriver` (done: the
+   accelerator's `MetalPluginName` in `src/rdna4accel.cpp` and `src/accelcensus.cpp` changed with it; the driver runs its
+   `Contents/Helpers/air2amdgpu`; `tools/metal/native/install.sh <bundle>` installs it and removes 0.3's bundle). The postinstall removes the old `/usr/local/libexec/rdna4-*` files and `AMDRadeonRDNA4Metal.bundle`.
 3. ABI check in `rdna4_open`, versions in `rdna4-run info`.
 4. `make package`, the distribution file, the uninstaller.
 5. Docs: `INSTALL.md` for users; `docs/install-tahoe.md` keeps the rig-specific history.
