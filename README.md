@@ -1,8 +1,8 @@
 # AMDRadeonRDNA4
 
-A macOS driver for AMD Radeon **RDNA 4** graphics cards (Navi 48: RX 9070 XT, RX 9070, RX 9070 GRE) on x86_64
-Hackintosh. It is a **Lilu plugin**, injected by OpenCore, built against MacKernelSDK; it cross-compiles on Apple
-Silicon and on Linux/WSL.
+A macOS driver for AMD Radeon **RDNA 4** graphics cards (Navi 48: RX 9070 XT, RX 9070, RX 9070 GRE; Navi 44: RX 9060 XT,
+not yet run on one under macOS) on x86_64 Hackintosh. It is a **Lilu plugin**, injected by OpenCore, built against
+MacKernelSDK; it cross-compiles on Apple Silicon and on Linux/WSL.
 
 macOS has no driver for RDNA 3 or RDNA 4: Apple's AMD support ends at RDNA 2, and an RDNA 2 driver cannot be spoofed
 onto Navi 48 (its command streams are another architecture's). AMDRadeonRDNA4 drives the card itself:
@@ -28,10 +28,16 @@ name.
 | Radeon RX 9070 | Navi 48 (gfx1201) | `1002:7550` (`0xC3`) | **Supported.** Ran the paravirtual GPU under Sequoia 15.8.2 (the measurements of PR 6). |
 | Radeon RX 9070 GRE | Navi 48 (gfx1201) | `1002:7550` (`0xC2`) | Recognised and named, its 48 compute units reported; **needs testing** (not yet run on one). |
 | Radeon AI PRO R9700 | Navi 48 (gfx1201) | `1002:7551` | Matched and named; **needs testing** (not yet run on one). |
-| Radeon RX 9060 XT, RX 9060 | Navi 44 (gfx1200) | `1002:7590` | **Port started, not run on a card.** The kext matches the card, names it and carries its firmware set (PSP 14.0.2, SMU 14.0.2, SDMA 7.0.0, GC 12.0.0), chosen from the GC version the card reports. Its display paths and power management have not been looked at: expect the boot display at best. |
+| Radeon RX 9060 XT | Navi 44 (gfx1200) | `1002:7590` (`0xC0`) | **Experimental: not yet run under macOS** (help wanted). The kext matches the card, names it, and carries its own firmware set (PSP 14.0.2, SMU 14.0.2, SDMA 7.0.0, GC 12.0.0), chosen from the GC version the card reports. Measured on an RX 9060 XT 16 GB under Linux: the same register bases and `GB_ADDR_CONFIG` as the RX 9070 XT, 2 shader engines and 32 compute units, its VBIOS's display paths (two DisplayPort, one HDMI) parsed by the host tests, and the kext's triangle and colour-triangle streams drawing right; the kext also runs through every bring-up stage in the emulator with that card's VBIOS and firmware (PR 17). Its displays, power management and the SMU 14.0.2 table layout have not been driven by the kext. |
+| Radeon RX 9060 | Navi 44 (gfx1200) | `1002:7590` | As the RX 9060 XT, untested; it is named and counted as an RX 9060 XT (32 compute units) for now. |
 
-Everything that differs between the Navi 48 cards (VRAM size, shader engines, display paths, the compute pool's
-place) is read from the card, not assumed (`src/sku.hpp` holds only the names and compute-unit counts).
+Everything that differs between the cards (VRAM size, shader engines, display paths, the compute pool's place) is read
+from the card, not assumed (`src/sku.hpp` holds only the names and compute-unit counts). One kext carries the firmware of
+both chips when both sets are in `firmware/amdgpu/` (`tools/build/fetch-firmware.sh` fetches both); a card whose set the
+build lacks stops at the firmware stage with a message that says so.
+
+On an RX 9060 XT under Linux, reading the display engine's registers one after another (`tools/linux/linux-capture.sh`)
+froze the machine at `ODM_MEM_PWR_CTRL2`; the kext never reads it, and `docs/emu-linux.md` has the details.
 
 ## macOS versions
 
@@ -131,7 +137,8 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 - Hardware video decode and encode (VCN).
 - Fan control; the power features held back so that they do not retune clocks under the lit displays (display DPM,
   memory and fabric deep sleep, GFXOFF).
-- The Navi 44 cards (RX 9060 XT, RX 9060): matched and given their firmware, nothing verified on one (see *Supported cards*).
+- The Navi 44 cards (RX 9060 XT, RX 9060) under macOS: matched and given their firmware, measured under Linux and in the
+  emulator, not yet run on one (see *Supported cards*).
 
 ## Installing
 
@@ -302,7 +309,7 @@ pointers are refused at load, with the reason in the kernel log.
 Clone with the submodules (`git clone --recursive`, or `git submodule update --init`; they are in `lib/`).
 
 ```sh
-tools/build/fetch-firmware.sh   # once: AMD's firmware for the compute bring-up, into firmware/amdgpu/
+tools/build/fetch-firmware.sh   # once: AMD's firmware for the compute bring-up (both chips' sets), into firmware/amdgpu/
 make                            # the kext and the programs (x86_64, macOS 11 and later)
 make PVGPU=1                    # with the paravirtual GPU (Metal, OpenGL, Vulkan through MoltenVK)
 make PVGPU=1 metal-helper       # the shader translator for it
