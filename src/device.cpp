@@ -2636,9 +2636,24 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 		if (tracePci)
 			logPciState("before-memory-enable");
 
-		// Enable memory space so the aperture is reachable; never bus
-		// mastering — nothing here issues DMA.
-		pciDevice->setMemoryEnable(true);
+		// Only change PCI command space when firmware left memory decoding
+		// disabled. Rewriting an already-enabled command register is needless
+		// during framebuffer takeover, and some firmware/bridge combinations
+		// are sensitive to redundant configuration transactions. Never enable
+		// bus mastering — nothing here issues DMA.
+		const uint16_t pciCommand = pciDevice->configRead16(kIOPCIConfigCommand);
+		if (pciCommand == 0xFFFF) {
+			FBLOG("init: PCI command register is unreadable; leaving the framebuffer to IOBootNDRV");
+			return false;
+		}
+		if ((pciCommand & 0x0002) == 0) {
+			pciDevice->setMemoryEnable(true);
+			FBLOG("init: enabled PCI memory decoding (command 0x%04x -> 0x%04x)",
+			      pciCommand, pciDevice->configRead16(kIOPCIConfigCommand));
+		} else {
+			FBLOG("init: PCI memory decoding already enabled (command 0x%04x); no config write",
+			      pciCommand);
+		}
 		if (tracePci)
 			logPciState("after-memory-enable");
 
