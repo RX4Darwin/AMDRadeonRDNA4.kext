@@ -1886,6 +1886,9 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 - (BOOL)drawnInFlight:(RDNA4MTLTexture *)t;   // a draw not yet waited for draws into it
 // On the card, before the next draw: a wait for the draws in flight, then the copies (none: the wait alone)
 - (NSError *)gpuBarrier:(const RDNA4Copy *)copies count:(uint32_t)count;
+// A kernel on the gfx ring behind the draws before it, not waited for (RDNA4_RINGDISPATCH=1); NO: not one it takes (scratch, other user data)
+- (BOOL)canDispatchOnRing:(const rdna4_program_t *)k;
+- (NSError *)dispatchOnRing:(const rdna4_program_t *)k groups:(const uint32_t[3])groups size:(const uint32_t[3])size args:(NSData *)args;
 @end
 
 // Whether the card is done with a resource, as Apple's GL-on-Metal renderer asks (-isComplete, -isWriteComplete, -waitUntilComplete,
@@ -2650,6 +2653,30 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
 	NSArray<RDNA4MTLTexture *> *late = [_commandBuffer refreshShadows:shadowed];   // (see the draw's)
 	RDNA4MTLCommandBuffer *cb = _commandBuffer;
+	BOOL plain = !shadowed.count && !late.count;   // no surface copies or held surfaces to bring in first: on the gfx ring when the kernel can
+	for (RDNA4MTLTexture *t in kernelTextures)
+		plain &= !t.held;
+	rdna4_program_t ringProg = pipeline.program;
+	if (plain && [device canDispatchOnRing:&ringProg]) {
+		const std::array<uint32_t, 3> g = { (uint32_t)groups.width, (uint32_t)groups.height, (uint32_t)groups.depth };
+		const std::array<uint32_t, 3> s = { (uint32_t)groupSize.width, (uint32_t)groupSize.height, (uint32_t)groupSize.depth };
+		[_commandBuffer recordDraw:^NSError * {
+			(void)held;
+			const uint64_t t0 = nowUs();
+			rdna4_program_t prog = pipeline.program;
+			NSError *why = [device dispatchOnRing:&prog groups:g.data() size:s.data() args:args];
+			for (RDNA4MTLTexture *t in kernelTextures) {   // what the kernel may have written (as below)
+				[t wroteAll];
+				[t heldRows:0 to:(uint32_t)t.height width:(uint32_t)t.width];
+				if (t.usage & MTLTextureUsageShaderWrite)
+					[cb drewInto:t];
+			}
+			statAdd(kStatDispatches, 1);
+			statAdd(kStatDispatchUs, nowUs() - t0);
+			return why;
+		}];
+		return;
+	}
 	[_commandBuffer record:^NSError * {
 		rdna4_program_t prog = pipeline.program;
 		const uint32_t g[3] = { (uint32_t)groups.width, (uint32_t)groups.height, (uint32_t)groups.depth };
@@ -4299,17 +4326,7 @@ static void abortStack(int sig)
 	if (!self.gfx)
 		return rdna4Error(@"a copy or fill on the card without the device's gfx buffers", 0);
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];
-	uint32_t n = 0;
-	if (_lastFence || _batchCount) {
-		const uint64_t word = _idle.gpu;
-		const uint32_t seq = ++_idleSeq ?: ++_idleSeq;
-		const uint32_t barrier[15] = {
-			Pm4::header(Pm4::OpReleaseMem, 6), Pm4::kReleaseGcrSeq | Pm4::kReleaseGcrGl2Wb | Pm4::kReleaseCachePolicy3 | Pm4::kEventCacheFlushTs |
-			Pm4::kReleaseEventIndex5, Pm4::kReleaseData32, (uint32_t)word, (uint32_t)(word >> 32), seq, 0, 0,
-			0xc0053c00u, 3u | 1u << 4 | 1u << 8, (uint32_t)word, (uint32_t)(word >> 32), seq, 0xffffffffu, 4 };   // WAIT_REG_MEM: equal, memory, PFP
-		memcpy(ib, barrier, sizeof barrier);
-		n = 15;
-	}
+	uint32_t n = _lastFence || _batchCount ? [self idleBarrier:ib] : 0;
 	uint64_t total = 0;
 	for (uint32_t c = 0; c < count; c++)
 	for (uint64_t at = 0, bytes = copies[c].bytes; at < bytes;) {
@@ -4416,6 +4433,77 @@ static void abortStack(int sig)
 
 // Waits for the draws submitted so far (on the work queue: before the CPU or the compute queue touches what they wrote, and at the end of
 // a command buffer). The gfx fences are ordered, so the last one is enough; its stream's own fence word says the stream ran to its end.
+// An idle barrier: the draws before it done, the caches flushed and the L2 written back (gpuBarrier's opening, a ring dispatch's ends).
+- (uint32_t)idleBarrier:(uint32_t *)ib
+{
+	const uint64_t word = _idle.gpu;
+	const uint32_t seq = ++_idleSeq ?: ++_idleSeq;
+	const uint32_t barrier[15] = {
+		Pm4::header(Pm4::OpReleaseMem, 6), Pm4::kReleaseGcrSeq | Pm4::kReleaseGcrGl2Wb | Pm4::kReleaseCachePolicy3 | Pm4::kEventCacheFlushTs |
+		Pm4::kReleaseEventIndex5, Pm4::kReleaseData32, (uint32_t)word, (uint32_t)(word >> 32), seq, 0, 0,
+		0xc0053c00u, 3u | 1u << 4 | 1u << 8, (uint32_t)word, (uint32_t)(word >> 32), seq, 0xffffffffu, 4 };   // WAIT_REG_MEM: equal, memory, PFP
+	memcpy(ib, barrier, sizeof barrier);
+	return 15;
+}
+
+// Scratch and user data other than the kernarg pointer stay with the kext's dispatch (rdna4_dispatch).
+- (BOOL)canDispatchOnRing:(const rdna4_program_t *)k
+{
+	static const BOOL on = getenv("RDNA4_RINGDISPATCH") && atoi(getenv("RDNA4_RINGDISPATCH")) == 1;
+	const uint32_t user = (k->rsrc2 >> 1) & 0x1f;
+	return on && self.gfx && !(k->rsrc2 & 1) && user == ((k->properties >> 3 & 1) ? 2u : 0u) && !(k->properties & 1u << 1);
+}
+
+// As the kext's launch (src/compute.cpp), in a slot of the gfx ring: the draws before it waited for on the card (idle barrier), the
+// caches invalidated (the draw stream's opening ACQUIRE_MEM), the program, its resources, the kernarg pointer in USER_DATA_0/1 (the
+// kernargs in the slot's state page, past its stream fence word), DISPATCH_DIRECT as a compute packet (SHADER_TYPE 1), the idle barrier
+// again for what reads its results. Register offsets: GC seg0 (src/gfxregs.hpp) + 0x1260 - SET_SH_REG's 0x2c00.
+- (NSError *)dispatchOnRing:(const rdna4_program_t *)k groups:(const uint32_t[3])groups size:(const uint32_t[3])size args:(NSData *)args
+{
+	const uint64_t kernargBytes = MAX((uint64_t)args.length, k->kernargBytes);
+	if (kernargBytes > kMiscBytes - 0x100)
+		return rdna4Error([NSString stringWithFormat:@"a dispatch's %llu bytes of kernargs", kernargBytes], 0);
+	uint32_t slot = 0;
+	NSError *taken = [self takeSlot:&slot];
+	if (taken)
+		return taken;
+	uint8_t *kernarg = _miscCpu + (uint64_t)slot * kMiscBytes + 0x100;
+	memset(kernarg, 0, kernargBytes);
+	memcpy(kernarg, args.bytes, args.length);
+	const uint64_t kernargGpu = _misc.gpu + (uint64_t)slot * kMiscBytes + 0x100;
+	const uint32_t lds = ((uint32_t)k->ldsBytes + 1023) / 1024 * 1024 / 512;   // ldsSizeField: 1 KiB granules in 512-byte units
+	uint32_t ib[96], n = [self idleBarrier:ib];
+	const uint32_t acquire[8] = { 0xc0065800u, 0, 0xffffffffu, 0x00ffffffu, 0, 0, 0x0000000au, 0x0000c3b1u };
+	memcpy(ib + n, acquire, sizeof acquire), n += 8;
+	auto sh = [&](uint32_t reg, std::initializer_list<uint32_t> v) {
+		ib[n++] = 0xc0007600u | (uint32_t)v.size() << 16;
+		ib[n++] = reg;
+		for (uint32_t x : v)
+			ib[n++] = x;
+	};
+	sh(0x20c, { (uint32_t)(k->gpu >> 8), (uint32_t)(k->gpu >> 40) });                               // COMPUTE_PGM_LO, HI
+	sh(0x212, { (uint32_t)k->rsrc1, ((uint32_t)k->rsrc2 & ~(0x1ffu << 15)) | lds << 15 });             // RSRC1, RSRC2 (LDS_SIZE)
+	sh(0x228, { (uint32_t)k->rsrc3 });                                                                // RSRC3
+	sh(0x215, { 0 });                                                                                 // COMPUTE_RESOURCE_LIMITS
+	sh(0x218, { 0 });                                                                                 // COMPUTE_TMPRING_SIZE
+	sh(0x216, { 0xffffffffu, 0xffffffffu });                                                         // STATIC_THREAD_MGMT_SE0, SE1
+	sh(0x219, { 0xffffffffu, 0xffffffffu });                                                         // SE2, SE3
+	sh(0x22b, { 0, 0, 0, 0 });                                                                        // SE4..SE7: none on Navi 48
+	sh(0x204, { 0, 0, 0 });                                                                           // COMPUTE_START_X, Y, Z
+	sh(0x207, { size[0], size[1], size[2] });                                                         // COMPUTE_NUM_THREAD_X, Y, Z
+	if ((k->rsrc2 >> 1) & 0x1f)
+		sh(0x240, { (uint32_t)kernargGpu, (uint32_t)(kernargGpu >> 32) });                           // COMPUTE_USER_DATA_0, 1
+	ib[n++] = 0xc0031502u;   // DISPATCH_DIRECT, SHADER_TYPE compute
+	ib[n++] = groups[0], ib[n++] = groups[1], ib[n++] = groups[2];
+	ib[n++] = 1u | 1u << 2 | (k->properties & 1u << 10 ? 1u << 15 : 0u);   // COMPUTE_SHADER_EN, FORCE_START_AT_000, CS_W32_EN
+	n += [self idleBarrier:ib + n];
+	memcpy(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE, ib, n * 4);
+	__sync_synchronize();
+	[self queueSlot:slot dwords:n];   // (_lastSlot stays the last draw's: its stream fence is what drainGfx checks)
+	_slotPipe[slot] = nil;   // (no stream fence of its own: the batch's fence is what drainGfx waits for)
+	return nil;
+}
+
 - (NSError *)drainGfx
 {
 	NSError *flushed = [self flushBatch];
