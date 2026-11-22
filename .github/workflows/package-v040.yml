@@ -97,7 +97,7 @@ jobs:
             lipo -verify_arch x86_64 "$executable"
           done
 
-          test -f "$bundle/Contents/Resources/radeon_icd.json"
+          test -f "$bundle/Contents/Frameworks/AMDRadeonRDNA4.framework/Versions/A/AMDRadeonRDNA4"\n          test -f "$bundle/Contents/Resources/radeon_icd.json"
           test -s "$bundle/Contents/Resources/rdna4.metallib"
           test -s "Build/native/probe.metallib"
           test -s "$pkg"
@@ -118,7 +118,7 @@ jobs:
           cp "$pkg" README.md "$stage/"
           (
             cd "$stage"
-            shasum -a 256 "$pkg" README.md AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4 > SHA256SUMS.txt
+            shasum -a 256 "AMDRadeonRDNA4-$version.pkg" README.md AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4 > SHA256SUMS.txt
             shasum -a 256 -c SHA256SUMS.txt
           )
 
@@ -137,7 +137,7 @@ jobs:
       - name: Upload complete installer and matching kext
         uses: actions/upload-artifact@v4
         with:
-          name: AMDRadeonRDNA4-v${{ github.sha }}-macos-tahoe
+          name: AMDRadeonRDNA4-macos-tahoe-${{ github.sha }}
           if-no-files-found: error
           retention-days: 30
           path: |
