@@ -486,6 +486,9 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 @end
 static RDNA4Held *heldFor(IOSurfaceRef surface, BOOL make, RDNA4MTLDevice *device, RDNA4MTLBuffer *host);
 
+// MTLTextureSwizzleChannels as RDNA4MTLTexture's _swizzle (pvdraw.hpp viewSel): red .. alpha a byte each
+static uint32_t packSwizzle(MTLTextureSwizzleChannels s) { return s.red | s.green << 8 | s.blue << 16 | (uint32_t)s.alpha << 24; }
+
 @interface RDNA4MTLTexture : NSObject <MTLTexture>
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)descriptor;
 // Over an IOSurface (CAMetalLayer's drawables): its memory mapped into the GPU, its rows as the surface has them.
@@ -621,7 +624,7 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 @implementation RDNA4MTLTexture {
 	id<MTLBuffer> _overBuffer;   // made over a buffer (newTextureWithDescriptor:offset:bytesPerRow:): it, the offset and the row pitch given
 	NSUInteger _overOffset, _overRowBytes;
-	uint32_t _swizzle;   // a view's MTLTextureSwizzleChannels, red .. alpha a byte each; 0: none (pvdraw.hpp viewSel)
+	uint32_t _swizzle;   // its descriptor's or view's MTLTextureSwizzleChannels, red .. alpha a byte each; 0: none (pvdraw.hpp viewSel)
 	uint64_t _written[kWrittenRanges][2];   // (gCopied) identity addresses [lo, hi), sorted, apart
 	uint32_t _writtenCount;
 	BOOL _shadowAhead;   // (drewIntoShadow) the copy holds newer pixels than the surface: on the root texture, not a view
@@ -674,6 +677,7 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 	_height = d.height;
 	_format = d.pixelFormat;
 	_usage = d.usage;
+	_swizzle = packSwizzle(d.swizzle);
 	return self;
 }
 
@@ -892,6 +896,7 @@ static char gCopyKey;
 	_height = d.height;
 	_format = d.pixelFormat;
 	_usage = d.usage;
+	_swizzle = packSwizzle(d.swizzle);
 	return self;
 }
 
@@ -944,7 +949,7 @@ static char gCopyKey;
 {
 	RDNA4MTLTexture *v = [[RDNA4MTLTexture alloc] initViewOf:self format:format type:type levels:levels slices:slices];
 	if (v)
-		v->_swizzle = swizzle.red | swizzle.green << 8 | swizzle.blue << 16 | (uint32_t)swizzle.alpha << 24;
+		v->_swizzle = packSwizzle(swizzle);
 	return v;
 }
 
@@ -1045,6 +1050,7 @@ static char gCopyKey;
 	_height = d.height;
 	_format = d.pixelFormat;
 	_usage = d.usage;
+	_swizzle = packSwizzle(d.swizzle);
 	return self;
 }
 
@@ -1110,6 +1116,7 @@ static char gCopyKey;
 	_height = d.height;
 	_format = d.pixelFormat;
 	_usage = d.usage;
+	_swizzle = packSwizzle(d.swizzle);
 	return self;
 }
 
