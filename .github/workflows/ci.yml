@@ -5,7 +5,7 @@ name: CI
 
 on:
   push:
-    branches: [main, next, "devel/**", "premetal/**"]
+    branches: [main, next, "devel/**", "premetal/**", "dev/**"]
   pull_request:
   workflow_dispatch:
 
