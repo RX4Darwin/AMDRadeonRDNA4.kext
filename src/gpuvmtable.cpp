@@ -108,8 +108,6 @@ bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 
 	uint64_t page = 0;
 	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes, page++) {
-		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
-			return false;
 		if (at < GpuVm::kVaStart || at >= GpuVm::kVaStart + denseVa(tableBytes))
 			return false;
 		const uint64_t ptOff = densePt(at);
