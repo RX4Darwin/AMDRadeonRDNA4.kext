@@ -7,6 +7,11 @@ on:
     paths:
       - ".github/workflows/package-v040.yml"
       - "Makefile"
+      - "README.md"
+      - ".gitmodules"
+      - "Info.plist"
+      - "lib/Lilu/**"
+      - "tools/build/**"
       - "tools/metal/**"
       - "userspace/vulkan/**"
       - "userspace/rdna4-run/**"
@@ -47,6 +52,11 @@ jobs:
 
       - name: Fetch AMD firmware
         run: tools/build/fetch-firmware.sh
+
+      - name: Check packaging shell syntax
+        run: |
+          sh -n tools/package/package.sh
+          sh -n tools/package/uninstall.sh
 
       - name: Build matching release kext and test tools
         run: make all PVGPU=1
