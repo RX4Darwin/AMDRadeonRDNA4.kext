@@ -2806,127 +2806,131 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 
 - (void)record:(MTLSize)groups groupSize:(MTLSize)groupSize grid:(MTLSize)grid
 {
-	if (!_pipeline) {
-		RLOG(@"RDNA4MTL: a dispatch without a compute pipeline, left out");
-		return;
-	}
-	// The translator's kernargs: a buffer address per index, u32 threads per group x y z, u32 threads in the grid x y z, the texture table.
-	const uint32_t n = _pipeline.buffers;
-	NSMutableData *args = [NSMutableData dataWithLength:8 * n + 24 + 8];
-	uint8_t *p = (uint8_t *)args.mutableBytes;
-	memcpy(p, _addresses, 8 * MIN(n, (uint32_t)kMaxBufferIndex));
-	// unbound buffer slots: the zeroed spare buffer, as a draw's (a kernel's read through address 0 faulted: Core Animation's
-	// calculate_average_luma, 2026-11-20)
-	const uint64_t spare = [(RDNA4MTLDevice *)self.device spareBuffer];
-	for (uint32_t i = 0; i < n; i++)
-		if (!((uint64_t *)p)[i])
-			((uint64_t *)p)[i] = spare;
-	const uint32_t sizes[6] = { (uint32_t)groupSize.width, (uint32_t)groupSize.height, (uint32_t)groupSize.depth,
-		                        (uint32_t)grid.width,      (uint32_t)grid.height,      (uint32_t)grid.depth };
-	memcpy(p + 8 * n, sizes, sizeof sizes);
-	RDNA4MTLComputePipeline *pipeline = _pipeline;
-	NSMutableArray *held = [NSMutableArray array];   // the bound buffers and textures, kept until the dispatch ran
-	for (int i = 0; i < kMaxBufferIndex; i++)
-		if (_bound[i])
-			[held addObject:_bound[i]];
-	// the textures and samplers: a table of their own (T# n at RDNA4_MTLC_TABLE_TEXTURES + 32 n, S# n at RDNA4_MTLC_TABLE_SAMPLERS + 16 n), its
-	// address after the sizes in the kernargs (air2amdgpu.cpp); shadowed IOSurfaces copied in before the dispatch
-	NSMutableArray<RDNA4MTLTexture *> *shadowed = [NSMutableArray array], *kernelTextures = [NSMutableArray array];
-	uint8_t table[0x400] = {};
-	BOOL anyTexture = NO;
-	for (int i = 0; i < 16; i++) {
-		if ([(id)_textures[i] isKindOfClass:[RDNA4MTLTexture class]] && !((RDNA4MTLTexture *)_textures[i]).isDepth) {
-			RDNA4MTLTexture *t = (RDNA4MTLTexture *)_textures[i];
-			[t descriptor:(uint32_t *)(table + RDNA4_MTLC_TABLE_TEXTURES + 32 * i)];
+	// what it autoreleases freed here: OpenSceneGraph draws on a thread that never drains a pool, and the draws' kept buffers
+	// (staging chunks, kernel tables) piled up in it until the client's host quota ran out (OpenMW, 2026-11-22)
+	@autoreleasepool {
+		if (!_pipeline) {
+			RLOG(@"RDNA4MTL: a dispatch without a compute pipeline, left out");
+			return;
+		}
+		// The translator's kernargs: a buffer address per index, u32 threads per group x y z, u32 threads in the grid x y z, the texture table.
+		const uint32_t n = _pipeline.buffers;
+		NSMutableData *args = [NSMutableData dataWithLength:8 * n + 24 + 8];
+		uint8_t *p = (uint8_t *)args.mutableBytes;
+		memcpy(p, _addresses, 8 * MIN(n, (uint32_t)kMaxBufferIndex));
+		// unbound buffer slots: the zeroed spare buffer, as a draw's (a kernel's read through address 0 faulted: Core Animation's
+		// calculate_average_luma, 2026-11-20)
+		const uint64_t spare = [(RDNA4MTLDevice *)self.device spareBuffer];
+		for (uint32_t i = 0; i < n; i++)
+			if (!((uint64_t *)p)[i])
+				((uint64_t *)p)[i] = spare;
+		const uint32_t sizes[6] = { (uint32_t)groupSize.width, (uint32_t)groupSize.height, (uint32_t)groupSize.depth,
+			                        (uint32_t)grid.width,      (uint32_t)grid.height,      (uint32_t)grid.depth };
+		memcpy(p + 8 * n, sizes, sizeof sizes);
+		RDNA4MTLComputePipeline *pipeline = _pipeline;
+		NSMutableArray *held = [NSMutableArray array];   // the bound buffers and textures, kept until the dispatch ran
+		for (int i = 0; i < kMaxBufferIndex; i++)
+			if (_bound[i])
+				[held addObject:_bound[i]];
+		// the textures and samplers: a table of their own (T# n at RDNA4_MTLC_TABLE_TEXTURES + 32 n, S# n at RDNA4_MTLC_TABLE_SAMPLERS + 16 n), its
+		// address after the sizes in the kernargs (air2amdgpu.cpp); shadowed IOSurfaces copied in before the dispatch
+		NSMutableArray<RDNA4MTLTexture *> *shadowed = [NSMutableArray array], *kernelTextures = [NSMutableArray array];
+		uint8_t table[0x400] = {};
+		BOOL anyTexture = NO;
+		for (int i = 0; i < 16; i++) {
+			if ([(id)_textures[i] isKindOfClass:[RDNA4MTLTexture class]] && !((RDNA4MTLTexture *)_textures[i]).isDepth) {
+				RDNA4MTLTexture *t = (RDNA4MTLTexture *)_textures[i];
+				[t descriptor:(uint32_t *)(table + RDNA4_MTLC_TABLE_TEXTURES + 32 * i)];
+				[held addObject:t];
+				[kernelTextures addObject:t];
+				if (t.shadowed)
+					[shadowed addObject:t];
+				anyTexture = YES;
+			}
+			if ([(id)_samplers[i] isKindOfClass:[RDNA4MTLSamplerState class]]) {
+				memcpy(table + RDNA4_MTLC_TABLE_SAMPLERS + 16 * i, ((RDNA4MTLSamplerState *)_samplers[i]).words, 16);
+				anyTexture = YES;
+			}
+		}
+		for (RDNA4MTLTexture *t in _used) {
+			if ([kernelTextures containsObject:t])
+				continue;
 			[held addObject:t];
 			[kernelTextures addObject:t];
 			if (t.shadowed)
 				[shadowed addObject:t];
-			anyTexture = YES;
 		}
-		if ([(id)_samplers[i] isKindOfClass:[RDNA4MTLSamplerState class]]) {
-			memcpy(table + RDNA4_MTLC_TABLE_SAMPLERS + 16 * i, ((RDNA4MTLSamplerState *)_samplers[i]).words, 16);
-			anyTexture = YES;
+		{   // always: a kernel's texture read through a table at 0 faulted
+			(void)anyTexture;
+			uint32_t spare[8];
+			[(RDNA4MTLDevice *)self.device spareImage:spare];
+			for (int i = 0; i < 16; i++)   // unbound slots: the spare texel (an all-zero T# can stall the texture unit)
+				if (![(id)_textures[i] isKindOfClass:[RDNA4MTLTexture class]] || ((RDNA4MTLTexture *)_textures[i]).isDepth)
+					memcpy(table + RDNA4_MTLC_TABLE_TEXTURES + 32 * i, spare, 32);
+			id<MTLBuffer> t = [self.device newBufferWithBytes:table length:sizeof table options:MTLResourceStorageModeShared];
+			const uint64_t at = t.gpuAddress;
+			memcpy(p + 8 * n + 24, &at, 8);
+			if (t)
+				[held addObject:t];
 		}
-	}
-	for (RDNA4MTLTexture *t in _used) {
-		if ([kernelTextures containsObject:t])
-			continue;
-		[held addObject:t];
-		[kernelTextures addObject:t];
-		if (t.shadowed)
-			[shadowed addObject:t];
-	}
-	{   // always: a kernel's texture read through a table at 0 faulted
-		(void)anyTexture;
-		uint32_t spare[8];
-		[(RDNA4MTLDevice *)self.device spareImage:spare];
-		for (int i = 0; i < 16; i++)   // unbound slots: the spare texel (an all-zero T# can stall the texture unit)
-			if (![(id)_textures[i] isKindOfClass:[RDNA4MTLTexture class]] || ((RDNA4MTLTexture *)_textures[i]).isDepth)
-				memcpy(table + RDNA4_MTLC_TABLE_TEXTURES + 32 * i, spare, 32);
-		id<MTLBuffer> t = [self.device newBufferWithBytes:table length:sizeof table options:MTLResourceStorageModeShared];
-		const uint64_t at = t.gpuAddress;
-		memcpy(p + 8 * n + 24, &at, 8);
-		if (t)
-			[held addObject:t];
-	}
-	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
-	NSArray<RDNA4MTLTexture *> *late = [_commandBuffer refreshShadows:shadowed];   // (see the draw's)
-	RDNA4MTLCommandBuffer *cb = _commandBuffer;
-	BOOL plain = !shadowed.count && !late.count;   // no surface copies or held surfaces to bring in first: on the gfx ring when the kernel can
-	for (RDNA4MTLTexture *t in kernelTextures)
-		plain &= !t.held;
-	rdna4_program_t ringProg = pipeline.program;
-	if (plain && [device canDispatchOnRing:&ringProg]) {
-		const std::array<uint32_t, 3> g = { (uint32_t)groups.width, (uint32_t)groups.height, (uint32_t)groups.depth };
-		const std::array<uint32_t, 3> s = { (uint32_t)groupSize.width, (uint32_t)groupSize.height, (uint32_t)groupSize.depth };
-		[_commandBuffer recordDraw:^NSError * {
-			(void)held;
-			const uint64_t t0 = nowUs();
+		RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
+		NSArray<RDNA4MTLTexture *> *late = [_commandBuffer refreshShadows:shadowed];   // (see the draw's)
+		RDNA4MTLCommandBuffer *cb = _commandBuffer;
+		BOOL plain = !shadowed.count && !late.count;   // no surface copies or held surfaces to bring in first: on the gfx ring when the kernel can
+		for (RDNA4MTLTexture *t in kernelTextures)
+			plain &= !t.held;
+		rdna4_program_t ringProg = pipeline.program;
+		if (plain && [device canDispatchOnRing:&ringProg]) {
+			const std::array<uint32_t, 3> g = { (uint32_t)groups.width, (uint32_t)groups.height, (uint32_t)groups.depth };
+			const std::array<uint32_t, 3> s = { (uint32_t)groupSize.width, (uint32_t)groupSize.height, (uint32_t)groupSize.depth };
+			[_commandBuffer recordDraw:^NSError * {
+				(void)held;
+				const uint64_t t0 = nowUs();
+				rdna4_program_t prog = pipeline.program;
+				NSError *why = [device dispatchOnRing:&prog groups:g.data() size:s.data() args:args];
+				for (RDNA4MTLTexture *t in kernelTextures) {   // what the kernel may have written (as below)
+					[t wroteAll];
+					[t heldRows:0 to:(uint32_t)t.height width:(uint32_t)t.width];
+					if (t.usage & MTLTextureUsageShaderWrite)
+						[cb drewInto:t];
+				}
+				statAdd(kStatDispatches, 1);
+				statAdd(kStatDispatchUs, nowUs() - t0);
+				return why;
+			}];
+			return;
+		}
+		[_commandBuffer record:^NSError * {
 			rdna4_program_t prog = pipeline.program;
-			NSError *why = [device dispatchOnRing:&prog groups:g.data() size:s.data() args:args];
-			for (RDNA4MTLTexture *t in kernelTextures) {   // what the kernel may have written (as below)
+			const uint32_t g[3] = { (uint32_t)groups.width, (uint32_t)groups.height, (uint32_t)groups.depth };
+			const uint32_t s[3] = { (uint32_t)groupSize.width, (uint32_t)groupSize.height, (uint32_t)groupSize.depth };
+			(void)held;
+			[cb refreshLate:late];
+			BOOL synced = NO;
+			for (RDNA4MTLTexture *t in kernelTextures) {
+				NSError *why = t.held ? [t.held sync] : nil;
+				if (why)
+					return why;
+				synced |= t.held != nil;
+			}
+			NSError *drained = synced ? [device drainGfx] : nil;   // (the fills went to the gfx ring, the dispatch to a compute queue)
+			if (drained)
+				return drained;
+			const uint64_t t0 = nowUs();
+			const kern_return_t kr = device.gpu ? rdna4_dispatch(device.gpu, &prog, g, s, args.bytes, (uint32_t)args.length, 1000, NULL) : kIOReturnNotOpen;
+			for (RDNA4MTLTexture *t in kernelTextures) {   // what the kernel may have written
 				[t wroteAll];
 				[t heldRows:0 to:(uint32_t)t.height width:(uint32_t)t.width];
+				// a shadowed IOSurface it may write: its copy into the surface at the end, as a draw's (VideoToolbox's 420v -> BGRA into
+				// System Settings' display thumbnails, 2752 bytes a row: written in the copy only, they stayed black, 2026-11-21)
 				if (t.usage & MTLTextureUsageShaderWrite)
 					[cb drewInto:t];
 			}
 			statAdd(kStatDispatches, 1);
 			statAdd(kStatDispatchUs, nowUs() - t0);
-			return why;
+			return kr ? rdna4Error(@"a dispatch", kr) : nil;
 		}];
-		return;
 	}
-	[_commandBuffer record:^NSError * {
-		rdna4_program_t prog = pipeline.program;
-		const uint32_t g[3] = { (uint32_t)groups.width, (uint32_t)groups.height, (uint32_t)groups.depth };
-		const uint32_t s[3] = { (uint32_t)groupSize.width, (uint32_t)groupSize.height, (uint32_t)groupSize.depth };
-		(void)held;
-		[cb refreshLate:late];
-		BOOL synced = NO;
-		for (RDNA4MTLTexture *t in kernelTextures) {
-			NSError *why = t.held ? [t.held sync] : nil;
-			if (why)
-				return why;
-			synced |= t.held != nil;
-		}
-		NSError *drained = synced ? [device drainGfx] : nil;   // (the fills went to the gfx ring, the dispatch to a compute queue)
-		if (drained)
-			return drained;
-		const uint64_t t0 = nowUs();
-		const kern_return_t kr = device.gpu ? rdna4_dispatch(device.gpu, &prog, g, s, args.bytes, (uint32_t)args.length, 1000, NULL) : kIOReturnNotOpen;
-		for (RDNA4MTLTexture *t in kernelTextures) {   // what the kernel may have written
-			[t wroteAll];
-			[t heldRows:0 to:(uint32_t)t.height width:(uint32_t)t.width];
-			// a shadowed IOSurface it may write: its copy into the surface at the end, as a draw's (VideoToolbox's 420v -> BGRA into
-			// System Settings' display thumbnails, 2752 bytes a row: written in the copy only, they stayed black, 2026-11-21)
-			if (t.usage & MTLTextureUsageShaderWrite)
-				[cb drewInto:t];
-		}
-		statAdd(kStatDispatches, 1);
-		statAdd(kStatDispatchUs, nowUs() - t0);
-		return kr ? rdna4Error(@"a dispatch", kr) : nil;
-	}];
 }
 
 - (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)size
@@ -3270,237 +3274,241 @@ RDNA4_ANSWER_MISSING
 - (void)record:(MTLPrimitiveType)type start:(NSUInteger)start count:(NSUInteger)count instances:(NSUInteger)instances
     baseInstance:(NSUInteger)baseInstance indices:(id<MTLBuffer>)indexBuffer offset:(NSUInteger)indexOffset type:(MTLIndexType)indexType
 {
-	const StatTime timed { kStatRecordUs };
-	id<MTLBuffer> indirect = _indirect;   // an indirect draw's arguments: read when it runs (written on the card by then, below)
-	const NSUInteger indirectOffset = _indirectOffset;
-	RDNA4Draw d = { .type = (uint32_t)type, .start = (uint32_t)start, .count = (uint32_t)count, .instances = (uint32_t)instances,
-		            .baseInstance = (uint32_t)baseInstance,
-		            .viewport = { (float)_viewport.originX, (float)_viewport.originY, (float)_viewport.width, (float)_viewport.height },
-		            .scissor = { (uint32_t)_scissor.x, (uint32_t)_scissor.y, (uint32_t)_scissor.width, (uint32_t)_scissor.height } };
-	memcpy(d.blendColour, _blendColour, sizeof d.blendColour);
-	memcpy(d.table, _addresses, sizeof d.table);
-	NSMutableArray *held = [NSMutableArray array];   // what the draw uses, kept until it ran
-	NSMutableArray<RDNA4MTLTexture *> *shadowed = [NSMutableArray array];   // read through copies made current before the draw
-	NSMutableArray *reads = [NSMutableArray array];   // {stage, slot, texture}: what the draw samples
-	const BOOL wantsLevels = _pipeline && ((_pipeline.vs[7] | _pipeline.ps[7]) >> 16 & 1);
-	NSMutableData *levelT = wantsLevels ? [NSMutableData dataWithLength:2 * 7 * 16 * 32] : nil;
-	const BOOL wantsHandles = _pipeline && (([_pipeline texturesOf:0] | [_pipeline texturesOf:1]) & RDNA4_MTLC_TXRD_HANDLES);
-	NSMutableData *handles = wantsHandles ? [NSMutableData dataWithLength:2 * kHandleTextures * 8] : nil;
-	for (int st = 0; st < 2; st++) {
-		for (int i = 0; i < kTableBuffers; i++)
-			if (_bound[st][i])
-				[held addObject:_bound[st][i]];
-		// the textures its shaders use only: one left bound by an earlier draw is not read, made current, waited for or copied (Core
-		// Animation's target, left bound, was a copy of it for every draw of Vfx / Xc, 2026-11-20)
-		const uint32_t uses = _pipeline ? [_pipeline texturesOf:st] : 0xffff;
-		for (int i = 0; i < kTextures; i++) {
-			if ((uses >> i & 1) && [(id)_textures[st][i] isKindOfClass:[RDNA4MTLTexture class]] && ((RDNA4MTLTexture *)_textures[st][i]).sampleable) {
-				RDNA4MTLTexture *t = (RDNA4MTLTexture *)_textures[st][i];
-				[t descriptor:d.textures[st][i]];
-				for (NSUInteger l = 1; levelT && i < kStageTextures && l < 8; l++)   // (the helper refuses levels of textures 16-30)
-					[t descriptor:(uint32_t *)((uint8_t *)levelT.mutableBytes + ((st * 7 + (l - 1)) * 16 + i) * 32) level:l];
+	// what it autoreleases freed here: OpenSceneGraph draws on a thread that never drains a pool, and the draws' kept buffers
+	// (staging chunks, kernel tables) piled up in it until the client's host quota ran out (OpenMW, 2026-11-22)
+	@autoreleasepool {
+		const StatTime timed { kStatRecordUs };
+		id<MTLBuffer> indirect = _indirect;   // an indirect draw's arguments: read when it runs (written on the card by then, below)
+		const NSUInteger indirectOffset = _indirectOffset;
+		RDNA4Draw d = { .type = (uint32_t)type, .start = (uint32_t)start, .count = (uint32_t)count, .instances = (uint32_t)instances,
+			            .baseInstance = (uint32_t)baseInstance,
+			            .viewport = { (float)_viewport.originX, (float)_viewport.originY, (float)_viewport.width, (float)_viewport.height },
+			            .scissor = { (uint32_t)_scissor.x, (uint32_t)_scissor.y, (uint32_t)_scissor.width, (uint32_t)_scissor.height } };
+		memcpy(d.blendColour, _blendColour, sizeof d.blendColour);
+		memcpy(d.table, _addresses, sizeof d.table);
+		NSMutableArray *held = [NSMutableArray array];   // what the draw uses, kept until it ran
+		NSMutableArray<RDNA4MTLTexture *> *shadowed = [NSMutableArray array];   // read through copies made current before the draw
+		NSMutableArray *reads = [NSMutableArray array];   // {stage, slot, texture}: what the draw samples
+		const BOOL wantsLevels = _pipeline && ((_pipeline.vs[7] | _pipeline.ps[7]) >> 16 & 1);
+		NSMutableData *levelT = wantsLevels ? [NSMutableData dataWithLength:2 * 7 * 16 * 32] : nil;
+		const BOOL wantsHandles = _pipeline && (([_pipeline texturesOf:0] | [_pipeline texturesOf:1]) & RDNA4_MTLC_TXRD_HANDLES);
+		NSMutableData *handles = wantsHandles ? [NSMutableData dataWithLength:2 * kHandleTextures * 8] : nil;
+		for (int st = 0; st < 2; st++) {
+			for (int i = 0; i < kTableBuffers; i++)
+				if (_bound[st][i])
+					[held addObject:_bound[st][i]];
+			// the textures its shaders use only: one left bound by an earlier draw is not read, made current, waited for or copied (Core
+			// Animation's target, left bound, was a copy of it for every draw of Vfx / Xc, 2026-11-20)
+			const uint32_t uses = _pipeline ? [_pipeline texturesOf:st] : 0xffff;
+			for (int i = 0; i < kTextures; i++) {
+				if ((uses >> i & 1) && [(id)_textures[st][i] isKindOfClass:[RDNA4MTLTexture class]] && ((RDNA4MTLTexture *)_textures[st][i]).sampleable) {
+					RDNA4MTLTexture *t = (RDNA4MTLTexture *)_textures[st][i];
+					[t descriptor:d.textures[st][i]];
+					for (NSUInteger l = 1; levelT && i < kStageTextures && l < 8; l++)   // (the helper refuses levels of textures 16-30)
+						[t descriptor:(uint32_t *)((uint8_t *)levelT.mutableBytes + ((st * 7 + (l - 1)) * 16 + i) * 32) level:l];
+					if (t.shadowed)
+						[shadowed addObject:t];
+					[held addObject:t];
+					[reads addObject:@[ @(st), @(i), t ]];
+				}
+				if (i < kStageTextures && [(id)_samplers[st][i] isKindOfClass:[RDNA4MTLSamplerState class]])
+					memcpy(d.samplers[st][i], ((RDNA4MTLSamplerState *)_samplers[st][i]).words, 16);
+			}
+			// textures 31-127: their T# slots (gpuResourceID writes the T# as it is now), unbound ones the spare texel's
+			for (int i = kTextures; handles && (uses & RDNA4_MTLC_TXRD_HANDLES) && i < kMaxTextures; i++) {
+				RDNA4MTLTexture *t = [(id)_textures[st][i] isKindOfClass:[RDNA4MTLTexture class]] ? (RDNA4MTLTexture *)_textures[st][i] : nil;
+				const uint64_t slot = t ? t.gpuResourceID._impl : 0;
+				((uint64_t *)handles.mutableBytes)[st * kHandleTextures + (i - kTextures)] = slot ?: [(RDNA4MTLDevice *)self.device spareHandle];
+				if (!t || !t.sampleable)
+					continue;
 				if (t.shadowed)
 					[shadowed addObject:t];
 				[held addObject:t];
 				[reads addObject:@[ @(st), @(i), t ]];
 			}
-			if (i < kStageTextures && [(id)_samplers[st][i] isKindOfClass:[RDNA4MTLSamplerState class]])
-				memcpy(d.samplers[st][i], ((RDNA4MTLSamplerState *)_samplers[st][i]).words, 16);
 		}
-		// textures 31-127: their T# slots (gpuResourceID writes the T# as it is now), unbound ones the spare texel's
-		for (int i = kTextures; handles && (uses & RDNA4_MTLC_TXRD_HANDLES) && i < kMaxTextures; i++) {
-			RDNA4MTLTexture *t = [(id)_textures[st][i] isKindOfClass:[RDNA4MTLTexture class]] ? (RDNA4MTLTexture *)_textures[st][i] : nil;
-			const uint64_t slot = t ? t.gpuResourceID._impl : 0;
-			((uint64_t *)handles.mutableBytes)[st * kHandleTextures + (i - kTextures)] = slot ?: [(RDNA4MTLDevice *)self.device spareHandle];
-			if (!t || !t.sampleable)
-				continue;
-			if (t.shadowed)
-				[shadowed addObject:t];
-			[held addObject:t];
-			[reads addObject:@[ @(st), @(i), t ]];
+		if (handles)
+			[held addObject:handles];
+		if (indexBuffer) {
+			d.indexGpu = indexBuffer.gpuAddress + indexOffset;
+			d.indexBytes = indexType == MTLIndexTypeUInt32 ? 4 : 2;
+			[held addObject:indexBuffer];
 		}
-	}
-	if (handles)
-		[held addObject:handles];
-	if (indexBuffer) {
-		d.indexGpu = indexBuffer.gpuAddress + indexOffset;
-		d.indexBytes = indexType == MTLIndexTypeUInt32 ? 4 : 2;
-		[held addObject:indexBuffer];
-	}
-	if (_depthState && (_depth || _stencil)) {
-		RDNA4MTLTexture *z = _depth ?: _stencil;
-		d.depthWidth = (uint32_t)z.width;
-		d.depthHeight = (uint32_t)z.height;
-		[held addObject:z];
-	}
-	// Z on only when it tests or writes something (the PV host's rule): with Z on, compare always and no write, a 4x pass's stencil writes
-	// were lost in a pattern of 8x16-pixel tiles (mtlprobe nativestencil, 2026-11-20)
-	if (_depth && _depthState && (_depthState.compare != MTLCompareFunctionAlways || _depthState.write)) {
-		d.depthGpu = _depth.gpuBase;
-		d.depthCompare = _depthState.compare;
-		d.depthWrite = _depthState.write;
-	}
-	if (_stencil && _depthState) {
-		d.stencilGpu = _stencil.gpuBase + _stencil.depthBytes;
-		d.stencilDepthControl = _depthState.stencilDepthControl;
-		d.stencilControl = _depthState.stencilControl;
-		d.stencilReadMask = _depthState.readMask;
-		d.stencilWriteMask = _depthState.writeMask;
-		d.stencilRef = _stencilRef;
-		[held addObject:_stencil];
-	}
-	// The attachment it goes into, as the PV host's runDraw: the one other than 0 the fragment shader writes (its header's bits 28-30), or of
-	// several it writes (bits 20-27) the first the pipeline writes (its mask) and the pass has a texture for.
-	RDNA4MTLRenderPipeline *pipeline = _pipeline;
-	const uint32_t attr = pipeline ? pipeline.ps[7] : 0, writes = attr >> 20 & 0xff;
-	d.attachment = attr >> 28 & 7;
-	for (uint32_t k = 0; k < 8; k++)
-		if ((writes >> k & 1) && [pipeline blendOf:k][9] && _targets[k]) {
-			d.attachment = k;
-			break;
+		if (_depthState && (_depth || _stencil)) {
+			RDNA4MTLTexture *z = _depth ?: _stencil;
+			d.depthWidth = (uint32_t)z.width;
+			d.depthHeight = (uint32_t)z.height;
+			[held addObject:z];
 		}
-	RDNA4MTLTexture *target = _targets[d.attachment];
-	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
-	RDNA4MTLTexture *depthTarget = _depth;   // (drewDepth: once the draw ran)
-	// The other attachments it writes (Unity's deferred G-buffer: four), each a draw of its own after it into that attachment
-	// (RDNA4_MTLC_TABLE_ATTACHMENT picks the value the shader exports). ponytail: a draw a target instead of the colour block's MRTs.
-	NSMutableArray<NSNumber *> *more = [NSMutableArray array];
-	NSMutableArray<RDNA4MTLTexture *> *moreTargets = [NSMutableArray array];
-	for (uint32_t k = d.attachment + 1; k < 8; k++)
-		if ((writes >> k & 1) && [pipeline blendOf:k][9] && _targets[k]) {
-			[more addObject:@(k)];
-			[moreTargets addObject:_targets[k]];
+		// Z on only when it tests or writes something (the PV host's rule): with Z on, compare always and no write, a 4x pass's stencil writes
+		// were lost in a pattern of 8x16-pixel tiles (mtlprobe nativestencil, 2026-11-20)
+		if (_depth && _depthState && (_depthState.compare != MTLCompareFunctionAlways || _depthState.write)) {
+			d.depthGpu = _depth.gpuBase;
+			d.depthCompare = _depthState.compare;
+			d.depthWrite = _depthState.write;
 		}
-	// A pass of depth (and stencil) only (Unity's shadow maps): as if into a stand-in of the depth's size, colour not written. Refused
-	// before: "a draw without ... a colour attachment", and the command buffer's later work with it (Daggerfall Unity, 2026-11-22).
-	if (!target && (_depth || _stencil) && (target = [device standInFor:_depth ?: _stencil]))
-		d.depthOnly = 1;
-	memcpy(d.covered, d.scissor, sizeof d.covered);
-	if (pipeline)
-		[self bound:&d pipeline:pipeline indices:indexBuffer offset:indexOffset type:indexType];
-	d.levelT = (const uint8_t *)levelT.bytes;
-	d.handles = (const uint64_t *)handles.bytes;
-	if (pipeline && !pipeline.described) {   // what each pipeline's first draw binds: a hang's draw named (drainGfx), this says what it read
-		pipeline.described = YES;
-		NSMutableString *what = [NSMutableString stringWithFormat:@"pipeline %@: vs 0x%08x ps 0x%08x, vs rsrc %08x %08x, ps rsrc %08x %08x ena %08x addr %08x, blend",
-		                                                          pipeline.names, pipeline.vs[7], pipeline.ps[7], pipeline.vs[3], pipeline.vs[4],
-		                                                          pipeline.ps[3], pipeline.ps[4], pipeline.ps[5], pipeline.ps[6]];
-		for (int k = 2; k < 10; k++)
-			[what appendFormat:@" %u", [pipeline blendOf:d.attachment][k]];
-		for (int st = 0; st < 2; st++)
-			for (int i = 0; i < kStageTextures; i++) {
-				id<MTLTexture> t = _textures[st][i];
-				if (t)
-					[what appendFormat:@"; %s tex %d: %@ type %lu fmt %lu %lux%lux%lu lv %lu%s", st ? "fs" : "vs", i, NSStringFromClass([(id)t class]),
-					                   (unsigned long)t.textureType, (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height,
-					                   (unsigned long)t.depth, (unsigned long)t.mipmapLevelCount,
-					                   [(id)t isKindOfClass:[RDNA4MTLTexture class]] && ((RDNA4MTLTexture *)t).shadowed ? " shadowed" : ""];
-				if (_samplers[st][i]) {
-					const uint32_t *w = (const uint32_t *)d.samplers[st][i];
-					[what appendFormat:@"; %s smp %d: %08x %08x %08x %08x", st ? "fs" : "vs", i, w[0], w[1], w[2], w[3]];
+		if (_stencil && _depthState) {
+			d.stencilGpu = _stencil.gpuBase + _stencil.depthBytes;
+			d.stencilDepthControl = _depthState.stencilDepthControl;
+			d.stencilControl = _depthState.stencilControl;
+			d.stencilReadMask = _depthState.readMask;
+			d.stencilWriteMask = _depthState.writeMask;
+			d.stencilRef = _stencilRef;
+			[held addObject:_stencil];
+		}
+		// The attachment it goes into, as the PV host's runDraw: the one other than 0 the fragment shader writes (its header's bits 28-30), or of
+		// several it writes (bits 20-27) the first the pipeline writes (its mask) and the pass has a texture for.
+		RDNA4MTLRenderPipeline *pipeline = _pipeline;
+		const uint32_t attr = pipeline ? pipeline.ps[7] : 0, writes = attr >> 20 & 0xff;
+		d.attachment = attr >> 28 & 7;
+		for (uint32_t k = 0; k < 8; k++)
+			if ((writes >> k & 1) && [pipeline blendOf:k][9] && _targets[k]) {
+				d.attachment = k;
+				break;
+			}
+		RDNA4MTLTexture *target = _targets[d.attachment];
+		RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
+		RDNA4MTLTexture *depthTarget = _depth;   // (drewDepth: once the draw ran)
+		// The other attachments it writes (Unity's deferred G-buffer: four), each a draw of its own after it into that attachment
+		// (RDNA4_MTLC_TABLE_ATTACHMENT picks the value the shader exports). ponytail: a draw a target instead of the colour block's MRTs.
+		NSMutableArray<NSNumber *> *more = [NSMutableArray array];
+		NSMutableArray<RDNA4MTLTexture *> *moreTargets = [NSMutableArray array];
+		for (uint32_t k = d.attachment + 1; k < 8; k++)
+			if ((writes >> k & 1) && [pipeline blendOf:k][9] && _targets[k]) {
+				[more addObject:@(k)];
+				[moreTargets addObject:_targets[k]];
+			}
+		// A pass of depth (and stencil) only (Unity's shadow maps): as if into a stand-in of the depth's size, colour not written. Refused
+		// before: "a draw without ... a colour attachment", and the command buffer's later work with it (Daggerfall Unity, 2026-11-22).
+		if (!target && (_depth || _stencil) && (target = [device standInFor:_depth ?: _stencil]))
+			d.depthOnly = 1;
+		memcpy(d.covered, d.scissor, sizeof d.covered);
+		if (pipeline)
+			[self bound:&d pipeline:pipeline indices:indexBuffer offset:indexOffset type:indexType];
+		d.levelT = (const uint8_t *)levelT.bytes;
+		d.handles = (const uint64_t *)handles.bytes;
+		if (pipeline && !pipeline.described) {   // what each pipeline's first draw binds: a hang's draw named (drainGfx), this says what it read
+			pipeline.described = YES;
+			NSMutableString *what = [NSMutableString stringWithFormat:@"pipeline %@: vs 0x%08x ps 0x%08x, vs rsrc %08x %08x, ps rsrc %08x %08x ena %08x addr %08x, blend",
+			                                                          pipeline.names, pipeline.vs[7], pipeline.ps[7], pipeline.vs[3], pipeline.vs[4],
+			                                                          pipeline.ps[3], pipeline.ps[4], pipeline.ps[5], pipeline.ps[6]];
+			for (int k = 2; k < 10; k++)
+				[what appendFormat:@" %u", [pipeline blendOf:d.attachment][k]];
+			for (int st = 0; st < 2; st++)
+				for (int i = 0; i < kStageTextures; i++) {
+					id<MTLTexture> t = _textures[st][i];
+					if (t)
+						[what appendFormat:@"; %s tex %d: %@ type %lu fmt %lu %lux%lux%lu lv %lu%s", st ? "fs" : "vs", i, NSStringFromClass([(id)t class]),
+						                   (unsigned long)t.textureType, (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height,
+						                   (unsigned long)t.depth, (unsigned long)t.mipmapLevelCount,
+						                   [(id)t isKindOfClass:[RDNA4MTLTexture class]] && ((RDNA4MTLTexture *)t).shadowed ? " shadowed" : ""];
+					if (_samplers[st][i]) {
+						const uint32_t *w = (const uint32_t *)d.samplers[st][i];
+						[what appendFormat:@"; %s smp %d: %08x %08x %08x %08x", st ? "fs" : "vs", i, w[0], w[1], w[2], w[3]];
+					}
+				}
+			for (int i = 0; i < 16; i++)
+				if (pipeline.attributes[4 * i + 2])
+					[what appendFormat:@"; attr %d: %u %u 0x%x %u", i, pipeline.attributes[4 * i], pipeline.attributes[4 * i + 1],
+					                   pipeline.attributes[4 * i + 2], pipeline.attributes[4 * i + 3]];
+			RLOG(@"RDNA4MTL trace: %@", what);
+		}
+		// The target's copy current before it is drawn into, as the textures read: the whole copy goes back into the surface after the command
+		// buffer. A texture of a surface another texture or the CPU had drawn, drawn into with load (Core Animation's partial repaints of
+		// Safari's tiles), put its old copy, zeros, over the surface around what it drew: black under the menus (2026-11-22).
+		if (target.shadowed && target.iosurface && ![shadowed containsObject:target])
+			[shadowed addObject:target];
+		NSArray<RDNA4MTLTexture *> *late = [_commandBuffer refreshShadows:shadowed];
+		RDNA4MTLCommandBuffer *cb = _commandBuffer;
+		[_commandBuffer recordDraw:^NSError * {
+			(void)held;
+			(void)levelT;
+			[cb refreshLate:late];
+			// As the PV host: a texture an earlier draw still in flight draws into is read after those draws (a barrier on the card), and the
+			// draw's own target, read as a texture (Core Animation's backdrops), is read from a copy the card makes (the PV host's staged copy);
+			// read in place while drawn, WindowServer's first native frames hung the gfx ring (2026-11-20).
+			RDNA4Draw dd = d;
+			// An indirect draw's arguments, as the PV host's: what wrote them (MoltenVK's culling kernels in vkQuake) ran before this step,
+			// dispatches being waited for. MTLDraw(Indexed)PrimitivesIndirectArguments.
+			if (indirect) {
+				const uint32_t *a = (const uint32_t *)((const uint8_t *)indirect.contents + indirectOffset);
+				if (!indirect.contents || indirectOffset + 20 > indirect.length)
+					return rdna4Error(@"an indirect draw's arguments outside its buffer", 0);
+				dd.count = a[0], dd.instances = a[1];
+				if (dd.indexGpu) {
+					dd.indexGpu += (uint64_t)a[2] * dd.indexBytes;
+					dd.start = a[3], dd.baseInstance = a[4];   // (the base vertex as the first vertex, as drawIndexed...baseVertex:)
+				} else {
+					dd.start = a[2], dd.baseInstance = a[3];
+				}
+				if (!dd.count || !dd.instances)
+					return nil;
+			}
+			NSError *why = [target.held sync];
+			for (NSUInteger i = 0; i < reads.count && !why; i++)
+				why = [((RDNA4MTLTexture *)reads[i][2]).held sync];
+			if (why)
+				return why;
+			BOOL barrier = NO;
+			RDNA4MTLTexture *fresh = nil;   // the target, copied before this draw
+			for (NSArray *r in reads) {
+				RDNA4MTLTexture *t = r[2];
+				if (t != target && [device drawnInFlight:t])
+					barrier = YES;
+				if (t == target) {
+					// Brought up to date before each such draw: Core Animation's draws read what the draws just before them drew, with or
+					// without a barrier (copied once a pass, its glass and Safari's toolbar showed the desktop under the windows, 2026-11-20).
+					// What was written since the last copy only, on the card: copied whole by the CPU (4K, 2000 in 5 s), it took WindowServer's
+					// work queue 3.8 s of each 5 while windows moved.
+					RDNA4MTLTexture *copy = target.readCopy;
+					if (!copy)
+						return rdna4Error(@"a draw reading its own target: no copy of it", 0);
+					fresh = target;
+					[copy descriptor:dd.textures[[r[0] intValue]][[r[1] intValue]]];
 				}
 			}
-		for (int i = 0; i < 16; i++)
-			if (pipeline.attributes[4 * i + 2])
-				[what appendFormat:@"; attr %d: %u %u 0x%x %u", i, pipeline.attributes[4 * i], pipeline.attributes[4 * i + 1],
-				                   pipeline.attributes[4 * i + 2], pipeline.attributes[4 * i + 3]];
-		RLOG(@"RDNA4MTL trace: %@", what);
-	}
-	// The target's copy current before it is drawn into, as the textures read: the whole copy goes back into the surface after the command
-	// buffer. A texture of a surface another texture or the CPU had drawn, drawn into with load (Core Animation's partial repaints of
-	// Safari's tiles), put its old copy, zeros, over the surface around what it drew: black under the menus (2026-11-22).
-	if (target.shadowed && target.iosurface && ![shadowed containsObject:target])
-		[shadowed addObject:target];
-	NSArray<RDNA4MTLTexture *> *late = [_commandBuffer refreshShadows:shadowed];
-	RDNA4MTLCommandBuffer *cb = _commandBuffer;
-	[_commandBuffer recordDraw:^NSError * {
-		(void)held;
-		(void)levelT;
-		[cb refreshLate:late];
-		// As the PV host: a texture an earlier draw still in flight draws into is read after those draws (a barrier on the card), and the
-		// draw's own target, read as a texture (Core Animation's backdrops), is read from a copy the card makes (the PV host's staged copy);
-		// read in place while drawn, WindowServer's first native frames hung the gfx ring (2026-11-20).
-		RDNA4Draw dd = d;
-		// An indirect draw's arguments, as the PV host's: what wrote them (MoltenVK's culling kernels in vkQuake) ran before this step,
-		// dispatches being waited for. MTLDraw(Indexed)PrimitivesIndirectArguments.
-		if (indirect) {
-			const uint32_t *a = (const uint32_t *)((const uint8_t *)indirect.contents + indirectOffset);
-			if (!indirect.contents || indirectOffset + 20 > indirect.length)
-				return rdna4Error(@"an indirect draw's arguments outside its buffer", 0);
-			dd.count = a[0], dd.instances = a[1];
-			if (dd.indexGpu) {
-				dd.indexGpu += (uint64_t)a[2] * dd.indexBytes;
-				dd.start = a[3], dd.baseInstance = a[4];   // (the base vertex as the first vertex, as drawIndexed...baseVertex:)
-			} else {
-				dd.start = a[2], dd.baseInstance = a[3];
-			}
-			if (!dd.count || !dd.instances)
+			uint64_t ranges[kWrittenRanges][2];
+			// The rows it covers only, and a few around them (a sample a little outside them): it writes there only, and Core Animation's
+			// backdrops are a window's or a menu's rectangle of a 4K target (all of it copied, 10 GB/s on the card while windows moved,
+			// 2026-11-20). ponytail: a draw sampling further outside what it covers reads those rows as last copied.
+			enum { kReadMargin = 16 };
+			const uint64_t row = fresh.rowBytes, y0 = dd.covered[1] > kReadMargin ? dd.covered[1] - kReadMargin : 0,
+			               y1 = MIN((uint64_t)dd.covered[1] + dd.covered[3] + kReadMargin, (uint64_t)fresh.height);
+			const uint32_t n = fresh ? [fresh takeWritten:ranges from:fresh.identity + y0 * row to:fresh.identity + y1 * row] : 0;   // 0: copied
+			RDNA4Copy copies[kWrittenRanges];
+			for (uint32_t i = 0; i < n; i++)
+				copies[i] = (RDNA4Copy){ fresh.gpuBase + (ranges[i][0] - fresh.identity), fresh.readCopy.gpuBase + (ranges[i][0] - fresh.identity),
+					                     ranges[i][1] - ranges[i][0] };
+			if ((barrier || n) && (why = [device gpuBarrier:copies count:n]))
+				return why;
+			if (!pipeline || !target)
+				return rdna4Error(@"a draw without a render pipeline or a colour attachment of this device", 0);
+			if (pipeline.broken)
 				return nil;
-		}
-		NSError *why = [target.held sync];
-		for (NSUInteger i = 0; i < reads.count && !why; i++)
-			why = [((RDNA4MTLTexture *)reads[i][2]).held sync];
-		if (why)
-			return why;
-		BOOL barrier = NO;
-		RDNA4MTLTexture *fresh = nil;   // the target, copied before this draw
-		for (NSArray *r in reads) {
-			RDNA4MTLTexture *t = r[2];
-			if (t != target && [device drawnInFlight:t])
-				barrier = YES;
-			if (t == target) {
-				// Brought up to date before each such draw: Core Animation's draws read what the draws just before them drew, with or
-				// without a barrier (copied once a pass, its glass and Safari's toolbar showed the desktop under the windows, 2026-11-20).
-				// What was written since the last copy only, on the card: copied whole by the CPU (4K, 2000 in 5 s), it took WindowServer's
-				// work queue 3.8 s of each 5 while windows moved.
-				RDNA4MTLTexture *copy = target.readCopy;
-				if (!copy)
-					return rdna4Error(@"a draw reading its own target: no copy of it", 0);
-				fresh = target;
-				[copy descriptor:dd.textures[[r[0] intValue]][[r[1] intValue]]];
-			}
-		}
-		uint64_t ranges[kWrittenRanges][2];
-		// The rows it covers only, and a few around them (a sample a little outside them): it writes there only, and Core Animation's
-		// backdrops are a window's or a menu's rectangle of a 4K target (all of it copied, 10 GB/s on the card while windows moved,
-		// 2026-11-20). ponytail: a draw sampling further outside what it covers reads those rows as last copied.
-		enum { kReadMargin = 16 };
-		const uint64_t row = fresh.rowBytes, y0 = dd.covered[1] > kReadMargin ? dd.covered[1] - kReadMargin : 0,
-		               y1 = MIN((uint64_t)dd.covered[1] + dd.covered[3] + kReadMargin, (uint64_t)fresh.height);
-		const uint32_t n = fresh ? [fresh takeWritten:ranges from:fresh.identity + y0 * row to:fresh.identity + y1 * row] : 0;   // 0: copied
-		RDNA4Copy copies[kWrittenRanges];
-		for (uint32_t i = 0; i < n; i++)
-			copies[i] = (RDNA4Copy){ fresh.gpuBase + (ranges[i][0] - fresh.identity), fresh.readCopy.gpuBase + (ranges[i][0] - fresh.identity),
-				                     ranges[i][1] - ranges[i][0] };
-		if ((barrier || n) && (why = [device gpuBarrier:copies count:n]))
-			return why;
-		if (!pipeline || !target)
-			return rdna4Error(@"a draw without a render pipeline or a colour attachment of this device", 0);
-		if (pipeline.broken)
-			return nil;
 
-		const uint64_t t0 = nowUs();
-		why = [device draw:&dd pipeline:pipeline target:target];
-		if (!why)
-			[cb drewInto:target];
-		// the others: the same pixels (depth equal to what the first wrote, not written again; stencil tested, not written)
-		for (NSUInteger i = 0; i < more.count && !why; i++) {
-			RDNA4Draw again = dd;
-			again.attachment = more[i].unsignedIntValue;
-			if (again.depthGpu)
-				again.depthCompare = MTLCompareFunctionEqual, again.depthWrite = 0;
-			again.stencilWriteMask = 0;
-			RDNA4MTLTexture *t = moreTargets[i];
-			why = [device draw:&again pipeline:pipeline target:t];
+			const uint64_t t0 = nowUs();
+			why = [device draw:&dd pipeline:pipeline target:target];
 			if (!why)
-				[cb drewInto:t];
-		}
-		if (!why && dd.depthWrite)   // a draw sampling it next waits for it (a shadow map: drawn, then read in the same command buffer)
-			[device drewDepth:depthTarget];
-		statAdd(kStatDraws, 1);
-		statAdd(kStatDrawUs, nowUs() - t0);
-		return why;
-	}];
+				[cb drewInto:target];
+			// the others: the same pixels (depth equal to what the first wrote, not written again; stencil tested, not written)
+			for (NSUInteger i = 0; i < more.count && !why; i++) {
+				RDNA4Draw again = dd;
+				again.attachment = more[i].unsignedIntValue;
+				if (again.depthGpu)
+					again.depthCompare = MTLCompareFunctionEqual, again.depthWrite = 0;
+				again.stencilWriteMask = 0;
+				RDNA4MTLTexture *t = moreTargets[i];
+				why = [device draw:&again pipeline:pipeline target:t];
+				if (!why)
+					[cb drewInto:t];
+			}
+			if (!why && dd.depthWrite)   // a draw sampling it next waits for it (a shadow map: drawn, then read in the same command buffer)
+				[device drewDepth:depthTarget];
+			statAdd(kStatDraws, 1);
+			statAdd(kStatDrawUs, nowUs() - t0);
+			return why;
+		}];
+	}
 }
 
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instances
@@ -3827,17 +3835,24 @@ static void eventWait(id event, uint64_t value)
 - (id<MTLBuffer>)stage:(const void *)bytes length:(NSUInteger)length offset:(NSUInteger *)offset
 {
 	enum { kChunk = 256 << 10, kAlone = 64 << 10 };
+	// bytes NULL: zeros (Apple's GL-on-Metal renderer sets a program's uniforms so when it has none to give: OpenMW's first frame
+	// crashed in this memcpy, 2026-11-22)
 	if (length > kAlone) {
 		*offset = 0;
-		return [self.device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared];
+		return bytes ? [self.device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared]
+		             : [self.device newBufferWithLength:length options:MTLResourceStorageModeShared];
 	}
 	if (!_chunk || _chunkUsed + length > kChunk) {
 		_chunk = [self.device newBufferWithLength:kChunk options:MTLResourceStorageModeShared];
 		_chunkUsed = 0;
 	}
 	*offset = _chunkUsed;
-	if (length)
+	if (!_chunk.contents)
+		return nil;   // (no memory for it: the draw reads the spare buffer)
+	if (length && bytes)
 		memcpy((uint8_t *)_chunk.contents + _chunkUsed, bytes, length);
+	else if (length)
+		memset((uint8_t *)_chunk.contents + _chunkUsed, 0, length);
 	_chunkUsed += (length + 255) & ~(NSUInteger)255;
 	return _chunk;
 }
