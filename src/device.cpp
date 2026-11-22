@@ -332,8 +332,20 @@ bool RDNA4Device::mapRegisters() {
 		return false;
 	}
 
-	rmmio = reinterpret_cast<volatile uint32_t *>(rmmioMap->getVirtualAddress());
-	rmmioSize = rmmioMap->getLength();
+	// Do not publish a register aperture until the mapping is demonstrably
+	// usable. A failed/empty mapping must leave all register access disabled.
+	const mach_vm_address_t address = rmmioMap->getVirtualAddress();
+	const IOByteCount length = rmmioMap->getLength();
+	if (!address || length < sizeof(uint32_t) || (length & (sizeof(uint32_t) - 1))) {
+		FBLOG("mmio: rejecting invalid BAR5 mapping (address 0x%llx, length %llu)",
+		      static_cast<uint64_t>(address), static_cast<uint64_t>(length));
+		rmmioMap->release();
+		rmmioMap = nullptr;
+		return false;
+	}
+
+	rmmio = reinterpret_cast<volatile uint32_t *>(address);
+	rmmioSize = static_cast<size_t>(length);
 	FBLOG("mmio: BAR5 mapped, %zu KiB", rmmioSize / 1024);
 	return true;
 }
@@ -348,9 +360,13 @@ void RDNA4Device::unmapRegisters() {
 }
 
 uint32_t RDNA4Device::regRead32(uint32_t byteOffset) const {
-	if (!rmmio || byteOffset + 4 > rmmioSize)
+	// Subtract only after checking the aperture size: byteOffset + 4 can
+	// wrap at UINT32_MAX and accidentally pass an out-of-range access.
+	if (!rmmio || rmmioSize < sizeof(uint32_t) ||
+	    static_cast<size_t>(byteOffset) > rmmioSize - sizeof(uint32_t) ||
+	    (byteOffset & (sizeof(uint32_t) - 1)))
 		return 0xFFFFFFFF;
-	return rmmio[byteOffset / 4];
+	return rmmio[byteOffset / sizeof(uint32_t)];
 }
 
 uint32_t RDNA4Device::regReadDmu(uint8_t baseIdx, uint32_t dwordOffset) const {
