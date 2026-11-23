@@ -622,6 +622,35 @@ void RDNA4Compute::n48nDiscard() {
 	}
 }
 
+// sleepRestoreLocked, rtLock held, the kept heaps back (their page tables and buffers in them): each session's address space
+// again. The pool forgot every pin at the wake's reset (vmPool.unbindAll), so a session may come back under another VMID; the
+// client only reports it. Work on the ring at the sleep was dropped (gfxSleepDrain): its fence reads as reached.
+void RDNA4Compute::n48nResume() {
+	n48nRingDwords = 0;
+	for (N48nState *&s : n48n) {
+		if (!s)
+			continue;
+		s->ringDwords = 0;
+		Vmid::Grant grant;           // only kept with rdna4-vmshared=2 (sleepSaveLocked)
+		bool ok = vmPool.pin(reinterpret_cast<uintptr_t>(s), reinterpret_cast<uintptr_t>(s), 0, grant) == Vmid::Result::Ok;
+		if (ok)
+			s->vmid = grant.vmid;
+		RtClient context {};
+		context.vmid = s->vmid;
+		context.rootPhys = s->client.root();
+		ok = ok && vmContextInit(context);
+		if (!ok) {
+			VLOG("a client could not get its address space back after the sleep");
+			n48nDrop(s);
+			s = nullptr;
+			continue;
+		}
+		*poolDw(static_cast<uint32_t>(s->fencePage)) = s->ringSequence;
+		N48nBackend::flush(s);
+		VLOG("client kept across the sleep: address space %u", s->vmid);
+	}
+}
+
 // A session forgotten without writing to the card: its system memory freed, its address space given back.
 void RDNA4Compute::n48nDrop(N48nState *s) {
 	for (uint32_t h = 1; h < N48N_MAX_BOS; h++) {
@@ -801,7 +830,10 @@ IOReturn RDNA4VulkanClient::externalMethod(uint32_t selector, IOExternalMethodAr
                                            IOExternalMethodDispatch *, OSObject *, void *) {
 	if (!privileged && (selector >= 32 || !(kLocalCalls >> selector & 1)))
 		return kIOReturnNotPrivileged;
-	return compute ? compute->n48nCall(this, selector, args) : kIOReturnNotReady;
+	if (!compute)
+		return kIOReturnNotReady;
+	compute->waitAwake();   // a call during a sleep waits for the wake (a refused submit's semaphore never signals: vkcube froze)
+	return compute->n48nCall(this, selector, args);
 }
 
 IOReturn RDNA4VulkanClient::clientMemoryForType(UInt32 type, IOOptionBits *, IOMemoryDescriptor **memory) {

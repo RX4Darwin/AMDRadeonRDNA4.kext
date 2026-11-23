@@ -5,6 +5,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- **Vulkan apps survive a system sleep**: RADV sessions are kept with the rest of the runtime (their page tables and buffers are
+  in the saved VRAM); each gets its address space back at the wake, and its calls during the sleep wait for the wake instead of
+  failing (a refused submit froze vkcube). The VRAM saved at sleep goes to host memory in 64 MiB pieces: one 542 MiB buffer
+  could not be had, and the wake then dropped every client, WindowServer's included.
+
 ## 0.4.0 (2026-11-22)
 
 **In short** (all on the RX 9070 XT, macOS Tahoe 26.6.2; the sections below and the commits have the details)

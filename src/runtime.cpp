@@ -4351,10 +4351,7 @@ void RDNA4Compute::resetRuntimeForResume() {
 	for (SharedQueue &q : sharedQ)
 		q.up = q.wedged = false;
 	sharedInit = false;
-	vmPool.unbindAll();
-	// ponytail: the Vulkan (N48N) sessions are still dropped across a sleep; what they held in the kept heaps stays taken
-	// until the next boot. Keep them too if a Vulkan app has to survive a sleep.
-	n48nDiscard();
+	vmPool.unbindAll();         // the Vulkan (N48N) sessions too: they get their address spaces back in sleepRestoreLocked
 	dropPendingPresentsLocked(kIOReturnAborted);
 	presentActive = false;
 	presentOwner = nullptr;
@@ -4429,11 +4426,14 @@ void RDNA4Compute::discardRuntimeLocked() {
 
 // One saved range through the bounce buffer, 16 MiB at a time (the cache flushes as dmaCopy's). rtLock held, dmaReady.
 bool RDNA4Compute::sleepCopyRun(const SleepRun &r, bool toGpu) {
-	auto *copy = static_cast<uint8_t *>(sleepCopy->getBytesNoCopy());
 	for (uint64_t done = 0; done < r.bytes;) {
-		const uint32_t n = static_cast<uint32_t>(r.bytes - done < kBounceBytes ? r.bytes - done : kBounceBytes);
+		const uint64_t at = r.at + done, room = kSleepChunk - at % kSleepChunk;
+		uint64_t left = r.bytes - done;
+		left = left < room ? left : room;
+		const uint32_t n = static_cast<uint32_t>(left < kBounceBytes ? left : kBounceBytes);
+		uint8_t *copy = static_cast<uint8_t *>(sleepCopy[at / kSleepChunk]->getBytesNoCopy()) + at % kSleepChunk;
 		if (toGpu) {
-			memcpy(bounceVa, copy + r.at + done, n);
+			memcpy(bounceVa, copy, n);
 			bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
 			if (!bounceCopy(r.mc + done, 0, n, true))
 				return false;
@@ -4442,7 +4442,7 @@ bool RDNA4Compute::sleepCopyRun(const SleepRun &r, bool toGpu) {
 			if (!bounceCopy(r.mc + done, 0, n, false))
 				return false;
 			bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
-			memcpy(copy + r.at + done, bounceVa, n);
+			memcpy(copy, bounceVa, n);
 		}
 		done += n;
 	}
@@ -4450,7 +4450,8 @@ bool RDNA4Compute::sleepCopyRun(const SleepRun &r, bool toGpu) {
 }
 
 void RDNA4Compute::sleepDropSave() {
-	OSSafeReleaseNULL(sleepCopy);
+	for (IOBufferMemoryDescriptor *&c : sleepCopy)
+		OSSafeReleaseNULL(c);
 	if (sleepRuns)
 		IOFree(sleepRuns, sleepRunCount * sizeof(SleepRun));
 	sleepRuns = nullptr;
@@ -4465,6 +4466,8 @@ bool RDNA4Compute::sleepSaveLocked() {
 	uint32_t live = 0;
 	for (const RtClient &c : clients)
 		live += c.active && !c.aborted;
+	for (const N48nState *n : n48n)
+		live += n != nullptr;
 	if (!keep || !live || !vmEnabled || vmShared != 2 || !dmaReady || !bounce) {
 		RLOG("power: sleep: clients not kept (%s)", !keep ? "rdna4-sleepkeep=0" : !live ? "none open" : !dmaReady ? "no copy engine"
 		     : "needs rdna4-vmshared=2");
@@ -4481,9 +4484,14 @@ bool RDNA4Compute::sleepSaveLocked() {
 	if (runs)
 		sleepRuns = static_cast<SleepRun *>(IOMalloc(runs * sizeof(SleepRun)));
 	sleepRunCount = runs;
-	sleepCopy = total ? IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryPageable, total, page_size)
-	                  : nullptr;
-	if (!runs || !sleepRuns || !sleepCopy || !sleepCopy->getBytesNoCopy()) {
+	const uint32_t chunks = static_cast<uint32_t>((total + kSleepChunk - 1) / kSleepChunk);
+	bool have = chunks <= kSleepChunks;
+	for (uint32_t c = 0; have && c < chunks; c++) {
+		const uint64_t bytes = c + 1 < chunks ? kSleepChunk : total - c * kSleepChunk;
+		sleepCopy[c] = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryPageable, bytes, page_size);
+		have = sleepCopy[c] && sleepCopy[c]->getBytesNoCopy();
+	}
+	if (!runs || !sleepRuns || !have) {
 		RLOG("power: sleep: clients not kept: no host memory for %llu MiB in %u range(s)", total >> 20, runs);
 		sleepDropSave();
 		return false;
@@ -4511,7 +4519,7 @@ bool RDNA4Compute::sleepSaveLocked() {
 // shared queues up, every kept client's fences at the last value handed out (what ran at the sleep is not run again).
 bool RDNA4Compute::sleepRestoreLocked() {
 	sleepKept = false;
-	bool ok = dmaReady && bounce && sleepCopy;
+	bool ok = dmaReady && bounce && sleepCopy[0];
 	const uint64_t from = mach_absolute_time();
 	for (uint32_t i = 0; ok && i < sleepRunCount; i++)
 		ok = sleepCopyRun(sleepRuns[i], true);
@@ -4529,6 +4537,8 @@ bool RDNA4Compute::sleepRestoreLocked() {
 			*c.gfxFenceCpu = c.gfxFence;
 		kept++;
 	}
+	if (ok)
+		n48nResume();
 	flushHdp();
 	uint64_t ns = 0;
 	absolutetime_to_nanoseconds(mach_absolute_time() - from, &ns);

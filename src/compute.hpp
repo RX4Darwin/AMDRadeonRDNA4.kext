@@ -265,8 +265,11 @@ private:
 	// the card loses its power, the clients, buffers, programs and page tables left as they were, and the memory copied back at
 	// the same VRAM addresses when the wake's runtime is published. The native Metal device's clients, WindowServer among them,
 	// go on after the wake (before, each was aborted and WindowServer died, 2026-11-22). rdna4-sleepkeep=0: discarded as before.
-	struct SleepRun { uint64_t mc, bytes, at; };   // a VRAM range and where its bytes are in sleepCopy
-	IOBufferMemoryDescriptor *sleepCopy { nullptr };
+	struct SleepRun { uint64_t mc, bytes, at; };   // a VRAM range and where its bytes are in the sleepCopy chunks
+	// 64 MiB pieces: one 542 MiB buffer (desktop + vkcube) could not be had (card, 2026-11-23), 457 MiB could.
+	static constexpr uint64_t kSleepChunk = 64ull << 20;
+	static constexpr uint32_t kSleepChunks = 64;     // 4 GiB
+	IOBufferMemoryDescriptor *sleepCopy[kSleepChunks] {};
 	SleepRun *sleepRuns { nullptr };
 	uint32_t  sleepRunCount { 0 };
 	bool      sleepKept { false };     // saved: the wake keeps the clients, publishRuntime copies the memory back
@@ -809,6 +812,7 @@ private:
 	N48nState *n48nOf(const void *owner) const;
 	void n48nReleaseVmid(N48nState *s);
 	void     n48nDiscard();        // the card lost its memory under the clients (sleep): forget them, write nothing
+	void     n48nResume();         // the heaps kept across a sleep: each client's address space set up again
 	void     n48nDrop(N48nState *s);
 	struct N48nView;
 	N48nView *n48nViews { nullptr };   // what processes map of the pool heap's buffers (n48nMemory), kept for the boot
