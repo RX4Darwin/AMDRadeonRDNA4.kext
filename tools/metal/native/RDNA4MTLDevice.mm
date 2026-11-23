@@ -2055,6 +2055,7 @@ static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFun
 @interface RDNA4MTLComputePipeline : NSObject <MTLComputePipelineState>
 @property (readonly) rdna4_program_t program;
 @property (readonly) uint32_t buffers;   // the kernargs' buffer addresses: indices 0 .. buffers - 1
+@property (readonly) BOOL indicesOnly;   // Apple's GL renderer's fixIndexBuffer: it touches nothing but index memory
 @end
 
 @implementation RDNA4MTLComputePipeline {
@@ -2067,6 +2068,7 @@ static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFun
 	if (!(self = [super init]))
 		return nil;
 	_device = device;
+	_indicesOnly = [function.name isEqualToString:@"fixIndexBuffer"];
 	NSError *why = [self loadFunction:function];
 	if (why && error)
 		*error = why;
@@ -2160,6 +2162,7 @@ typedef struct {
 	uint32_t depthOnly;                 // the pass has no colour attachment: drawn into a stand-in (standInFor:), colour not written
 } RDNA4Draw;
 
+typedef struct { uint64_t in, inBytes, out, outBytes; } RDNA4IndexJob;   // what a fixIndexBuffer dispatch reads and writes (outBytes 0: not one)
 typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // GPU addresses; src 0: a fill with the pattern
 
 @interface RDNA4MTLDevice ()
@@ -2178,7 +2181,8 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 - (NSError *)gpuBarrier:(const RDNA4Copy *)copies count:(uint32_t)count;
 // A kernel on the gfx ring behind the draws before it, not waited for (GL apps, or RDNA4_RINGDISPATCH=1); NO: not one it takes (scratch, other user data)
 - (BOOL)canDispatchOnRing:(const rdna4_program_t *)k;
-- (NSError *)dispatchOnRing:(const rdna4_program_t *)k groups:(const uint32_t[3])groups size:(const uint32_t[3])size args:(NSData *)args;
+- (NSError *)dispatchOnRing:(const rdna4_program_t *)k groups:(const uint32_t[3])groups size:(const uint32_t[3])size args:(NSData *)args
+                     indices:(RDNA4IndexJob)job;
 @end
 
 // Whether the card is done with a resource, as Apple's GL-on-Metal renderer asks (-isComplete, -isWriteComplete, -waitUntilComplete,
@@ -2502,7 +2506,7 @@ static id<MTLFunction> noFragmentFunction(RDNA4MTLDevice *device)
 		if (_blob[k].length < 4 * kHead || h[0] != kRgfxMagic || h[1] != (uint32_t)k + 1 || h[2] > room[k] || (h[7] & 0xffff) > 16 ||
 		    4ull * kHead + h[2] + 8ull * (h[7] & 0xffff) > _blob[k].length)
 			return rdna4Error([NSString stringWithFormat:@"%@: not a %s shader that fits its slot", fn[k].name, k ? "fragment" : "vertex"], 0);
-		if (h[7] & 0x7fff0000u & ~(k ? 0x7ffd0000u : 0x00010000u))   // (several attachments: the PV host's choice; bit 18 dual source, 19 depth)
+		if (h[7] & 0x7fff0000u & ~(k ? 0x7fff0000u : 0x00030000u))   // (several attachments: the PV host's choice; bit 17 writes memory, 18 dual source, 19 depth)
 			return rdna4Error([NSString stringWithFormat:@"%@: attributes 0x%x not supported yet", fn[k].name, h[7]], 0);
 	}
 	for (int k = 0; k < 2; k++) {   // the records after the values (TXRD, POSM)
@@ -2967,11 +2971,20 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 		if (plain && [device canDispatchOnRing:&ringProg]) {
 			const std::array<uint32_t, 3> g = { (uint32_t)groups.width, (uint32_t)groups.height, (uint32_t)groups.depth };
 			const std::array<uint32_t, 3> s = { (uint32_t)groupSize.width, (uint32_t)groupSize.height, (uint32_t)groupSize.depth };
+			// fixIndexBuffer's memory: buffer 0 the indices in (if any), 1 those out, buffer 2's first word how many go in. Each thread is one
+			// primitive and writes at most 6 indices of at most 4 bytes (a quad's two triangles). A triangle list writes 3; 2 threads over
+			// 6 indices could also be a quad strip, so they count as 6 each.
+			RDNA4IndexJob job = {};
+			if (pipeline.indicesOnly && _bound[1] && _bound[2].contents && _addresses[2] + 4 <= _bound[2].gpuAddress + _bound[2].length) {
+				const uint64_t in = *(const uint32_t *)((const uint8_t *)_bound[2].contents + (_addresses[2] - _bound[2].gpuAddress));
+				const uint64_t threads = grid.width * grid.height * grid.depth, out = (in == 3 * threads && threads != 2 ? 3 : 6) * threads;
+				job = { _bound[0] ? _addresses[0] : 0, _bound[0] ? 4 * in : 0, _addresses[1], 4 * out };
+			}
 			[_commandBuffer recordDraw:^NSError * {
 				(void)held;
 				const uint64_t t0 = nowUs();
 				rdna4_program_t prog = pipeline.program;
-				NSError *why = [device dispatchOnRing:&prog groups:g.data() size:s.data() args:args];
+				NSError *why = [device dispatchOnRing:&prog groups:g.data() size:s.data() args:args indices:job];
 				for (RDNA4MTLTexture *t in kernelTextures) {   // what the kernel may have written (as below)
 					[t wroteAll];
 					[t heldRows:0 to:(uint32_t)t.height width:(uint32_t)t.width];
@@ -4270,6 +4283,37 @@ static uint32_t *streamReg(uint32_t *ib, uint32_t n, uint32_t opcode, uint32_t r
 	return NULL;
 }
 
+// A draw's stream for a run of draws that overlap on the card (draw:pipeline:target:): its end no longer flushes the colour and depth caches
+// (the run's end does) and, behind the run's first draw, it leaves out what makes the card wait for everything before it: the cache
+// invalidation, the occlusion event, the bottom-of-pipe event and PWS wait, and the ring registers they guard.
+// False: not the layout expected, and the stream is unchanged.
+static bool overlapStream(uint32_t *ib, uint32_t n, bool behindFirst)
+{
+	uint32_t acquire[2], release[2], rings[2], event = 0, acquires = 0, releases = 0, ringWrites = 0, events = 0;
+	for (uint32_t i = 0; i + 1 < n;) {
+		const uint32_t h = ib[i], opcode = (h >> 8) & 0xff;
+		if ((h >> 30) != 3)
+			return false;
+		if (opcode == 0x58 && acquires < 2)                                                  // ACQUIRE_MEM
+			acquire[acquires++] = i;
+		else if (opcode == 0x49 && releases < 2)                                             // RELEASE_MEM
+			release[releases++] = i;
+		else if (opcode == 0x46 && !events++)                                                // EVENT_WRITE: the occlusion counters' control
+			event = i;
+		else if (opcode == 0x79 && (ib[i + 1] == 0x444 || ib[i + 1] == 0x268) && ringWrites < 2)   // the attribute, position and primitive rings
+			rings[ringWrites++] = i;
+		i += 2 + ((h >> 16) & 0x3fff);
+	}
+	if (acquires != 2 || releases != 2 || ringWrites != 2 || events != 1)
+		return false;
+	uint32_t &end = ib[release[1] + 1];
+	end = (end & ~(0x3fu | Pm4::kReleaseGcrGl2Wb | Pm4::kReleaseGcrSeq)) | 0x28;           // BOTTOM_OF_PIPE_TS: its fence word, no cache flush
+	if (behindFirst)
+		for (uint32_t at : { acquire[0], event, acquire[1], release[0], rings[0], rings[1] })
+			ib[at] = 0xc0001000u | (ib[at] & 0x3fff0000u);                                   // a NOP over the packet
+	return true;
+}
+
 static uint32_t floatBits(float f)
 {
 	uint32_t u;
@@ -4528,6 +4572,11 @@ RDNA4_ANSWER_MISSING
 	BOOL _drawsInFlight;                       // a draw since the last drainGfx: drainGfx checks _lastSlot's stream fence word
 	uint32_t _slot, _lastSlot;
 	uint32_t _batchFirst, _batchCount;   // the slots written and not yet submitted (queueSlot, flushBatch): consecutive, from _batchFirst
+	uint32_t _batchTail;                 // dwords in the batch's last slot, before its padding
+	BOOL _overlapRun;                    // draws of a GL app overlapping on the card since the last barrier, in this batch: their caches unflushed
+	uint64_t _runColour, _runDepth;      // what the run draws into
+	uint64_t _runRange[kSlots][2];       // the index memory its draws read and its index jobs wrote, [start, end)
+	uint32_t _runRanges;
 	rdna4_program_t _resolve[2];
 }
 
@@ -4720,23 +4769,34 @@ static void abortStack(int sig)
 
 // Slot `slot`'s IB (n dwords in its page) padded to the page's end with a NOP and added to the batch: the pages of consecutive slots are
 // then one IB. One submit (a kext call, 8 us) a draw was a third of WindowServer's wait for its frames' submits (2026-11-20).
-- (void)queueSlot:(uint32_t)slot dwords:(uint32_t)n
+static void padSlot(uint32_t *page, uint32_t n)
 {
-	uint32_t *page = (uint32_t *)(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE);
 	const uint32_t room = RDNA4_TRIRUN_PAGE / 4 - n;
 	if (room == 1)
 		page[n] = 0xffff1000u;   // the one-dword NOP (PACKET3(NOP, 0x3FFF))
 	else if (room)
 		page[n] = 0xc0001000u | (room - 2) << 16;   // NOP: a header and room - 1 dwords skipped
+}
+
+- (void)queueSlot:(uint32_t)slot dwords:(uint32_t)n
+{
+	padSlot((uint32_t *)(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE), n);
 	if (!_batchCount)
 		_batchFirst = slot;
 	_batchCount++;
+	_batchTail = n;
 }
 
 - (NSError *)flushBatch
 {
 	if (!_batchCount)
 		return nil;
+	if (_overlapRun) {   // the run's caches written back and waited for, behind its last slot: nothing after this IB finds them dirty
+		uint32_t *page = (uint32_t *)(_ibCpu + (uint64_t)(_batchFirst + _batchCount - 1) * RDNA4_TRIRUN_PAGE);
+		const uint32_t tail = _batchTail + [self idleBarrier:page + _batchTail];
+		padSlot(page, tail);
+		_overlapRun = NO;
+	}
 	__sync_synchronize();   // the pages in memory before the card reads them
 	const uint64_t t0 = nowUs();
 	uint64_t fence = 0;
@@ -4801,6 +4861,7 @@ static void abortStack(int sig)
 	memcpy(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE, ib, n * 4);
 	[self queueSlot:slot dwords:n];   // (_lastSlot stays the last draw's: its stream fence is what drainGfx checks)
 	_slotPipe[slot] = nil;
+	_overlapRun = NO;
 	[_drawnInFlight removeAllObjects];
 	statAdd(kStatSelfReads, total ? 1 : 0);
 	statAdd(kStatSelfReadBytes, total);
@@ -4921,6 +4982,7 @@ static void abortStack(int sig)
 // kernargs in the slot's state page, past its stream fence word), DISPATCH_DIRECT as a compute packet (SHADER_TYPE 1), the idle barrier
 // again for what reads its results. Register offsets: GC seg0 (src/gfxregs.hpp) + 0x1260 - SET_SH_REG's 0x2c00.
 - (NSError *)dispatchOnRing:(const rdna4_program_t *)k groups:(const uint32_t[3])groups size:(const uint32_t[3])size args:(NSData *)args
+                     indices:(RDNA4IndexJob)job
 {
 	const uint64_t kernargBytes = MAX((uint64_t)args.length, k->kernargBytes);
 	if (kernargBytes > kMiscBytes - 0x100)
@@ -4934,9 +4996,23 @@ static void abortStack(int sig)
 	memcpy(kernarg, args.bytes, args.length);
 	const uint64_t kernargGpu = _misc.gpu + (uint64_t)slot * kMiscBytes + 0x100;
 	const uint32_t lds = ((uint32_t)k->ldsBytes + 1023) / 1024 * 1024 / 512;   // ldsSizeField: 1 KiB granules in 512-byte units
-	uint32_t ib[96], n = [self idleBarrier:ib];
+	// Apple's GL renderer's fixIndexBuffer, inside a run of draws: while its memory is none that the run's draws and jobs have used, the draws
+	// before it go on, and the draw after it needs it finished, nothing more (CS_PARTIAL_FLUSH). The run's first draw invalidated the caches.
+	// GL reuses these outputs and counts on Metal's hazard tracking: about 3 % of the jobs write the indices of one of the 4 draws before them,
+	// and written under a draw still reading them, that draw fetched vertices from wild addresses and its wave stopped (MEMVIOL, 2026-11-23).
+	auto untouched = [&](uint64_t at, uint64_t bytes) {
+		for (uint32_t i = 0; i < _runRanges; i++)
+			if (at < _runRange[i][1] && _runRange[i][0] < at + bytes)
+				return false;
+		return true;
+	};
+	const BOOL inRun = job.outBytes && _overlapRun && untouched(job.out, job.outBytes) && (!job.inBytes || untouched(job.in, job.inBytes));
+	if (inRun)
+		_runRange[_runRanges][0] = job.out, _runRange[_runRanges][1] = job.out + job.outBytes, _runRanges++;
+	uint32_t ib[96], n = inRun ? 0 : [self idleBarrier:ib];
 	const uint32_t acquire[8] = { 0xc0065800u, 0, 0xffffffffu, 0x00ffffffu, 0, 0, 0x0000000au, 0x0000c3b1u };
-	memcpy(ib + n, acquire, sizeof acquire), n += 8;
+	if (!inRun)
+		memcpy(ib + n, acquire, sizeof acquire), n += 8;
 	auto sh = [&](uint32_t reg, std::initializer_list<uint32_t> v) {
 		ib[n++] = 0xc0007600u | (uint32_t)v.size() << 16;
 		ib[n++] = reg;
@@ -4960,7 +5036,10 @@ static void abortStack(int sig)
 	ib[n++] = 1u | 1u << 2 | (k->properties & 1u << 10 ? 1u << 15 : 0u);   // COMPUTE_SHADER_EN, FORCE_START_AT_000, CS_W32_EN
 	// The kernel done before the barrier: RELEASE_MEM implies only the vertex and pixel stages idle (Mesa's ac_barrier.c).
 	ib[n++] = Pm4::header(Pm4::OpEventWrite, 0), ib[n++] = 7u | 4u << 8;   // EVENT_WRITE: CS_PARTIAL_FLUSH, EVENT_INDEX 4
-	n += [self idleBarrier:ib + n];
+	if (!inRun) {
+		n += [self idleBarrier:ib + n];
+		_overlapRun = NO;
+	}
 	memcpy(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE, ib, n * 4);
 	__sync_synchronize();
 	[self queueSlot:slot dwords:n];   // (_lastSlot stays the last draw's: its stream fence is what drainGfx checks)
@@ -5013,6 +5092,14 @@ static void abortStack(int sig)
 		                                             (unsigned long)[p formatOf:d->attachment], (unsigned long)t.pixelFormat], 0);
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];   // built here and copied into the slot's pages: draws are made on the work queue only
 	static uint64_t misc[kMiscBytes / 8];
+	// A GL app's draws into the same targets overlap on the card: each used to wait for everything before it and flush the caches behind
+	// it, and OpenMW's 2200 draws a frame ran one at a time (2026-11-23). Another target ends the run with a barrier, as does the batch's end. RDNA4_OVERLAP=0 or 1 decides for a process.
+	static const char *const overlapEnv = getenv("RDNA4_OVERLAP");
+	// (A shader that writes memory is not in a run: what the draws after it read of that memory needs it finished.)
+	const BOOL overlap = (overlapEnv ? atoi(overlapEnv) == 1 : gGlPrograms.load()) && !((p.vs[7] | p.ps[7]) >> 17 & 1);
+	if (_overlapRun && (!overlap || t.gpuBase != _runColour || d->depthGpu != _runDepth))
+		if (NSError *why = [self gpuBarrier:NULL count:0])
+			return why;
 	uint32_t slot = 0;
 	NSError *taken = [self takeSlot:&slot];
 	if (taken)
@@ -5092,10 +5179,15 @@ static void abortStack(int sig)
 		{ 0x69, 0x302, kLocs[logSamples] }, { 0x69, 0x306, kLocs[logSamples] }, { 0x69, 0x30a, kLocs[logSamples] }, { 0x69, 0x317, kMaxDist[logSamples] },
 	};
 	for (size_t i = 0; i < sizeof patch / sizeof patch[0]; i++) {
-		uint32_t *at = streamReg(ib, n, patch[i].opcode, patch[i].reg);
-		if (!at)
-			return rdna4Error([NSString stringWithFormat:@"the stream lacks register 0x%x", patch[i].reg], 0);
-		*at = patch[i].value;
+		static uint16_t places[2][sizeof patch / sizeof patch[0]];   // where each register is in a stream of this kind: walking there 60 times a draw was slow
+		uint16_t &place = places[outs ? 1 : 0][i];
+		if (!place) {
+			const uint32_t *at = streamReg(ib, n, patch[i].opcode, patch[i].reg);
+			if (!at)
+				return rdna4Error([NSString stringWithFormat:@"the stream lacks register 0x%x", patch[i].reg], 0);
+			place = (uint16_t)(at - ib);
+		}
+		ib[place] = patch[i].value;
 	}
 	// The stages' tables in the state page (unbound buffers: a zeroed spare, as the PV host), the fence word at +0 zeroed.
 	const BOOL levels = (vs[7] | ps[7]) >> 16 & 1;   // a stage samples at explicit LODs: levels 1-7 of each texture (one level: level 0's T#)
@@ -5212,6 +5304,8 @@ static void abortStack(int sig)
 			return rdna4Error(@"the stream lacks a shader's RSRC2", 0);
 		*at = (*at & ~0x3003eu) | rsrc2[i][1] << 1 | rsrc2[i][2];
 	}
+	if (overlap && (total + 16 > RDNA4_TRIRUN_PAGE / 4 || !overlapStream(ib, total, _overlapRun)))   // (the run's end barrier fits behind it)
+		return rdna4Error([NSString stringWithFormat:@"a draw's stream of %u dwords cannot overlap", total], 0);
 	for (unsigned st = 0; levels && st < 2; st++)   // each level's own image (a texture of fewer levels: its last), unbound ones the spare texel
 		for (uint32_t level = 1; level < RDNA4_MTLC_LEVELS; level++) {
 			uint8_t *at = (uint8_t *)misc + kMiscTables + RDNA4_MTLC_LEVEL_STRIDE * (level - 1) + 0x400 * st;
@@ -5232,6 +5326,12 @@ static void abortStack(int sig)
 	pad.queued = true;
 	_lastSlot = slot;
 	_drawsInFlight = YES;
+	if (overlap) {
+		_runRanges = _overlapRun ? _runRanges : 0;
+		_overlapRun = YES, _runColour = t.gpuBase, _runDepth = d->depthGpu;
+		if (d->indexGpu)
+			_runRange[_runRanges][0] = d->indexGpu, _runRange[_runRanges][1] = d->indexGpu + (uint64_t)d->count * d->indexBytes, _runRanges++;
+	}
 	const uint32_t cx = d->covered[0], cy = d->covered[1], cx2 = MIN(cx + d->covered[2], (uint32_t)t.width), cy2 = MIN(cy + d->covered[3], (uint32_t)t.height);
 	if (cx < cx2 && cy < cy2)
 		statAdd(t.onSurface ? kStatDrawnSurface : kStatDrawnOwn, (uint64_t)(cx2 - cx) * (cy2 - cy) * t.bpp);

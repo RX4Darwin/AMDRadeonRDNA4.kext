@@ -20,6 +20,10 @@ otherwise). The newest version is on top. How versions and branches work is in `
   comes before the shader's one final export.
 - **No more black boxes in OpenMW's menus**: the pool of freed buffers is limited to 1024. Without a limit on their number it could use
   up the app's kext buffers, and new textures were refused.
+- **OpenMW runs about half again as fast** (about 10 to 15 fps at one spot in Seyda Neen): a GL app's draws into one target now
+  overlap on the card. Each used to wait for everything before it and flush the colour and depth caches behind it; now the end of
+  the run flushes them. Apple's per-draw index job stays inside the run when its memory is none the run has used, and finding a
+  draw's registers no longer walks its stream 60 times. `RDNA4_OVERLAP=0` turns the overlap off for a process.
 
 ## 0.4.0 (2026-11-22)
 
