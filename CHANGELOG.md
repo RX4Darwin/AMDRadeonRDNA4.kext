@@ -12,6 +12,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - **OpenMW's shader water works**: GL programs are compiled with their pipeline's stage data, as Metal's own requests are; the GL
   state sent in its place was read as an offset and crashed Metal's compiler service. Identical render pipelines are now reused:
   Apple's GL renderer asked for its blits thousands of times, until allocations failed and it aborted.
+- **GL apps run their compute work on the graphics ring**: Apple's renderer runs a kernel per draw, and each was a round trip through
+  the kext. OpenMW draws about twice as much (57k to 110k draws in 5 s). The ring's dispatch now waits for the kernel
+  (`CS_PARTIAL_FLUSH`): without it the ring hung within a minute. `RDNA4_RINGDISPATCH=0` turns it off for a process.
 
 ## 0.4.0 (2026-11-22)
 

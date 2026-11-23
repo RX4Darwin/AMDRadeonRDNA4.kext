@@ -1762,6 +1762,7 @@ static NSError *translateByKext(rdna4_t *gpu, NSData *air, NSString *name, NSDat
 // is a metallib, an NSString error) in the struct the completion handler gets: its layout is Tahoe 26.6.2's MTLCompiler private.
 static __weak id<MTLDevice> gGlDevice;   // the process's device (initNativeWithAcceleratorPort:): a GL function's own -device is nil
 static char kGlAir;                      // associated-object key: a GL function's {stage data: @[metallib, reflection or null]}
+static std::atomic<bool> gGlPrograms;    // this process draws through Apple's GL renderer (canDispatchOnRing)
 
 // A GL program's state (its pluginData); nil for any other function
 static NSData *glState(id<MTLFunction> function)
@@ -1803,6 +1804,7 @@ static NSArray *glProgram(id<MTLFunction> function, NSData *stage)
 	NSData *state = stage ? glState(function) : nil;
 	if (!state)
 		return nil;
+	gGlPrograms = true;
 	const unsigned char type = ((unsigned char (*)(id, SEL))objc_msgSend)(f, @selector(bitcodeType));
 	NSMutableDictionary *programs;
 	@synchronized(f) {
@@ -2171,7 +2173,7 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 - (void)drewDepth:(RDNA4MTLTexture *)t;      // (work queue) a draw wrote its depth: in flight as a draw's target is
 // On the card, before the next draw: a wait for the draws in flight, then the copies (none: the wait alone)
 - (NSError *)gpuBarrier:(const RDNA4Copy *)copies count:(uint32_t)count;
-// A kernel on the gfx ring behind the draws before it, not waited for (RDNA4_RINGDISPATCH=1); NO: not one it takes (scratch, other user data)
+// A kernel on the gfx ring behind the draws before it, not waited for (GL apps, or RDNA4_RINGDISPATCH=1); NO: not one it takes (scratch, other user data)
 - (BOOL)canDispatchOnRing:(const rdna4_program_t *)k;
 - (NSError *)dispatchOnRing:(const rdna4_program_t *)k groups:(const uint32_t[3])groups size:(const uint32_t[3])size args:(NSData *)args;
 @end
@@ -4903,7 +4905,10 @@ static void abortStack(int sig)
 // Scratch and user data other than the kernarg pointer stay with the kext's dispatch (rdna4_dispatch).
 - (BOOL)canDispatchOnRing:(const rdna4_program_t *)k
 {
-	static const BOOL on = getenv("RDNA4_RINGDISPATCH") && atoi(getenv("RDNA4_RINGDISPATCH")) == 1;
+	// On for GL apps (Apple's renderer runs a kernel per draw: OpenMW spent over half its time in those round trips, and drew twice as
+	// much on the ring, 2026-11-23); elsewhere opt-in, not yet run under WindowServer. RDNA4_RINGDISPATCH=0 or 1 decides for a process.
+	static const char *const env = getenv("RDNA4_RINGDISPATCH");
+	const BOOL on = env ? atoi(env) == 1 : gGlPrograms.load();
 	const uint32_t user = (k->rsrc2 >> 1) & 0x1f;
 	return on && self.gfx && !(k->rsrc2 & 1) && user == ((k->properties >> 3 & 1) ? 2u : 0u) && !(k->properties & 1u << 1);
 }
@@ -4950,6 +4955,9 @@ static void abortStack(int sig)
 	ib[n++] = 0xc0031502u;   // DISPATCH_DIRECT, SHADER_TYPE compute
 	ib[n++] = groups[0], ib[n++] = groups[1], ib[n++] = groups[2];
 	ib[n++] = 1u | 1u << 2 | (k->properties & 1u << 10 ? 1u << 15 : 0u);   // COMPUTE_SHADER_EN, FORCE_START_AT_000, CS_W32_EN
+	// The kernel done before the barrier: RELEASE_MEM implies only the vertex and pixel stages idle (Mesa's ac_barrier.c). Without it the
+	// gfx ring hung within a minute of OpenMW, its shader stage busy (2026-11-23).
+	ib[n++] = Pm4::header(Pm4::OpEventWrite, 0), ib[n++] = 7u | 4u << 8;   // EVENT_WRITE: CS_PARTIAL_FLUSH, EVENT_INDEX 4
 	n += [self idleBarrier:ib + n];
 	memcpy(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE, ib, n * 4);
 	__sync_synchronize();
