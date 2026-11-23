@@ -58,6 +58,13 @@ git tag -a v0.1.0 -m "AMDRadeonRDNA4 0.1.0"
 git push origin main v0.1.0
 ```
 
+Build the release zips from the tag, with `tools/package/efi.sh` beside the kext, and go through
+[docs/licenses.md](docs/licenses.md). Upload the checksums with the zips:
+
+```bash
+shasum -a 256 AMDRadeonRDNA4-*.zip > SHA256SUMS
+```
+
 Then, on `next`, raise `VERSION` to the following one and open its section in `CHANGELOG.md`. After a `PATCH`
 release `VERSION` goes back to the `MINOR` version `next` was heading for, and its section starts with "After 0.x.y".
 

@@ -53,8 +53,8 @@ daemon() {
 r=$w/core-root
 mkdir -p "$r/Library/GPUBundles" "$r/Library/LaunchDaemons" "$r/usr/local/bin"
 cp -R "$dir/$bundle" "$r/Library/GPUBundles/"
-cp tools/package/uninstall.sh "$r/Library/GPUBundles/$bundle/Contents/Resources/uninstall.sh"
-codesign -s - -f "$r/Library/GPUBundles/$bundle" > /dev/null 2>&1   # (the uninstaller is part of its resources)
+cp tools/package/uninstall.sh tools/package/efi.sh "$r/Library/GPUBundles/$bundle/Contents/Resources/"
+codesign -s - -f "$r/Library/GPUBundles/$bundle" > /dev/null 2>&1   # (the scripts are part of its resources)
 daemon "$r/Library/LaunchDaemons/org.rdna4.air2amdgpu.plist" org.rdna4.air2amdgpu "$helpers/air2amdgpu" --serve -- \
 	'<key>KeepAlive</key><true/>' '<key>ProcessType</key><string>Interactive</string>' '<key>ThrottleInterval</key><integer>10</integer>' \
 	'<key>StandardErrorPath</key><string>/var/log/rdna4-air2amdgpu.log</string>'

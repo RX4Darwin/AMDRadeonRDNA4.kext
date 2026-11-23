@@ -189,6 +189,44 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 Keep a known-good copy of your EFI on a USB stick while testing. `rdna4-off=1` turns the plugin off and `-liluoff` all
 Lilu plugins; macOS then runs its stock framebuffer.
 
+### OpenCore settings
+
+**Install macOS first**, with the kext disabled or with `rdna4-off=1`. The macOS installer and Recovery do not have the Metal
+driver from the package. Then enable the kext and install the package.
+
+| Setting | Value | Why |
+|---|---|---|
+| Lilu | 1.7.1 or newer, in `Kernel → Add` before this kext | Older Lilu turns itself off on macOS 26 |
+| Other GPU kexts | WhateverGreen, NootRX and older copies of this driver disabled, their boot-args removed | Only one driver can claim the card |
+| `Misc → Security → SecureBootModel` | `Disabled` | Apple Secure Boot refuses kexts Apple did not sign |
+| `csr-active-config` | `03000000` or looser | Bit `0x2` lets WindowServer load the Metal driver |
+| `boot-args` | `amfi_get_out_of_my_way=0x1` (or AMFIPass), no old `rdna4-*` options | The defaults need no driver options |
+| `NVRAM → Delete → 7C436110-AB2A-4BBB-A880-FE41995C9F82` | list `boot-args` and `csr-active-config` | Otherwise OpenCore keeps the stored value and logs `ignored, exists` |
+| BIOS | Above 4G Decoding on, CSM off | The card's apertures need it |
+| BAR0 | 256 MiB is the tested size (Resizable BAR off); check it in `ioreg` | With a much smaller BAR0 the compute runtime has no room and stays off |
+| USB | A port map (on Tahoe, USBToolBox 1.2.0 or newer) | Without one the keyboard and mouse may not work at all |
+| System sleep | If USB does not wake the machine: USBWakeFixup and an `SSDT-USBW` for your board's GPE | Some boards wake USB through a GPE nothing claims (GPE 8 on the main test system) |
+
+`tools/package/efi.sh` (also in the driver bundle's `Contents/Resources`) applies the kext, boot-args and `NVRAM → Delete` parts of this
+table to a mounted EFI, and keeps a backup. It reports SIP and Secure Boot without changing them. It has been tested against sample
+configs, not yet on a real EFI, so keep your USB copy. Try it with `--dry-run` first:
+
+```bash
+sh tools/package/efi.sh install --efi /Volumes/EFI --kext AMDRadeonRDNA4.kext --dry-run
+```
+
+Check a config without changing it:
+
+```bash
+sh tools/package/efi.sh check --efi /Volumes/EFI
+```
+
+Go back to the `config.plist` and kext from before the last install:
+
+```bash
+sh tools/package/efi.sh remove --efi /Volumes/EFI
+```
+
 ### Updating from 0.3.3
 
 0.4.0 needs no boot-args: what 0.3 asked for is built in, and its desktop is now the driver's own accelerator
@@ -387,4 +425,4 @@ BSD-2-Clause-Patent; the rest of the repository is BSD-3-Clause.
 
 What each directory and source file is: [docs/index.md](docs/index.md). The design notes and measurements of the
 paravirtual GPU are in `docs/m0-pvgpu.md` and `docs/m1-stream.md`, the native Metal driver's in
-`docs/native-metal-spike.md`.
+`docs/native-metal-spike.md`. The licences of what a release ships: [docs/licenses.md](docs/licenses.md).

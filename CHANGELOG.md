@@ -24,6 +24,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
   overlap on the card. Each used to wait for everything before it and flush the colour and depth caches behind it; now the end of
   the run flushes them. Apple's per-draw index job stays inside the run when its memory is none the run has used, and finding a
   draw's registers no longer walks its stream 60 times. `RDNA4_OVERLAP=0` turns the overlap off for a process.
+- **A script for the OpenCore side of the install** (`tools/package/efi.sh`): `check`, `install` and `remove`. It backs up
+  `config.plist` and the kext, adds the kext after Lilu, turns off drivers that claim the card, cleans old boot-args, lists
+  `boot-args` under `NVRAM → Delete`, and `remove` restores the backup byte for byte. Tested against sample configs, not yet on a real EFI.
+- **Licences**: the kext and driver bundle now carry the licence texts of what they contain (Lilu, MacKernelSDK, amdgpu, Mesa, LLVM,
+  Navi48-MacOS); earlier releases carried only AMD's firmware licence. The README has the OpenCore settings in one table.
 
 ## 0.4.0 (2026-11-22)
 

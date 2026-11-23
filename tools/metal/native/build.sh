@@ -61,6 +61,7 @@ fi
 
 xcrun -sdk macosx metal -c tools/metal/native/rdna4.metal -o Build/native/rdna4.air
 xcrun -sdk macosx metallib Build/native/rdna4.air -o "$c/Resources/rdna4.metallib"
+sh tools/package/licenses.sh bundle "$out"
 for f in "$c/Frameworks/"* "$c/Helpers/"*; do
 	[ -e "$f" ] && codesign -s - -f "$f" > /dev/null 2>&1
 done

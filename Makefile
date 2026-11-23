@@ -155,10 +155,11 @@ kext: check-config $(LILU_STAMP)
 		LILU_SHIM=$(UP_$(VMTEST))/$(LILU_SHIM))
 	@cp $(OBJDIR)/$(PRODUCT) $(KEXT)/Contents/MacOS/$(PRODUCT)
 	@sed 's/@VERSION@/$(VERSION)/' Info.plist > $(KEXT)/Contents/Info.plist
-	@# AMD's firmware license travels with the binary that embeds its firmware.
+	@# The licences of what the binary contains; AMD's firmware license only with its firmware.
 	@rm -rf $(KEXT)/Contents/Resources; \
+	sh tools/package/licenses.sh kext $(KEXT)/Contents/Resources; \
 	if ! grep -q NO_FIRMWARE $(OBJDIR)/fwconfig.h && [ -f $(FW_DIR)/LICENSE.amdgpu ]; then \
-		mkdir -p $(KEXT)/Contents/Resources && cp $(FW_DIR)/LICENSE.amdgpu $(KEXT)/Contents/Resources/LICENSE.amdgpu; fi
+		cp $(FW_DIR)/LICENSE.amdgpu $(KEXT)/Contents/Resources/LICENSE.amdgpu; fi
 	@# Minimal, ad-hoc code signature so kextutil is happier during testing.
 	@codesign --force --sign - $(KEXT) 2>/dev/null || true
 	@echo "Built $(KEXT) for $(ARCH) (min macOS $(DEPLOY))"
@@ -344,6 +345,7 @@ test: $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(DMUBLOAD_TEST) $(HOST)/test-
 	$(HOST)/test-gfx12tri
 	$(HOST)/test-gfx12tricol
 	$(HOST)/test-w12k-pm4
+	sh test/test-efi.sh
 	bash test/check-isa.sh
 
 # --- cleaning ----------------------------------------------------------------
