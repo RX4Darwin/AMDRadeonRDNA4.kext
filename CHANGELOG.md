@@ -13,8 +13,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
   state sent in its place was read as an offset and crashed Metal's compiler service. Identical render pipelines are now reused:
   Apple's GL renderer asked for its blits thousands of times, until allocations failed and it aborted.
 - **GL apps run their compute work on the graphics ring**: Apple's renderer runs a kernel per draw, and each was a round trip through
-  the kext. OpenMW draws about twice as much (57k to 110k draws in 5 s). The ring's dispatch now waits for the kernel
-  (`CS_PARTIAL_FLUSH`): without it the ring hung within a minute. `RDNA4_RINGDISPATCH=0` turns it off for a process.
+  the kext. OpenMW draws about twice as much (57k to 110k draws in 5 s). A dispatch on the ring waits for its kernel
+  (`CS_PARTIAL_FLUSH`). `RDNA4_RINGDISPATCH=0` turns it off for a process.
+- **Known issue: OpenMW can hang the GPU** about 40-70 s after a launch, in roughly one launch in three: a GL draw's shader never
+  finishes, the displays freeze and the machine needs a restart. It happens with or without shader water and ring dispatch, and on
+  the driver from before these changes; the cause is not known yet.
 - **No more black boxes in OpenMW's menus**: the pool of freed buffers is limited to 1024. Without a limit on their number it could use
   up the app's kext buffers, and new textures were refused.
 

@@ -4958,8 +4958,7 @@ static void abortStack(int sig)
 	ib[n++] = 0xc0031502u;   // DISPATCH_DIRECT, SHADER_TYPE compute
 	ib[n++] = groups[0], ib[n++] = groups[1], ib[n++] = groups[2];
 	ib[n++] = 1u | 1u << 2 | (k->properties & 1u << 10 ? 1u << 15 : 0u);   // COMPUTE_SHADER_EN, FORCE_START_AT_000, CS_W32_EN
-	// The kernel done before the barrier: RELEASE_MEM implies only the vertex and pixel stages idle (Mesa's ac_barrier.c). Without it the
-	// gfx ring hung within a minute of OpenMW, its shader stage busy (2026-11-23).
+	// The kernel done before the barrier: RELEASE_MEM implies only the vertex and pixel stages idle (Mesa's ac_barrier.c).
 	ib[n++] = Pm4::header(Pm4::OpEventWrite, 0), ib[n++] = 7u | 4u << 8;   // EVENT_WRITE: CS_PARTIAL_FLUSH, EVENT_INDEX 4
 	n += [self idleBarrier:ib + n];
 	memcpy(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE, ib, n * 4);
