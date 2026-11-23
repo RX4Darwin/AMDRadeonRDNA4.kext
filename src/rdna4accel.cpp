@@ -19,10 +19,12 @@
 #include <IOKit/IODeviceTreeSupport.h>
 #include <libkern/OSKextLib.h>
 #include <sys/sysctl.h>
+#include <sys/vnode.h>
 
 #include <IOKit/graphics/IOFramebuffer.h>
 
 #include "accelcensus.hpp"
+#include "compute.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
 #include "pvhooks.hpp"
@@ -1072,6 +1074,45 @@ void bootDone()
 	gBootDone = true;
 }
 
+#ifdef AMDRadeonRDNA4_NO_FIRMWARE
+#define RDNA4_FW_STATE "not built in"
+#else
+#define RDNA4_FW_STATE "built in"
+#endif
+
+#ifndef AMDRadeonRDNA4_VM_TEST
+// WindowServer has reached its first wrangler open (waitForWindowServer): by then the data volume, and with it /Library, is mounted.
+bool gServerAtDoor;
+
+bool metalBundleInstalled()
+{
+	static const char kBundle[] = "/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle/Contents/MacOS/AMDRadeonRDNA4MTLDriver";
+	vfs_context_t ctx = vfs_context_create(nullptr);
+	vnode_t vn = NULLVP;
+	const bool there = ctx && !vnode_lookup(kBundle, 0, &vn, ctx);
+	if (vn != NULLVP)
+		vnode_put(vn);
+	if (ctx)
+		vfs_context_rele(ctx);
+	return there;
+}
+
+// The accelerator names this bundle as its Metal driver, and the macOS installer and Recovery do not have it. /Library is empty until
+// the data volume is mounted, so "not there" counts only once WindowServer is at the door (10 minutes at most: a boot without one).
+bool waitForMetalBundle()
+{
+	for (int ms = 0; ms < 600000; ms += 200) {
+		const bool atDoor = __atomic_load_n(&gServerAtDoor, __ATOMIC_ACQUIRE);   // read first: the last look comes after it was set
+		if (metalBundleInstalled())
+			return true;
+		if (atDoor)
+			return false;
+		IOSleep(200);
+	}
+	return false;
+}
+#endif
+
 void accelAtBoot(void *, wait_result_t)
 {
 	for (int ms = 0; ms < 60000 && !RDNA4AccelCensus::gpu(); ms += 100)
@@ -1083,6 +1124,22 @@ void accelAtBoot(void *, wait_result_t)
 		thread_terminate(current_thread());
 		return;
 	}
+#ifndef AMDRadeonRDNA4_VM_TEST
+	// Without the runtime WindowServer's Metal device has nothing to open (RDNA4ComputeService comes with stage 6 or 7, and needs the
+	// firmware: a kext built without it stops at stage 2 whatever the stage asked for).
+#ifdef AMDRadeonRDNA4_NO_FIRMWARE
+	const bool runtimePossible = false;
+#else
+	const bool runtimePossible = RDNA4Compute::requestedStage() >= RDNA4Compute::StageDispatch;
+#endif
+	if (want == 4 && !runtimePossible) {
+		rdna4Log("AMDRadeonRDNA4: accel: no compute runtime this boot (rdna4-compute=%u, firmware %s): WindowServer stays on the plain "
+		         "framebuffers\n", RDNA4Compute::requestedStage(), RDNA4_FW_STATE);
+		bootDone();
+		thread_terminate(current_thread());
+		return;
+	}
+#endif
 	if (guardIs("pending")) {
 		rdna4Log("AMDRadeonRDNA4: accel: rdna4-accel=%u: the last attempt did not survive %u s (guard \"pending\"): skipped; "
 		         "debug.rdna4_accel=0 clears the guard\n", want, kGuardSeconds);
@@ -1103,6 +1160,16 @@ void accelAtBoot(void *, wait_result_t)
 	OSSafeReleaseNULL(match);
 	OSSafeReleaseNULL(fb);
 	IOSleep(2000);
+#ifndef AMDRadeonRDNA4_VM_TEST
+	if (want == 4 && !waitForMetalBundle()) {
+		rdna4Log("AMDRadeonRDNA4: accel: the Metal driver bundle is not installed (installer or Recovery?): WindowServer stays on the "
+		         "plain framebuffers\n");
+		guardSet("no bundle");   // not "pending": the boot after the package is installed must try
+		bootDone();
+		thread_terminate(current_thread());
+		return;
+	}
+#endif
 	const int err = accelTo(static_cast<int>(want));
 	rdna4Log("AMDRadeonRDNA4: accel: rdna4-accel=%u at boot: %s (%d)\n", want, err ? "FAILED" : "done", err);
 	bootDone();
@@ -1292,6 +1359,9 @@ void RDNA4Accel::waitForWindowServer()
 	if (!Trial::bootArg("rdna4-accel", want) || want != 4)
 		return;
 	rdna4Log("AMDRadeonRDNA4: accel: WindowServer opens the GPU wrangler: held until the accelerator is registered\n");
+#ifndef AMDRadeonRDNA4_VM_TEST
+	__atomic_store_n(&gServerAtDoor, true, __ATOMIC_RELEASE);
+#endif
 	for (int ms = 0; ms < 60000 && !gBootDone; ms += 50)
 		IOSleep(50);
 	// the GPU wrangler takes our accelerator as the GPU's asynchronously (its own work loop, on our registerService): until its
