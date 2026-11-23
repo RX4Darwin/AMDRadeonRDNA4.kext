@@ -15,9 +15,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - **GL apps run their compute work on the graphics ring**: Apple's renderer runs a kernel per draw, and each was a round trip through
   the kext. OpenMW draws about twice as much (57k to 110k draws in 5 s). A dispatch on the ring waits for its kernel
   (`CS_PARTIAL_FLUSH`). `RDNA4_RINGDISPATCH=0` turns it off for a process.
-- **Known issue: OpenMW can hang the GPU** about 40-70 s after a launch, in roughly one launch in three: a GL draw's shader never
-  finishes, the displays freeze and the machine needs a restart. It happens with or without shader water and ring dispatch, and on
-  the driver from before these changes; the cause is not known yet.
+- **OpenMW no longer hangs the GPU**: in about one launch in three its displays froze until a restart. A fragment shader whose wave
+  had all its pixels discarded could export `done` twice, an illegal instruction that stops the wave for good. Every discard now
+  comes before the shader's one final export.
 - **No more black boxes in OpenMW's menus**: the pool of freed buffers is limited to 1024. Without a limit on their number it could use
   up the app's kext buffers, and new textures were refused.
 

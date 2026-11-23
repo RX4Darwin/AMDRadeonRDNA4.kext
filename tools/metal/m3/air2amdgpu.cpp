@@ -1084,8 +1084,8 @@ static std::string legalize(Function &k) {
 			b.CreateFence(AtomicOrdering::AcquireRelease, ctx.getOrInsertSyncScopeID("agent"));
 		} else if (name.starts_with("get_sample_position.")) {   // ponytail: the pixel's centre, as [[sample_id]] is 0 (see there)
 			r = ConstantFP::get(c->getType(), 0.5);
-		} else if (name == "discard_fragment") {   // fragment only: the lane ends
-			b.CreateIntrinsic(Intrinsic::amdgcn_kill, {}, {b.getFalse()});
+		} else if (name == "discard_fragment") {   // fragment only: the lane is demoted, its export and writes are dropped
+			b.CreateIntrinsic(Intrinsic::amdgcn_wqm_demote, {}, {b.getFalse()});
 		} else if (name == "get_read_sampler") {
 			r = PoisonValue::get(c->getType());   // read_texture's sampler operand: unused
 		} else if (op.starts_with("unpack.") || op.starts_with("pack.")) {
@@ -1603,6 +1603,27 @@ struct Kernel {
 	uint32_t texturesWritten;   // bit i: texture index i is written (or read and written)
 };
 
+// A discard's path made to return, before the shader is inlined into its entry, so that the entry's one `done` export comes after every
+// discard. Left `unreachable`, the export sat on the other branch: a wave whose lanes all died on this path had exported `done` already,
+// and the discard's early exit exported `done` again, an illegal instruction that stops the wave for good and hung the gfx ring (OpenMW's
+// alpha-tested draws, 2026-11-23).
+static void returnAfterDiscards(Module &m) {
+	for (Function &f : m)
+		for (BasicBlock &bb : f) {
+			auto *end = dyn_cast<UnreachableInst>(bb.getTerminator());
+			const bool discards = end && any_of(bb, [](Instruction &i) {
+				auto *c = dyn_cast<CallInst>(&i);
+				Function *callee = c ? c->getCalledFunction() : nullptr;
+				return callee && callee->getName().starts_with("air.") && callee->getName().ends_with("discard_fragment");
+			});
+			if (!discards)
+				continue;
+			Type *type = f.getReturnType();
+			ReturnInst::Create(m.getContext(), type->isVoidTy() ? nullptr : PoisonValue::get(type), end->getIterator());
+			end->eraseFromParent();
+		}
+}
+
 // A vertex or fragment function as a gfx12 shader with the hardware ABI of the kext's hand-written triangle shaders, for the host's draws
 // (src/pvgpu.cpp), as an RGFX blob: {char[4] "RGFX", u32 stage (1 vertex, 2 fragment), u32 code bytes, u32 SPI_SHADER_PGM_RSRC1, u32 RSRC2,
 // u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes (bits 0-15 the values between the stages; bit 16 its textures' levels read
@@ -1629,6 +1650,8 @@ struct Kernel {
 // A value between the stages is up to four 32-bit words: float, half, int, short, char or bool, scalar or vector (half widened to float,
 // smaller integers zero-extended).
 static std::string translateShader(Module &m, Function *air, const MDNode *md, bool vertex, Kernel &out) {
+	if (!vertex)
+		returnAfterDiscards(m);
 	LLVMContext &ctx = m.getContext();
 	Type *i32 = Type::getInt32Ty(ctx), *f32 = Type::getFloatTy(ctx);
 	const auto *outputs = md->getNumOperands() > 1 ? dyn_cast<MDNode>(md->getOperand(1)) : nullptr;
