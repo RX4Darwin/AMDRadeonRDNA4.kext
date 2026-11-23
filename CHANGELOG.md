@@ -9,6 +9,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
   in the saved VRAM); each gets its address space back at the wake, and its calls during the sleep wait for the wake instead of
   failing (a refused submit froze vkcube). The VRAM saved at sleep goes to host memory in 64 MiB pieces: one 542 MiB buffer
   could not be had, and the wake then dropped every client, WindowServer's included.
+- **OpenMW's shader water works**: GL programs are compiled with their pipeline's stage data, as Metal's own requests are; the GL
+  state sent in its place was read as an offset and crashed Metal's compiler service. Identical render pipelines are now reused:
+  Apple's GL renderer asked for its blits thousands of times, until allocations failed and it aborted.
 
 ## 0.4.0 (2026-11-22)
 

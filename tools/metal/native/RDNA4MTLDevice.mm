@@ -1754,23 +1754,64 @@ static NSError *translateByKext(rdna4_t *gpu, NSData *air, NSString *name, NSDat
 // An OpenGL program (Apple's GL-on-Metal renderer: GL Core IR, bitcodeType not 0, with its GL state as pluginData) as a metallib of AIR.
 // Only Metal's compiler service turns GL Core IR into AIR (libGLDPlugin's OGLCodeGenService, with the state), on its way to a device's
 // compiler plugin; Apple's paravirtual plugin then packs that AIR as a metallib for its host, so it is asked here: an MTLCompiler with
-// that plugin (as -[AppleParavirtDevice setupCompiler] makes it: target {shader version 2, 2}, flags 0x20), one request per function,
-// the state as the request's frameworkData. ponytail: the reply is found by its content (the dispatch_data that is a metallib, an
-// NSString error) in the struct the completion handler gets: its layout is Tahoe 26.6.2's MTLCompiler private.
+// that plugin (as -[AppleParavirtDevice setupCompiler] makes it: target {shader version 2, 2}, flags 0x20), one request per function.
+// Its frameworkData is the pipeline's serialized stage data (`stage`, glStageData), as Metal's own requests have it: the service reads
+// its first words as offsets of dictionaries. The function's GL state there instead (until 2026-11-23) read GL bits as an offset and
+// crashed the service (MTLDeserializePluginDataDictionary) where that pointed at unmapped memory: OpenMW's water. One AIR per stage data:
+// the plugin may compile a function for its pipeline's attachments. ponytail: the reply is found by its content (the dispatch_data that
+// is a metallib, an NSString error) in the struct the completion handler gets: its layout is Tahoe 26.6.2's MTLCompiler private.
 static __weak id<MTLDevice> gGlDevice;   // the process's device (initNativeWithAcceleratorPort:): a GL function's own -device is nil
-static char kGlAir, kGlReflection;       // associated-object keys: a GL function's metallib and its reflection
+static char kGlAir;                      // associated-object key: a GL function's {stage data: @[metallib, reflection or null]}
 
-static NSData *glProgramAir(id<MTLFunction> function)
+// A GL program's state (its pluginData); nil for any other function
+static NSData *glState(id<MTLFunction> function)
 {
 	id f = function;
-	if (![f respondsToSelector:@selector(pluginData)] || ![f respondsToSelector:@selector(bitcodeType)])
+	if (![f respondsToSelector:@selector(pluginData)] || ![f respondsToSelector:@selector(bitcodeType)] ||
+	    !((unsigned char (*)(id, SEL))objc_msgSend)(f, @selector(bitcodeType)))
 		return nil;
 	NSData *state = [f performSelector:@selector(pluginData)];
-	const unsigned char type = ((unsigned char (*)(id, SEL))objc_msgSend)(f, @selector(bitcodeType));
-	if (!type || ![state isKindOfClass:[NSData class]])
+	return [state isKindOfClass:[NSData class]] ? state : nil;
+}
+
+// A GL pipeline's serialized data for stage k (0 vertex, 1 fragment), as Metal sends it with a function's compile request; nil for other
+// functions. The vertex stage's without its vertex descriptor (bits 1 and 2 of word 2, and the descriptor after the 12-byte header): with
+// it, the service builds Metal's vertex fetch into the program and renames its entry, and this driver fetches vertices itself.
+// ponytail: Tahoe 26.6.2's layout.
+static NSData *glStageData(MTLRenderPipelineDescriptor *desc, int k)
+{
+	typedef id (*NewFragment)(id, SEL, unsigned long long, unsigned long long) __attribute__((ns_returns_retained));
+	typedef id (*NewVertex)(id, SEL, unsigned long long, unsigned long long, NSError **) __attribute__((ns_returns_retained));
+	SEL vertex = sel_registerName("newSerializedVertexDataWithFlags:options:error:"), fragment = sel_registerName("newSerializedFragmentDataWithFlags:options:");
+	if (!glState(k ? desc.fragmentFunction : desc.vertexFunction) || ![desc respondsToSelector:vertex] || ![desc respondsToSelector:fragment])
 		return nil;
-	if (NSData *done = objc_getAssociatedObject(f, &kGlAir))
-		return done;
+	NSError *e = nil;
+	NSData *d = k ? ((NewFragment)objc_msgSend)(desc, fragment, 0, 0) : ((NewVertex)objc_msgSend)(desc, vertex, 0, 0, &e);
+	if (![d isKindOfClass:[NSData class]])   // (a dispatch_data: an NSData)
+		return nil;
+	if (k)
+		return d;
+	if (d.length < 12)
+		return nil;
+	const uint32_t header[3] = { 0, 0, ((const uint32_t *)d.bytes)[2] & ~6u };
+	return [NSData dataWithBytes:header length:sizeof header];
+}
+
+static NSArray *glProgram(id<MTLFunction> function, NSData *stage)
+{
+	id f = function;
+	NSData *state = stage ? glState(function) : nil;
+	if (!state)
+		return nil;
+	const unsigned char type = ((unsigned char (*)(id, SEL))objc_msgSend)(f, @selector(bitcodeType));
+	NSMutableDictionary *programs;
+	@synchronized(f) {
+		programs = objc_getAssociatedObject(f, &kGlAir);
+		if (!programs)
+			objc_setAssociatedObject(f, &kGlAir, programs = [NSMutableDictionary dictionary], OBJC_ASSOCIATION_RETAIN);
+		if (NSArray *hit = programs[stage])
+			return hit;
+	}
 	static id compiler;   // ponytail: one for the process (one device)
 	static std::once_flag once;
 	std::call_once(once, ^{
@@ -1795,7 +1836,7 @@ static NSData *glProgramAir(id<MTLFunction> function)
 	// buffer type info, binding info): without it the reflection named no uniform buffer and GL bound none
 	((void (*)(id, SEL, unsigned long long))objc_msgSend)(request, sel_registerName("setPipelineOptions:"), 0x40003ull);
 	((void (*)(id, SEL, id))objc_msgSend)(request, sel_registerName("setFrameworkData:"),
-	                                      (id)dispatch_data_create(state.bytes, state.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT));
+	                                      (id)dispatch_data_create(stage.bytes, stage.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT));
 	__block NSData *air = nil, *reflection = nil;
 	__block NSString *why = nil;
 	void (^done)(const void *, uintptr_t) = ^(const void *reply, uintptr_t) {
@@ -1815,32 +1856,31 @@ static NSData *glProgramAir(id<MTLFunction> function)
 	};
 	((void (*)(id, SEL, id, id))objc_msgSend)(compiler, sel_registerName("compileFunctionRequest:completionHandler:"), request, done);
 	if (!air) {
-		// (Metal's compiler service crashes on some of OpenMW's water programs, in MTLDeserializePluginDataDictionary, whatever their order
-		// or how often asked, 2026-11-22: not found yet)
 		RLOG(@"RDNA4MTL: OpenGL program %@ not compiled: %@ (bitcode type %u, state %lu bytes)", function.name,
 		     why ?: @"no metallib in the reply", type, (unsigned long)state.length);
 		return nil;
 	}
-	objc_setAssociatedObject(f, &kGlAir, air, OBJC_ASSOCIATION_RETAIN);
-	if (reflection)
-		objc_setAssociatedObject(f, &kGlReflection, reflection, OBJC_ASSOCIATION_RETAIN);
-	return air;
+	NSArray *program = @[ air, reflection ?: NSNull.null ];
+	@synchronized(f) {
+		programs[stage] = program;
+	}
+	return program;
 }
 
-// A GL program's reflection, as the compiler service gave it with its AIR (glProgramAir), else nil
-static NSData *glReflection(id<MTLFunction> function)
+// A GL program's metallib and reflection, as the compiler service gave them for this stage data (glProgram), else nil
+static NSData *glProgramAir(id<MTLFunction> function, NSData *stage) { return glProgram(function, stage).firstObject; }
+static NSData *glReflection(id<MTLFunction> function, NSData *stage)
 {
-	if (!function)
-		return nil;
-	(void)glProgramAir(function);   // (compiled already when the pipeline was: from the function's own cache then)
-	return objc_getAssociatedObject(function, &kGlReflection);
+	id r = glProgram(function, stage).lastObject;   // (compiled already with the pipeline: from the function's cache)
+	return [r isKindOfClass:[NSData class]] ? r : nil;
 }
 
-static NSData *functionAir(id<MTLFunction> function)
+// `stage`: the pipeline's stage data (glStageData) for a GL program, else nil
+static NSData *functionAir(id<MTLFunction> function, NSData *stage)
 {
 	if ([(id)function isKindOfClass:[RDNA4MTLFunction class]])
 		return [NSData dataWithContentsOfFile:((RDNA4MTLFunction *)function).library.path];
-	if (NSData *gl = glProgramAir(function))
+	if (NSData *gl = glProgramAir(function, stage))
 		return gl;
 	id bitcode = [(id)function respondsToSelector:@selector(bitcodeData)] ? [(id)function performSelector:@selector(bitcodeData)] : nil;
 	return [bitcode isKindOfClass:[NSData class]] ? bitcode : nil;
@@ -1862,19 +1902,19 @@ static BOOL appendLinkEntry(NSMutableData *box, NSString *name, NSData *data)
 
 // `linked`: the functions `function` calls (a render stage's private linked functions, X.MTL_VISIBLE_FN_REF: RenderBox's custom shaders),
 // sent with it in one container that the translator links before translating
-static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFunction>> *linked, NSData **blob, uint32_t *buffers);
+static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFunction>> *linked, NSData *stage, NSData **blob, uint32_t *buffers);
 
 // A function's translation, once a process for the same AIR: VideoToolbox makes its transfer pipeline anew for each frame (System Settings'
 // Displays pane started the translator 14 times a second, 2026-11-21). ponytail: kept for the process's life, unbounded; by the library's
 // path or the bitcode's SHA-256 and the name (linked functions: not kept).
-static NSError *translateFunction(id<MTLFunction> function, NSArray<id<MTLFunction>> *linked, NSData **blob, uint32_t *buffers)
+static NSError *translateFunction(id<MTLFunction> function, NSArray<id<MTLFunction>> *linked, NSData *stage, NSData **blob, uint32_t *buffers)
 {
 	static NSMutableDictionary<NSString *, NSArray *> *done;
 	NSString *key = nil;
 	if (!linked.count) {
 		if ([(id)function isKindOfClass:[RDNA4MTLFunction class]]) {
 			key = [NSString stringWithFormat:@"%@\n%@", ((RDNA4MTLFunction *)function).library.path, function.name];
-		} else if (NSData *air = functionAir(function)) {
+		} else if (NSData *air = functionAir(function, stage)) {
 			uint8_t digest[CC_SHA256_DIGEST_LENGTH];
 			CC_SHA256(air.bytes, (CC_LONG)air.length, digest);
 			key = [NSString stringWithFormat:@"%@\n%@", [[NSData dataWithBytes:digest length:sizeof digest] base64EncodedStringWithOptions:0],
@@ -1888,7 +1928,7 @@ static NSError *translateFunction(id<MTLFunction> function, NSArray<id<MTLFuncti
 			return nil;
 		}
 	}
-	NSError *why = translateFunctionNow(function, linked, blob, buffers);
+	NSError *why = translateFunctionNow(function, linked, stage, blob, buffers);
 	if (!why && key && *blob)
 		@synchronized([RDNA4MTLFunction class]) {
 			done = done ?: [NSMutableDictionary dictionary];
@@ -1897,7 +1937,7 @@ static NSError *translateFunction(id<MTLFunction> function, NSArray<id<MTLFuncti
 	return why;
 }
 
-static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFunction>> *linked, NSData **blob, uint32_t *buffers)
+static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFunction>> *linked, NSData *stage, NSData **blob, uint32_t *buffers)
 {
 	// the bundle's own (Contents/Helpers: the translator these functions need, ray queries say), else the paravirtual GPU's helper
 	static NSString *const helper = [[NSBundle bundleForClass:[RDNA4MTLFunction class]].bundlePath stringByAppendingPathComponent:@"Contents/Helpers/air2amdgpu"];
@@ -1918,7 +1958,7 @@ static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFun
 	NSData *air = nil;
 	if ([(id)function isKindOfClass:[RDNA4MTLFunction class]]) {
 		input = ((RDNA4MTLFunction *)function).library.path;
-	} else if ((air = functionAir(function))) {
+	} else if ((air = functionAir(function, stage))) {
 		scratch = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"rdna4mtl-%d-%@.bc", getpid(), fileName]];
 		if ([air writeToFile:scratch atomically:NO])
 			input = scratch;
@@ -1947,7 +1987,7 @@ static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFun
 		[box appendBytes:&count length:4];
 		BOOL ok = appendLinkEntry(box, function.name, air ?: [NSData dataWithContentsOfFile:input]);
 		for (id<MTLFunction> f in linked)
-			ok = ok && appendLinkEntry(box, f.name, functionAir(f));
+			ok = ok && appendLinkEntry(box, f.name, functionAir(f, nil));
 		NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"rdna4mtl-%d-%@.rdlk", getpid(), fileName]];
 		if (scratch)
 			[NSFileManager.defaultManager removeItemAtPath:scratch error:nil];
@@ -2033,7 +2073,7 @@ static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFun
 	if (!_device.gpu)
 		return rdna4Error(@"the kext's runtime client is not open (root only)", 0);
 	NSData *elf = nil;
-	NSError *why = translateFunction(function, nil, &elf, &_buffers);
+	NSError *why = translateFunction(function, nil, nil, &elf, &_buffers);
 	if (why)
 		return why;
 	// the kernel's symbol: its name cut at 63 bytes (air2amdgpu.cpp; RDNA4_MAX_NAME)
@@ -2436,9 +2476,10 @@ static id<MTLFunction> noFragmentFunction(RDNA4MTLDevice *device)
 		NSData *blob = nil;
 		_names = [NSString stringWithFormat:@"%@ / %@", fn[0].name, fn[1].name];
 		NSArray *linked = (k ? desc.fragmentLinkedFunctions : desc.vertexLinkedFunctions).privateFunctions;
-		NSError *why = translateFunction(fn[k], linked, &blob, &unused);
+		NSData *stage = glStageData(desc, k);
+		NSError *why = translateFunction(fn[k], linked, stage, &blob, &unused);
 		if (why)   // once more: the helper may have been out of memory or busy
-			why = translateFunction(fn[k], linked, &blob, &unused);
+			why = translateFunction(fn[k], linked, stage, &blob, &unused);
 		if (why) {
 			// A pipeline whose draws are left out, not none: Core Animation aborts WindowServer when one fails to build (the session
 			// logged out when TkfhBvcmXc_Iclr did not translate, 2026-11-20). Stand-in shaders (s_endpgm) keep the rest of the setup whole.
@@ -5537,9 +5578,24 @@ static void abortStack(int sig)
 	return [[RDNA4MTLDepthStencilState alloc] initWithDevice:self descriptor:descriptor];
 }
 
+// The same descriptor gets the same pipeline, as from Metal's own device. Apple's GL-on-Metal renderer asks anew for its built-in blits
+// many times a second (OpenMW with shader water: 26721 pipelines in nine minutes), each with its own code buffer, until allocations
+// failed and the renderer aborted, 2026-11-23. ponytail: one cache a process (one device), NSCache keeps up to 512.
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor error:(NSError **)error
 {
-	return [[RDNA4MTLRenderPipeline alloc] initWithDevice:self descriptor:descriptor error:error];
+	static NSCache *made = ^{
+		NSCache *c = [NSCache new];
+		c.countLimit = 512;
+		return c;
+	}();
+	MTLRenderPipelineDescriptor *key = [descriptor copy];
+	RDNA4MTLRenderPipeline *pipeline = [made objectForKey:key];
+	if (pipeline)
+		return pipeline;
+	pipeline = [[RDNA4MTLRenderPipeline alloc] initWithDevice:self descriptor:descriptor error:error];
+	if (pipeline && !pipeline.broken)
+		[made setObject:pipeline forKey:key];
+	return pipeline;
 }
 
 // The asynchronous forms: made as the synchronous ones, the handler called on another thread as Metal's (MoltenVK waits for it holding a
@@ -5597,7 +5653,7 @@ static dispatch_queue_t pipelineQueue(void) { return dispatch_get_global_queue(Q
 	if (reflection) {
 		// GL's programs: Metal's own reflection object from the compiler service's data, which names their arguments (Apple's GL-on-Metal
 		// renderer binds the uniform buffers it lists, and none without it: every uniform read 0, 2026-11-21). Others: none, as before.
-		NSData *v = glReflection(descriptor.vertexFunction), *f = glReflection(descriptor.fragmentFunction);
+		NSData *v = glReflection(descriptor.vertexFunction, glStageData(descriptor, 0)), *f = glReflection(descriptor.fragmentFunction, glStageData(descriptor, 1));
 		Class c = objc_getClass("MTLRenderPipelineReflectionInternal");
 		SEL init = sel_registerName("initWithVertexData:fragmentData:serializedVertexDescriptor:device:options:flags:");
 		id r = nil;
