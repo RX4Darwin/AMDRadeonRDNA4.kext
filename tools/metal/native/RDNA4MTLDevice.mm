@@ -212,6 +212,8 @@ static void missingCall(id obj, NSInvocation *inv)
 	}
 
 @interface _MTLDevice : NSObject   // Metal's own base class (exported by Metal.framework)
+- (id)targetDeviceArchitecture;
+- (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)descriptor error:(NSError **)error;
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error;
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error;
 @end
@@ -5370,6 +5372,18 @@ static void padSlot(uint32_t *page, uint32_t n)
 - (uint64_t)peerGroupID { return 0; }   // not in a peer group (MoltenVK asks)
 - (uint32_t)peerIndex { return 0; }
 - (uint32_t)peerCount { return 0; }
+
+// Metal's file-backed archive loader requires a target architecture to select a precompiled slice.
+- (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)descriptor error:(NSError **)error
+{
+	if (descriptor.url && ![self targetDeviceArchitecture]) {
+		if (error)
+			*error = [NSError errorWithDomain:MTLBinaryArchiveDomain code:MTLBinaryArchiveErrorInternalError
+			                         userInfo:@{NSLocalizedDescriptionKey: @"RX4Darwin has no Metal target architecture for loading a precompiled binary archive."}];
+		return nil;
+	}
+	return [super newBinaryArchiveWithDescriptor:descriptor error:error];
+}
 
 - (NSString *)name { return @"AMD Radeon RDNA4 (native Metal, spike)"; }
 // Apple's GL-on-Metal renderer takes its renderer string and its per-vendor limits from this ("AMD" or "ATI" for AMD's)
