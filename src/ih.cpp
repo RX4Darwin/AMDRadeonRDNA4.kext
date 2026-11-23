@@ -826,7 +826,8 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 
 		count++;
 
-		if (count <= 64 || (count & 0x3f) == 0) {
+		// Address space 0's is the CP's stray read, which comes with every submission: its first few, so the log keeps a client's.
+		if (entry.vmid ? count <= 64 || (count & 0x3f) == 0 : count <= 4) {
 			const uint32_t access = entry.srcData[1] & 0xf0;
 			HLOG("GC VM page fault (client GFX, UTCL2_1_0__SRCID__FAULT): VMID %u, PASID %u = client slot %d, %s%s%s%s at VA 0x%llx "
 			     "(src_data 0x%08x 0x%08x 0x%08x 0x%08x, %u so far)", entry.vmid, entry.pasid, vmClientSlotByPasid(entry.pasid),

@@ -33,6 +33,7 @@
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/clock.h>
 #include <libkern/c++/OSObject.h>
+#include <sys/proc.h>
 
 #define RLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: runtime: " fmt "\n", ## __VA_ARGS__)
 #define CLOG(...) RLOG(__VA_ARGS__)
@@ -1828,6 +1829,13 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 		char why[48];
 		snprintf(why, sizeof(why), "open FAILED 0x%x", r);
 		vmOpTrace(why, 0, 0, 0);
+		return r;
+	}
+	Locked g(rtLock);
+	if (RtClient *c = clientFor(owner); c && c->pid < 0) {   // (runs on the opening process's thread: IOUserClient::start)
+		c->pid = proc_selfpid();
+		proc_selfname(c->proc, sizeof(c->proc));
+		RLOG("client slot %d (PASID %u) is pid %d (%s)", static_cast<int>(c - clients), c->pasid, c->pid, c->proc);
 	}
 	return r;
 }
@@ -3585,9 +3593,14 @@ void RDNA4Compute::gfxLogWaves(const char *why) {
 				}
 		wr(IpDiscovery::HwGc, GrbmGfxIndex, index);
 		RLOG("gfx: %s: waves, pass %u: %u valid at %u program counters", why, pass, valid, used);
-		for (uint32_t k = 0; k < used; k++)
-			RLOG("gfx: %s: wave pc 0x%llx x%u: status 0x%08x state 0x%08x excp 0x%08x exec 0x%08x, ME %u pipe %u VMID %u", why, kinds[k].pc, kinds[k].count,
-			     kinds[k].status, kinds[k].state, kinds[k].excp, kinds[k].exec, kinds[k].hw2 >> 8 & 3, kinds[k].hw2 >> 4 & 3, kinds[k].hw2 >> 24 & 0xf);
+		for (uint32_t k = 0; k < used; k++) {
+			const uint32_t vmid = kinds[k].hw2 >> 24 & 0xf;
+			const uint32_t pasid = vmid ? rd(IpDiscovery::HwOsssys, Reg { 0, vmid }) : 0;   // IH_VMID_n_LUT: the client this VMID is bound to
+			const int slot = vmClientSlotByPasid(pasid);
+			RLOG("gfx: %s: wave pc 0x%llx x%u: status 0x%08x state 0x%08x excp 0x%08x exec 0x%08x, ME %u pipe %u VMID %u = PASID %u, client slot %d, pid %d (%s)",
+			     why, kinds[k].pc, kinds[k].count, kinds[k].status, kinds[k].state, kinds[k].excp, kinds[k].exec, kinds[k].hw2 >> 8 & 3,
+			     kinds[k].hw2 >> 4 & 3, vmid, pasid, slot, slot < 0 ? -1 : clients[slot].pid, slot < 0 ? "?" : clients[slot].proc);
+		}
 		IODelay(1000);
 	}
 }

@@ -27,6 +27,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - **No accelerator without what it needs**: a boot with no compute runtime (`rdna4-compute` below 6, or a kext built without firmware)
   or without the Metal driver bundle (the macOS installer, Recovery) now stays on the plain framebuffers and says why in the log.
   WindowServer used to be sent to a device it could not open.
+- **A GPU hang's log says who and where**: each stuck shader wave's line names its process, and each pipeline's first draw logs its
+  code addresses, so a stuck program counter maps to a shader. The diagnostic boot-arg `rdna4-ih=1` also logs the address of a real GPU
+  page fault. It is for diagnosis only: with it, a faulted compute job ends by timeout instead of being stopped early.
 - **A script for the OpenCore side of the install** (`tools/package/efi.sh`): `check`, `install` and `remove`. It backs up
   `config.plist` and the kext, adds the kext after Lilu, turns off drivers that claim the card, cleans old boot-args, lists
   `boot-args` under `NVRAM → Delete`, and `remove` restores the backup byte for byte. Tested against sample configs, not yet on a real EFI.

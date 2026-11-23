@@ -932,6 +932,8 @@ private:
 		bool aborted { false };
 		bool vaBitsReady { false };   // vaBits[this slot] set up (vaBitsOf)
 		uint32_t ibSlot { kBufferSlots };   // rtSubmitGfxIb: the buffer that held the last IB
+		int32_t  pid { -1 };                // the process that opened it, for a hang's wave log
+		char     proc[17] {};
 	};
 	uint64_t vaTake(RtClient &c, uint64_t bytes);
 	uint64_t *vaBitsOf(RtClient &c);

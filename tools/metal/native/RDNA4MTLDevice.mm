@@ -3487,8 +3487,8 @@ RDNA4_ANSWER_MISSING
 		d.handles = (const uint64_t *)handles.bytes;
 		if (pipeline && !pipeline.described) {   // what each pipeline's first draw binds: a hang's draw named (drainGfx), this says what it read
 			pipeline.described = YES;
-			NSMutableString *what = [NSMutableString stringWithFormat:@"pipeline %@: vs 0x%08x ps 0x%08x, vs rsrc %08x %08x, ps rsrc %08x %08x ena %08x addr %08x, blend",
-			                                                          pipeline.names, pipeline.vs[7], pipeline.ps[7], pipeline.vs[3], pipeline.vs[4],
+			NSMutableString *what = [NSMutableString stringWithFormat:@"pipeline %@: code vs 0x%llx fs 0x%llx, vs 0x%08x ps 0x%08x, vs rsrc %08x %08x, ps rsrc %08x %08x ena %08x addr %08x, blend",
+			                                                          pipeline.names, pipeline.code, pipeline.code + RDNA4_TRI_PS_OFFSET, pipeline.vs[7], pipeline.ps[7], pipeline.vs[3], pipeline.vs[4],
 			                                                          pipeline.ps[3], pipeline.ps[4], pipeline.ps[5], pipeline.ps[6]];
 			for (int k = 2; k < 10; k++)
 				[what appendFormat:@" %u", [pipeline blendOf:d.attachment][k]];
