@@ -3551,6 +3551,47 @@ void RDNA4Compute::gfxClientReset() {
 		IOLockUnlock(rtLock);
 }
 
+// The valid waves of every shader array by program counter, three times 1 ms apart: a PC that stays is where a hung shader stands. Read
+// through SQ_IND without halting them (registers of gc_12_0_0: STATUS.VALID [16], HW_ID2 ME [9:8], PIPE [5:4], VM_ID [27:24]).
+void RDNA4Compute::gfxLogWaves(const char *why) {
+	enum : uint32_t { kStatus = 0x102, kStatePriv = 0x104, kExcpPriv = 0x111, kHwId2 = 0x118, kPcLo = 0x140, kPcHi = 0x141, kExecLo = 0x27e, kKinds = 12 };
+	struct Kind { uint64_t pc; uint32_t count, status, state, excp, hw2, exec; };
+	const uint32_t index = rdGc(GrbmGfxIndex);
+	auto sq = [&](uint32_t wave, uint32_t reg) {
+		wr(IpDiscovery::HwGc, SqIndIndex, wave | reg << 16);
+		return rdGc(SqIndData);
+	};
+	for (uint32_t pass = 0; pass < 3; pass++) {
+		Kind kinds[kKinds] {};
+		uint32_t valid = 0, used = 0;
+		for (uint32_t se = 0; se < 4; se++)
+			for (uint32_t sa = 0; sa < 2; sa++)
+				for (uint32_t instance = 0; instance < 16; instance++) {
+					wr(IpDiscovery::HwGc, GrbmGfxIndex, instance | sa << 8 | se << 16);
+					for (uint32_t wave = 0; wave < 32; wave++) {
+						const uint32_t status = sq(wave, kStatus);
+						if (status == ~0u || !(status >> 16 & 1))
+							continue;
+						valid++;
+						const uint64_t pc = sq(wave, kPcLo) | static_cast<uint64_t>(sq(wave, kPcHi)) << 32;
+						uint32_t k = 0;
+						while (k < used && kinds[k].pc != pc)
+							k++;
+						if (k == used && used < kKinds)
+							kinds[used++] = { pc, 0, status, sq(wave, kStatePriv), sq(wave, kExcpPriv), sq(wave, kHwId2), sq(wave, kExecLo) };
+						if (k < used)
+							kinds[k].count++;
+					}
+				}
+		wr(IpDiscovery::HwGc, GrbmGfxIndex, index);
+		RLOG("gfx: %s: waves, pass %u: %u valid at %u program counters", why, pass, valid, used);
+		for (uint32_t k = 0; k < used; k++)
+			RLOG("gfx: %s: wave pc 0x%llx x%u: status 0x%08x state 0x%08x excp 0x%08x exec 0x%08x, ME %u pipe %u VMID %u", why, kinds[k].pc, kinds[k].count,
+			     kinds[k].status, kinds[k].state, kinds[k].excp, kinds[k].exec, kinds[k].hw2 >> 8 & 3, kinds[k].hw2 >> 4 & 3, kinds[k].hw2 >> 24 & 0xf);
+		IODelay(1000);
+	}
+}
+
 /* A client's work on the graphics ring does not finish: remove what hangs and keep the ring for everybody else. True if
  * the client's fence then came through, false if the ring has to be given up (gfxClientWedge).
  * Card, 2026-10-07 (vkprobe's "fault", two boots): a shader that writes to an address nothing is mapped at leaves waves
@@ -3575,6 +3616,7 @@ bool RDNA4Compute::gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceW
 	RLOG("gfx: %s: work in address space %u did not finish (fence %u of %u): hub fault 0x%08x at 0x%llx, GRBM 0x%08x, CP_STAT 0x%08x; "
 	     "the CP in the IB at 0x%08x%08x (%u dwords, %u left, offset 0x%x)", why, vmid, *fenceWord, fence, rdGc(GcL2FaultStatusLo), gcFaultVa(),
 	     rdGc(GrbmStatus), rdGc(CpStat), rdGc(CpIb1BaseHi), rdGc(CpIb1BaseLo), rdGc(CpIb1CmdBufsz), rdGc(CpIb1Bufsz), rdGc(CpIb1Offset));
+	gfxLogWaves(why);
 
 	// The status keeps the first fault until it is cleared, and the CP's read of VA 0 since the bring-up (gfxFaultMark) holds it: cleared
 	// and read again a moment later, it shows what the hung work retries now, if it waits on a fault.
