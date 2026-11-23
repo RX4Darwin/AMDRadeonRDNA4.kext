@@ -249,10 +249,13 @@ static NSError *rdna4Error(NSString *what, kern_return_t kr)
 @end
 
 // Host memory freed, kept 2 s for an allocation of the same size (at most kPoolBytes): Core Animation makes and drops a few textures and
-// buffers a frame, each allocation and free a kext call of about 1 ms (2026-11-20). Handed out zeroed, as new memory is.
+// buffers a frame, each allocation and free a kext call of about 1 ms (2026-11-20). Handed out zeroed, as new memory is. At most kPoolCount:
+// each holds one of the client's 8192 kext buffers (OpenMW makes 20000 small ones a second: with no limit on their number, its new
+// textures were refused and showed black, 2026-11-23), and every allocation and free walks the list.
 namespace {
 struct Pooled { rdna4_t *gpu; rdna4_buffer_t buf; void *cpu; uint64_t bytes; CFAbsoluteTime at; };
 constexpr uint64_t kPoolBytes = 128ull << 20;
+constexpr size_t kPoolCount = 1024;
 std::mutex gPoolLock;
 std::vector<Pooled> gPool;
 uint64_t gPooledBytes;
@@ -334,7 +337,7 @@ void poolPut(rdna4_t *gpu, rdna4_buffer_t buf, void *cpu, uint64_t bytes)
 	{
 		std::lock_guard<std::mutex> hold(gPoolLock);
 		poolExpired(freed, now);
-		if (gPooledBytes + bytes <= kPoolBytes) {
+		if (gPooledBytes + bytes <= kPoolBytes && gPool.size() < kPoolCount) {
 			gPool.push_back({ gpu, buf, cpu, bytes, now });
 			gPooledBytes += bytes;
 		} else {

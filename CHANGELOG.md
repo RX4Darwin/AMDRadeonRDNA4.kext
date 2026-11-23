@@ -15,6 +15,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - **GL apps run their compute work on the graphics ring**: Apple's renderer runs a kernel per draw, and each was a round trip through
   the kext. OpenMW draws about twice as much (57k to 110k draws in 5 s). The ring's dispatch now waits for the kernel
   (`CS_PARTIAL_FLUSH`): without it the ring hung within a minute. `RDNA4_RINGDISPATCH=0` turns it off for a process.
+- **No more black boxes in OpenMW's menus**: the pool of freed buffers is limited to 1024. Without a limit on their number it could use
+  up the app's kext buffers, and new textures were refused.
 
 ## 0.4.0 (2026-11-22)
 
