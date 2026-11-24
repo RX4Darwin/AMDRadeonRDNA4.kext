@@ -35,11 +35,27 @@ The runs below n=1024 take well under a millisecond and several report the same 
 
 `mtlprobe spin` is held to the display's 60 Hz, so it shows steady frame delivery and not how fast the card can draw.
 
+## Idle power
+
+An hour of the idle desktop, one `rdna4-run sensors` sample a minute, the display kept awake and nothing touched, on 2026-11-24 with
+the RELEASE build of `8ff4f3d` and BAR0 at 1 GiB (Resizable BAR on, `ResizeAppleGpuBars` 10). All 60 samples were read, WindowServer
+stayed up and no GPU hang was logged.
+
+| | Median | Range |
+|---|---|---|
+| Card power (the SMU's socket power) | 47 W | 46 to 52 W |
+| Graphics clock | 93 MHz | 23 to 471 MHz |
+| Edge temperature | 47 °C | 46 to 47 °C |
+| Hotspot temperature | 48 °C | 48 to 49 °C |
+| Memory clock | 2505 MHz | not lowered at idle |
+| Fans | stopped | 0 RPM throughout |
+
+The memory clock stays at its highest step with the displays on, so most of the 47 W is memory.
+
 ## Not measured yet
 
 - **MetalQuake's timedemo:** the app stops at its launcher and ignores the command line, so it needs a scripted way in.
 - **The animated wallpaper:** measuring it means changing the desktop's wallpaper.
-- **Idle power held for an hour.**
 - **A 24-hour stability run with the Metal desktop.**
 
 ## Repeating it
