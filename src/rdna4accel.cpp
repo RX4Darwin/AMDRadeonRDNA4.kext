@@ -532,7 +532,8 @@ class RDNA4DeviceControl : public AppleGraphicsDeviceControl {
 			if (auto *dep = OSDynamicCast(OSNumber, fb[in[0]]->getProperty("IOFBDependentIndex")))
 				port = dep->unsigned32BitValue();
 #ifdef AMDRadeonRDNA4_PVGPU
-			(void)PvScanout::mode(port, width, height);
+			if (!PvScanout::scaledFrame(port, width, height))   // (a scaled mode's: the frame WindowServer presents)
+				(void)PvScanout::mode(port, width, height);
 #endif
 			if (!width || !height) {
 				auto *w = OSDynamicCast(OSNumber, fb[in[0]]->getProperty("Console,Width"));
@@ -1172,6 +1173,10 @@ void accelAtBoot(void *, wait_result_t)
 #endif
 	const int err = accelTo(static_cast<int>(want));
 	rdna4Log("AMDRadeonRDNA4: accel: rdna4-accel=%u at boot: %s (%d)\n", want, err ? "FAILED" : "done", err);
+#ifdef AMDRadeonRDNA4_PVGPU
+	if (!err && want == 4)
+		PvScanout::offerScaled();
+#endif
 	bootDone();
 	IOSleep(kGuardSeconds * 1000);
 	guardSet("survived");

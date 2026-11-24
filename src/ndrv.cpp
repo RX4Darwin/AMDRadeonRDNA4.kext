@@ -115,6 +115,8 @@ void Translator::init(const Modes::Mode *table, size_t n, uint32_t bootId,
                       const uint8_t *edidBytes, size_t edidBytesLen, const Backend &backend) {
 	modes = table;
 	count = table ? n : 0;
+	__atomic_store_n(&scaledCount, 0, __ATOMIC_RELEASE);
+	scaledModes = nullptr;
 	bootModeId = bootId;
 	edid = edidBytes;
 	edidLen = edidBytes ? (edidBytesLen / 128) * 128 : 0;
@@ -135,10 +137,26 @@ int32_t Translator::idFor(const Modes::Mode &m) const {
 }
 
 const Modes::Mode *Translator::modeFor(int32_t id) const {
-	for (size_t i = 0; i < count; i++)
-		if (idFor(modes[i]) == id)
-			return &modes[i];
+	const size_t n = total();
+	for (size_t i = 0; i < n; i++)
+		if (idFor(at(i)) == id)
+			return &at(i);
 	return nullptr;
+}
+
+void Translator::setScaled(const Modes::Mode *scaled, size_t n) {
+	__atomic_store_n(&scaledCount, 0, __ATOMIC_RELEASE);
+	scaledModes = scaled;
+	__atomic_store_n(&scaledCount, count && scaled ? n : 0, __ATOMIC_RELEASE);
+}
+
+bool Translator::scaledFrame(uint32_t &width, uint32_t &height) const {
+	const Modes::Mode *m = modeFor(current);
+	if (!m || m->source != Modes::SourceScaled)
+		return false;
+	width = m->t.hActive;
+	height = m->t.vActive;
+	return true;
 }
 
 bool Translator::surface(const Modes::Mode &m, Surface &out) const {
@@ -272,20 +290,21 @@ int32_t Translator::getNextResolution(VDResolutionInfoRec &r) const {
 	} else if (prev == kDisplayModeIDCurrent) {
 		m = modeFor(current);
 	} else {
+		const size_t n = total();
 		size_t i = 0;
-		while (i < count && idFor(modes[i]) != prev)
+		while (i < n && idFor(at(i)) != prev)
 			i++;
-		if (i == count) {
+		if (i == n) {
 			// Unknown ID, or kDisplayModeIDFindFirstProgrammable: there
 			// are no programmable timings.
 			r.csDisplayModeID = kDisplayModeIDInvalid;
 			return kBadArgument;
 		}
-		if (i + 1 == count) {
+		if (i + 1 == n) {
 			r.csDisplayModeID = kDisplayModeIDNoMore;
 			return kSuccess;
 		}
-		m = &modes[i + 1];
+		m = &at(i + 1);
 	}
 	if (!m) {
 		r.csDisplayModeID = kDisplayModeIDInvalid;

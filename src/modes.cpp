@@ -106,6 +106,7 @@ const char *sourceName(uint8_t source) {
 	case SourceEst:    return "est";
 	case SourceBoot:   return "boot";
 	case SourceDisplayId: return "displayid";
+	case SourceScaled: return "scaled";
 	default:           return "?";
 	}
 }
@@ -305,6 +306,38 @@ int ensure(Mode *modes, size_t &n, size_t cap, const Edid::DetailedTiming &t, ui
 	m.native = false;
 	m.source = source;
 	return static_cast<int>(slot);
+}
+
+const Mode *scaleBase(const Mode *modes, size_t n) {
+	const auto off60 = [](const Mode &m) {
+		return m.refreshMilliHz > 60000 ? m.refreshMilliHz - 60000 : 60000 - m.refreshMilliHz;
+	};
+	const Mode *best = nullptr;
+	for (size_t i = 0; i < n; i++) {
+		const Mode &m = modes[i];
+		const uint64_t area = static_cast<uint64_t>(m.t.hActive) * m.t.vActive;
+		const uint64_t bestArea = best ? static_cast<uint64_t>(best->t.hActive) * best->t.vActive : 0;
+		if (area > bestArea ||
+		    (best && m.t.hActive == best->t.hActive && m.t.vActive == best->t.vActive && off60(m) < off60(*best)))
+			best = &m;
+	}
+	return best && best->t.hActive >= 3840 && best->t.hActive <= 4096 ? best : nullptr;
+}
+
+size_t buildScaled(const Mode *modes, size_t n, Mode *out, size_t cap) {
+	const Mode *base = scaleBase(modes, n);
+	size_t count = 0;
+	for (size_t i = 0; base && i < MaxScaled && count < cap; i++) {
+		Mode m = *base;
+		m.id = ScaledIdBase + static_cast<uint32_t>(i);
+		m.t.hActive = static_cast<uint16_t>((2u * base->t.hActive * ScaledSteps[i][0] / ScaledSteps[i][1]) & ~1u);
+		m.t.vActive = static_cast<uint16_t>(2u * base->t.vActive * ScaledSteps[i][0] / ScaledSteps[i][1]);
+		m.t.pixelClockKHz = static_cast<uint32_t>(static_cast<uint64_t>(m.t.hTotal()) * m.t.vTotal() * base->refreshMilliHz / 1000000);
+		m.native = false;
+		m.source = SourceScaled;
+		out[count++] = m;
+	}
+	return count;
 }
 
 } // namespace Modes

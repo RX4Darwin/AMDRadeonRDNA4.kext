@@ -2813,6 +2813,73 @@ struct FakeBackend {
 	}
 };
 
+// "Looks like" frames: sizes, the base they scale to, where they are listed, and that a switch to one is told apart from a real mode.
+static int testScaledModes() {
+	int failures = 0;
+	const auto mode = [](uint32_t id, uint16_t w, uint16_t h, uint32_t milliHz) {
+		Modes::Mode m {};
+		m.id = id;
+		m.t.hActive = w;
+		m.t.hBlank = 160;
+		m.t.vActive = h;
+		m.t.vBlank = 62;
+		m.t.pixelClockKHz = static_cast<uint32_t>(static_cast<uint64_t>(w + 160u) * (h + 62u) * milliHz / 1000000);
+		m.refreshMilliHz = milliHz;
+		m.source = Modes::SourceDtd;
+		return m;
+	};
+	const Modes::Mode table[] = { mode(1, 3840, 2160, 30000), mode(2, 3840, 2160, 60000), mode(3, 1920, 1080, 60000) };
+	const Modes::Mode small[] = { mode(1, 2560, 1440, 60000), mode(2, 1920, 1080, 60000) };
+	const Modes::Mode *base = Modes::scaleBase(table, 3);
+	failures += check(base == &table[1], "scaled: the base is not 3840x2160 nearest 60 Hz");
+	failures += check(!Modes::scaleBase(small, 2), "scaled: a head below 3840 wide has a base");
+	Modes::Mode s[Modes::MaxScaled];
+	const size_t n = Modes::buildScaled(table, 3, s, Modes::MaxScaled);
+	static constexpr uint16_t kSizes[][2] = { {4096, 2304}, {4608, 2592}, {5120, 2880}, {6016, 3384}, {6400, 3600}, {6720, 3780} };
+	failures += check(n == 6, "scaled: %zu frames", n);
+	for (size_t i = 0; i < n && i < 6; i++) {
+		failures += check(s[i].t.hActive == kSizes[i][0] && s[i].t.vActive == kSizes[i][1] && s[i].source == Modes::SourceScaled &&
+		                  !s[i].native && s[i].id == Modes::ScaledIdBase + i, "scaled: frame %zu is %ux%u", i, s[i].t.hActive, s[i].t.vActive);
+		const uint32_t hz = Modes::refresh1616(s[i].t) >> 16;
+		failures += check(hz >= 59 && hz <= 60, "scaled: frame %zu refreshes at %u Hz", i, hz);
+	}
+
+	FakeBackend fb;
+	fb.w = 6720, fb.h = 3780, fb.pitch = 6720 * 4;
+	Ndrv::Translator tr;
+	tr.init(table, 3, 2, nullptr, 0, fb.backend());
+	tr.setScaled(s, n);
+	int32_t ret = 0;
+	Ndrv::VDResolutionInfoRec res {};
+	res.csPreviousDisplayModeID = Ndrv::kDisplayModeIDFindFirst;
+	size_t walked = 0;
+	uint32_t lastW = 0;
+	while (tr.status(Ndrv::cscGetNextResolution, &res, ret) && ret == Ndrv::kSuccess && res.csDisplayModeID > 0 && walked < 12) {
+		lastW = res.csHorizontalPixels;
+		walked++;
+		res.csPreviousDisplayModeID = res.csDisplayModeID;
+	}
+	failures += check(walked == 9 && lastW == 6720, "scaled: %zu modes listed, the last %u wide", walked, lastW);
+	failures += check(tr.modeCount() == 3, "scaled: they count as the head's own modes");
+	uint32_t w = 0, h = 0;
+	failures += check(!tr.scaledFrame(w, h), "scaled: the boot mode reads as scaled");
+	Ndrv::VDSwitchInfoRec sw {};
+	sw.csData = tr.idFor(s[2]);
+	sw.csMode = Ndrv::kDepthMode1;
+	failures += check(tr.control(Ndrv::cscSwitchMode, &sw, ret) && ret == Ndrv::kSuccess && fb.switches == 1, "scaled: the switch to 5120x2880");
+	failures += check(tr.scaledFrame(w, h) && w == 5120 && h == 2880, "scaled: the frame is %ux%u", w, h);
+	sw = {};
+	sw.csData = tr.idFor(table[2]);
+	sw.csMode = Ndrv::kDepthMode1;
+	failures += check(tr.control(Ndrv::cscSwitchMode, &sw, ret) && ret == Ndrv::kSuccess && !tr.scaledFrame(w, h), "scaled: back to a real mode");
+	tr.init(table, 3, 2, nullptr, 0, fb.backend());
+	sw = {};
+	sw.csData = Ndrv::kBootModeId + static_cast<int32_t>(s[2].id);
+	sw.csMode = Ndrv::kDepthMode1;
+	failures += check(tr.control(Ndrv::cscSwitchMode, &sw, ret) && ret == Ndrv::kBadArgument, "scaled: init left the frames offered");
+	return failures;
+}
+
 static int testNdrv() {
 	int failures = 0;
 
@@ -5597,6 +5664,7 @@ int main(int argc, char **argv) {
 	failures += testPipeDiscovery();
 	failures += testDmubPayloads();
 	failures += testNdrv();
+	failures += testScaledModes();
 	failures += testModeSet();
 	failures += testDpRetime();
 	failures += testPipe2();

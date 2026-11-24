@@ -82,6 +82,12 @@ uint32_t modes(uint32_t port, Mode *out, uint32_t cap);
  */
 bool largest(uint32_t port, uint32_t &width, uint32_t &height);
 
+/* Our accelerator serves WindowServer: the heads' framebuffers also offer the "looks like" frames above their largest mode (plugin.cpp). */
+void offerScaled();
+
+/* The frame size of the scaled mode head `port`'s framebuffer is in; false in a mode the head runs itself (plugin.cpp). */
+bool scaledFrame(uint32_t port, uint32_t &width, uint32_t &height);
+
 /*
  * Head `port` switched to its mode of `width` x `height` (plugin.cpp): what
  * macOS presents in after the mode was chosen in the Displays settings.

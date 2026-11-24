@@ -41,6 +41,7 @@ enum Source : uint8_t {
 	SourceEst    = 4,   // established timing -> DMT table
 	SourceBoot   = 5,   // read back from the OTG the GOP programmed
 	SourceDisplayId = 6,   // detailed timing in a DisplayID extension (Edid::displayIdTimings)
+	SourceScaled = 7,      // no timing of the monitor's: a frame macOS draws in, scaled down to the head's largest mode when presented
 };
 
 // Short lowercase tag ("dtd", "cta-dtd", "vic", "std", "est", "boot", "displayid").
@@ -90,6 +91,18 @@ uint32_t refresh1616(const Edid::DetailedTiming &t);
 // The sanity rules every table entry passes: progressive, even width,
 // non-zero sync pulses, a raster OtgTiming::compute accepts, 1-1000 Hz.
 bool usable(const Edid::DetailedTiming &t);
+
+// macOS's HiDPI "looks like 2048x1152" to "3360x1890" on a 3840x2160 head: frames of these fractions of twice its width and height.
+constexpr uint32_t ScaledSteps[][2] = { {8, 15}, {3, 5}, {2, 3}, {47, 60}, {5, 6}, {7, 8} };
+constexpr size_t MaxScaled = sizeof(ScaledSteps) / sizeof(ScaledSteps[0]);
+constexpr uint32_t ScaledIdBase = 1000;   // above any table's IDs
+
+// The largest mode of a table, of its size the one nearest 60 Hz: what a scaled frame is scaled down to. nullptr unless it is 3840 to
+// 4096 wide (a larger head's frames would wire too much host memory).
+const Mode *scaleBase(const Mode *modes, size_t n);
+
+// One entry per step for scaleBase's mode: its blanking and refresh, the frame's size. Returns how many (0 without a base).
+size_t buildScaled(const Mode *modes, size_t n, Mode *out, size_t cap);
 
 } // namespace Modes
 

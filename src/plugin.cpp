@@ -27,6 +27,7 @@
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>   // header-only types for IOMacOSVideo.h
@@ -261,10 +262,50 @@ FbEntry *fbEntry(void *fb) {
 	return nullptr;
 }
 
+// The memory behind a scaled ("looks like") mode's framebuffer. Such a frame is larger than the head, and BAR0 has no room for one: the
+// console and the head slots end where the compute pool starts, at 128 MiB. WindowServer draws it through our accelerator, so nothing
+// needs it in VRAM, but IOFramebuffer maps and may clear rowBytes x height of its aperture. Wired host memory takes that, handed out by
+// wrapGetApertureRange (not contiguous: 96 MiB in one piece was not to be had on the rig). Write-combined as IOFramebuffer maps it, and
+// zeroed, as WindowServer can map it too.
+// ponytail: sized for the head's largest frame (up to 97 MiB) and kept to the next boot, as IOFramebuffer can hold its map past a mode change.
+struct ScaledMemory {
+	IOBufferMemoryDescriptor *buffer { nullptr };
+};
+
+bool scaledMemoryFor(ScaledMemory &s, const Modes::Mode *frames, size_t n) {
+	if (s.buffer)
+		return true;
+	if (!n)
+		return false;
+	const Modes::Mode &largest = frames[n - 1];
+	const uint64_t bytes = (static_cast<uint64_t>(largest.t.hActive) * 4 * largest.t.vActive + 128 + 0xfff) & ~0xfffull;
+	auto *b = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache,
+	                                                      bytes, PAGE_SIZE);
+	if (!b || !b->getBytesNoCopy()) {
+		FBLOG("modes: no %llu MiB of host memory for a scaled mode's framebuffer", bytes >> 20);
+		OSSafeReleaseNULL(b);
+		return false;
+	}
+	bzero(b->getBytesNoCopy(), bytes);
+	s.buffer = b;
+	FBLOG("modes: scaled framebuffer: %llu MiB of host memory", bytes >> 20);
+	return true;
+}
+
+Modes::Mode gBootScaled[Modes::MaxScaled] {};   // the boot display's scaled modes (PvScanout::offerScaled)
+size_t gBootScaledCount { 0 };
+ScaledMemory gBootScaledMemory;
+bool gScaledOffered { false };                  // our accelerator serves WindowServer: it can present their frames
+bool gApertureRouted { false };                 // wrapGetApertureRange is in: without it a scaled mode's aperture would be cut from BAR0
+
 // Ndrv::Backend over RDNA4Device. Every mode reuses the boot surface: modes
 // never exceed the GOP framebuffer and keep its pitch (see device.hpp).
 bool deviceSurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) {
 	auto *dev = static_cast<RDNA4Device *>(ctx);
+	if (m.source == Modes::SourceScaled) {
+		out = { dev->fbPhysBase, m.t.hActive * 4u, m.t.hActive, m.t.vActive };   // (the base is only reported: wrapGetApertureRange)
+		return true;
+	}
 	if (m.t.hActive > dev->fbWidth || m.t.vActive > dev->fbHeight)
 		return false;
 	out = { dev->fbPhysBase, dev->fbRowBytes, m.t.hActive, m.t.vActive };
@@ -272,7 +313,15 @@ bool deviceSurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out)
 }
 
 int32_t deviceSwitchTo(void *ctx, const Modes::Mode &m, bool) {
-	return static_cast<RDNA4Device *>(ctx)->applyMode(m);
+	auto *dev = static_cast<RDNA4Device *>(ctx);
+	if (m.source != Modes::SourceScaled)
+		return dev->applyMode(m);
+	// the head stays on (or goes to) its largest mode; the present path scales the frames down to it
+	const Modes::Mode *base = Modes::scaleBase(dev->modeTable, dev->modeCount);
+	if (!base || !scaledMemoryFor(gBootScaledMemory, gBootScaled, gBootScaledCount))
+		return kIOReturnNoMemory;
+	const Edid::DetailedTiming *live = dev->liveMode();
+	return live && Edid::sameTiming(*live, base->t) ? kIOReturnSuccess : dev->applyMode(*base);
 }
 
 void deviceSetPower(void *ctx, bool on) {
@@ -385,6 +434,9 @@ struct Head2 {
 	Ndrv::Surface    surface {};
 	IODeviceMemory  *vram { nullptr };      // the surface, for getVRAMRange (wrapGetVRAMRange)
 	Modes::Mode      table[Modes::MaxModes] {};
+	Modes::Mode      scaled[Modes::MaxScaled] {};   // its "looks like" frames (offerScaledOn)
+	size_t           scaledCount { 0 };
+	ScaledMemory     scaledMemory;
 	uint8_t          edid[256] {};          // base block and one extension
 	size_t           edidLen { 0 };
 	uint32_t         traceBudget { 400 };   // its own: head 0 must not use up the lines
@@ -421,6 +473,7 @@ uint32_t head2Level { 0 };
 uint32_t hotplugLevel { 0 };
 mach_vm_address_t orgStart { 0 };
 mach_vm_address_t orgGetVRAMRange { 0 };
+mach_vm_address_t orgGetApertureRange { 0 };
 mach_vm_address_t orgRegisterForInterruptType { 0 };
 
 void attach(FbEntry &e);
@@ -434,6 +487,10 @@ Head2 *headFor(void *fb) {
 
 // Every mode scans the one surface, from its first pixel and with its pitch.
 bool head2SurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) {
+	if (m.source == Modes::SourceScaled) {
+		out = { static_cast<Head2 *>(ctx)->surface.physBase, m.t.hActive * 4u, m.t.hActive, m.t.vActive };   // (only reported: wrapGetApertureRange)
+		return true;
+	}
 	const Ndrv::Surface &s = static_cast<Head2 *>(ctx)->surface;
 	if (m.t.hActive > s.width || m.t.vActive > s.height)
 		return false;
@@ -443,9 +500,15 @@ bool head2SurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) 
 
 int32_t head2SwitchTo(void *ctx, const Modes::Mode &m, bool) {
 	auto *h = static_cast<Head2 *>(ctx);
+	const Modes::Mode *run = &m;
+	if (m.source == Modes::SourceScaled) {   // the head on its largest mode; the present path scales the frames down to it
+		run = Modes::scaleBase(h->table, h->ndrv.modeCount());
+		if (!run || !scaledMemoryFor(h->scaledMemory, h->scaled, h->scaledCount))
+			return kIOReturnNoMemory;
+	}
 	RDNA4Device::ExtraHold hold(*h->dev);
 	h->dev->selectExtra(h->slot);
-	return h->dev->applySecondPipeMode(m);
+	return h->dev->applySecondPipeMode(*run);
 }
 
 void head2SetPower(void *ctx, bool on) {
@@ -575,6 +638,18 @@ void head2MapSurface(Head2 *h) {
 		HLOG(h, "no VRAM range for the surface: WindowServer will not map it");
 }
 
+// The head's "looks like" frames, for a head whose surface is its largest mode (what they are scaled into).
+void offerScaledOn(Head2 *h) {
+	const size_t n = h->ndrv.modeCount();
+	const Modes::Mode *base = gApertureRouted && pvScaledModes && !pvHeads && n > 1 ? Modes::scaleBase(h->table, n) : nullptr;
+	h->scaledCount = base && base->t.hActive == h->surface.width && base->t.vActive == h->surface.height
+	                 ? Modes::buildScaled(h->table, n, h->scaled, Modes::MaxScaled) : 0;
+	h->ndrv.setScaled(h->scaled, h->scaledCount);
+	if (h->scaledCount)
+		HLOG(h, "%zu scaled modes offered, up to %ux%u", h->scaledCount, h->scaled[h->scaledCount - 1].t.hActive,
+		     h->scaled[h->scaledCount - 1].t.vActive);
+}
+
 // Hand the table to the translator, with `mode` as the one the head is in.
 void head2Init(Head2 *h, RDNA4Device &dev, const Modes::Mode *mode, size_t n) {
 	Ndrv::Backend be {};
@@ -589,6 +664,8 @@ void head2Init(Head2 *h, RDNA4Device &dev, const Modes::Mode *mode, size_t n) {
 	if (switching)
 		be.switchTo = head2SwitchTo;
 	h->ndrv.init(switching ? h->table : mode, switching ? n : 1, mode->id, h->edid, h->edidLen, be);
+	if (gScaledOffered)
+		offerScaledOn(h);
 	for (size_t i = 0; switching && i < n; i++) {
 		const Modes::Mode &m = h->table[i];
 		HLOG(h, "mode id %u %ux%u@%u.%03u %u kHz%s%s", m.id, m.t.hActive, m.t.vActive,
@@ -1219,6 +1296,28 @@ IODeviceMemory *wrapGetVRAMRange(void *fb) {
 	return FunctionCast(wrapGetVRAMRange, orgGetVRAMRange)(fb);
 }
 
+// In a scaled mode the framebuffer's memory is the host buffer (ScaledMemory): the original would cut rowBytes x height out of BAR0, over
+// the other heads and the compute pool. Retained, as the original's is; a descriptor passed as IODeviceMemory, as the original does.
+IODeviceMemory *wrapGetApertureRange(void *fb, IOPixelAperture aperture) {
+	if (aperture == kIOFBSystemAperture) {
+		uint32_t width, height;
+		ScaledMemory *memory = nullptr;
+		if (Head2 *h = headFor(fb)) {
+			if (h->ndrv.scaledFrame(width, height))
+				memory = &h->scaledMemory;
+		} else if (bootState && bootState->ndrv.scaledFrame(width, height)) {
+			for (const auto &e : fbTable)
+				if (e.fb == fb && e.state == bootState)
+					memory = &gBootScaledMemory;
+		}
+		if (memory && memory->buffer) {
+			memory->buffer->retain();
+			return reinterpret_cast<IODeviceMemory *>(memory->buffer);
+		}
+	}
+	return FunctionCast(wrapGetApertureRange, orgGetApertureRange)(fb, aperture);
+}
+
 bool wrapStart(void *fb, IOService *provider) {
 	auto *pci = OSDynamicCast(IOPCIDevice, provider);
 	if (!headCount && pci && isOurDevice(pci))
@@ -1812,6 +1911,14 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 		patcher.clearError();
 	}
 #ifdef AMDRadeonRDNA4_PVGPU
+	{
+		KernelPatcher::RouteRequest aperture {
+			"__ZN17IONDRVFramebuffer16getApertureRangeEi", wrapGetApertureRange, orgGetApertureRange,
+		};
+		gApertureRouted = patcher.routeMultiple(index, &aperture, 1, address, size);
+		FBLOG("modes: IONDRVFramebuffer::getApertureRange %s", gApertureRouted ? "routed" : "NOT routed: no scaled modes");
+		patcher.clearError();
+	}
 	{   // (pass-through unless our accelerator serves WindowServer)
 		uint32_t accel = 0;
 		gAccelCursor = Trial::bootArg("rdna4-accel", accel) && accel == 4;
@@ -2268,7 +2375,6 @@ uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
 	// Above 3840x2160, sizes no pipe runs: macOS's HiDPI "looks like 2048x1152" to "3360x1890" draw in twice those, which the host
 	// scales down to the largest mode (presentOnCard). The steps macOS offers a 4K monitor on Apple's framebuffer of a 6600 XT, which
 	// it makes from that framebuffer's scaler; the paravirtual one's modes are only those of this list.
-	static constexpr uint32_t kSteps[][2] = { {8, 15}, {3, 5}, {2, 3}, {47, 60}, {5, 6}, {7, 8} };   // of the width and height
 	uint32_t bigW = litW, bigH = litH;
 
 	for (size_t i = 0; i < n; i++)
@@ -2277,8 +2383,9 @@ uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
 			bigH = table[i].t.vActive;
 		}
 
-	for (size_t i = 0; bigW >= 3840 && pvScaledModes && i < sizeof(kSteps) / sizeof(kSteps[0]); i++)
-		all[total++] = { 2 * bigW * kSteps[i][0] / kSteps[i][1], 2 * bigH * kSteps[i][0] / kSteps[i][1], 60000 };
+	for (size_t i = 0; bigW >= 3840 && pvScaledModes && i < Modes::MaxScaled; i++)
+		all[total++] = { 2 * bigW * Modes::ScaledSteps[i][0] / Modes::ScaledSteps[i][1],
+		                 2 * bigH * Modes::ScaledSteps[i][0] / Modes::ScaledSteps[i][1], 60000 };
 
 	const bool fast = !h && pvFastModes;   // the boot display's (port 0)
 
@@ -2344,6 +2451,33 @@ bool PvScanout::largest(uint32_t port, uint32_t &width, uint32_t &height)
 	}
 
 	return width && height;
+}
+
+// Once our accelerator serves WindowServer (rdna4accel.cpp, before WindowServer is let go): only it can present a frame larger than the head.
+void PvScanout::offerScaled()
+{
+	gScaledOffered = true;
+	if (gApertureRouted && bootState && !pvBootHead && !pvHeads && pvScaledModes && bootState->dev.modesetRequested) {
+		const RDNA4Device &dev = bootState->dev;
+		const Modes::Mode *base = Modes::scaleBase(dev.modeTable, dev.modeCount);
+
+		gBootScaledCount = base && base->t.hActive <= dev.fbWidth && base->t.vActive <= dev.fbHeight
+		                   ? Modes::buildScaled(dev.modeTable, dev.modeCount, gBootScaled, Modes::MaxScaled) : 0;
+		bootState->ndrv.setScaled(gBootScaled, gBootScaledCount);
+		if (gBootScaledCount)
+			FBLOG("modes: boot display: %zu scaled modes offered, up to %ux%u", gBootScaledCount,
+			      gBootScaled[gBootScaledCount - 1].t.hActive, gBootScaled[gBootScaledCount - 1].t.vActive);
+	}
+	for (size_t i = 0; i < headCount; i++)
+		offerScaledOn(heads[i]);
+}
+
+bool PvScanout::scaledFrame(uint32_t port, uint32_t &width, uint32_t &height)
+{
+	if (Head2 *extra = pvHead(port))
+		return extra->ndrv.scaledFrame(width, height);
+
+	return port == 0 && bootState && bootState->ndrv.scaledFrame(width, height);
 }
 
 bool PvScanout::wantsMode(uint32_t port, uint32_t width, uint32_t height)
@@ -2518,6 +2652,14 @@ bool PvScanout::cursorArgb(uint32_t port, const uint32_t *argb, uint32_t width, 
 // x, y: the hot spot's position (what the guest's page holds); drawHardwareCursor takes the image's top-left corner.
 bool PvScanout::cursorMove(uint32_t port, int32_t x, int32_t y, bool visible)
 {
+	uint32_t frameW, frameH;
+	Head lit;
+
+	if (scaledFrame(port, frameW, frameH) && head(port, lit)) {   // in a scaled mode macOS's position is on the frame, the plane's on the head
+		x = static_cast<int32_t>(static_cast<int64_t>(x) * lit.width / frameW);
+		y = static_cast<int32_t>(static_cast<int64_t>(y) * lit.height / frameH);
+	}
+
 	return pvOnCursorPipe(port, [&](RDNA4Device &dev) {
 		return dev.drawHardwareCursor(x - static_cast<int32_t>(dev.cursorHotX()), y - static_cast<int32_t>(dev.cursorHotY()), visible) ==
 		       kIOReturnSuccess;

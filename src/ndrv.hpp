@@ -280,12 +280,18 @@ public:
 	// until a connect interrupt makes it ask again.
 	void setConnected(bool on) { connected = on; }
 	size_t  modeCount() const { return count; }
+	// Frames above the head's modes (Modes::buildScaled), listed after them. `scaled` must outlive the Translator; init clears them.
+	void setScaled(const Modes::Mode *scaled, size_t n);
+	// The frame size of the scaled mode macOS is in; false in a mode the head runs itself.
+	bool scaledFrame(uint32_t &width, uint32_t &height) const;
 	// NDRV mode ID of table entry `m`.
 	int32_t idFor(const Modes::Mode &m) const;
 
 private:
 	const Modes::Mode *modes { nullptr };
 	size_t   count { 0 };
+	const Modes::Mode *scaledModes { nullptr };
+	size_t   scaledCount { 0 };
 	uint32_t bootModeId { 0 };
 	const uint8_t *edid { nullptr };
 	size_t   edidLen { 0 };
@@ -294,6 +300,8 @@ private:
 	uint8_t  syncState { kDPMSSyncOn };
 	bool     connected { true };
 
+	size_t total() const { return count + __atomic_load_n(&scaledCount, __ATOMIC_ACQUIRE); }
+	const Modes::Mode &at(size_t i) const { return i < count ? modes[i] : scaledModes[i - count]; }
 	const Modes::Mode *modeFor(int32_t id) const;
 	bool surface(const Modes::Mode &m, Surface &out) const;
 

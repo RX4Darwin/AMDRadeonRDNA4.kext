@@ -33,6 +33,10 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - **No more Metal aborts from precompiled archives**: Metal asserts when it loads a file-backed binary archive on a device with no target
   architecture, which crashed `iconservicesagent` and the Dock's extra on Tahoe 26.7.3. The driver now returns an error for such an
   archive and RenderBox carries on without it. From cosminolaru-collab's patch in issue 23.
+- **The "looks like" sizes are back on the native desktop**: Displays offers 2048x1152 to 3360x1890 on a 4K display again. macOS draws in
+  twice that size, the card scales each frame down to the display's largest mode, and the framebuffer's memory for such a mode is host
+  memory (up to 97 MiB, wired from the first scaled switch to the next boot), as VRAM's CPU-visible part has no room for it. The pointer
+  lands in the right place but is drawn at its unscaled size. `rdna4-pvscaled=0` turns these modes off.
 - **A script for the OpenCore side of the install** (`tools/package/efi.sh`): `check`, `install` and `remove`. It backs up
   `config.plist` and the kext, adds the kext after Lilu, turns off drivers that claim the card, cleans old boot-args, lists
   `boot-args` under `NVRAM → Delete`, and `remove` restores the backup byte for byte. Tested against sample configs, not yet on a real EFI.
