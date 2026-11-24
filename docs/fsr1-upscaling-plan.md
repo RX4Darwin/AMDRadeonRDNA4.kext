@@ -1,7 +1,7 @@
 # Driver-level FSR 1 upscaling ("Super Resolution"), plan
 
-Status, 2026-11-24: step 0 done (below: the display-mode route covers few games); step 1 done (the kernels, host-tested, compiled
-for gfx1201, not yet run on the card). AMD's source is the `lib/FidelityFX-FSR` submodule (FSR v1.0.2).
+Status, 2026-11-24: step 0 done (the display-mode route covers few games); the kernels done; the Metal bundle route chosen and built,
+card-tested with a test window (below); the games tested present full-size frames. AMD's source is the `lib/FidelityFX-FSR` submodule (FSR v1.0.2).
 
 ## Why FSR 1 and not FSR 4
 
@@ -11,7 +11,7 @@ camera jitter, so a driver cannot add it to a game that does not ship it. FSR 1 
 needs only the finished frame, which is what the driver has. Its source, `Kits/FidelityFX/upscalers/fsr3/include/gpu/fsr1/ffx_fsr1.h`
 in the FidelityFX SDK, is MIT licensed. Radeon Super Resolution in AMD's Windows driver is the same idea.
 
-## What it does
+## The display-mode route (described first, not taken)
 
 With **Super Resolution** on in RDNA4 Gadget's new **Tweaks** pane, a display mode smaller than the monitor's largest one no longer
 changes the monitor's timing. The head stays on its native mode, macOS draws frames of the smaller size, and each presented frame is
@@ -25,7 +25,7 @@ Not covered: HiDPI modes, including "looks like" (their frames are already at or
 and render a smaller drawable in a full-screen window; CoreAnimation scales those inside WindowServer, out of our reach. Those could be
 done later in the Metal bundle (EASU on the drawable at present), a separate project.
 
-## Where it goes (what exists)
+## Where the display-mode route would have gone (not taken)
 
 - Native present path: `RDNA4PvHost` present code (`src/pvgpu.cpp`, about line 8500) copies or scales each frame into the head's
   scanout with a compute dispatch in the frame's IB. `scale.cl` already runs there for "looks like" frames larger than the head
@@ -53,32 +53,36 @@ modes at all. The route that covers the other three is the one listed under "Not
 than its layer, in the Metal bundle at present time, before Core Animation's own scaling. That changes the plan's step 1 (the same
 EASU/RCAS kernels, run from the bundle on the drawable) and replaces steps 2 and 3. Decision pending.
 
-## Steps
+## Route chosen: the Metal bundle (2026-11-24, Sunneva)
 
-0. **Gate: which games change the mode (no code).** On the rig, start vkQuake, OpenMW, Daggerfall Unity, Quake II and MetalQuake in full
-   screen at 1920x1080 on the Samsung (4K) and see whether the kext logs a mode switch (`ndrv` switch lines, `cgmode` list). If none of
-   them does, stop here and rethink (the bundle route above).
-1. **Done: `src/shaders/fsr1.cl`** (`test/fsr1-test.c` in `make test`; both kernels inline everything: no stack, EASU 64 VGPRs): EASU and RCAS ported by hand from the float path of `ffx_fsr1.h` (`ffxFsrEasuFloat`, `fsrEasuTapFloat`,
-   `fsrEasuSetFloat`, the RCAS float path) to OpenCL C. Buffers in, not textures: EASU's four gathers become twelve loads. 8-bit and
-   10-bit (`'l10r'`) pixels as `scale.cl` reads them. The constants (`ffxFsrPopulateEasuConstants`, `FsrRcasCon`) are computed in the
-   kernel from integer sizes and an integer sharpness, so the kext does no floating point. AMD's MIT notice at the top of the file and in
-   `docs/licenses.md`. Host check: the same file compiled as C on the Mac (a few macros), with assert checks that a flat image stays
-   flat, 1:1 is close to identity, and an edge stays sharp.
-2. **Present path**: a frame smaller than the head both ways with the kernel loaded: EASU into a per-port buffer of the output size
-   (VRAM from the runtime, made at first use, freed when the port goes back to direct), a compute barrier, RCAS from it into the
-   scanout buffer. The bars cleared in the same pass. The debug grab (`debug.rdna4_pvframe`) takes the output, as for scaled frames.
-3. **Mode switch**: with upscaling on, a real mode smaller than the head's largest switches the head to the largest mode of the same
-   refresh, or the one nearest it, and marks the frame as upscaled. `scaledFrame` returns the frame for those too, so cursor position and
-   attribute 0x10 follow. No host memory is needed: the frame fits in the head's VRAM slot, unlike "looks like". Without the kernel the
-   switch falls back to a real mode set.
-4. **Control**: a property any user may set (no password), on the runtime's service: `AMDRadeonRDNA4,Upscale` = `{Enabled, Sharpness}`,
-   checked in `setProperties`. Sharpness is read for each frame. Enabled applies at the next mode switch. The app keeps the choice
-   and sets it again at launch (it opens at login), so it lasts across boots without NVRAM.
-5. **Tweaks pane** in RDNA4 Gadget: a "Super Resolution (FSR 1)" switch and a sharpness slider (RCAS stops, 0 = sharpest; AMD's
-   samples default to 0.2). One line: "For games that switch to a lower resolution; applies at the next resolution change."
-6. **Card tests**: `cgmode` 1920x1080 and 1280x720 on the Samsung, with grabs compared on and off; the cost per frame from the
-   present timing; vkQuake at 1080p full screen by eye (picture, pointer position, menus); a 5:4 mode (bars); display sleep and wake
-   while upscaled; back to native goes direct again; the Lenovo (1080p) at 1280x720.
+Built (`tools/metal/native/RDNA4MTLDevice.mm`, "Super Resolution" at its end; off unless `RDNA4_FSR=1` or RDNA4Gadget's
+`SuperResolution` preference is on, `defaults write com.rx4darwin.RDNA4Gadget SuperResolution -bool true`; sharpness `Sharpness` or
+`RDNA4_FSR_SHARPNESS`, thousandths of a stop, default 200):
+
+- CAMetalLayer's `setDrawableSize:`, `drawableSize` and `nextDrawable` are replaced once a process (not WindowServer). A layer of our
+  device (or none yet: SDL sets the size first) asked for a drawable smaller than the pixels it covers on the screen (its bounds at its
+  window's backing scale) in both directions, in an 8-bit or 10-bit format, keeps its own size; the app is told the size it asked for.
+- `nextDrawable` gives the app an `RDNA4UpscaledDrawable`: its texture a private one of the asked size (one per real drawable texture).
+- Presenting it (a command buffer's `presentDrawable:`, or its own `present`) records a step after the app's draws: EASU into an
+  intermediate VRAM image of the layer's size, RCAS into the real drawable's texture (`src/shaders/fsr1.cl`, `src/fsr1_codeobj.h`,
+  `rdna4_dispatch`), then the real drawable is presented.
+
+Card-tested (2026-11-24, rig): a test window (1280x720 points at 2x, drawables of 640x360) shows FSR's output, 2560x1440, sharp edges
+where Core Animation's own scaling is blocky; no errors.
+
+**Finding: the games tested do not present small drawables.** Quake II's Metal port (SDL 2, HiDPI) asks for 3200x1800 on a 1600x900-point
+window; Daggerfall Unity at 1920x1080 asks for the full 5120x2880 and scales its frame up itself (step 0's "macOS scales the frame" was
+wrong). So nothing of theirs reaches the upscaler. It applies to apps that hand Core Animation a smaller frame: SDL games without HiDPI
+support, apps with a render scale that shrinks the drawable. **Open decision:** a "render scale" (Quality 77 %, Balanced 67 %,
+Performance 50 %) that makes apps asking for a full-size drawable draw a smaller one, upscaled by FSR: the real frame-rate gain, but an app
+that sizes its viewport from the layer's bounds rather than its drawable would draw clipped; to be tried per game.
+
+## Next
+
+1. **RDNA4Gadget "Tweaks" pane** (Sunneva: Adrenalin-like): a Super Resolution switch and a sharpness slider (and the render scale, if
+   decided), writing the preferences above; one line on what it covers. Applies to apps started after the change.
+2. **Card tests** with an app that presents small drawables, frame cost (EASU + RCAS at 4K), display sleep, a window moved between
+   displays of different scales (the layer's size is taken when the app sets the drawable size).
 
 ## Open questions and limits
 

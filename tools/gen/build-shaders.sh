@@ -5,15 +5,18 @@
 #   src/shaders/<name>.cl  -> src/<name>_codeobj.h  a whole code object (clang + ld.lld)
 # The generated headers are committed, so building the kext needs no LLVM.
 #
+#   tools/gen/build-shaders.sh [name.cl ...]   (names given: only those OpenCL kernels, the others' headers left as they are)
 #   tools/gen/build-shaders.sh            (LLVM=/usr/lib/llvm-19 by default; the .s headers are LLVM 23's: LLVM=$(brew --prefix llvm),
 #                                          which check-isa and CI compare them with; ld.lld for the .cl ones is in Homebrew's lld)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 LLVM=${LLVM:-/usr/lib/llvm-19}
+LLD=${LLD:-$LLVM/bin/ld.lld}   # (Homebrew keeps it apart: LLD=$(brew --prefix lld)/bin/ld.lld)
 mkdir -p Build/shaders
 
-# Raw machine code from assembly.
-for src in src/shaders/*.s; do
+# Raw machine code from assembly (not when kernels are named).
+[ $# -gt 0 ] && set -- $(printf 'src/shaders/%s ' "$@")
+for src in $([ $# -gt 0 ] || echo src/shaders/*.s); do
 	name=$(basename "$src" .s)
 	attr=
 	case "$name" in *64) attr=-mattr=+wavefrontsize64 ;; esac   # src/shaders/*64.s are wave64 (ngg64.s)
@@ -40,11 +43,11 @@ PY
 done
 
 # Whole code objects from OpenCL C, for the kext's code-object loader.
-for src in src/shaders/*.cl; do
+for src in ${@:-src/shaders/*.cl}; do
 	name=$(basename "$src" .cl)
 	"$LLVM/bin/clang" -target amdgcn-amd-amdhsa -mcpu=gfx1201 -x cl -cl-std=CL2.0 -O2 \
 		-nogpulib -c "$src" -o "Build/shaders/$name.o"
-	"$LLVM/bin/ld.lld" -shared "Build/shaders/$name.o" -o "Build/shaders/$name.hsaco"
+	"$LLD" -shared "Build/shaders/$name.o" -o "Build/shaders/$name.hsaco"
 	python3 - "$name" "Build/shaders/$name.hsaco" "src/${name}_codeobj.h" "$src" <<'PY'
 import sys
 name, elf, out, src = sys.argv[1:]

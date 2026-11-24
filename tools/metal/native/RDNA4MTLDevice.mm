@@ -152,6 +152,7 @@ static void statReport(void)
 #include "gfx12trirun.h"
 #include "rdna4mtlc.h"
 #include "mtlkernels.h"
+#include "fsr1_codeobj.h"
 
 // The return-type-correct signature of a protocol method the class adopts (protocols it adopts included), else nil.
 static const char *protocolTypes(Protocol *p, SEL sel)
@@ -2383,6 +2384,14 @@ static BOOL fixIndices(uint32_t kind, const RDNA4IndexJob &j, uint8_t *to)
 }
 typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // GPU addresses; src 0: a fill with the pattern
 
+// A drawable of a layer upscaled (Super Resolution, at the end of this file): the app draws into `small`, of the size it asked the
+// layer for; presented, `small` is upscaled into the layer's `real` drawable of the layer's own size, which is presented.
+@interface RDNA4UpscaledDrawable : NSObject <CAMetalDrawable>
+- (instancetype)initWithReal:(id<CAMetalDrawable>)real small:(RDNA4MTLTexture *)small;
+@property (readonly) id<CAMetalDrawable> real;
+@property (readonly) RDNA4MTLTexture *small;
+@end
+
 @interface RDNA4MTLDevice ()
 - (BOOL)gfx;   // the client may submit gfx IBs and the device's gfx buffers exist
 - (uint64_t)gfxRings;
@@ -2394,6 +2403,7 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 @property (readonly) dispatch_queue_t finishing;   // where a GL app's command buffers end, in order (nil until the first)
 - (dispatch_queue_t)work;
 - (const rdna4_program_t *)resolveKernel:(BOOL)srgb;   // rdna4_resolve or rdna4_resolve_srgb, loaded on first use (NULL: not loaded)
+- (NSError *)upscale:(RDNA4MTLTexture *)src into:(RDNA4MTLTexture *)dst;   // (work queue) FSR 1: EASU then RCAS (src/shaders/fsr1.cl)
 - (uint64_t)spareBuffer;             // what an unbound buffer slot points at: the zeroed spare buffer
 - (BOOL)drawnInFlight:(RDNA4MTLTexture *)t;   // a draw not yet waited for draws into it, a view of it or the texture it views
 - (void)drewDepth:(RDNA4MTLTexture *)t;      // (work queue) a draw wrote its depth: in flight as a draw's target is
@@ -4380,9 +4390,32 @@ static void eventWait(id event, uint64_t value)
 }
 
 - (id<MTLDevice>)device { return _queue.device; }
-- (void)presentDrawable:(id<MTLDrawable>)drawable { [_drawables addObject:drawable]; }
-- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time { [_drawables addObject:drawable]; }
-- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration { [_drawables addObject:drawable]; }
+- (void)presentDrawable:(id<MTLDrawable>)drawable { [self keepDrawable:drawable]; }
+- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time { [self keepDrawable:drawable]; }
+- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration { [self keepDrawable:drawable]; }
+
+// Presented once the work has run; an upscaled layer's drawable (RDNA4UpscaledDrawable) upscaled into its real one first, a step after the
+// app's draws, and the real one presented
+- (void)keepDrawable:(id<MTLDrawable>)drawable
+{
+	if ([(id)drawable isKindOfClass:[RDNA4UpscaledDrawable class]]) {
+		RDNA4UpscaledDrawable *u = (RDNA4UpscaledDrawable *)drawable;
+		RDNA4MTLTexture *src = u.small, *dst = (RDNA4MTLTexture *)u.real.texture;
+		RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
+		[self writesTo:dst];
+		[self record:^NSError * {
+			NSError *why = [device upscale:src into:dst];
+			if (!why) {
+				[dst wroteAll];
+				[dst heldRows:0 to:(uint32_t)dst.height width:(uint32_t)dst.width];
+				[self drewInto:dst];
+			}
+			return why;
+		}];
+		drawable = u.real;
+	}
+	[_drawables addObject:drawable];
+}
 - (id<MTLCommandQueue>)commandQueue { return _queue; }
 - (MTLCommandBufferStatus)status { return _status; }
 - (NSError *)error { return _error; }
@@ -4979,6 +5012,8 @@ static bool rebindImport(const struct mach_header_64 *image, const char *name, v
 }
 
 // SkyLight's surface calls to ours, once, in a GL process (never WindowServer)
+static void superResolutionInstall(void);   // (at the end of the file)
+
 static void glSurfacesInstall(void)
 {
 	static std::mutex lock;
@@ -5084,6 +5119,8 @@ RDNA4_ANSWER_MISSING
 	uint64_t _drawTimePrev;      // the GPU timestamp of the last timed draw seen ended
 	BOOL _drawTimeGap;           // a dispatch or barrier slot since it
 	rdna4_program_t _resolve[2];
+	rdna4_program_t _fsr[2];   // easu, rcas (upscale:into:)
+	rdna4_buffer_t _fsrMid;    // EASU's output, RCAS's input: the largest drawable upscaled so far
 }
 
 static NSString *serviceString(io_service_t service, CFStringRef key);
@@ -5149,6 +5186,7 @@ static void abortStack(int sig)
 		return nil;
 	gGlDevice = self;
 	glSurfacesInstall();   // (a GL process: before SkyLight binds its window surfaces)
+	superResolutionInstall();
 	IOObjectRetain(service);
 	_service = service;
 	IORegistryEntryGetRegistryEntryID(service, &_registryID);
@@ -6692,3 +6730,189 @@ static NSString *serviceString(io_service_t service, CFStringRef key)
 }
 
 @end
+
+// ---- Super Resolution: FSR 1 for drawables smaller than their layer (docs/fsr1-upscaling-plan.md)
+//
+// A game that renders below the screen's resolution sets its CAMetalLayer's drawableSize smaller than the pixels the layer covers, and Core
+// Animation scales its frames up (bilinear). With Super Resolution on (RDNA4Gadget's setting, or RDNA4_FSR=1), the layer is kept at its
+// own size instead: the app is told the size it asked for and draws into a texture of that size (RDNA4UpscaledDrawable's `small`), which
+// FSR 1 upscales (EASU) and sharpens (RCAS) into the layer's real drawable when it is presented. 8-bit and 10-bit drawables (BGRA8,
+// RGBA8 and their sRGB forms, RGB10A2, BGR10A2); RGBA16Float (EDR) is left to Core Animation.
+
+static const CFStringRef kGadgetDomain = CFSTR("com.rx4darwin.RDNA4Gadget");   // where RDNA4Gadget keeps the settings
+
+static BOOL fsrWanted(void)
+{
+	if (const char *env = getenv("RDNA4_FSR"))
+		return atoi(env) != 0;
+	return CFPreferencesGetAppBooleanValue(CFSTR("SuperResolution"), kGadgetDomain, NULL);
+}
+
+// RCAS's sharpness in thousandths of a stop (0 sharpest; AMD's samples: 0.2 stops)
+static uint32_t fsrSharpness(void)
+{
+	if (const char *env = getenv("RDNA4_FSR_SHARPNESS"))
+		return (uint32_t)atoi(env);
+	Boolean set = false;
+	const CFIndex v = CFPreferencesGetAppIntegerValue(CFSTR("Sharpness"), kGadgetDomain, &set);
+	return set && v >= 0 ? (uint32_t)v : 200;
+}
+
+static BOOL fsrFormat(MTLPixelFormat f)
+{
+	return f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB || f == MTLPixelFormatRGBA8Unorm ||
+	       f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatRGB10A2Unorm || f == MTLPixelFormatBGR10A2Unorm;
+}
+
+@implementation RDNA4MTLDevice (SuperResolution)
+
+- (NSError *)upscale:(RDNA4MTLTexture *)src into:(RDNA4MTLTexture *)dst
+{
+	const MTLPixelFormat f = dst.pixelFormat;
+	if (!fsrFormat(f) || src.pixelFormat != f || src.samples > 1 || !src.gpuBase || !dst.gpuBase)
+		return rdna4Error([NSString stringWithFormat:@"an upscale of a format %lu texture into a format %lu one", (unsigned long)src.pixelFormat,
+		                                             (unsigned long)f], 0);
+	const uint32_t sw = (uint32_t)src.width, sh = (uint32_t)src.height, dw = (uint32_t)dst.width, dh = (uint32_t)dst.height;
+	@synchronized(self) {
+		if (!_fsr[1].handle && (rdna4_load(&_gpu, kFsr1CodeObject, sizeof kFsr1CodeObject, "easu", &_fsr[0]) ||
+		                        rdna4_load(&_gpu, kFsr1CodeObject, sizeof kFsr1CodeObject, "rcas", &_fsr[1])))
+			return rdna4Error(@"the FSR kernels", 0);
+		const uint64_t bytes = (uint64_t)dw * dh * 4;
+		if (_fsrMid.bytes < bytes) {
+			if (_fsrMid.handle)
+				rdna4_free(&_gpu, &_fsrMid);
+			if (const kern_return_t kr = rdna4_alloc(&_gpu, bytes, &_fsrMid))
+				return rdna4Error(@"the upscale's intermediate image", kr);
+		}
+	}
+	NSError *why = [dst.held sync];
+	if (!why && dst.held)
+		why = [self drainGfx];   // (the held copy's fill went to the gfx ring, the dispatches to a compute queue)
+	if (why)
+		return why;
+	const uint32_t tenBit = f == MTLPixelFormatRGB10A2Unorm || f == MTLPixelFormatBGR10A2Unorm;
+	// the kernels' arguments (fsr1.cl's easu and rcas): pixel pitches, sizes
+	struct __attribute__((packed)) { uint64_t src, dst; uint32_t srcPitch, dstPitch, srcW, srcH, dstW, dstH, tenBit; } easu = {
+		src.gpuBase, _fsrMid.gpu, (uint32_t)(src.rowBytes / 4), dw, sw, sh, dw, dh, tenBit };
+	struct __attribute__((packed)) { uint64_t src, dst; uint32_t srcPitch, dstPitch, w, h, sharpness, tenBit; } rcas = {
+		_fsrMid.gpu, dst.gpuBase, dw, (uint32_t)(dst.rowBytes / 4), dw, dh, fsrSharpness(), tenBit };
+	const uint32_t groups[3] = { (dw + 63) / 64, dh, 1 }, size[3] = { 64, 1, 1 };
+	kern_return_t kr = rdna4_dispatch(&_gpu, &_fsr[0], groups, size, &easu, sizeof easu, 1000, NULL);
+	if (!kr)
+		kr = rdna4_dispatch(&_gpu, &_fsr[1], groups, size, &rcas, sizeof rcas, 1000, NULL);
+	return kr ? rdna4Error(@"an FSR upscale", kr) : nil;
+}
+
+@end
+
+@implementation RDNA4UpscaledDrawable {
+	id<CAMetalDrawable> _real;
+	RDNA4MTLTexture *_small;
+}
+
+- (instancetype)initWithReal:(id<CAMetalDrawable>)real small:(RDNA4MTLTexture *)small
+{
+	if ((self = [super init]))
+		_real = real, _small = small;
+	return self;
+}
+
+- (id<CAMetalDrawable>)real { return _real; }
+- (RDNA4MTLTexture *)small { return _small; }
+- (id<MTLTexture>)texture { return _small; }
+- (CAMetalLayer *)layer { return _real.layer; }
+- (NSUInteger)drawableID { return _real.drawableID; }
+- (CFTimeInterval)presentedTime { return _real.presentedTime; }
+// (the app's handler is given this drawable, the one it presented; kept by the real one until it was presented, as Metal's are)
+- (void)addPresentedHandler:(MTLDrawablePresentedHandler)block
+{
+	RDNA4UpscaledDrawable *me = self;
+	[_real addPresentedHandler:^(id<MTLDrawable>) { block(me); }];
+}
+// Presented without a command buffer: through one of its own (the upscale is a step of a command buffer)
+- (void)present
+{
+	static id<MTLCommandQueue> queue;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{ queue = [_small.device newCommandQueue]; });
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	[cb presentDrawable:self];
+	[cb commit];
+}
+- (void)presentAtTime:(CFTimeInterval)time { [self present]; }
+- (void)presentAfterMinimumDuration:(CFTimeInterval)duration { [self present]; }
+- (id)forwardingTargetForSelector:(SEL)sel { return _real; }   // (anything else a drawable answers: the real one's)
+
+@end
+
+static void (*gRealSetDrawableSize)(id, SEL, CGSize);
+static CGSize (*gRealDrawableSize)(id, SEL);
+static id (*gRealNextDrawable)(id, SEL);
+static const void *const kUpscaledSize = &kUpscaledSize;   // a layer's: the size the app asked for (NSValue) while it is upscaled
+static const void *const kSmallTexture = &kSmallTexture;   // a real drawable's texture's: the small texture the app draws into for it
+
+static void fsrSetDrawableSize(CAMetalLayer *layer, SEL sel, CGSize size)
+{
+	// the pixels the layer covers on the screen: its bounds at its window's scale (a game may set contentsScale to fit its smaller
+	// frames: Unity's 1920x1080 in a 2560x1440 window), else at its own
+	id view = layer.delegate;
+	const CGFloat window = [view respondsToSelector:@selector(window)] ? [[view valueForKeyPath:@"window.backingScaleFactor"] doubleValue] : 0;
+	const CGFloat scale = window > 0 ? window : layer.contentsScale;
+	const CGSize own = CGSizeMake(round(layer.bounds.size.width * scale), round(layer.bounds.size.height * scale));
+	// (a layer with no device yet counts: SDL sets the size first; the first drawable undoes it if the device is not ours)
+	const BOOL up = (!layer.device || [(id)layer.device isKindOfClass:[RDNA4MTLDevice class]]) && fsrFormat(layer.pixelFormat) && size.width >= 1 &&
+	                size.height >= 1 && size.width < own.width * 0.95 && size.height < own.height * 0.95 && own.width <= 16384 &&
+	                own.height <= 16384 && fsrWanted();
+	NSValue *was = objc_getAssociatedObject(layer, kUpscaledSize);
+	if (up && !(was && CGSizeEqualToSize(was.sizeValue, size)))
+		RLOG(@"RDNA4MTL: Super Resolution: %.0fx%.0f frames upscaled to %.0fx%.0f", size.width, size.height, own.width, own.height);
+	objc_setAssociatedObject(layer, kUpscaledSize, up ? [NSValue valueWithSize:size] : nil, OBJC_ASSOCIATION_RETAIN);
+	gRealSetDrawableSize(layer, sel, up ? own : size);
+}
+
+static CGSize fsrDrawableSize(CAMetalLayer *layer, SEL sel)
+{
+	NSValue *asked = objc_getAssociatedObject(layer, kUpscaledSize);
+	return asked ? asked.sizeValue : gRealDrawableSize(layer, sel);
+}
+
+static id fsrNextDrawable(CAMetalLayer *layer, SEL sel)
+{
+	NSValue *asked = objc_getAssociatedObject(layer, kUpscaledSize);
+	if (asked && ![(id)layer.device isKindOfClass:[RDNA4MTLDevice class]]) {   // another device's layer after all: the size asked for
+		objc_setAssociatedObject(layer, kUpscaledSize, nil, OBJC_ASSOCIATION_RETAIN);
+		gRealSetDrawableSize(layer, @selector(setDrawableSize:), asked.sizeValue);
+		asked = nil;
+	}
+	id<CAMetalDrawable> real = gRealNextDrawable(layer, sel);
+	RDNA4MTLTexture *big = (RDNA4MTLTexture *)real.texture;
+	const NSUInteger w = (NSUInteger)asked.sizeValue.width, h = (NSUInteger)asked.sizeValue.height;
+	// (not one larger than asked for: a layer resized since, say; the app gets the real one)
+	if (!asked || ![(id)big isKindOfClass:[RDNA4MTLTexture class]] || big.width <= w || big.height <= h)
+		return real;
+	RDNA4MTLTexture *small = objc_getAssociatedObject(big, kSmallTexture);
+	if (!small || small.width != w || small.height != h || small.pixelFormat != big.pixelFormat) {
+		MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:big.pixelFormat width:w height:h mipmapped:NO];
+		d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+		d.storageMode = MTLStorageModePrivate;
+		if (!(small = (RDNA4MTLTexture *)[layer.device newTextureWithDescriptor:d]))
+			return real;
+		objc_setAssociatedObject(big, kSmallTexture, small, OBJC_ASSOCIATION_RETAIN);
+	}
+	return [[RDNA4UpscaledDrawable alloc] initWithReal:real small:small];
+}
+
+// Once a process, when its first device of ours is made (not in WindowServer: its layers are not apps' frames)
+static void superResolutionInstall(void)
+{
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		if (!strcmp(getprogname(), "WindowServer"))
+			return;
+		Class c = [CAMetalLayer class];
+		gRealSetDrawableSize = (void (*)(id, SEL, CGSize))method_setImplementation(class_getInstanceMethod(c, @selector(setDrawableSize:)),
+		                                                                          (IMP)fsrSetDrawableSize);
+		gRealDrawableSize = (CGSize (*)(id, SEL))method_setImplementation(class_getInstanceMethod(c, @selector(drawableSize)), (IMP)fsrDrawableSize);
+		gRealNextDrawable = (id (*)(id, SEL))method_setImplementation(class_getInstanceMethod(c, @selector(nextDrawable)), (IMP)fsrNextDrawable);
+	});
+}
