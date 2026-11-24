@@ -65,8 +65,8 @@ struct GadgetView: View {
                 }
                 GridRow {
                     Reading(label: "Fan", value: g.fanRPM.map { $0 == 0 ? "stopped" : String(format: "%.0f RPM", $0) })
-                    Reading(label: "VRAM", value: g.vramUsed.map { used in
-                        g.vramTotal.map { String(format: "%.1f / %.0f GB", used / 1e9, $0 / 1e9) } ?? String(format: "%.1f GB", used / 1e9)
+                    Reading(label: "VRAM", value: g.vramUsed.map { used in   // in GiB, as macOS and AMD state a card's memory
+                        g.vramTotal.map { String(format: "%.1f / %.0f GB", used / 0x1p30, $0 / 0x1p30) } ?? String(format: "%.1f GB", used / 0x1p30)
                     })
                     Reading(label: "Driver", value: g.driver.isEmpty ? nil : g.driver.replacingOccurrences(of: "Accelerator", with: ""))
                 }

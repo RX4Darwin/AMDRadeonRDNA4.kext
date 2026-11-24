@@ -764,7 +764,7 @@ struct {
 	bool ok;
 	RDNA4Sensors s;
 	RDNA4SensorsEx ex;
-	uint64_t heapBytes, heapFree;
+	uint64_t heapBytes, heapFree, vramBytes;
 } gStats;
 
 void putNumber(OSDictionary *d, const char *key, uint64_t value)
@@ -787,6 +787,7 @@ uintptr_t writePerformanceStats(OSObject *self, OSDictionary *d, bool reset)
 	if (!gStats.at || now - gStats.at >= second) {
 		RDNA4Compute *c = gComputeService ? gComputeService->compute : nullptr;
 		gStats.ok = c && c->statisticsSample(gStats.s, gStats.ex, gStats.heapBytes, gStats.heapFree);
+		gStats.vramBytes = c ? c->vramBytes() : 0;
 		gStats.at = now;
 	}
 	if (gStats.ok) {
@@ -800,7 +801,7 @@ uintptr_t writePerformanceStats(OSObject *self, OSDictionary *d, bool reset)
 		putNumber(d, "inUseVidMemoryBytes", gStats.heapBytes - gStats.heapFree);
 		putNumber(d, "vramUsedBytes", gStats.heapBytes - gStats.heapFree);   // (the family writes its own inUseVidMemoryBytes after these)
 		putNumber(d, "vramFreeBytes", gStats.heapFree);
-		putNumber(d, "VRAM,totalBytes", gStats.heapBytes);
+		putNumber(d, "VRAM,totalBytes", gStats.vramBytes ? gStats.vramBytes : gStats.heapBytes);   // the card's; used and free are the heap's
 	}
 	IOLockUnlock(gStatsLock);
 	return r;
