@@ -1502,9 +1502,84 @@ static int rtCompare(const void *a, const void *b)
 	return cx < cy ? -1 : cx > cy;
 }
 
-// The subtree of tris[first, first + count) from nodes[*used] on, depth first; leaves of at most kRtLeaf triangles, split at the median
-// of the widest axis of their centres.
-static void rtBuild(RtTri *tris, uint32_t first, uint32_t count, RtNode *nodes, uint32_t *used)
+// Half the surface area of a box (the SAH's measure; the factor does not change which split is cheapest).
+static float rtArea(const float lo[3], const float hi[3])
+{
+	const float x = hi[0] - lo[0], y = hi[1] - lo[1], z = hi[2] - lo[2];
+	return x * y + y * z + z * x;
+}
+
+// Where tris[first, first + count) split by the surface area heuristic over kBins bins of their centres along each axis: the number that
+// goes left (they are moved there), or 0 when no bin boundary separates them. The median split this replaced gave Quake's levels loose
+// boxes, and MetalQuake's ray-traced world took 3 ms a draw at 5120x2880 (2026-11-24).
+static uint32_t rtSplitSah(RtTri *tris, uint32_t first, uint32_t count, const float clo[3], const float chi[3])
+{
+	enum { kBins = 16 };
+	int bestAxis = -1;
+	uint32_t bestBin = 0;
+	float bestCost = INFINITY;
+	for (int a = 0; a < 3; a++) {
+		const float extent = chi[a] - clo[a];
+		if (!(extent > 0))
+			continue;
+		struct { uint32_t n; float lo[3], hi[3]; } bin[kBins];
+		for (int b = 0; b < kBins; b++) {
+			bin[b].n = 0;
+			for (int k = 0; k < 3; k++)
+				bin[b].lo[k] = INFINITY, bin[b].hi[k] = -INFINITY;
+		}
+		for (uint32_t i = first; i < first + count; i++) {
+			const float c = tris[i].v[a] + tris[i].v[3 + a] + tris[i].v[6 + a];
+			const int b = MIN((int)((c - clo[a]) / extent * kBins), kBins - 1);
+			bin[b].n++;
+			for (int v = 0; v < 3; v++)
+				for (int k = 0; k < 3; k++)
+					bin[b].lo[k] = fminf(bin[b].lo[k], tris[i].v[3 * v + k]), bin[b].hi[k] = fmaxf(bin[b].hi[k], tris[i].v[3 * v + k]);
+		}
+		// the right side's cost for each boundary, swept from the right; then the left side's, swept from the left
+		float rightCost[kBins];
+		uint32_t n = 0;
+		float lo[3] = { INFINITY, INFINITY, INFINITY }, hi[3] = { -INFINITY, -INFINITY, -INFINITY };
+		for (int b = kBins - 1; b > 0; b--) {
+			n += bin[b].n;
+			for (int k = 0; k < 3; k++)
+				lo[k] = fminf(lo[k], bin[b].lo[k]), hi[k] = fmaxf(hi[k], bin[b].hi[k]);
+			rightCost[b] = n ? n * rtArea(lo, hi) : 0;
+		}
+		n = 0;
+		for (int k = 0; k < 3; k++)
+			lo[k] = INFINITY, hi[k] = -INFINITY;
+		for (int b = 0; b < kBins - 1; b++) {
+			n += bin[b].n;
+			for (int k = 0; k < 3; k++)
+				lo[k] = fminf(lo[k], bin[b].lo[k]), hi[k] = fmaxf(hi[k], bin[b].hi[k]);
+			if (!n || n == count)
+				continue;
+			const float cost = n * rtArea(lo, hi) + rightCost[b + 1];
+			if (cost < bestCost)
+				bestCost = cost, bestAxis = a, bestBin = (uint32_t)b;
+		}
+	}
+	if (bestAxis < 0)
+		return 0;
+	// in place: those in bins 0..bestBin to the front
+	const float extent = chi[bestAxis] - clo[bestAxis];
+	uint32_t left = first;
+	for (uint32_t i = first; i < first + count; i++) {
+		const float c = tris[i].v[bestAxis] + tris[i].v[3 + bestAxis] + tris[i].v[6 + bestAxis];
+		if ((uint32_t)MIN((int)((c - clo[bestAxis]) / extent * kBins), kBins - 1) <= bestBin) {
+			const RtTri t = tris[left];
+			tris[left++] = tris[i];
+			tris[i] = t;
+		}
+	}
+	return left - first;
+}
+
+// The subtree of tris[first, first + count) from nodes[*used] on, depth first; leaves of at most kRtLeaf triangles, split by the surface
+// area heuristic (rtSplitSah), or at the median of the widest axis of their centres where no bin boundary separates them or below depth
+// 48 (the median keeps the recursion shallow on a secondary thread's stack whatever the geometry).
+static void rtBuild(RtTri *tris, uint32_t first, uint32_t count, RtNode *nodes, uint32_t *used, uint32_t depth)
 {
 	RtNode *n = &nodes[(*used)++];
 	float clo[3] = { INFINITY, INFINITY, INFINITY }, chi[3] = { -INFINITY, -INFINITY, -INFINITY };
@@ -1527,11 +1602,15 @@ static void rtBuild(RtTri *tris, uint32_t first, uint32_t count, RtNode *nodes, 
 		n->escape = *used;
 		return;
 	}
-	gRtAxis = chi[1] - clo[1] > chi[0] - clo[0] ? 1 : 0;
-	gRtAxis = chi[2] - clo[2] > chi[gRtAxis] - clo[gRtAxis] ? 2 : gRtAxis;
-	qsort(tris + first, count, sizeof(RtTri), rtCompare);
-	rtBuild(tris, first, count / 2, nodes, used);
-	rtBuild(tris, first + count / 2, count - count / 2, nodes, used);
+	uint32_t left = depth < 48 ? rtSplitSah(tris, first, count, clo, chi) : 0;
+	if (!left) {
+		gRtAxis = chi[1] - clo[1] > chi[0] - clo[0] ? 1 : 0;
+		gRtAxis = chi[2] - clo[2] > chi[gRtAxis] - clo[gRtAxis] ? 2 : gRtAxis;
+		qsort(tris + first, count, sizeof(RtTri), rtCompare);
+		left = count / 2;
+	}
+	rtBuild(tris, first, left, nodes, used, depth + 1);
+	rtBuild(tris, first + left, count - left, nodes, used, depth + 1);
 	n->tris = 0;
 	n->escape = *used;
 }
@@ -1665,7 +1744,7 @@ static RDNA4MTLBuffer *structureMemory(id<MTLAccelerationStructure> as);
 	RtNode *nodes = (RtNode *)(head + 4);
 	uint32_t used = 0;
 	if (count)
-		rtBuild((RtTri *)tris.mutableBytes, 0, count, nodes, &used);
+		rtBuild((RtTri *)tris.mutableBytes, 0, count, nodes, &used, 0);
 	memcpy(nodes + used, tris.bytes, tris.length);
 	head[0] = 0x31534152u;   // 'RAS1'
 	head[1] = used;
@@ -4256,6 +4335,14 @@ static int64_t earlyBacklog(void)   // RDNA4_EARLYBACKLOG=n: another cap, for me
 		dispatch_queue_t handlers = self->_queue.handlers;
 		NSError *why = nil;
 		uint64_t slowest = 0, slowestAt = 0;   // its longest step (a command buffer of 200 ms or more is logged: the pointer stood at times)
+		// (RDNA4_DRAWTIME) the work queue's timeline of command buffers 300 to 305: where it waited (MetalQuake, 2026-11-24)
+		static std::atomic<uint32_t> traced;
+		static const BOOL timing = getenv("RDNA4_DRAWTIME") && atoi(getenv("RDNA4_DRAWTIME")) == 1;
+		const uint32_t cbNumber = timing ? traced++ : 0;
+		const BOOL tl = cbNumber >= 300 && cbNumber < 306;
+		if (tl)
+			RLOG(@"RDNA4MTL timeline: cb %u (%@) starts, %lu ops, %lu draws, %.2f ms after commit", cbNumber, self.label ?: @"-",
+			     (unsigned long)self->_ops.count, (unsigned long)self->_draws.count, (started - self->_committedUs) / 1e3);
 		for (NSUInteger i = 0; i < self->_ops.count && !why; i++) {
 			const BOOL draw = [self->_draws containsIndex:i];
 			const uint64_t t0 = nowUs();
@@ -4265,6 +4352,14 @@ static int64_t earlyBacklog(void)   // RDNA4_EARLYBACKLOG=n: another cap, for me
 			if (!why)
 				why = self->_ops[i]();
 			const uint64_t t2 = nowUs();
+			if (tl && (!draw || t2 - t0 > 500)) {
+				struct BlockHead { void *isa; int flags, reserved; void *invoke; };
+				const BlockHead *block = static_cast<const BlockHead *>((__bridge void *)self->_ops[i]);
+				Dl_info where = {};
+				dladdr(block->invoke, &where);
+				RLOG(@"RDNA4MTL timeline: cb %u op %lu %s at +%.2f ms: drain %.2f ms, run %.2f ms (%s)", cbNumber, (unsigned long)i, draw ? "draw" : "step",
+				     (t0 - started) / 1e3, (t1 - t0) / 1e3, (t2 - t1) / 1e3, where.dli_sname ?: "?");
+			}
 			if (t2 - t0 > slowest)
 				slowest = t2 - t0, slowestAt = i;
 			if (!draw)
@@ -4276,6 +4371,8 @@ static int64_t earlyBacklog(void)   // RDNA4_EARLYBACKLOG=n: another cap, for me
 		// once its draws were done, WindowServer's main thread waited for the card in 23 % of a window drag (spindump, 2026-11-20).
 		NSError *flushed = [device flushBatch];   // (the last batch of draws onto the ring first)
 		why = why ?: flushed;
+		if (tl)
+			RLOG(@"RDNA4MTL timeline: cb %u submitted at +%.2f ms", cbNumber, (nowUs() - started) / 1e3);
 		void (^scheduledNow)(void) = ^{
 			self->_status = MTLCommandBufferStatusScheduled;
 			gUnscheduled--;
@@ -4734,6 +4831,8 @@ RDNA4_ANSWER_MISSING
 	// writes or reads as indices, and of a copy's source. A slot whose work could write anywhere has the whole range.
 	uint64_t _slotUse[kSlots][2][2];
 	uint8_t _slotKind[kSlots];   // (RDNA4_DRAWTIME) what the slot ran: kSlotDraw (kSlotRunFirst), kSlotDispatch, kSlotBarrier; kSlotBatchFirst
+	NSString *_slotName[kSlots]; // (RDNA4_DRAWTIME) its draw's pipeline, "vertex / fragment"
+	uint64_t _slotVerts[kSlots]; // (RDNA4_DRAWTIME) its draw's vertices times instances
 	uint64_t _drawTimePrev;      // the GPU timestamp of the last timed draw seen ended
 	BOOL _drawTimeGap;           // a dispatch or barrier slot since it
 	rdna4_program_t _resolve[2];
@@ -4926,10 +5025,15 @@ static void abortStack(int sig)
 	memset(_slotUse[*slot], 0, sizeof _slotUse[*slot]);
 	if (const uint8_t kind = _slotKind[*slot]) {
 		_slotKind[*slot] = 0;
+		NSString *name = _slotName[*slot];
+		const uint64_t verts = _slotVerts[*slot];
+		_slotName[*slot] = nil;
 		if (kind & kSlotDraw) {
 			const uint64_t ts = *(volatile uint64_t *)(_miscCpu + (uint64_t)*slot * kMiscBytes + 8);
-			if (_drawTimePrev && ts > _drawTimePrev && ts - _drawTimePrev < 100000000)
+			if (_drawTimePrev && ts > _drawTimePrev && ts - _drawTimePrev < 100000000) {
 				drawTimeAdd(kind | (_drawTimeGap ? 0x80 : 0), ts - _drawTimePrev);
+				drawTimeByPipeline(name, ts - _drawTimePrev, verts);
+			}
 			_drawTimePrev = ts, _drawTimeGap = NO;
 		} else {
 			_drawTimeGap = YES;
@@ -4958,7 +5062,7 @@ static void drawTimeAdd(uint32_t kind, uint64_t ticks)
 	while (b < 7 && ticks >= (100ull << b))   // buckets: < 1, 2, 4 .. 64 us, more
 		b++;
 	count[c]++, sum[c] += ticks, hist[c][b]++;
-	if (++total < 20000)
+	if (++total < 5000)
 		return;
 	for (int i = 0; i < 4; i++)
 		if (count[i])
@@ -4966,6 +5070,30 @@ static void drawTimeAdd(uint32_t kind, uint64_t ticks)
 			     @(names[i]), count[i], sum[i] / 100.0 / count[i], sum[i] / 1e5, hist[i][0], hist[i][1], hist[i][2], hist[i][3], hist[i][4],
 			     hist[i][5], hist[i][6], hist[i][7]);
 	memset(count, 0, sizeof count), memset(sum, 0, sizeof sum), memset(hist, 0, sizeof hist), total = 0;
+}
+
+// (RDNA4_DRAWTIME) The card's time by pipeline: every 5000 draws, the ten that took the most of it (MetalQuake, 2026-11-24).
+static void drawTimeByPipeline(NSString *name, uint64_t ticks, uint64_t verts)
+{
+	static NSMutableDictionary<NSString *, NSMutableArray<NSNumber *> *> *by;
+	static uint64_t total, draws;
+	if (!by)
+		by = [NSMutableDictionary dictionary];
+	NSMutableArray<NSNumber *> *e = by[name ?: @"?"] ?: (by[name ?: @"?"] = [@[ @0, @0, @0 ] mutableCopy]);
+	e[0] = @(e[0].unsignedLongLongValue + 1), e[1] = @(e[1].unsignedLongLongValue + ticks), e[2] = @(e[2].unsignedLongLongValue + verts);
+	total += ticks;
+	if (++draws < 5000)
+		return;
+	NSArray<NSString *> *keys = [by keysSortedByValueUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
+		return [b[1] compare:a[1]];
+	}];
+	RLOG(@"RDNA4MTL drawtime: %llu draws, %.1f ms of card time; by pipeline:", draws, total / 1e5);
+	for (NSUInteger i = 0; i < MIN(keys.count, (NSUInteger)10); i++)
+		RLOG(@"RDNA4MTL drawtime:   %.1f ms (%.0f%%) in %@ draws, %.1f us and %llu vertices each: %@", by[keys[i]][1].unsignedLongLongValue / 1e5,
+		     100.0 * by[keys[i]][1].unsignedLongLongValue / total, by[keys[i]][0], by[keys[i]][1].unsignedLongLongValue / 100.0 /
+		     by[keys[i]][0].unsignedLongLongValue, by[keys[i]][2].unsignedLongLongValue / by[keys[i]][0].unsignedLongLongValue, keys[i]);
+	[by removeAllObjects];
+	total = draws = 0;
 }
 
 static void widenRange(uint64_t r[2], uint64_t at, uint64_t bytes)
@@ -5077,8 +5205,21 @@ static void padSlot(uint32_t *page, uint32_t n)
 	NSError *why = [self takeSlot:&slot];
 	if (why)
 		return why;
+	// (RDNA4_DRAWTIME) its end on the card's clock, as a draw's, and what it filled and copied: a barrier's own time
+	const BOOL timed = drawTimeOn() && n + 8 + 1 <= RDNA4_TRIRUN_PAGE / 4;
+	if (timed) {
+		const uint64_t at = _misc.gpu + (uint64_t)slot * kMiscBytes + 8;
+		const uint32_t stamp[8] = { Pm4::header(Pm4::OpReleaseMem, 6), 0x528u, 3u << 29, (uint32_t)at, (uint32_t)(at >> 32), 0, 0, 0 };
+		memcpy(ib + n, stamp, sizeof stamp);
+		n += 8;
+		uint64_t filled = 0;
+		for (uint32_t c = 0; c < count; c++)
+			filled += copies[c].src ? 0 : copies[c].bytes;
+		_slotName[slot] = [NSString stringWithFormat:@"(barrier: %.0f MB filled, %.0f MB copied)", filled / 1e6, total / 1e6];
+		_slotVerts[slot] = 0;
+	}
 	memcpy(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE, ib, n * 4);
-	_slotKind[slot] = drawTimeOn() ? kSlotBarrier : 0;
+	_slotKind[slot] = timed ? kSlotBarrier | kSlotDraw : drawTimeOn() ? kSlotBarrier : 0;
 	[self queueSlot:slot dwords:n];   // (_lastSlot stays the last draw's: its stream fence is what drainGfx checks)
 	_slotPipe[slot] = nil;
 	for (uint32_t c = 0; c < count; c++) {
@@ -5647,6 +5788,8 @@ static void padSlot(uint32_t *page, uint32_t n)
 	if (kr)
 		return rdna4Error([NSString stringWithFormat:@"a draw of %u vertices (%u dwords)", d->count, total], kr);
 	_slotKind[slot] = timed ? (uint8_t)(kSlotDraw | (overlap && _overlapRun ? 0 : kSlotRunFirst)) : 0;
+	_slotName[slot] = timed ? p.names : nil;
+	_slotVerts[slot] = (uint64_t)d->count * MAX(d->instances, 1u);
 	[self queueSlot:slot dwords:total];
 	pad.queued = true;
 	_lastSlot = slot;
