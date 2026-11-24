@@ -6758,6 +6758,16 @@ static uint32_t fsrSharpness(void)
 	return set && v >= 0 ? (uint32_t)v : 200;
 }
 
+// The render scale in percent (RenderScale, RDNA4_FSR_SCALE): below 100, an app asking for a full-size drawable is given one that much
+// smaller in each direction, upscaled back (FSR 1's Ultra Quality 77, Quality 67, Balanced 59, Performance 50); 100 (the default) leaves it.
+static uint32_t fsrRenderScale(void)
+{
+	Boolean set = false;
+	const char *env = getenv("RDNA4_FSR_SCALE");
+	const long v = env ? atol(env) : CFPreferencesGetAppIntegerValue(CFSTR("RenderScale"), kGadgetDomain, &set);
+	return (env || set) && v >= 25 && v < 100 ? (uint32_t)v : 100;
+}
+
 static BOOL fsrFormat(MTLPixelFormat f)
 {
 	return f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB || f == MTLPixelFormatRGBA8Unorm ||
@@ -6860,14 +6870,21 @@ static void fsrSetDrawableSize(CAMetalLayer *layer, SEL sel, CGSize size)
 	const CGFloat scale = window > 0 ? window : layer.contentsScale;
 	const CGSize own = CGSizeMake(round(layer.bounds.size.width * scale), round(layer.bounds.size.height * scale));
 	// (a layer with no device yet counts: SDL sets the size first; the first drawable undoes it if the device is not ours)
-	const BOOL up = (!layer.device || [(id)layer.device isKindOfClass:[RDNA4MTLDevice class]]) && fsrFormat(layer.pixelFormat) && size.width >= 1 &&
-	                size.height >= 1 && size.width < own.width * 0.95 && size.height < own.height * 0.95 && own.width <= 16384 &&
-	                own.height <= 16384 && fsrWanted();
+	const BOOL ours = (!layer.device || [(id)layer.device isKindOfClass:[RDNA4MTLDevice class]]) && fsrFormat(layer.pixelFormat) && size.width >= 1 &&
+	                  size.height >= 1 && size.width <= 16384 && size.height <= 16384 && own.width <= 16384 && own.height <= 16384 && fsrWanted();
+	CGSize small = size, real = own;   // what the app draws, what is presented
+	BOOL up = ours && size.width < own.width * 0.95 && size.height < own.height * 0.95;   // the app's own smaller frames
+	const uint32_t renderScale = ours && !up ? fsrRenderScale() : 100;
+	if (renderScale < 100 && size.width >= own.width * 0.95 && size.height >= own.height * 0.95) {   // a full-size one: at the render scale
+		small = CGSizeMake(MAX(round(size.width * renderScale / 100), 1.0), MAX(round(size.height * renderScale / 100), 1.0));
+		real = size, up = YES;
+	}
 	NSValue *was = objc_getAssociatedObject(layer, kUpscaledSize);
-	if (up && !(was && CGSizeEqualToSize(was.sizeValue, size)))
-		RLOG(@"RDNA4MTL: Super Resolution: %.0fx%.0f frames upscaled to %.0fx%.0f", size.width, size.height, own.width, own.height);
-	objc_setAssociatedObject(layer, kUpscaledSize, up ? [NSValue valueWithSize:size] : nil, OBJC_ASSOCIATION_RETAIN);
-	gRealSetDrawableSize(layer, sel, up ? own : size);
+	if (up && !(was && CGSizeEqualToSize(was.sizeValue, small)))
+		RLOG(@"RDNA4MTL: Super Resolution: %.0fx%.0f frames upscaled to %.0fx%.0f%s", small.width, small.height, real.width, real.height,
+		     renderScale < 100 ? " (render scale)" : "");
+	objc_setAssociatedObject(layer, kUpscaledSize, up ? [NSValue valueWithSize:small] : nil, OBJC_ASSOCIATION_RETAIN);
+	gRealSetDrawableSize(layer, sel, up ? real : size);
 }
 
 static CGSize fsrDrawableSize(CAMetalLayer *layer, SEL sel)

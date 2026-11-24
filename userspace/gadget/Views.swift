@@ -1,4 +1,4 @@
-// Views.swift: the popover: the card's readings and the driver (versions, update, removal).
+// Views.swift: the popover: the card's readings, the driver (versions, update, removal), its tweaks (Super Resolution).
 
 import SwiftUI
 
@@ -14,12 +14,14 @@ struct GadgetView: View {
             readings
             Picker("", selection: $tab) {
                 Text("Driver").tag(0)
-                Text("Gadget").tag(1)
+                Text("Tweaks").tag(1)
+                Text("Gadget").tag(2)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
             switch tab {
             case 0: driver
+            case 1: TweaksView()
             default: gadget
             }
             if let busy = model.busy {
@@ -170,5 +172,39 @@ private struct Sparkline: View {
         }
         .padding(4)
         .background(RoundedRectangle(cornerRadius: 5).fill(Color.primary.opacity(0.05)))
+    }
+}
+
+// The driver's tweaks, kept in this app's preferences where the Metal driver reads them when a game sets up its window
+// (tools/metal/native/RDNA4MTLDevice.mm, "Super Resolution"): they apply to games started after a change.
+struct TweaksView: View {
+    @AppStorage("SuperResolution") private var superResolution = false
+    @AppStorage("RenderScale") private var renderScale = 100     // percent of the size a game asks for; 100: its own size
+    @AppStorage("Sharpness") private var sharpness = 200         // RCAS, thousandths of a stop below the sharpest
+
+    // FSR 1's quality modes (AMD's names and scales)
+    private static let modes: [(String, Int)] = [("Off: the game's own size", 100), ("Ultra Quality (77 %)", 77), ("Quality (67 %)", 67),
+                                                 ("Balanced (59 %)", 59), ("Performance (50 %)", 50)]
+
+    // shown as 0-100 % (Adrenalin's way), kept as stops below the sharpest: 100 % is 0, 0 % is 2 stops
+    private var sharpnessPercent: Int { max(0, 2000 - sharpness) / 20 }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Super Resolution (AMD FSR 1)", isOn: $superResolution).toggleStyle(.switch)
+            Group {
+                Picker("Render scale", selection: $renderScale) {
+                    ForEach(Self.modes, id: \.1) { Text($0.0).tag($0.1) }
+                }
+                HStack {
+                    Text("Sharpness")
+                    Slider(value: Binding(get: { Double(sharpnessPercent) }, set: { sharpness = 2000 - Int($0.rounded()) * 20 }), in: 0...100)
+                    Text("\(sharpnessPercent) %").monospacedDigit().frame(width: 40, alignment: .trailing)
+                }
+            }
+            .disabled(!superResolution)
+            Text("Games that draw below the screen's resolution are upscaled with FSR 1 and sharpened instead of stretched. A render scale below the game's own size makes games draw fewer pixels for more frames. Applies to games started after a change; a game that draws to the wrong size at a render scale needs it off.")
+                .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
     }
 }

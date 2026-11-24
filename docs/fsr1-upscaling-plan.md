@@ -77,12 +77,15 @@ support, apps with a render scale that shrinks the drawable. **Open decision:** 
 Performance 50 %) that makes apps asking for a full-size drawable draw a smaller one, upscaled by FSR: the real frame-rate gain, but an app
 that sizes its viewport from the layer's bounds rather than its drawable would draw clipped; to be tried per game.
 
-## Next
+## Render scale and the Tweaks pane (2026-11-24)
 
-1. **RDNA4Gadget "Tweaks" pane** (Sunneva: Adrenalin-like): a Super Resolution switch and a sharpness slider (and the render scale, if
-   decided), writing the preferences above; one line on what it covers. Applies to apps started after the change.
-2. **Card tests** with an app that presents small drawables, frame cost (EASU + RCAS at 4K), display sleep, a window moved between
-   displays of different scales (the layer's size is taken when the app sets the drawable size).
+Render scale (`RenderScale` percent, `RDNA4_FSR_SCALE`; FSR 1's Ultra Quality 77, Quality 67, Balanced 59, Performance 50): an app asking
+for a full-size drawable gets one that much smaller, upscaled back. Card-tested at 67 %: Quake II draws 2144x1206 shown at 3200x1800,
+Daggerfall Unity 3430x1930 shown at 5120x2880, both whole (no clipping). RDNA4Gadget's **Tweaks** tab sets the switch, the render scale and
+the sharpness (0-100 %, 100 % = 0 stops); they apply to games started after a change.
+
+Not done yet: frame-rate numbers at each scale; the cost of the upscale at 4K; display sleep and a window moved between displays of
+different scales.
 
 ## Open questions and limits
 
