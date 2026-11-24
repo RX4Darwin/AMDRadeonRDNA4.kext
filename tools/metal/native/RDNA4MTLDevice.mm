@@ -2239,6 +2239,7 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 - (void)drewDepth:(RDNA4MTLTexture *)t;      // (work queue) a draw wrote its depth: in flight as a draw's target is
 // On the card, before the next draw: a wait for the draws in flight, then the copies (none: the wait alone)
 - (NSError *)gpuBarrier:(const RDNA4Copy *)copies count:(uint32_t)count;
+- (NSError *)gpuBarrier:(const RDNA4Copy *)copies count:(uint32_t)count fresh:(BOOL)fresh;   // fresh: the caches invalidated before the copies
 // A kernel on the gfx ring behind the draws before it, not waited for (GL apps, or RDNA4_RINGDISPATCH=1); NO: not one it takes (scratch, other user data)
 - (BOOL)canDispatchOnRing:(const rdna4_program_t *)k;
 - (NSError *)dispatchOnRing:(const rdna4_program_t *)k groups:(const uint32_t[3])groups size:(const uint32_t[3])size args:(NSData *)args
@@ -2860,6 +2861,7 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 // encoding, a client's pixels came out transparent (Safari's page showed the desktop through, 2026-11-20).
 - (NSArray<RDNA4MTLTexture *> *)refreshShadows:(NSArray<RDNA4MTLTexture *> *)shadowed;
 - (void)refreshLate:(NSArray<RDNA4MTLTexture *> *)late;   // those, when the step runs (work queue), once a command buffer each
+- (void)writesTo:(id<MTLTexture>)texture;   // (encoding) it may write `texture`: commitAndWaitUntilSubmitted waits if an IOSurface's
 - (void)drewInto:(RDNA4MTLTexture *)target;   // (work queue) a shadowed IOSurface's copy drawn: written back to it at the end
 @end
 
@@ -3013,7 +3015,12 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 			if (t.shadowed)
 				[shadowed addObject:t];
 		}
-		{   // always: a kernel's texture read through a table at 0 faulted
+		for (RDNA4MTLTexture *t in kernelTextures)   // (any it can reach: which it writes is not known here)
+			[_commandBuffer writesTo:t];
+		// fixIndexBuffer has no textures: the zeroed spare, not a new buffer for each job (a tenth of OpenMW's render thread, 2026-11-24)
+		if (pipeline.indicesOnly)
+			memcpy(p + 8 * n + 24, &spare, 8);
+		else {   // always: a kernel's texture read through a table at 0 faulted
 			(void)anyTexture;
 			uint32_t spare[8];
 			[(RDNA4MTLDevice *)self.device spareImage:spare];
@@ -3173,6 +3180,8 @@ RDNA4_ANSWER_MISSING
 		MTLRenderPassColorAttachmentDescriptor *a = pass.colorAttachments[i];
 		if (!a.texture)
 			continue;
+		[commandBuffer writesTo:a.texture];
+		[commandBuffer writesTo:a.resolveTexture];
 		if (![(id)a.texture isKindOfClass:[RDNA4MTLTexture class]] || ((RDNA4MTLTexture *)a.texture).isDepth) {
 			RLOG(@"RDNA4MTL: a render pass whose colour attachment %lu is not a colour texture of this device: its draws into it fail",
 			      (unsigned long)i);
@@ -3218,6 +3227,8 @@ RDNA4_ANSWER_MISSING
 	       pass.colorAttachments[1].texture ? @"yes" : @"-", pass.depthAttachment.texture ? @"yes" : @"-");
 	MTLRenderPassDepthAttachmentDescriptor *z = pass.depthAttachment;
 	MTLRenderPassStencilAttachmentDescriptor *sa = pass.stencilAttachment;
+	[commandBuffer writesTo:z.texture];
+	[commandBuffer writesTo:sa.texture];
 	RDNA4MTLTexture *zt = [(id)z.texture isKindOfClass:[RDNA4MTLTexture class]] ? (RDNA4MTLTexture *)z.texture : nil;
 	RDNA4MTLTexture *st = [(id)sa.texture isKindOfClass:[RDNA4MTLTexture class]] ? (RDNA4MTLTexture *)sa.texture : nil;
 	first = first ?: zt ?: st;   // a pass of depth (and stencil) only: its size theirs (empty before: every draw outside the scissor)
@@ -3834,6 +3845,23 @@ static NSError *colourOnly(id<MTLTexture> t)
 - (void)copyFromBuffer:(id<MTLBuffer>)from sourceOffset:(NSUInteger)fromOffset toBuffer:(id<MTLBuffer>)to
      destinationOffset:(NSUInteger)toOffset size:(NSUInteger)size
 {
+	// In a GL app on the card, behind the draws before it: on the CPU each one waited for the card to finish them all first (glBufferSubData's
+	// copy from GL's staging memory, a thousand a second in OpenMW, 2026-11-24). RDNA4_RINGCOPY=0 or 1 decides for a process.
+	static const char *const env = getenv("RDNA4_RINGCOPY");
+	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
+	if ((env ? atoi(env) == 1 : gGlPrograms.load()) && device.gfx && [(id)to isKindOfClass:[RDNA4MTLBuffer class]] &&
+	    !((RDNA4MTLBuffer *)to).readOnly && !((fromOffset | toOffset | size | from.gpuAddress | to.gpuAddress) & 3)) {
+		[_commandBuffer recordDraw:^NSError * {
+			if (fromOffset + size > from.length || toOffset + size > to.length)
+				return rdna4Error(@"a buffer copy past a buffer's end", 0);
+			if (!size)
+				return nil;
+			wrote(to.gpuAddress + toOffset, to.gpuAddress + toOffset + size);
+			const RDNA4Copy copy = { from.gpuAddress + fromOffset, to.gpuAddress + toOffset, size, 0 };
+			return [device gpuBarrier:&copy count:1 fresh:YES];
+		}];
+		return;
+	}
 	[_commandBuffer record:^NSError * {
 		if (fromOffset + size > from.length || toOffset + size > to.length)
 			return rdna4Error(@"a buffer copy past a buffer's end", 0);
@@ -3858,6 +3886,7 @@ static NSError *colourOnly(id<MTLTexture> t)
    sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)to destinationSlice:(NSUInteger)slice
       destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin
 {
+	[_commandBuffer writesTo:to];
 	[_commandBuffer record:^NSError * {
 		NSError *why = colourOnly(to);
 		if (!why && offset + bpr * (size.height - 1) + ((RDNA4MTLTexture *)to).bpp * size.width > from.length)   // (Maps' glyphs: R8)
@@ -3873,6 +3902,7 @@ static NSError *colourOnly(id<MTLTexture> t)
    sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)to destinationSlice:(NSUInteger)slice
       destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin options:(MTLBlitOption)options
 {
+	[_commandBuffer writesTo:to];
 	[self copyFromBuffer:from sourceOffset:offset sourceBytesPerRow:bpr sourceBytesPerImage:bpi sourceSize:size toTexture:to
 	    destinationSlice:slice destinationLevel:level destinationOrigin:origin];
 }
@@ -3904,6 +3934,7 @@ static NSError *colourOnly(id<MTLTexture> t)
            sourceOrigin:(MTLOrigin)fromOrigin sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)to
        destinationSlice:(NSUInteger)toSlice destinationLevel:(NSUInteger)toLevel destinationOrigin:(MTLOrigin)toOrigin
 {
+	[_commandBuffer writesTo:to];
 	[_commandBuffer record:^NSError * {
 		NSError *why = colourOnly(from) ?: colourOnly(to);
 		if (why)
@@ -3918,6 +3949,7 @@ static NSError *colourOnly(id<MTLTexture> t)
 
 - (void)copyFromTexture:(id<MTLTexture>)from toTexture:(id<MTLTexture>)to
 {
+	[_commandBuffer writesTo:to];
 	[self copyFromTexture:from sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
 	           sourceSize:MTLSizeMake(MIN(from.width, to.width), MIN(from.height, to.height), 1) toTexture:to destinationSlice:0
 	     destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
@@ -3925,6 +3957,7 @@ static NSError *colourOnly(id<MTLTexture> t)
 
 - (void)generateMipmapsForTexture:(id<MTLTexture>)texture
 {
+	[_commandBuffer writesTo:texture];
 	[_commandBuffer record:^NSError * {
 		NSError *why = colourOnly(texture);
 		if (!why)
@@ -3979,6 +4012,7 @@ static void eventWait(id event, uint64_t value)
 	NSMutableArray *_signals, *_waits;   // encodeSignalEvent: {event, value}: signalled once the work has run; encodeWaitForEvent: waited
 	                                     // for before it runs (its queue's gate)
 	dispatch_group_t _scheduledGroup, _done;
+	BOOL _writesSurface;   // a pass, copy or kernel of it may write an IOSurface's texture (writesTo:)
 	NSMutableDictionary *_userDictionary;
 	id<MTLBuffer> _chunk;   // set*Bytes data (stage:)
 	NSUInteger _chunkUsed;
@@ -4124,9 +4158,33 @@ static void eventWait(id event, uint64_t value)
 	[_queue reserve:self];
 }
 - (void)waitUntilScheduled { if (_status >= MTLCommandBufferStatusCommitted) dispatch_group_wait(_scheduledGroup, DISPATCH_TIME_FOREVER); }
-- (void)commitAndWaitUntilSubmitted   // WindowServer's commit (a no-op here before: its frames never ran, the screen stayed black)
+- (void)writesTo:(id<MTLTexture>)texture
+{
+	if ([(id)texture isKindOfClass:[RDNA4MTLTexture class]] && ((RDNA4MTLTexture *)texture).onSurface)
+		_writesSurface = YES;
+}
+// WindowServer's commit (a no-op here before: its frames never ran, the screen stayed black), and Apple's GL renderer's at each flush:
+// glBufferSubData and glBlitFramebuffer of a resource in use (OpenMW's render thread waited there for the work queue to build every draw
+// of the buffer, 2026-11-24). The work queue keeps the card's order, so in a GL app one that writes no IOSurface and presents nothing does not
+// wait: only another process (WindowServer reading the window's surface) needs its draws on the ring first. RDNA4_EARLYSUBMIT=0 or 1 decides
+// for a process. ponytail: buffers are not looked at (an IOSurface-backed buffer written and handed to another process would need it).
+static std::atomic<int64_t> gUnscheduled;   // command buffers committed and not yet scheduled, in the process
+static int64_t earlyBacklog(void)   // RDNA4_EARLYBACKLOG=n: another cap, for measuring
+{
+	static const int64_t n = getenv("RDNA4_EARLYBACKLOG") ? atoll(getenv("RDNA4_EARLYBACKLOG")) : 4;
+	return n;
+}
+- (void)commitAndWaitUntilSubmitted
 {
 	[self commit];
+	static const char *const env = getenv("RDNA4_EARLYSUBMIT");
+	// At most earlyBacklog() not yet scheduled: with none, GL's render thread ran ahead of the work queue while loading a cell, the
+	// command buffers in between held their memory until the client's buffers ran out (resource shortage), and Apple's GL renderer crashed
+	// on the texture it did not get (GLRTextureResource::getGLViewResource, OpenMW, 2026-11-24); with 16 or 32 it still did, with 4 not. One
+	// with scheduled handlers waits as before.
+	if ((env ? atoi(env) == 1 : gGlPrograms.load()) && !_writesSurface && !_drawables.count && !_scheduled.count &&
+	    gUnscheduled.load() <= earlyBacklog())
+		return;
 	[self waitUntilScheduled];
 }
 - (void)waitUntilCompleted { if (_status >= MTLCommandBufferStatusCommitted) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }
@@ -4176,6 +4234,7 @@ static void eventWait(id event, uint64_t value)
 	statMax(gEncodeMaxUs, _committedUs - _createdUs);
 	_status = MTLCommandBufferStatusCommitted;
 	dispatch_group_enter(_scheduledGroup);
+	gUnscheduled++;
 	dispatch_group_enter(_done);
 	[_queue committed:self];
 }
@@ -4213,6 +4272,7 @@ static void eventWait(id event, uint64_t value)
 		why = why ?: flushed;
 		void (^scheduledNow)(void) = ^{
 			self->_status = MTLCommandBufferStatusScheduled;
+			gUnscheduled--;
 			dispatch_group_leave(self->_scheduledGroup);
 			NSArray<MTLCommandBufferHandler> *scheduled = [self->_scheduled copy];
 			// given up once run, as the completed ones: a handler holding its command buffer (iTerm2's) kept it, its set*Bytes buffers and
@@ -4667,6 +4727,9 @@ RDNA4_ANSWER_MISSING
 	// What each slot's work may touch of memory the CPU's index jobs use, until the slot is taken again or a drain: [start, end) of what it
 	// writes or reads as indices, and of a copy's source. A slot whose work could write anywhere has the whole range.
 	uint64_t _slotUse[kSlots][2][2];
+	uint8_t _slotKind[kSlots];   // (RDNA4_DRAWTIME) what the slot ran: kSlotDraw (kSlotRunFirst), kSlotDispatch, kSlotBarrier; kSlotBatchFirst
+	uint64_t _drawTimePrev;      // the GPU timestamp of the last timed draw seen ended
+	BOOL _drawTimeGap;           // a dispatch or barrier slot since it
 	rdna4_program_t _resolve[2];
 }
 
@@ -4855,11 +4918,50 @@ static void abortStack(int sig)
 		return rdna4Error([NSString stringWithFormat:@"waiting for slot %u's earlier draw", *slot], kr);
 	_slotFence[*slot] = 0;
 	memset(_slotUse[*slot], 0, sizeof _slotUse[*slot]);
+	if (const uint8_t kind = _slotKind[*slot]) {
+		_slotKind[*slot] = 0;
+		if (kind & kSlotDraw) {
+			const uint64_t ts = *(volatile uint64_t *)(_miscCpu + (uint64_t)*slot * kMiscBytes + 8);
+			if (_drawTimePrev && ts > _drawTimePrev && ts - _drawTimePrev < 100000000)
+				drawTimeAdd(kind | (_drawTimeGap ? 0x80 : 0), ts - _drawTimePrev);
+			_drawTimePrev = ts, _drawTimeGap = NO;
+		} else {
+			_drawTimeGap = YES;
+		}
+	}
 	return nil;
 }
 
 // Slot `slot`'s IB (n dwords in its page) padded to the page's end with a NOP and added to the batch: the pages of consecutive slots are
 // then one IB. One submit (a kext call, 8 us) a draw was a third of WindowServer's wait for its frames' submits (2026-11-20).
+// (diagnostic, RDNA4_DRAWTIME=1) Each draw's end as the card's 100 MHz clock, in its state page at +8: the time between consecutive draws'
+// ends, by kind, logged every 20000 draws. Where the card's time per draw goes (OpenMW, 2026-11-24).
+enum { kSlotDraw = 1, kSlotRunFirst = 2, kSlotDispatch = 4, kSlotBarrier = 8, kSlotBatchFirst = 16 };
+static BOOL drawTimeOn(void)
+{
+	static const BOOL on = getenv("RDNA4_DRAWTIME") && atoi(getenv("RDNA4_DRAWTIME")) == 1;
+	return on;
+}
+
+static void drawTimeAdd(uint32_t kind, uint64_t ticks)
+{
+	static const char *const names[4] = { "in a run", "a run's first", "after a dispatch or barrier", "a batch's first" };
+	static uint64_t count[4], sum[4], hist[4][8], total;
+	const int c = kind & kSlotBatchFirst ? 3 : kind & 0x80 ? 2 : kind & kSlotRunFirst ? 1 : 0;
+	int b = 0;
+	while (b < 7 && ticks >= (100ull << b))   // buckets: < 1, 2, 4 .. 64 us, more
+		b++;
+	count[c]++, sum[c] += ticks, hist[c][b]++;
+	if (++total < 20000)
+		return;
+	for (int i = 0; i < 4; i++)
+		if (count[i])
+			RLOG(@"RDNA4MTL drawtime: %@: %llu draws, %.1f us each, %.1f ms in all; <1 %llu <2 %llu <4 %llu <8 %llu <16 %llu <32 %llu <64 %llu more %llu",
+			     @(names[i]), count[i], sum[i] / 100.0 / count[i], sum[i] / 1e5, hist[i][0], hist[i][1], hist[i][2], hist[i][3], hist[i][4],
+			     hist[i][5], hist[i][6], hist[i][7]);
+	memset(count, 0, sizeof count), memset(sum, 0, sizeof sum), memset(hist, 0, sizeof hist), total = 0;
+}
+
 static void widenRange(uint64_t r[2], uint64_t at, uint64_t bytes)
 {
 	if (!bytes)
@@ -4882,6 +4984,8 @@ static void padSlot(uint32_t *page, uint32_t n)
 	padSlot((uint32_t *)(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE), n);
 	if (!_batchCount)
 		_batchFirst = slot;
+	if (!_batchCount && _slotKind[slot])
+		_slotKind[slot] |= kSlotBatchFirst;
 	_batchCount++;
 	_batchTail = n;
 }
@@ -4927,12 +5031,22 @@ static void padSlot(uint32_t *page, uint32_t n)
 // was most of WindowServer's frame time.
 - (NSError *)gpuBarrier:(const RDNA4Copy *)copies count:(uint32_t)count
 {
+	return [self gpuBarrier:copies count:count fresh:NO];
+}
+
+- (NSError *)gpuBarrier:(const RDNA4Copy *)copies count:(uint32_t)count fresh:(BOOL)fresh
+{
 	// the gfx buffers made first, as a draw does (a pass whose first work is a clear, GL's into its window's buffer, reached them unmade:
 	// a null IB page, 2026-11-21)
 	if (!self.gfx)
 		return rdna4Error(@"a copy or fill on the card without the device's gfx buffers", 0);
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];
 	uint32_t n = _lastFence || _batchCount ? [self idleBarrier:ib] : 0;
+	if (fresh && count) {   // ACQUIRE_MEM as a draw run's first: what the CPU wrote since is not read from stale L2 lines
+		const uint32_t acquire[8] = { 0xc0065800u, 0, 0xffffffffu, 0x00ffffffu, 0, 0, 0x0000000au, 0x0000c3b1u };
+		memcpy(ib + n, acquire, sizeof acquire);
+		n += 8;
+	}
 	uint64_t total = 0;
 	for (uint32_t c = 0; c < count; c++)
 	for (uint64_t at = 0, bytes = copies[c].bytes; at < bytes;) {
@@ -4958,6 +5072,7 @@ static void padSlot(uint32_t *page, uint32_t n)
 	if (why)
 		return why;
 	memcpy(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE, ib, n * 4);
+	_slotKind[slot] = drawTimeOn() ? kSlotBarrier : 0;
 	[self queueSlot:slot dwords:n];   // (_lastSlot stays the last draw's: its stream fence is what drainGfx checks)
 	_slotPipe[slot] = nil;
 	for (uint32_t c = 0; c < count; c++) {
@@ -5146,6 +5261,7 @@ static void padSlot(uint32_t *page, uint32_t n)
 	}
 	memcpy(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE, ib, n * 4);
 	__sync_synchronize();
+	_slotKind[slot] = drawTimeOn() ? kSlotDispatch : 0;
 	[self queueSlot:slot dwords:n];   // (_lastSlot stays the last draw's: its stream fence is what drainGfx checks)
 	_slotPipe[slot] = nil;   // (no stream fence of its own: the batch's fence is what drainGfx waits for)
 	if (job.outBytes) {
@@ -5501,6 +5617,13 @@ static void padSlot(uint32_t *page, uint32_t n)
 	}
 	if (overlap && (total + 16 > RDNA4_TRIRUN_PAGE / 4 || !overlapStream(ib, total, _overlapRun)))   // (the run's end barrier fits behind it)
 		return rdna4Error([NSString stringWithFormat:@"a draw's stream of %u dwords cannot overlap", total], 0);
+	const BOOL timed = drawTimeOn() && total + 8 + 16 <= RDNA4_TRIRUN_PAGE / 4;
+	if (timed) {   // RELEASE_MEM: BOTTOM_OF_PIPE_TS, EVENT_INDEX 5, DATA_SEL 3 (the 64-bit GPU clock)
+		const uint64_t at = miscGpu + 8;
+		const uint32_t stamp[8] = { Pm4::header(Pm4::OpReleaseMem, 6), 0x528u, 3u << 29, (uint32_t)at, (uint32_t)(at >> 32), 0, 0, 0 };
+		memcpy(ib + total, stamp, sizeof stamp);
+		total += 8;
+	}
 	for (unsigned st = 0; levels && st < 2; st++)   // each level's own image (a texture of fewer levels: its last), unbound ones the spare texel
 		for (uint32_t level = 1; level < RDNA4_MTLC_LEVELS; level++) {
 			uint8_t *at = (uint8_t *)misc + kMiscTables + RDNA4_MTLC_LEVEL_STRIDE * (level - 1) + 0x400 * st;
@@ -5517,6 +5640,7 @@ static void padSlot(uint32_t *page, uint32_t n)
 	statAdd(kStatWriteUs, nowUs() - t0);
 	if (kr)
 		return rdna4Error([NSString stringWithFormat:@"a draw of %u vertices (%u dwords)", d->count, total], kr);
+	_slotKind[slot] = timed ? (uint8_t)(kSlotDraw | (overlap && _overlapRun ? 0 : kSlotRunFirst)) : 0;
 	[self queueSlot:slot dwords:total];
 	pad.queued = true;
 	_lastSlot = slot;
