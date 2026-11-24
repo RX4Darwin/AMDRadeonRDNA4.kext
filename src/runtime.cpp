@@ -788,7 +788,7 @@ bool RDNA4Compute::initRuntimeHeap() {
 	return heap.size() != 0;
 }
 
-void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
+void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes, bool deferSparseSync) {
 	if (!poolCpu || !hasTables(c) || !bytes || va & (GpuVm::kPageBytes - 1) || bytes > ~0ull - (GpuVm::kPageBytes - 1))
 		return;   // (the last: the round-up would wrap)
 	c.tlbSeq++;      /* a removed PTE: the next job on any VMID this client owns flushes first (amdgpu's tlb_seq) */
@@ -797,7 +797,7 @@ void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
 		TreeCtx tc { this, &c };   // treeUnmap never backs a page just to clear a PTE in it
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
 		GpuVmTable::treeUnmap(tree, va, end);
-		if (!sparseSync(c))
+		if (!deferSparseSync && !sparseSync(c))
 			RLOG("vmid %u: page-table unmap sync failed", c.vmid);
 		return;
 	}
@@ -4250,49 +4250,64 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		return;
 	}
 
-	uint32_t nb = 0, np = 0;
-	bool hostUnmapped = false;
-	for (RtBuffer &b : buffers) {
-		if (b.owner == owner) {
-			if (c)
-				vmUnmap(*c, b.va, b.bytes);
-			if (b.host) {
-				hostUnmapped = true;
-			} else {
-				(b.device ? devHeap : heap).free(b.offset);
-				b.owner = nullptr;
-			}
-			nb++;
-		}
+	const bool batch = c && c->sp;
+	uint32_t nb = 0, np = 0, hosts = 0;
+	for (const RtBuffer &b : buffers) {
+		if (b.owner != owner)
+			continue;
+		if (c)
+			vmUnmap(*c, b.va, b.bytes, batch);
+		nb++;
+		if (b.host)
+			hosts++;
 	}
-	for (RtProgram &p : programs) {
-		if (p.owner == owner) {
-			if (c)
-				vmUnmap(*c, p.va, heap.lengthOf(p.offset));
-			heap.free(p.offset);
-			p.owner = nullptr;
-			np++;
-		}
+	for (const RtProgram &p : programs) {
+		if (p.owner != owner)
+			continue;
+		if (c)
+			vmUnmap(*c, p.va, heap.lengthOf(p.offset), batch);
+		np++;
 	}
-	const bool hostForgotten = !c || !hostUnmapped || vmInvalidateOwned(*c, "host unmap");
-
-	if (!hostForgotten)
+	// GPU work is drained and rtLock excludes all submits. Publish the final
+	// shadow of each changed sparse PT page before releasing any backing.
+	if (batch && (nb || np) && !sparseSync(*c)) {
+		RLOG("client close: sparse unmap sync failed; keeping client resources");
+		quarantineLocked(owner, *c);
+		return;
+	}
+	const bool needsInvalidate = batch ? (nb || np) : hosts != 0;
+	const bool forgotten = !c || !needsInvalidate || vmInvalidateOwned(*c, "client close unmap");
+	if (!forgotten) {
+		if (batch) {
+			RLOG("client close: sparse unmap invalidation failed; keeping client resources");
+			quarantineLocked(owner, *c);
+			return;
+		}
 		RLOG("vmid %u: host buffer cleanup invalidation timed out: their pages are kept, not reused", c->vmid);
-
+	}
 	for (RtBuffer &b : buffers) {
-		if (b.owner == owner && b.host) {
+		if (b.owner != owner)
+			continue;
+		if (b.host) {
 			const uint64_t rounded = b.mapped || b.hostImported ? 0 : (b.bytes + GpuVm::kPageBytes - 1) &
 			                                                          ~(GpuVm::kPageBytes - 1);
 			if (c && c->hostBytes >= rounded)
 				c->hostBytes -= rounded;
 			if (hostBytesTotal >= rounded)
 				hostBytesTotal -= rounded;
-			RLOG("vmid %u: host buffer unmapped during client close", c ? c->vmid : 0);
-			if (hostForgotten)
+			if (forgotten)
 				releaseHost(b);
 			else
 				leakHost(b);
-			b.owner = nullptr;
+		} else {
+			(b.device ? devHeap : heap).free(b.offset);
+		}
+		b.owner = nullptr;
+	}
+	for (RtProgram &p : programs) {
+		if (p.owner == owner) {
+			heap.free(p.offset);
+			p.owner = nullptr;
 		}
 	}
 	if (nb || np)

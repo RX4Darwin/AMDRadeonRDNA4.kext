@@ -5069,6 +5069,42 @@ static int testSparseTree() {
 	uint64_t phys = 0;
 	f += check(!e.translate(V, phys), "tree: before any mapping every VA faults");
 
+	// Client close with many small allocations sharing PT pages. Compare the
+	// GPU-visible image of incremental publication with batched publication.
+	{
+		static TreeEnv serial, batch;
+		serial.open(PtPages::kMaxPages);
+		batch.open(PtPages::kMaxPages);
+		constexpr unsigned count = 562;
+		const uint64_t stride = 0x10000, keep = V + count * stride;
+		bool mapped = true;
+		for (TreeEnv *env : { &serial, &batch }) {
+			for (unsigned i = 0; i <= count; ++i)
+				mapped &= treeMap(*env, V + i * stride, MC + i * stride, 0x1000);
+			env->syncCalls = 0;
+		}
+		bool copied = true;
+		for (unsigned i = 0; i < count; ++i) {
+			const uint64_t va = V + i * stride;
+			GpuVmTable::treeUnmap(serial.tree(), va, va + 0x1000);
+			copied &= serial.sync();
+			GpuVmTable::treeUnmap(batch.tree(), va, va + 0x1000);
+		}
+		f += check(mapped && copied && batch.translate(V, phys),
+		           "close batch: old GPU image remains visible until the final publication");
+		batch.failSyncCall = 2;
+		f += check(!batch.sync() && batch.vram != serial.vram, "close batch: partial DMA failure is detected");
+		batch.failSyncCall = 0;
+		bool equal = batch.sync() && batch.vram == serial.vram && batch.translate(keep, phys);
+		for (unsigned i = 0; i < count; ++i)
+			equal &= !batch.translate(V + i * stride, phys);
+		f += check(equal, "close batch: retry publishes every unmap and preserves a neighbouring mapping");
+		f += check(serial.syncCalls == count && batch.syncCalls == 19,
+		           "close batch: 562 incremental page copies versus 18 batched copies plus one failed attempt");
+		serial.close();
+		batch.close();
+	}
+
 	// A failed page-table transfer must remain dirty and be retried.
 	{
 		static TreeEnv retry;
