@@ -13,7 +13,7 @@
 #
 #   Build/AMDRadeonRDNA4-<version>-<CONFIG>/AMDRadeonRDNA4.kext
 #   Build/AMDRadeonRDNA4-<version>-<CONFIG>/AMDRadeonRDNA4MTLDriver.bundle   `make metal-driver`: the Metal driver and its user space
-#   Build/AMDRadeonRDNA4-<version>-<CONFIG>/RDNA4 Gadget.app   `make gadget`: the menu bar app (readings, updates, tuning)
+#   Build/AMDRadeonRDNA4-<version>-<CONFIG>/RDNA4Gadget.app    `make gadget`: the menu bar app (readings, updates)
 #   Build/AMDRadeonRDNA4-<version>-<CONFIG>/bin/     rdna4-run, n48nprobe, cgmodes, the rig's scripts, and with Mesa built
 #                                                   (`make mesa`) libvulkan_radeon.dylib, vkprobe and swapprobe;
 #                                                   `make vkcube` adds Khronos's vkcube and loader
@@ -263,7 +263,7 @@ metal-driver:
 
 # One installer for the driver bundle and its daemons (tools/package/package.sh): AMDRadeonRDNA4-<version>.pkg in the product dir. Needs
 # the translator (make metal-helper) and RADV (make mesa) built first; the kext is not in it.
-package: metal-driver
+package: metal-driver gadget
 	sh tools/package/package.sh $(PRODUCT_DIR) $(VERSION)
 
 # The Metal kernel translator's run-time helper for the rig (M3, docs/m1-stream.md s.5b); builds LLVM for x86_64 the first time.

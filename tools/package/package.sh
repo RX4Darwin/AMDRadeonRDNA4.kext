@@ -6,6 +6,7 @@
 #                       the bundle's Contents/Helpers; /usr/local/bin/rdna4-run
 #   logd    (chosen)    the LaunchDaemon org.rdna4.logd: each boot's kernel log in /var/log/rdna4
 #   vulkan  (chosen)    RADV's manifest in /usr/local/share/vulkan/icd.d, where Khronos's Vulkan loader looks
+#   gadget  (chosen)    /Applications/RDNA4Gadget.app, the menu bar app (`make gadget`)
 # The scripts stop and remove what the per-component install.sh scripts of 0.3 put in place first. Unsigned (packaging-plan.md:
 # no Developer ID while the driver needs AMFI relaxed). The kext is not in it: OpenCore injects it (README, Installing).
 set -eu
@@ -17,6 +18,7 @@ helpers=$installed/Contents/Helpers
 id=com.rx4darwin.AMDRadeonRDNA4
 [ -f "$dir/$bundle/Contents/MacOS/AMDRadeonRDNA4MTLDriver" ] || { echo "no $dir/$bundle: make metal-driver" >&2; exit 1; }
 [ -x "$dir/$bundle/Contents/Helpers/air2amdgpu" ] || { echo "the bundle has no translator: make metal-helper, then make metal-driver" >&2; exit 1; }
+[ -x "$dir/RDNA4Gadget.app/Contents/MacOS/RDNA4Gadget" ] || { echo "no $dir/RDNA4Gadget.app: make gadget" >&2; exit 1; }
 
 w=$dir/pkg
 rm -rf "$w"
@@ -73,6 +75,14 @@ r=$w/vulkan-root
 mkdir -p "$r/usr/local/share/vulkan/icd.d"
 cp "$dir/$bundle/Contents/Resources/radeon_icd.json" "$r/usr/local/share/vulkan/icd.d/radeon_icd.json"
 
+# gadget
+r=$w/gadget-root
+mkdir -p "$r/Applications"
+cp -R "$dir/RDNA4Gadget.app" "$r/Applications/"
+# in /Applications even where another copy of it is (pkgbuild makes an app relocatable: the installer would update that one instead)
+pkgbuild --analyze --root "$r" "$w/gadget-components.plist" > /dev/null
+plutil -replace 0.BundleIsRelocatable -bool NO "$w/gadget-components.plist"
+
 # scripts: preinstall stops and removes the old pieces and this component's daemons, postinstall starts them
 script() {
 	mkdir -p "$w/$1-scripts"
@@ -90,14 +100,17 @@ launchctl bootout system/org.rdna4.logd 2> /dev/null
 rm -f /usr/local/libexec/rdna4-logd'
 script logd postinstall '
 launchctl bootstrap system /Library/LaunchDaemons/org.rdna4.logd.plist'
+script gadget preinstall '
+rm -rf "/Applications/RDNA4 Gadget.app"'   # (its name before 0.5.0)
 
 # (pkgutil lists ._ entries: the files' com.apple.provenance attribute, which macOS sets again at once; the installer writes them back
 # as attributes, not as files)
-for c in core logd vulkan; do
-	scripts=
+for c in core logd vulkan gadget; do
+	scripts= components=
 	[ -d "$w/$c-scripts" ] && scripts="--scripts $w/$c-scripts"
+	[ -f "$w/$c-components.plist" ] && components="--component-plist $w/$c-components.plist"
 	# shellcheck disable=SC2086
-	pkgbuild --quiet --root "$w/$c-root" $scripts --identifier "$id.$c" --version "$version" --install-location / \
+	pkgbuild --quiet --root "$w/$c-root" $scripts $components --identifier "$id.$c" --version "$version" --install-location / \
 		--ownership recommended "$w/$c.pkg"
 done
 
@@ -111,6 +124,7 @@ cat > "$w/distribution.xml" <<EOF
 		<line choice="core"/>
 		<line choice="logd"/>
 		<line choice="vulkan"/>
+		<line choice="gadget"/>
 	</choices-outline>
 	<choice id="core" title="Metal driver" description="The Metal driver with the kext's runtime client, the shader translator and the display setup (required). The kext itself goes to the EFI by hand: see the README." enabled="false" selected="true">
 		<pkg-ref id="$id.core"/>
@@ -121,9 +135,13 @@ cat > "$w/distribution.xml" <<EOF
 	<choice id="vulkan" title="Vulkan (RADV)" description="Mesa's Vulkan driver for programs that use Khronos's Vulkan loader." selected="true">
 		<pkg-ref id="$id.vulkan"/>
 	</choice>
+	<choice id="gadget" title="RDNA4Gadget" description="A menu bar app with the card's temperature and power, and driver updates. In /Applications." selected="true">
+		<pkg-ref id="$id.gadget"/>
+	</choice>
 	<pkg-ref id="$id.core" version="$version">core.pkg</pkg-ref>
 	<pkg-ref id="$id.logd" version="$version">logd.pkg</pkg-ref>
 	<pkg-ref id="$id.vulkan" version="$version">vulkan.pkg</pkg-ref>
+	<pkg-ref id="$id.gadget" version="$version">gadget.pkg</pkg-ref>
 </installer-gui-script>
 EOF
 productbuild --quiet --distribution "$w/distribution.xml" --package-path "$w" "$dir/AMDRadeonRDNA4-$version.pkg"

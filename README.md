@@ -128,7 +128,7 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
   250 MHz idle), the display clocks are held at what the displays need.
 - Sensors: temperature, power, clocks and activity (`rdna4-run sensors`), also in the accelerator's `PerformanceStatistics` under
   the keys Apple's AMD drivers use, so Activity Monitor's GPU history, AMD Power Gadget and iStat read them.
-- **RDNA4 Gadget** (`make gadget`, `userspace/gadget`): a menu bar app with the card's temperature and power, its readings in a
+- **RDNA4Gadget** (`RDNA4Gadget.app` in /Applications from the installer; `make gadget`, `userspace/gadget`): a menu bar app with the card's temperature and power, its readings in a
   popover, the installed driver against the latest release (with a notification when one is out), install, update and removal
   (the kext into the EFI OpenCore booted from, through `efi.sh` and its backup). A VirtualSMC GPU plug-in's SMC keys (`TGDD`,
   `TG0P`, ...) are shown where there is one.
