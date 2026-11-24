@@ -24,7 +24,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
   overlap on the card. Each used to wait for everything before it and flush the colour and depth caches behind it; now the end of
   the run flushes them. Apple's per-draw index job stays inside the run when its memory is none the run has used, and finding a
   draw's registers no longer walks its stream 60 times. `RDNA4_OVERLAP=0` turns the overlap off for a process.
-- **No accelerator without what it needs**: a boot with no compute runtime (`rdna4-compute` below 6, or a kext built without firmware)
+- **No accelerator without what it needs**: a boot whose compute runtime does not come up (`rdna4-compute` below 6, a kext built without
+  firmware, a failed bring-up, or the recovery boot after one that died)
   or without the Metal driver bundle (the macOS installer, Recovery) now stays on the plain framebuffers and says why in the log.
   WindowServer used to be sent to a device it could not open.
 - **A GPU hang's log says who and where**: each stuck shader wave's line names its process, and each pipeline's first draw logs its

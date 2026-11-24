@@ -148,6 +148,7 @@ public:
 
 	// rdna4-compute=<stage>, clamped to StageKernel. StageGfx when absent.
 	static uint32_t requestedStage();
+	static bool bringupEnded();   // this boot's bring-up thread is done, or none will run: the runtime is up by now or will not come
 	static bool requestedVm();
 	static bool requestedPowerManagement();
 

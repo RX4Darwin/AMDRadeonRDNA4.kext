@@ -1112,6 +1112,25 @@ bool waitForMetalBundle()
 	}
 	return false;
 }
+
+// The stage asked for does not say the runtime comes: the boot after one that died in the bring-up skips it (runStages), and a stage can
+// fail. WindowServer's Metal device opens the runtime at once, so the accelerator waits for it, or for the bring-up to end without it.
+// Inside WindowServer's 60 s at the door (waitForWindowServer).
+bool waitForRuntime()
+{
+	OSDictionary *match = IOService::serviceMatching(RDNA4_COMPUTE_SERVICE);
+	bool up = false;
+	for (int ms = 0; match && !up && ms < 55000; ms += 200) {
+		const bool ended = RDNA4Compute::bringupEnded();   // read first: the last look comes after it ended
+		IOService *svc = IOService::waitForMatchingService(match, 200ull * kMillisecondScale);
+		up = svc;
+		OSSafeReleaseNULL(svc);
+		if (ended)
+			break;
+	}
+	OSSafeReleaseNULL(match);
+	return up;
+}
 #endif
 
 void accelAtBoot(void *, wait_result_t)
@@ -1166,6 +1185,13 @@ void accelAtBoot(void *, wait_result_t)
 		rdna4Log("AMDRadeonRDNA4: accel: the Metal driver bundle is not installed (installer or Recovery?): WindowServer stays on the "
 		         "plain framebuffers\n");
 		guardSet("no bundle");   // not "pending": the boot after the package is installed must try
+		bootDone();
+		thread_terminate(current_thread());
+		return;
+	}
+	if (want == 4 && !waitForRuntime()) {
+		rdna4Log("AMDRadeonRDNA4: accel: the compute runtime did not come up this boot: WindowServer stays on the plain framebuffers\n");
+		guardSet("no runtime");   // not "pending": the next boot must try
 		bootDone();
 		thread_terminate(current_thread());
 		return;

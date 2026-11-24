@@ -484,7 +484,21 @@ void RDNA4Compute::choosePool() {
 
 // ---------------------------------------------------------------------------
 
+static bool gBringupEnded;
+
+bool RDNA4Compute::bringupEnded() {
+	return __atomic_load_n(&gBringupEnded, __ATOMIC_ACQUIRE);
+}
+
 uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
+	// every way out of here without a bring-up thread: nobody needs to wait for a runtime
+	struct NoThread {
+		bool started { false };
+		~NoThread() {
+			if (!started)
+				__atomic_store_n(&gBringupEnded, true, __ATOMIC_RELEASE);
+		}
+	} noThread;
 	env = e;
 	uint32_t hang = 0;
 	hangRecoveryEnabled = PE_parse_boot_argn("rdna4-hang", &hang, sizeof(hang)) && hang != 0;
@@ -537,6 +551,7 @@ uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 		target = stage;
 		thread_t th = nullptr;
 		if (kernel_thread_start(threadMain, this, &th) == KERN_SUCCESS) {
+			noThread.started = true;
 			thread_deallocate(th);
 			CLOG("stages 2..%u continue on the bring-up thread", stage);
 		} else {
@@ -613,6 +628,7 @@ void RDNA4Compute::threadMain(void *arg, wait_result_t) {
 		IOSleep(100);
 
 	static_cast<RDNA4Compute *>(arg)->runStages();
+	__atomic_store_n(&gBringupEnded, true, __ATOMIC_RELEASE);
 	thread_terminate(current_thread());
 }
 
