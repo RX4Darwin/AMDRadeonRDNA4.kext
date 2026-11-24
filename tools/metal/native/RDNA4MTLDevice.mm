@@ -2174,6 +2174,8 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 - (RDNA4MTLTexture *)standInFor:(RDNA4MTLTexture *)depth;   // a BGRA8 target of the depth's size and samples, kept, never written
 - (NSError *)drainGfx;
 - (NSError *)flushBatch;   // the draws and barriers written so far onto the gfx ring (one submit)
+- (void)finishAfterDraws:(void (^)(NSError *))finish canOverlap:(BOOL)canOverlap;   // (work queue) `finish` once the draws so far are done
+@property (readonly) dispatch_queue_t finishing;   // where a GL app's command buffers end, in order (nil until the first)
 - (dispatch_queue_t)work;
 - (const rdna4_program_t *)resolveKernel:(BOOL)srgb;   // rdna4_resolve or rdna4_resolve_srgb, loaded on first use (NULL: not loaded)
 - (uint64_t)spareBuffer;             // what an unbound buffer slot points at: the zeroed spare buffer
@@ -2192,8 +2194,11 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 // earlier use done. ponytail: waits for all of the device's work, not this resource's.
 static void deviceIdle(RDNA4MTLDevice *device)
 {
-	if (dispatch_queue_t work = [device work])
+	if (dispatch_queue_t work = [device work]) {
 		dispatch_sync(work, ^{});
+		if (dispatch_queue_t finishing = [device finishing])   // (a GL app's command buffers end there: finishAfterDraws)
+			dispatch_sync(finishing, ^{});
+	}
 }
 
 
@@ -4150,59 +4155,63 @@ static void eventWait(id event, uint64_t value)
 		const BOOL shadowsDrawn = self->_drawnShadows.count > 0;
 		if (!shadowsDrawn)
 			scheduledNow();
-		NSError *drained = [device drainGfx];
-		self->_error = why ?: drained;
-		for (RDNA4MTLTexture *t in self->_drawnShadows)   // the draws done: their pixels into the surfaces
-			[t writeBack];
-		[self->_drawnShadows removeAllObjects];
-		// held surfaces the kext does not present (a screenshot's, read by screencaptureui as soon as this completes): their pixels into
-		// their memory now, not at the idle write-back (screenshots came out all transparent, 2026-11-22)
-		if (!self->_error && heldOn())
-			self->_error = heldWriteBackAll(device, NO);
-		if (shadowsDrawn)
-			scheduledNow();
-		const uint64_t done = nowUs();
-		statAdd(kStatRunUs, done - started);
-		uint64_t vblNs = 0;   // the kext's last VBL event on display 0 (the same clock): where in the frame this one was made, committed, done
-		size_t vblLen = sizeof vblNs;
-		if (!sysctlbyname("debug.rdna4_pvvblat", &vblNs, &vblLen, NULL, 0) && vblNs / 1000 <= self->_createdUs && done - vblNs / 1000 < 20000) {
-			const uint64_t vbl = vblNs / 1000;
-			statAdd(kStatFramed, 1), statAdd(kStatVblMade, self->_createdUs - vbl), statAdd(kStatVblCommitted, self->_committedUs - vbl),
-				statAdd(kStatVblDone, done - vbl);
-			static const uint64_t edges[] = { 1000, 2000, 4000, 6000, 8000 };   // us: the made histogram's buckets
-			int bucket = 0;
-			while (bucket < 5 && self->_createdUs - vbl >= edges[bucket])
-				bucket++;
-			statAdd(static_cast<RDNA4Stat>(kStatMade0 + bucket), 1);
-		}
-		if (done - started >= 200000)
-			RLOG(@"RDNA4MTL: a command buffer (%@) ran %.0f ms: %lu steps, %lu draws, the longest step %lu (%s) %.0f ms", self.label ?: @"-",
-			     (done - started) / 1e3, (unsigned long)self->_ops.count, (unsigned long)self->_draws.count, (unsigned long)slowestAt,
-			     [self->_draws containsIndex:slowestAt] ? "a draw" : "not a draw", slowest / 1e3);
-		statMax(gLatencyMaxUs, done - self->_committedUs);
-		RTRACE(60, @"command buffer %@: %lu steps, %lu draws, %lu drawables%@%@", self.label ?: @"-", (unsigned long)self->_ops.count,
-		       (unsigned long)self->_draws.count, (unsigned long)self->_drawables.count, self->_error ? @": " : @"",
-		       self->_error.localizedDescription ?: @"");
-		[self->_ops removeAllObjects];
-		for (id<MTLDrawable> d in self->_drawables)
-			[d present];
-		[self->_drawables removeAllObjects];
-		for (NSArray *s in self->_signals)
-			eventSignal(s[0], [s[1] unsignedLongLongValue]);
-		[self->_signals removeAllObjects];
-		self->_status = self->_error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
-		statAdd(kStatBuffers, 1);
-		statReport();
-		// the handlers on the queue's handler queue, in order (one that waits for the app's main thread must not stop the GPU work behind
-		// it), then waitUntilCompleted returns, as Metal's does
-		NSArray<MTLCommandBufferHandler> *completed = [self->_completed copy];
-		[self->_completed removeAllObjects];
-		dispatch_async(handlers, ^{
-			for (MTLCommandBufferHandler h in completed)
-				h(self);
-			dispatch_group_leave(self->_done);
-		});
-		heldIdle(device);
+		// The rest once its draws are done. A GL app's next command buffer need not wait for that: the ring keeps them in order with its
+		// barriers, and OpenMW's render thread spent half its time in waitUntilScheduled behind each one's wait for the card (2026-11-24).
+		const BOOL canOverlap = !shadowsDrawn && !self->_drawables.count && !heldOn();   // (the held surfaces' copies are made on the work queue)
+		[device finishAfterDraws:^(NSError *drained) {
+			self->_error = why ?: drained;
+			for (RDNA4MTLTexture *t in self->_drawnShadows)   // the draws done: their pixels into the surfaces
+				[t writeBack];
+			[self->_drawnShadows removeAllObjects];
+			// held surfaces the kext does not present (a screenshot's, read by screencaptureui as soon as this completes): their pixels into
+			// their memory now, not at the idle write-back (screenshots came out all transparent, 2026-11-22)
+			if (!self->_error && heldOn())
+				self->_error = heldWriteBackAll(device, NO);
+			if (shadowsDrawn)
+				scheduledNow();
+			const uint64_t done = nowUs();
+			statAdd(kStatRunUs, done - started);
+			uint64_t vblNs = 0;   // the kext's last VBL event on display 0 (the same clock): where in the frame this one was made, committed, done
+			size_t vblLen = sizeof vblNs;
+			if (!sysctlbyname("debug.rdna4_pvvblat", &vblNs, &vblLen, NULL, 0) && vblNs / 1000 <= self->_createdUs && done - vblNs / 1000 < 20000) {
+				const uint64_t vbl = vblNs / 1000;
+				statAdd(kStatFramed, 1), statAdd(kStatVblMade, self->_createdUs - vbl), statAdd(kStatVblCommitted, self->_committedUs - vbl),
+					statAdd(kStatVblDone, done - vbl);
+				static const uint64_t edges[] = { 1000, 2000, 4000, 6000, 8000 };   // us: the made histogram's buckets
+				int bucket = 0;
+				while (bucket < 5 && self->_createdUs - vbl >= edges[bucket])
+					bucket++;
+				statAdd(static_cast<RDNA4Stat>(kStatMade0 + bucket), 1);
+			}
+			if (done - started >= 200000)
+				RLOG(@"RDNA4MTL: a command buffer (%@) ran %.0f ms: %lu steps, %lu draws, the longest step %lu (%s) %.0f ms", self.label ?: @"-",
+				     (done - started) / 1e3, (unsigned long)self->_ops.count, (unsigned long)self->_draws.count, (unsigned long)slowestAt,
+				     [self->_draws containsIndex:slowestAt] ? "a draw" : "not a draw", slowest / 1e3);
+			statMax(gLatencyMaxUs, done - self->_committedUs);
+			RTRACE(60, @"command buffer %@: %lu steps, %lu draws, %lu drawables%@%@", self.label ?: @"-", (unsigned long)self->_ops.count,
+			       (unsigned long)self->_draws.count, (unsigned long)self->_drawables.count, self->_error ? @": " : @"",
+			       self->_error.localizedDescription ?: @"");
+			[self->_ops removeAllObjects];
+			for (id<MTLDrawable> d in self->_drawables)
+				[d present];
+			[self->_drawables removeAllObjects];
+			for (NSArray *s in self->_signals)
+				eventSignal(s[0], [s[1] unsignedLongLongValue]);
+			[self->_signals removeAllObjects];
+			self->_status = self->_error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
+			statAdd(kStatBuffers, 1);
+			statReport();
+			// the handlers on the queue's handler queue, in order (one that waits for the app's main thread must not stop the GPU work behind
+			// it), then waitUntilCompleted returns, as Metal's does
+			NSArray<MTLCommandBufferHandler> *completed = [self->_completed copy];
+			[self->_completed removeAllObjects];
+			dispatch_async(handlers, ^{
+				for (MTLCommandBufferHandler h in completed)
+					h(self);
+				dispatch_group_leave(self->_done);
+			});
+			heldIdle(device);
+		} canOverlap:canOverlap];
 	};
 	// through the queue's gate, in order: the events it waits for first, there (its queue's later buffers wait behind it, others do not)
 	dispatch_async(_queue.gate, ^{
@@ -4570,6 +4579,7 @@ RDNA4_ANSWER_MISSING
 	RDNA4MTLRenderPipeline *_slotPipe[kSlots];   // what each slot's draw is (pipeline, vertices, instances, target size and format): a hang
 	uint32_t _slotWhat[kSlots][5];               // names the draws in flight (described then: formatted for each draw, 4000 a second, it cost)
 	NSHashTable *_drawnInFlight;               // the targets of the draws since the last drainGfx (work queue only)
+	dispatch_queue_t _finishing;               // finishAfterDraws
 	NSMutableDictionary<NSString *, RDNA4MTLTexture *> *_standIns;   // standInFor:, by size and samples
 	BOOL _drawsInFlight;                       // a draw since the last drainGfx: drainGfx checks _lastSlot's stream fence word
 	uint32_t _slot, _lastSlot;
@@ -5048,6 +5058,31 @@ static void padSlot(uint32_t *page, uint32_t n)
 	_slotPipe[slot] = nil;   // (no stream fence of its own: the batch's fence is what drainGfx waits for)
 	return nil;
 }
+
+// A command buffer's end. RDNA4_ASYNCDONE=0 or 1 decides for a process; by default a GL app's end on their own queue, in order, while the work
+// queue goes on to the next. One that cannot (it has surfaces to write back or drawables to present) drains, after those before it ended.
+- (void)finishAfterDraws:(void (^)(NSError *))finish canOverlap:(BOOL)canOverlap
+{
+	static const char *const env = getenv("RDNA4_ASYNCDONE");
+	if (!canOverlap || !(env ? atoi(env) == 1 : gGlPrograms.load())) {
+		NSError *drained = [self drainGfx];
+		if (_finishing)
+			dispatch_sync(_finishing, ^{});
+		finish(drained);
+		return;
+	}
+	NSError *flushed = [self flushBatch];
+	const uint64_t fence = _lastFence;
+	if (!_finishing)
+		_finishing = dispatch_queue_create("RDNA4MTL finishing", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+	rdna4_t *gpu = &_gpu;
+	dispatch_async(_finishing, ^{
+		const kern_return_t kr = !flushed && fence ? rdna4_wait_gfx_fence(gpu, fence, 2000, NULL) : KERN_SUCCESS;
+		finish(flushed ?: kr ? rdna4Error(@"waiting for a command buffer's draws", kr) : nil);
+	});
+}
+
+- (dispatch_queue_t)finishing { return _finishing; }
 
 - (NSError *)drainGfx
 {
