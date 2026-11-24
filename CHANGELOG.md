@@ -9,6 +9,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
   `PerformanceStatistics` (AMD Power Gadget shows the card's temperature and power with no change to it).
 - **RDNA4 Gadget**: a menu bar app for the card's readings, driver updates (a notification when a release is out), install and
   removal (`make gadget`).
+- **Resizable BAR**: works with OpenCore's `ResizeAppleGpuBars` at 10 (a 1 GiB VRAM BAR for macOS). macOS gives a larger BAR no
+  address, which left no desktop; `efi.sh` now sets 10 when it is -1 or above 10, and the driver's log says what to change.
 - **Settings that last**: the `rdna4-settings` NVRAM variable (`debug.rdna4_settings`) for six options, turned off after a boot
   that does not last.
 - **OpenMW about 15 -> 24 fps**: GL command buffers end off the work queue, Apple's `fixIndexBuffer` jobs run on the CPU, GL's

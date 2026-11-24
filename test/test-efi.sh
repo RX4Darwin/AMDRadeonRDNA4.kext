@@ -56,6 +56,7 @@ sh "$EFISH" install --efi "$E" --kext "$T/new/AMDRadeonRDNA4.kext" > /dev/null
 [ "$(get "$C" "NVRAM:Add:$GUID:boot-args")" = "-v keepsyms=1 rdna4-trace=1 amfi_get_out_of_my_way=0x1" ] || fail "boot-args: $(get "$C" "NVRAM:Add:$GUID:boot-args")"; pass
 get "$C" "NVRAM:Delete:$GUID" | grep -q boot-args || fail "boot-args is not under NVRAM Delete"; pass
 [ "$(plutil -extract "NVRAM.Add.$GUID.csr-active-config" raw -o - "$C")" = "AwAAAA==" ] || fail "csr-active-config changed"; pass
+[ "$(get "$C" "Booter:Quirks:ResizeAppleGpuBars")" = 10 ] || fail "ResizeAppleGpuBars not set to 10"; pass
 sh "$EFISH" check --efi "$E" > /dev/null || fail "check fails after the install"; pass
 cp "$C" "$T/installed.plist"
 
@@ -113,5 +114,15 @@ add_kext "$C7" AMFIPass.kext true
 "$PB" -c "Set :NVRAM:Add:$GUID:boot-args rdna4-compute=3" "$C7"
 sh "$EFISH" install --efi "$E7" --kext "$T/new/AMDRadeonRDNA4.kext" > /dev/null || fail "an empty boot-args stopped the install"
 [ -z "$(get "$C7" "NVRAM:Add:$GUID:boot-args")" ] || fail "boot-args should be empty"; pass
+
+# Resizable BAR: 0 to 10 kept, -1 and anything above 1 GiB set to 10; check refuses above 10
+for r in 8:8 -1:10 13:10; do
+	E8=$T/efi8-${r%%:*}; C8=$E8/EFI/OC/config.plist
+	make_efi "$E8"
+	"$PB" -c "Add :Booter:Quirks:ResizeAppleGpuBars integer ${r%%:*}" "$C8"
+	[ "${r%%:*}" != 13 ] || sh "$EFISH" check --efi "$E8" 2>&1 | grep -q "FAIL  ResizeAppleGpuBars is 13" || fail "check did not refuse ResizeAppleGpuBars 13"
+	sh "$EFISH" install --efi "$E8" --kext "$T/new/AMDRadeonRDNA4.kext" > /dev/null
+	[ "$(get "$C8" "Booter:Quirks:ResizeAppleGpuBars")" = "${r#*:}" ] || fail "ResizeAppleGpuBars ${r%%:*} became $(get "$C8" "Booter:Quirks:ResizeAppleGpuBars")"; pass
+done
 
 echo "all $n EFI script tests passed"

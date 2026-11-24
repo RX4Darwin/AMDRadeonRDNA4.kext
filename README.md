@@ -211,12 +211,12 @@ driver from the package. Then enable the kext and install the package.
 | `boot-args` | `amfi_get_out_of_my_way=0x1` (or AMFIPass), no old `rdna4-*` options | The defaults need no driver options |
 | `NVRAM → Delete → 7C436110-AB2A-4BBB-A880-FE41995C9F82` | list `boot-args` and `csr-active-config` | Otherwise OpenCore keeps the stored value and logs `ignored, exists` |
 | BIOS | Above 4G Decoding on, CSM off | The card's apertures need it |
-| BAR0 | 256 MiB is the tested size (Resizable BAR off); check it in `ioreg` | With a much smaller BAR0 the compute runtime has no room and stays off |
+| Resizable BAR | On or off in the BIOS. With it on, `Booter → Quirks → ResizeAppleGpuBars` = `10` (1 GiB; `0` gives 256 MiB) | macOS gives a VRAM BAR above 1 GiB no address: with `-1` and Resizable BAR on there is no desktop. 256 MiB and 1 GiB are tested |
 | USB | A port map (on Tahoe, USBToolBox 1.2.0 or newer) | Without one the keyboard and mouse may not work at all |
 | System sleep | If USB does not wake the machine: USBWakeFixup and an `SSDT-USBW` for your board's GPE | Some boards wake USB through a GPE nothing claims (GPE 8 on the main test system) |
 
-`tools/package/efi.sh` (also in the driver bundle's `Contents/Resources`) applies the kext, boot-args and `NVRAM → Delete` parts of this
-table to a mounted EFI, and keeps a backup. It reports SIP and Secure Boot without changing them. It has been tested against sample
+`tools/package/efi.sh` (also in the driver bundle's `Contents/Resources`) applies the kext, boot-args, `NVRAM → Delete` and
+`ResizeAppleGpuBars` parts of this table to a mounted EFI, and keeps a backup. It reports SIP and Secure Boot without changing them. It has been tested against sample
 configs, not yet on a real EFI, so keep your USB copy. Try it with `--dry-run` first:
 
 ```bash

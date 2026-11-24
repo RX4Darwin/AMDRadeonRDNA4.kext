@@ -304,6 +304,12 @@ bool RDNA4Compute::survey() {
 		sv.bar0Size = bar0->getLength();
 		if (env.scanoutPhys >= sv.bar0Phys && env.scanoutPhys < sv.bar0Phys + sv.bar0Size)
 			sv.scanoutOffset = env.scanoutPhys - sv.bar0Phys;
+	} else {
+		// A VRAM BAR above 1 GiB (Resizable BAR on, OpenCore's ResizeAppleGpuBars -1): macOS takes its upper half for a 16-byte BAR
+		// of its own and writes an address there (0x0000000c b0000000 on the RX 9070 XT, 2026-11-24), so no desktop either
+		CLOG("memory: BAR0 (VRAM) has no address from macOS (its registers read 0x%08x 0x%08x): macOS drops a VRAM BAR above "
+		     "1 GiB (Resizable BAR). Set OpenCore's Booter -> Quirks -> ResizeAppleGpuBars to 10",
+		     env.pci->configRead32(kIOPCIConfigBaseAddress0), env.pci->configRead32(kIOPCIConfigBaseAddress1));
 	}
 	if (IODeviceMemory *bar2 = env.pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2))
 		sv.bar2Size = bar2->getLength();

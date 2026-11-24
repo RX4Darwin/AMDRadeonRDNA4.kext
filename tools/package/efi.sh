@@ -7,7 +7,8 @@
 #
 # install keeps the old config.plist (and kext) in EFI/rdna4-backups/efi-<time>/, adds the kext after Lilu, turns off the kexts
 # that claim the card, removes old rdna4-* and WhateverGreen boot-args (rdna4-trace stays), adds amfi_get_out_of_my_way=0x1 unless
-# AMFIPass is on, and lists boot-args under NVRAM -> Delete so that OpenCore applies them. SIP is reported, never changed.
+# AMFIPass is on, lists boot-args under NVRAM -> Delete so that OpenCore applies them, and sets ResizeAppleGpuBars to 10 unless it
+# is 0 to 10 (macOS gives a larger VRAM BAR no address: Resizable BAR on would leave it without a desktop). SIP is reported, never changed.
 # --pkg needs root. --dry-run prints the result and writes nothing.
 set -eu
 set -f   # (boot-args are split on spaces, never expanded)
@@ -72,6 +73,14 @@ check_config() {
 
 	s=$(pb "$1" "Print :Misc:Security:SecureBootModel") || s=
 	if [ "$s" = Disabled ]; then ok "SecureBootModel is Disabled"; else warn "SecureBootModel is ${s:-missing}: Apple Secure Boot refuses this kext (use Disabled)"; fi
+
+	# Resizable BAR: macOS gives a VRAM BAR above 1 GiB no address (no desktop); 10 caps it at 1 GiB for macOS only
+	r=$(pb "$1" "Print :Booter:Quirks:ResizeAppleGpuBars") || r=-1
+	case $r in
+	-1) warn "ResizeAppleGpuBars is -1: with Resizable BAR on in the BIOS, macOS gets no VRAM BAR and no desktop (use 10, 1 GiB)" ;;
+	[0-9]|10) ok "ResizeAppleGpuBars is $r: macOS gets a VRAM BAR of at most $(( r < 8 ? 256 : 1 << r )) MiB" ;;
+	*) bad "ResizeAppleGpuBars is $r: macOS gives a VRAM BAR above 1 GiB no address (use 10)" ;;
+	esac
 }
 
 # The config's changes for an install, in place.
@@ -126,6 +135,14 @@ edit_config() {
 	pb "$1" "Delete :NVRAM:Add:$GUID:boot-args" || true   # (replaced: Set refuses an empty value)
 	pb "$1" "Add :NVRAM:Add:$GUID:boot-args string $new" || die "could not set boot-args"
 	echo "  boot-args: $new"
+
+	r=$(pb "$1" "Print :Booter:Quirks:ResizeAppleGpuBars") || r=
+	case $r in
+	[0-9]|10) ;;
+	*)	pb "$1" "Delete :Booter:Quirks:ResizeAppleGpuBars" || true
+		pb "$1" "Add :Booter:Quirks:ResizeAppleGpuBars integer 10" || die "could not set ResizeAppleGpuBars"
+		echo "  ResizeAppleGpuBars: ${r:-missing} -> 10 (macOS's VRAM BAR at most 1 GiB, also with Resizable BAR on)" ;;
+	esac
 
 	pb "$1" "Print :NVRAM:Delete:$GUID" > /dev/null || pb "$1" "Add :NVRAM:Delete:$GUID array" || die "could not add NVRAM -> Delete -> $GUID"
 	if ! in_delete "$1" boot-args; then
