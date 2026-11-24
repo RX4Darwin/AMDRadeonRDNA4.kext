@@ -50,7 +50,7 @@ stayed up and no GPU hang was logged.
 | Memory clock | 2505 MHz | not lowered at idle |
 | Fans | stopped | 0 RPM throughout |
 
-The memory clock stays at its highest step with the displays on, so most of the 47 W is memory.
+The memory clock stays at its highest step with the displays on; how much of the 47 W that costs was not measured.
 
 ## Not measured yet
 
