@@ -1171,6 +1171,8 @@ private:
 	void     gfxClientWedge(const char *why);
 	bool     gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why);   // end one address space's hung work
 	void     gfxLogWaves(const char *why);   // where the shader waves are, at a gfx hang
+	void     dumpWave(const char *why, uint64_t pc, uint32_t at, uint32_t vmid);   // one stuck wave's registers and code
+	bool     clientRead(int slot, uint64_t va, void *out, uint32_t bytes);   // a client's memory by its GPU VA (caller holds rtLock)
 	void     gfxClientDrain(RtClient &client, const char *why);
 	void     quarantineLocked(const void *owner, RtClient &client);
 	void     gfxClientReset();                             // a fresh gfx ring: nothing is pending

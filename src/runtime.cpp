@@ -3573,7 +3573,7 @@ void RDNA4Compute::gfxClientReset() {
 // through SQ_IND without halting them (registers of gc_12_0_0: STATUS.VALID [16], HW_ID2 ME [9:8], PIPE [5:4], VM_ID [27:24]).
 void RDNA4Compute::gfxLogWaves(const char *why) {
 	enum : uint32_t { kStatus = 0x102, kStatePriv = 0x104, kExcpPriv = 0x111, kHwId2 = 0x118, kPcLo = 0x140, kPcHi = 0x141, kExecLo = 0x27e, kKinds = 12 };
-	struct Kind { uint64_t pc; uint32_t count, status, state, excp, hw2, exec; };
+	struct Kind { uint64_t pc; uint32_t count, status, state, excp, hw2, exec, at; };   // at: the first wave's GRBM_GFX_INDEX << 5 | wave
 	const uint32_t index = rdGc(GrbmGfxIndex);
 	auto sq = [&](uint32_t wave, uint32_t reg) {
 		wr(IpDiscovery::HwGc, SqIndIndex, wave | reg << 16);
@@ -3596,7 +3596,8 @@ void RDNA4Compute::gfxLogWaves(const char *why) {
 						while (k < used && kinds[k].pc != pc)
 							k++;
 						if (k == used && used < kKinds)
-							kinds[used++] = { pc, 0, status, sq(wave, kStatePriv), sq(wave, kExcpPriv), sq(wave, kHwId2), sq(wave, kExecLo) };
+							kinds[used++] = { pc, 0, status, sq(wave, kStatePriv), sq(wave, kExcpPriv), sq(wave, kHwId2), sq(wave, kExecLo),
+							                  (instance | sa << 8 | se << 16) << 5 | wave };
 						if (k < used)
 							kinds[k].count++;
 					}
@@ -3611,8 +3612,74 @@ void RDNA4Compute::gfxLogWaves(const char *why) {
 			     why, kinds[k].pc, kinds[k].count, kinds[k].status, kinds[k].state, kinds[k].excp, kinds[k].exec, kinds[k].hw2 >> 8 & 3,
 			     kinds[k].hw2 >> 4 & 3, vmid, pasid, slot, slot < 0 ? -1 : clients[slot].pid, slot < 0 ? "?" : clients[slot].proc);
 		}
+		if (pass == 2 && used) {   // the most common PC of the last pass: one of its waves' registers and the code around it
+			uint32_t top = 0;
+			for (uint32_t k = 1; k < used; k++)
+				top = kinds[k].count > kinds[top].count ? k : top;
+			dumpWave(why, kinds[top].pc, kinds[top].at, kinds[top].hw2 >> 24 & 0xf);
+		}
 		IODelay(1000);
 	}
+}
+
+// One stuck wave as a disassembler and a reader need it (issue 23: which load went to a wild address, and where that address came
+// from): its SGPRs, lane 0's first VGPRs (SQ_IND indices 0x200 and 0x400 as amdgpu's gfx_v12_0 wave_read_regs, auto-increment bit 11,
+// lane in bits 10:5 of gc_12_0_0_sh_mask.h), and 64 dwords of code from 0x80 bytes before its PC, read through the client's buffers.
+void RDNA4Compute::dumpWave(const char *why, uint64_t pc, uint32_t at, uint32_t vmid) {
+	enum : uint32_t { kSgprs = 0x200, kVgprs = 0x400, kAutoIncr = 1u << 11, kSgprCount = 104, kVgprCount = 64, kCodeDwords = 64 };
+	const uint32_t index = rdGc(GrbmGfxIndex), wave = at & 0x1f;
+	uint32_t r[kSgprCount];
+	auto read = [&](uint32_t reg, uint32_t n) {
+		wr(IpDiscovery::HwGc, SqIndIndex, wave | kAutoIncr | reg << 16);   // lane 0
+		for (uint32_t i = 0; i < n; i++)
+			r[i] = rdGc(SqIndData);
+	};
+	auto put = [&](const char *what, uint32_t n) {
+		for (uint32_t i = 0; i < n; i += 8)
+			RLOG("gfx: %s: wave %s%u-%u: %08x %08x %08x %08x %08x %08x %08x %08x", why, what, i, i + 7, r[i], r[i + 1], r[i + 2], r[i + 3],
+			     r[i + 4], r[i + 5], r[i + 6], r[i + 7]);
+	};
+	wr(IpDiscovery::HwGc, GrbmGfxIndex, at >> 5);
+	read(kSgprs, kSgprCount);
+	put("s", kSgprCount);
+	read(kVgprs, kVgprCount);
+	put("v", kVgprCount);
+	wr(IpDiscovery::HwGc, GrbmGfxIndex, index);
+
+	const uint32_t pasid = vmid ? rd(IpDiscovery::HwOsssys, Reg { 0, vmid }) : 0;
+	const uint64_t from = (pc & ~3ull) - 0x80;
+	if (!clientRead(vmClientSlotByPasid(pasid), from, r, kCodeDwords * 4)) {
+		RLOG("gfx: %s: the code at 0x%llx is in no buffer of the client's that can be read", why, from);
+		return;
+	}
+	for (uint32_t i = 0; i < kCodeDwords; i += 8)
+		RLOG("gfx: %s: code 0x%llx: %08x %08x %08x %08x %08x %08x %08x %08x", why, from + i * 4, r[i], r[i + 1], r[i + 2], r[i + 3],
+		     r[i + 4], r[i + 5], r[i + 6], r[i + 7]);
+}
+
+// `bytes` of client `slot`'s memory at its GPU VA, from the one buffer that holds them all: a host buffer through its descriptor, the
+// CPU-visible pool through its mapping, other VRAM by the copy engine into the end of the bounce buffer. Caller holds rtLock.
+bool RDNA4Compute::clientRead(int slot, uint64_t va, void *out, uint32_t bytes) {
+	if (slot < 0 || !bytes)
+		return false;
+	for (const RtBuffer &b : buffers) {
+		if (b.owner != clients[slot].owner || !b.va || va < b.va || va - b.va > b.bytes || bytes > b.bytes - (va - b.va))
+			continue;
+		const uint64_t off = va - b.va;
+		if (b.host)
+			return b.hostMemory && b.hostMemory->readBytes(off, out, bytes) == bytes;
+		if (b.foreign || !b.mc)
+			return false;
+		if (pool.valid && poolCpu && b.mc >= pool.mcAddress && b.mc + off + bytes <= pool.mcAddress + pool.size) {
+			memcpy(out, poolCpu + (b.mc - pool.mcAddress) + off, bytes);
+			return true;
+		}
+		const uint32_t at = kBounceBytes - 4096;
+		if (!dmaReady || !bounce || bytes > 4096 || !bounceCopy(b.mc + off, at, bytes, false))
+			return false;
+		return bounce->readBytes(at, out, bytes) == bytes;
+	}
+	return false;
 }
 
 /* A client's work on the graphics ring does not finish: remove what hangs and keep the ring for everybody else. True if
