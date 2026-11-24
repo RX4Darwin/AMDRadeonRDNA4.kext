@@ -5,6 +5,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- **3D apps much faster: render targets in VRAM, clears on the card**: MetalQuake at 4K went from about 18 to about 110 fps. Private
+  render targets were in host memory and drawn over PCIe; clear colours no 32-bit fill makes (16-bit float targets) were cleared by the
+  CPU every frame with the card idle.
 - **Apps that use multisampling no longer hang the GPU**: a view of a multisampled texture had address 0, so a shader reading
   through it faulted and its draw hung the graphics ring (Chess, within a few launches; issue 23).
 - **Closing an app holds the driver's lock for less time**: its page-table changes are published once instead of once per

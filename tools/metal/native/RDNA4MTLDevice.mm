@@ -685,6 +685,13 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 	return b;
 }
 
+// Private render targets in the card's memory (_vramTarget), unless RDNA4_RTHOST is set (host memory, as before 2026-11-24).
+static BOOL vramTargets(void)
+{
+	static const BOOL on = !getenv("RDNA4_RTHOST");
+	return on;
+}
+
 @implementation RDNA4MTLTexture {
 	id<MTLBuffer> _overBuffer;   // made over a buffer (newTextureWithDescriptor:offset:bytesPerRow:): it, the offset and the row pitch given
 	NSUInteger _overOffset, _overRowBytes;
@@ -712,7 +719,8 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 	RDNA4MTLTexture *_parent;   // a view's
 	RDNA4Held *_held;
 	uint64_t _handle;       // (gpuResourceID) its T#'s slot
-	rdna4_buffer_t _vram;   // a depth or multisampled texture's
+	rdna4_buffer_t _vram;   // a depth or multisampled texture's, or a private render target's (_vramTarget)
+	BOOL _vramTarget;       // a MTLStorageModePrivate render target in the card's memory, laid out as one in host memory would be
 	uint64_t _depthBytes, _stencilBytes;
 	uint32_t _samples;
 }
@@ -1028,6 +1036,7 @@ static char gCopyKey;
 	}
 	_device = t->_device;
 	_memory = t->_memory;
+	_vramTarget = t->_vramTarget;
 	_vram = t->_vram;         // a multisampled texture's samples (its only memory) and how many: without them a view of one had address 0 and
 	_samples = t->_samples;   // one sample, and Chess's (SceneKit's) read of its 4x MSAA image through a view faulted and hung the draw (issue 23)
 	_held = t->_held;
@@ -1230,6 +1239,11 @@ static char gCopyKey;
 		const NSUInteger align = _fm->bpp * _samples < 4 ? 255 : 127;
 		if (rdna4_alloc(device.gpu, (uint64_t)((d.width + align) & ~align) * ((d.height + align) & ~align) * _fm->bpp * _samples, &_vram))
 			return nil;
+	} else if (twoD && d.mipmapLevelCount == 1 && d.storageMode == MTLStorageModePrivate && (d.usage & MTLTextureUsageRenderTarget) && device.gpu &&
+	           vramTargets() && !rdna4_alloc(device.gpu, bytes, &_vram)) {
+		// A private render target in the card's memory: drawn over PCIe in host memory, MetalQuake's 4K RGBA16Float targets made a
+		// full-screen pass about 5 ms (2026-11-24). The CPU cannot reach it: its clears are fills or draws, its blits row copies on the card.
+		_vramTarget = YES;
 	} else if (!(_memory = [[RDNA4MTLBuffer alloc] initWithDevice:device length:bytes options:MTLResourceStorageModeShared]))
 		return nil;
 	_device = device;
@@ -1252,8 +1266,8 @@ static char gCopyKey;
 - (uint32_t)samples { return MAX(_samples, 1u); }
 - (NSUInteger)arrayLength { return _layers ?: 1; }
 - (MTLTextureUsage)usage { return _usage; }
-- (MTLStorageMode)storageMode { return MTLStorageModeShared; }
-- (NSUInteger)allocatedSize { return _memory.allocatedSize; }
+- (MTLStorageMode)storageMode { return _vramTarget ? MTLStorageModePrivate : MTLStorageModeShared; }
+- (NSUInteger)allocatedSize { return _memory ? _memory.allocatedSize : (NSUInteger)_vram.bytes; }
 - (BOOL)isFramebufferOnly { return NO; }
 - (uint64_t)gpuBase { return _held ? _held.gpu + _offset : _vram.handle ? _vram.gpu + _offset : _memory.gpuAddress + _offset; }
 - (uint8_t *)bytes
@@ -2568,16 +2582,72 @@ static void heldIdle(RDNA4MTLDevice *device)
 	return why ? nil : self;
 }
 
+// The bundle's own functions (rdna4.metal), loaded once a process.
+static id<MTLLibrary> bundleLibrary(RDNA4MTLDevice *device)
+{
+	static id<MTLLibrary> library;
+	static std::once_flag once;
+	std::call_once(once, ^{
+		NSString *path = [[NSBundle bundleForClass:[RDNA4MTLFunction class]] pathForResource:@"rdna4" ofType:@"metallib"];
+		library = path ? [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:nil] : nil;
+	});
+	return library;
+}
+
 // The bundle's rdna4_no_fragment (rdna4.metal), once a process.
 static id<MTLFunction> noFragmentFunction(RDNA4MTLDevice *device)
 {
 	static id<MTLFunction> function;
 	static std::once_flag once;
 	std::call_once(once, ^{
-		NSString *path = [[NSBundle bundleForClass:[RDNA4MTLFunction class]] pathForResource:@"rdna4" ofType:@"metallib"];
-		function = path ? [[device newLibraryWithURL:[NSURL fileURLWithPath:path] error:nil] newFunctionWithName:@"rdna4_no_fragment"] : nil;
+		function = [bundleLibrary(device) newFunctionWithName:@"rdna4_no_fragment"];
 	});
 	return function;
+}
+
+// The pipeline of a clear by a draw (rdna4_clear_vertex, rdna4_clear_fragment<attachment>) into colour attachment `attachment` (0-3) of a
+// target of `format` and `samples`, made once and kept; nil if it cannot be.
+static id<MTLRenderPipelineState> clearPipeline(RDNA4MTLDevice *device, MTLPixelFormat format, NSUInteger samples, NSUInteger attachment)
+{
+	static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *made;
+	static std::mutex lock;
+	if (attachment > 3)
+		return nil;
+	NSString *key = [NSString stringWithFormat:@"%lu %lu %lu", (unsigned long)format, (unsigned long)samples, (unsigned long)attachment];
+	std::lock_guard<std::mutex> g(lock);
+	if (!made)
+		made = [NSMutableDictionary dictionary];
+	if (id<MTLRenderPipelineState> p = made[key])
+		return p;
+	id<MTLLibrary> library = bundleLibrary(device);
+	MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+	d.vertexFunction = [library newFunctionWithName:@"rdna4_clear_vertex"];
+	d.fragmentFunction = [library newFunctionWithName:[NSString stringWithFormat:@"rdna4_clear_fragment%lu", (unsigned long)attachment]];
+	d.colorAttachments[attachment].pixelFormat = format;
+	d.rasterSampleCount = MAX(samples, (NSUInteger)1);
+	NSError *error = nil;
+	id<MTLRenderPipelineState> p = d.vertexFunction && d.fragmentFunction ? [device newRenderPipelineStateWithDescriptor:d error:&error] : nil;
+	if (!p)
+		RLOG(@"RDNA4MTL: the clear pipeline for format %lu, %lu samples, attachment %lu: %@", (unsigned long)format, (unsigned long)samples,
+		     (unsigned long)attachment, error.localizedDescription ?: @"no functions");
+	else
+		made[key] = p;
+	return p;
+}
+
+// Integer colour formats (a float4 fragment output does not clear them): R8, R16, RG8, R32, RG16, RGBA8, RGB10A2, RG32, RGBA16, RGBA32 Uint/Sint.
+static BOOL integerFormat(MTLPixelFormat f)
+{
+	switch (f) {
+	case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint:
+	case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint: case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint:
+	case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint:
+	case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA16Uint:
+	case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint:
+		return YES;
+	default:
+		return NO;
+	}
 }
 
 - (NSError *)build:(MTLRenderPipelineDescriptor *)desc
@@ -3261,6 +3331,8 @@ RDNA4_ANSWER_MISSING
 		return nil;
 	_commandBuffer = commandBuffer;
 	RDNA4MTLTexture *first = nil;
+	NSUInteger clearAt[4], drawClears = 0;   // the colour clears made by draws once the pass is set up
+	MTLClearColor clearTo[4];
 	for (NSUInteger i = 0; i < 8; i++) {
 		MTLRenderPassColorAttachmentDescriptor *a = pass.colorAttachments[i];
 		if (!a.texture)
@@ -3288,6 +3360,10 @@ RDNA4_ANSWER_MISSING
 		RDNA4MTLDevice *device = (RDNA4MTLDevice *)commandBuffer.device;
 		if (a.loadAction != MTLLoadActionClear)
 			continue;
+		if (![t fillFor:c pattern:&pattern bytes:&bytes] && !integerFormat(t.pixelFormat) && i < 4 && drawClears < 4) {
+			clearAt[drawClears] = i, clearTo[drawClears++] = c;   // a draw once the pass is set up (below)
+			continue;
+		}
 		if ([t fillFor:c pattern:&pattern bytes:&bytes])
 			[commandBuffer recordDraw:^NSError * {
 				NSError *why = [t.held sync];
@@ -3339,6 +3415,29 @@ RDNA4_ANSWER_MISSING
 				fills[n++] = sfill;
 			return [device gpuBarrier:fills count:n];
 		}];
+	}
+	// The colour clears no 32-bit fill makes, as draws: before, the CPU's (a drain, then 66 MB of a 4K RGBA16Float target every frame of
+	// MetalQuake's, 4-7 ms with the card idle) or not done at all for a target in the card's memory only (2026-11-24)
+	for (NSUInteger k = 0; k < drawClears; k++) {
+		RDNA4MTLTexture *t = _targets[clearAt[k]];
+		const MTLClearColor c = clearTo[k];
+		id<MTLRenderPipelineState> p = clearPipeline((RDNA4MTLDevice *)commandBuffer.device, t.pixelFormat, t.samples, clearAt[k]);
+		if (!p) {
+			[commandBuffer record:^NSError * {
+				[t clearTo:c];
+				[commandBuffer drewInto:t];
+				return nil;
+			}];
+			continue;
+		}
+		const float colour[4] = { (float)c.red, (float)c.green, (float)c.blue, (float)c.alpha };
+		[self setRenderPipelineState:p];
+		[self setFragmentBytes:colour length:sizeof colour atIndex:0];
+		[self drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	}
+	if (drawClears) {   // as a new pass is: no pipeline, fragment buffer 0 unbound
+		_pipeline = nil;
+		[self bind:1 buffer:nil offset:0 index:0];
 	}
 	return self;
 }
@@ -3927,6 +4026,44 @@ static NSError *colourOnly(id<MTLTexture> t)
 	       : rdna4Error(@"a blit of a texture that is not a colour texture of this device in the CPU's memory", 0);
 }
 
+// A copy of `rows` rows of `rowBytes` from `src` (rows `srcPitch` apart) to `dst` (`dstPitch` apart) on the card, behind the draws before it:
+// one copy where both sides' rows are contiguous, else one a row, 128 to a barrier (a 4 KiB IB page). For textures the CPU cannot reach
+// (private render targets in the card's memory, _vramTarget): their blits were refused (colourOnly).
+static void cardRowCopy(RDNA4MTLCommandBuffer *cb, uint64_t src, NSUInteger srcPitch, uint64_t dst, NSUInteger dstPitch, NSUInteger rowBytes,
+                        NSUInteger rows)
+{
+	RDNA4MTLDevice *device = (RDNA4MTLDevice *)cb.device;
+	[cb recordDraw:^NSError * {
+		if (!rows || !rowBytes)
+			return nil;
+		if ((src | dst | srcPitch | dstPitch | rowBytes) & 3)
+			return rdna4Error(@"a texture copy on the card of rows not 4-byte aligned", 0);
+		wrote(dst, dst + (rows - 1) * dstPitch + rowBytes);
+		if (rows == 1 || (srcPitch == rowBytes && dstPitch == rowBytes)) {
+			const RDNA4Copy all = { src, dst, (uint64_t)rows * rowBytes, 0 };
+			return [device gpuBarrier:&all count:1 fresh:YES];
+		}
+		RDNA4Copy batch[128];
+		for (NSUInteger y = 0; y < rows;) {
+			uint32_t n = 0;
+			for (; n < 128 && y < rows; n++, y++)
+				batch[n] = (RDNA4Copy){ src + y * srcPitch, dst + y * dstPitch, rowBytes, 0 };
+			if (NSError *why = [device gpuBarrier:batch count:n fresh:YES])
+				return why;
+		}
+		return nil;
+	}];
+}
+
+// A colour texture of one sample the CPU cannot reach, whose blits go to the card (cardRowCopy).
+static RDNA4MTLTexture *cardOnly(id<MTLTexture> t)
+{
+	if (![(id)t isKindOfClass:[RDNA4MTLTexture class]])
+		return nil;
+	RDNA4MTLTexture *r = (RDNA4MTLTexture *)t;
+	return !r.memory && !r.isDepth && r.samples == 1 && r.gpuBase ? r : nil;
+}
+
 - (void)copyFromBuffer:(id<MTLBuffer>)from sourceOffset:(NSUInteger)fromOffset toBuffer:(id<MTLBuffer>)to
      destinationOffset:(NSUInteger)toOffset size:(NSUInteger)size
 {
@@ -3972,6 +4109,11 @@ static NSError *colourOnly(id<MTLTexture> t)
       destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin
 {
 	[_commandBuffer writesTo:to];
+	if (RDNA4MTLTexture *t = !slice && size.depth <= 1 ? cardOnly([cardOnly(to) level:level]) : nil) {
+		cardRowCopy(_commandBuffer, from.gpuAddress + offset, bpr, t.gpuBase + origin.y * t.rowBytes + origin.x * t.bpp, t.rowBytes,
+		            size.width * t.bpp, size.height);
+		return;
+	}
 	[_commandBuffer record:^NSError * {
 		NSError *why = colourOnly(to);
 		if (!why && offset + bpr * (size.height - 1) + ((RDNA4MTLTexture *)to).bpp * size.width > from.length)   // (Maps' glyphs: R8)
@@ -3996,6 +4138,11 @@ static NSError *colourOnly(id<MTLTexture> t)
              sourceSize:(MTLSize)size toBuffer:(id<MTLBuffer>)to destinationOffset:(NSUInteger)offset
  destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi
 {
+	if (RDNA4MTLTexture *t = !slice && size.depth <= 1 ? cardOnly([cardOnly(from) level:level]) : nil) {
+		cardRowCopy(_commandBuffer, t.gpuBase + origin.y * t.rowBytes + origin.x * t.bpp, t.rowBytes, to.gpuAddress + offset, bpr,
+		            size.width * t.bpp, size.height);
+		return;
+	}
 	[_commandBuffer record:^NSError * {
 		NSError *why = colourOnly(from);
 		if (!why && offset + bpr * (size.height - 1) + ((RDNA4MTLTexture *)from).bpp * size.width > to.length)
@@ -4020,6 +4167,18 @@ static NSError *colourOnly(id<MTLTexture> t)
        destinationSlice:(NSUInteger)toSlice destinationLevel:(NSUInteger)toLevel destinationOrigin:(MTLOrigin)toOrigin
 {
 	[_commandBuffer writesTo:to];
+	// either side in the card's memory only: rows copied on the card (the other side's memory is the card's to reach too)
+	if ((cardOnly(from) || cardOnly(to)) && !fromSlice && !toSlice && size.depth <= 1 && [(id)from isKindOfClass:[RDNA4MTLTexture class]] &&
+	    [(id)to isKindOfClass:[RDNA4MTLTexture class]]) {
+		RDNA4MTLTexture *f = [(RDNA4MTLTexture *)from level:fromLevel], *t = [(RDNA4MTLTexture *)to level:toLevel];
+		if (f && t && f.bpp == t.bpp && f.samples == 1 && t.samples == 1 && !f.isDepth && !t.isDepth && f.gpuBase && t.gpuBase && !f.shadowed &&
+		    !t.shadowed) {
+			cardRowCopy(_commandBuffer, f.gpuBase + fromOrigin.y * f.rowBytes + fromOrigin.x * f.bpp, f.rowBytes,
+			            t.gpuBase + toOrigin.y * t.rowBytes + toOrigin.x * t.bpp, t.rowBytes, size.width * t.bpp, size.height);
+			[_commandBuffer drewInto:t];
+			return;
+		}
+	}
 	[_commandBuffer record:^NSError * {
 		NSError *why = colourOnly(from) ?: colourOnly(to);
 		if (why)
