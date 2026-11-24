@@ -5783,6 +5783,11 @@ static void padSlot(uint32_t *page, uint32_t n)
 		                                             [inFlight componentsJoinedByString:@"; "]], kr);
 	}
 	memset(_slotUse, 0, sizeof _slotUse);
+	// The last stream's own fence can show a few microseconds after the batch's (2 us, MetalGraphicsPlayground's MSAA sample, about 1
+	// drain in 1000, 2026-11-24): its pixels are written back before it, so it is waited for (up to 2 ms) before the draws count as done
+	// for the CPU. ("the draws finished but the last stream's fence reads 0" before, the command buffer failed.)
+	for (const uint64_t s0 = nowUs(); drew && streamFence != 1 && nowUs() - s0 < 2000;)
+		streamFence = *(volatile uint32_t *)(_miscCpu + (uint64_t)_lastSlot * kMiscBytes);
 	if (drew && streamFence != 1)
 		return rdna4Error([NSString stringWithFormat:@"the draws finished but the last stream's fence reads %u", streamFence], 0);
 	return nil;
