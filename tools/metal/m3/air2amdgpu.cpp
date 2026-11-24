@@ -630,6 +630,27 @@ static std::string legalize(Function &k) {
 			Value *at = b.CreateIntToPtr(b.CreatePtrToInt(handle, b.getInt64Ty()), PointerType::get(ctx, 4));
 			return b.CreateAlignedLoad(FixedVectorType::get(b.getInt32Ty(), dwords), at, Align(16));
 		};
+		// Level `level` (0-7) of a draw's texture as an image of its own: its level 0 T#, else the host's level table entry past it
+		// (RDNA4_MTLC_LEVEL_FIRST; the shader marked rdna4-levels so the host writes it). Draws' shaders only: kernels' tables have none.
+		const bool drawStage = k.getCallingConv() == CallingConv::AMDGPU_PS || k.getCallingConv() == CallingConv::AMDGPU_GS;
+		auto levelDescriptor = [&](Value *texture, Value *level) {
+			k.addFnAttr("rdna4-levels");
+			Value *past = b.CreateAdd(b.CreateMul(level, b.getInt32(RDNA4_MTLC_LEVEL_STRIDE)), b.getInt32(RDNA4_MTLC_LEVEL_FIRST - RDNA4_MTLC_LEVEL_STRIDE));
+			Value *at = b.CreateSelect(b.CreateICmpEQ(level, b.getInt32(0)), b.getInt32(0), past);
+			return descriptor(b.CreateGEP(b.getInt8Ty(), texture, b.CreateZExt(at, b.getInt64Ty())), 8);
+		};
+		// An explicit LOD sampled as levels floor(lod) and the next, each at its level 0, blended by the LOD's fraction (a linear mip filter).
+		// ponytail: always blended (a nearest mip filter too), the sampler's LOD clamps ignored.
+		auto sampleLevels = [&](Value *lod, function_ref<Value *(Value *)> sampleAt) {
+			Type *ft = b.getFloatTy();
+			Value *l = b.CreateBinaryIntrinsic(Intrinsic::minnum, b.CreateBinaryIntrinsic(Intrinsic::maxnum, lod, ConstantFP::get(ft, 0.0)),
+			                                   ConstantFP::get(ft, RDNA4_MTLC_LEVELS - 1.0));
+			Value *whole = b.CreateUnaryIntrinsic(Intrinsic::floor, l), *fraction = b.CreateFSub(l, whole);
+			Value *l0 = b.CreateFPToUI(whole, b.getInt32Ty());
+			Value *l1 = b.CreateBinaryIntrinsic(Intrinsic::umin, b.CreateAdd(l0, b.getInt32(1)), b.getInt32(RDNA4_MTLC_LEVELS - 1));
+			Value *s0 = sampleAt(l0), *s1 = sampleAt(l1);
+			return b.CreateFAdd(s0, b.CreateFMul(b.CreateFSub(s1, s0), b.CreateVectorSplat(4, fraction)));
+		};
 		// Texture calls with ushort coordinates (".i16" after the name) are the uint ones with their coordinates widened.
 		std::string texName = name.str();
 		if (const size_t i16 = texName.find("_2d.i16."); i16 != std::string::npos)
@@ -704,32 +725,17 @@ static std::string legalize(Function &k) {
 					args.push_back(minLod);
 				types.append({t->getType(), sm->getType()});
 				args.append({t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
-				const CallingConv::ID cc = k.getCallingConv();
-				if (mode == 2 && !cube && (cc == CallingConv::AMDGPU_PS || cc == CallingConv::AMDGPU_GS)) {
-					// An explicit LOD in a draw's shader (WindowServer's glass blurs each level from the one before, Tahoe): levels
-					// floor(lod) and the next as images of their own (RDNA4_MTLC_LEVEL_FIRST), sampled at their level 0, blended by the
-					// LOD's fraction, as a linear mip filter. ponytail: always blended (a nearest mip filter too), the sampler's LOD
-					// clamps ignored; kernels' tables have no levels (their explicit LODs read level 0 as before).
-					k.addFnAttr("rdna4-levels");
-					Type *ft = b.getFloatTy();
-					Value *l = b.CreateBinaryIntrinsic(Intrinsic::minnum, b.CreateBinaryIntrinsic(Intrinsic::maxnum, value, ConstantFP::get(ft, 0.0)),
-					                                   ConstantFP::get(ft, RDNA4_MTLC_LEVELS - 1.0));
-					Value *whole = b.CreateUnaryIntrinsic(Intrinsic::floor, l), *fraction = b.CreateFSub(l, whole);
-					Value *l0 = b.CreateFPToUI(whole, b.getInt32Ty());
-					Value *l1 = b.CreateBinaryIntrinsic(Intrinsic::umin, b.CreateAdd(l0, b.getInt32(1)), b.getInt32(RDNA4_MTLC_LEVELS - 1));
-					auto levelSample = [&](Value *level) {
-						Value *past = b.CreateAdd(b.CreateMul(level, b.getInt32(RDNA4_MTLC_LEVEL_STRIDE)),
-						                          b.getInt32(RDNA4_MTLC_LEVEL_FIRST - RDNA4_MTLC_LEVEL_STRIDE));
-						Value *at = b.CreateSelect(b.CreateICmpEQ(level, b.getInt32(0)), b.getInt32(0), past);
-						Value *lt = descriptor(b.CreateGEP(b.getInt8Ty(), c->getArgOperand(0), b.CreateZExt(at, b.getInt64Ty())), 8);
+				if (mode == 2 && !cube && drawStage) {
+					// An explicit LOD in a draw's shader (WindowServer's glass blurs each level from the one before, Tahoe); kernels'
+					// explicit LODs read level 0 as before
+					texel = sampleLevels(value, [&](Value *level) -> Value * {
+						Value *lt = levelDescriptor(c->getArgOperand(0), level);
 						SmallVector<Value *, 10> la = {b.getInt32(15)};
 						if (packed)
 							la.push_back(b.getInt32(packed));
 						la.append({x, y, lt, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
-						return b.CreateIntrinsic(ids[0][packed != 0][3], {v4f, ft, lt->getType(), sm->getType()}, la);
-					};
-					Value *s0 = levelSample(l0), *s1 = levelSample(l1);
-					texel = b.CreateFAdd(s0, b.CreateFMul(b.CreateFSub(s1, s0), b.CreateVectorSplat(4, fraction)));
+						return b.CreateIntrinsic(ids[0][packed != 0][3], {v4f, b.getFloatTy(), lt->getType(), sm->getType()}, la);
+					});
 				} else
 					texel = b.CreateIntrinsic(cl ? clIds[cube][packed != 0][mode] : ids[cube][packed != 0][mode], types, args);
 			} else {
@@ -885,7 +891,13 @@ static std::string legalize(Function &k) {
 				args.push_back(value);
 			types.append({t->getType(), sm->getType()});
 			args.append({t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
-			Value *texel = b.CreateIntrinsic(ids[mode], types, args);
+			// an explicit LOD in a draw's shader: the cube's levels as the 2D case's (MetalGraphicsPlayground's prefiltered environment)
+			Value *texel = mode == 2 && drawStage ? sampleLevels(value, [&](Value *level) -> Value * {
+				Value *lt = levelDescriptor(c->getArgOperand(0), level);
+				return b.CreateIntrinsic(ids[3], {v4f, ft, lt->getType(), sm->getType()},
+				                         {b.getInt32(15), sc, tc, face, lt, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+			})
+			                                      : b.CreateIntrinsic(ids[mode], types, args);
 			if (tex.starts_with("sample_texture_cube.v4f16"))
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
@@ -1190,10 +1202,17 @@ static std::string legalize(Function &k) {
 			Value *lod = c->arg_size() > 1 ? c->getArgOperand(1) : b.getInt32(0);
 			r = b.CreateIntrinsic(Intrinsic::umax, {b.getInt32Ty()}, {b.CreateLShr(b.CreateAdd(size, b.getInt32(1)), lod), b.getInt32(1)});
 		} else if (name.starts_with("get_num_mip_levels_")) {
-			// (texture): LAST_LEVEL (word3 [19:15]) + 1. ponytail: BASE_LEVEL taken as 0, as the T#s the host and the bundle write
-			// (a view of a later level is an image of its own); subtract it if views ever start at a level in the T#.
-			Value *w3 = b.CreateExtractElement(descriptor(c->getArgOperand(0), 8), 3);
-			r = b.CreateAdd(b.CreateAnd(b.CreateLShr(w3, 15), 0x1f), b.getInt32(1));
+			// (texture): in a draw's shader, 1 plus the levels of the host's level table whose address differs from the level before
+			// (past the last, it repeats the last); elsewhere (no table) 1: every T# has LAST_LEVEL 0, its levels images of their own
+			r = b.getInt32(1);
+			if (drawStage) {
+				Value *before = b.CreateExtractElement(levelDescriptor(c->getArgOperand(0), b.getInt32(0)), uint64_t(0));
+				for (unsigned l = 1; l < RDNA4_MTLC_LEVELS; l++) {
+					Value *base = b.CreateExtractElement(levelDescriptor(c->getArgOperand(0), b.getInt32(l)), uint64_t(0));
+					r = b.CreateAdd(r, b.CreateZExt(b.CreateICmpNE(base, before), b.getInt32Ty()));
+					before = base;
+				}
+			}
 		} else if (name.starts_with("get_array_size_texture_1d_array") || name.starts_with("get_array_size_texture_2d_array")) {
 			// (texture): the T#'s layers - 1 in word4 [13:0] (pvdraw.hpp linearArray1d / linearArray2d), plus one (Quake II's water)
 			Value *t = descriptor(c->getArgOperand(0), 8);
@@ -1822,6 +1841,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	// Dual-source blending: [[color(0), index(1)]], the blend's second source (Sublime Text's subpixel text through AppleMetalOpenGLRenderer
 	// blends with Source1Color): exported beside the colour (header bit 18), not as it
 	int dualMember = -1;
+	int layerMember = -1;   // the vertex output that is [[render_target_array_index]] (header bit 18; RDNA4_MTLC_TABLE_LAYER)
 	int depthMember = -1;   // the struct member that is the fragment's depth
 	for (unsigned k = 0; k < outputs->getNumOperands(); k++) {
 		const auto *o = cast<MDNode>(outputs->getOperand(k));
@@ -1836,10 +1856,11 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		// water too); the hardware's (POS1 export, PA_CL_VS_OUT_CNTL CLIP_DIST_ENA) when that shows
 		else if (vertex && kind == "air.clip_distance")
 			continue;
-		// ponytail: the layer is dropped: right for targets of one layer (MoltenVK's vtxCmdBlitImageLayered into vkQuake's 2D images),
-		// an array target's draws all land in its first layer; export it in the misc position (PA_CL_VS_OUT_CNTL) when one needs it
+		// The layer: the host runs the draw once for each layer of a layered pass, and a primitive of another layer is put outside the
+		// view (MetalGraphicsPlayground's cube faces, a draw of six instances). ponytail: the vertex work six times over; the hardware's
+		// own (the misc position export, PA_CL_VS_OUT_CNTL, slices in the colour block) when that shows.
 		else if (vertex && kind == "air.render_target_array_index")
-			continue;
+			layerMember = static_cast<int>(k);
 		// ponytail: [[sample_mask]] only as "none": a pixel whose mask is 0 is discarded, the others write every sample (exact for one
 		// sample; vkQuake's ambient-occlusion pass on MSAA); the mask export (DB_SHADER_CONTROL.MASK_EXPORT_ENABLE, MRTZ) when that shows
 		else if (!vertex && kind == "air.sample_mask")
@@ -2174,7 +2195,17 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		b.CreateCondBr(b.CreateICmpULT(lane, vertices), pos, afterPos);
 		b.SetInsertPoint(pos);
 		Value *r = callAir(b.CreateAdd(f->getArg(kVertexId), f->getArg(kFirstVertex)));
-		exportF32(12, r->getType()->isStructTy() ? b.CreateExtractValue(r, static_cast<unsigned>(position)) : r, false);   // pos0
+		Value *p = r->getType()->isStructTy() ? b.CreateExtractValue(r, static_cast<unsigned>(position)) : r;
+		if (layerMember >= 0) {   // of another layer than the host's: outside the view (x, y, z = 2w)
+			Value *at = b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(RDNA4_MTLC_TABLE_LAYER)), PointerType::get(ctx, 4));
+			Value *drawn = b.CreateAlignedLoad(b.getInt32Ty(), at, Align(4));
+			Value *mine = b.CreateAdd(b.CreateZExtOrTrunc(b.CreateExtractValue(r, static_cast<unsigned>(layerMember)), b.getInt32Ty()), b.getInt32(1));
+			Value *other = b.CreateAnd(b.CreateICmpNE(drawn, b.getInt32(0)), b.CreateICmpNE(drawn, mine));
+			Value *w = b.CreateExtractElement(p, 3), *away = b.CreateFMul(w, ConstantFP::get(b.getFloatTy(), 2.0));
+			Value *outside = b.CreateInsertElement(b.CreateVectorSplat(4, away), w, 3);
+			p = b.CreateSelect(other, outside, p);
+		}
+		exportF32(12, p, false);   // pos0
 		std::vector<Value *> values;
 		for (const Var &v : vars)
 			values.push_back(toVec4(b.CreateExtractValue(r, v.index)));
@@ -2346,7 +2377,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		return "explicit LODs with textures 16-30: their levels have no T#s yet";
 	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3],
 	                          static_cast<uint32_t>(vars.size()) | writes << 20 | (attachment > 0 ? static_cast<uint32_t>(attachment) << 28 : 0) |
-	                          (noColour ? 1u << 31 : 0) | (f->hasFnAttribute("rdna4-levels") ? 1u << 16 : 0) | (dualMember >= 0 ? 1u << 18 : 0) | (depthMember >= 0 ? 1u << 19 : 0) |
+	                          (noColour ? 1u << 31 : 0) | (f->hasFnAttribute("rdna4-levels") ? 1u << 16 : 0) | (dualMember >= 0 || layerMember >= 0 ? 1u << 18 : 0) | (depthMember >= 0 ? 1u << 19 : 0) |
 	                          (written || writesTexture ? 1u << 17 : 0)};
 	out.hsaco.assign(reinterpret_cast<const char *>(head), sizeof(head));
 	out.hsaco += code.str();

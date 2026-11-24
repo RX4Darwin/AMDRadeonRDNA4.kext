@@ -5,6 +5,10 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- **Cube and array textures with mip levels, layered render passes**: every level of a cube or 2D array is kept (only level 0 was),
+  drawn into a face and level at a time, sampled at an explicit LOD and counted by `get_num_mip_levels`; mipmapped depth cubes as
+  attachments; a vertex shader's `[[render_target_array_index]]` draws into that layer (all six cube faces went into the first). With these
+  MetalGraphicsPlayground's image-based lighting works: all twelve of its samples now draw.
 - **More Metal shaders translate**: depth sampling with a sampler declared in the shader, `reverse_bits`, a cube texture's size and
   mip count, and depth reads without a sampler; RG32Float and R32Sint textures; a pipeline with no format at a colour attachment the
   pass has draws without writing it there, as Metal does (it was refused: MetalQuake's 5000 refused draws a run). Four of

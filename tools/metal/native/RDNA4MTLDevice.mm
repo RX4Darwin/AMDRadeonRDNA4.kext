@@ -583,6 +583,8 @@ enum { kWrittenRanges = 8 };   // ranges kept apart (more: the two nearest merge
 - (uint32_t)sampleOr;                       // the OR of some of its pixels' first 4 bytes (the trace)
 - (NSString *)origin;                       // where its pixels are (the trace)
 - (RDNA4MTLTexture *)level:(NSUInteger)level;   // level `level` as a texture of its own (kept): a render pass's attachment level
+- (RDNA4MTLTexture *)level:(NSUInteger)level slice:(NSUInteger)slice;   // the same of an array's or a cube's slice
+- (RDNA4MTLTexture *)depthLevel:(NSUInteger)level slice:(NSUInteger)slice;   // a depth cube's or array's image as a depth texture
 @property (readonly) BOOL shadowed;         // the GPU reads a copy of an IOSurface's pixels (refresh)
 @property (readonly) BOOL onSurface;        // an IOSurface's
 @property (readonly) RDNA4Held *held;        // its IOSurface's pixels the GPU uses are in VRAM (rdna4-nativeheld=1)
@@ -710,8 +712,9 @@ static BOOL vramTargets(void)
 	MTLTextureType _type;   // 2D, or 1D (one row), or a 1D array (a row a layer), or 3D
 	NSUInteger _layers, _depth, _slicePitch;   // a 1D array's layers; a 3D texture's slices and the bytes from one to the next
 	NSUInteger _slices;   // a 2D array's, a cube's (6) or a cube array's 2D images, laid out as a 3D texture's slices (_slicePitch)
-	NSUInteger _levels, _levelOffset[16], _levelRow[16];   // a mipmapped 2D texture's levels: each an image of its own in _memory
-	NSUInteger _askedLevels;   // an array's or cube's mip levels as asked for (level 0 only kept)
+	// a mipmapped texture's levels, each an image of its own in _memory (an array's or cube's: its slices, _levelSlice apart, with the
+	// hardware's pitches for the level's size)
+	NSUInteger _levels, _levelOffset[16], _levelRow[16], _levelSlice[16];
 	const uint8_t *_surfaceRows;   // shadowed: the IOSurface's own pixels, _surfaceRowBytes apart; _memory is the GPU's copy
 	NSUInteger _surfaceRowBytes;
 	uint32_t _shadowSeed;   // a planar surface's seed when last refreshed (_shadowSeeded)
@@ -722,6 +725,11 @@ static BOOL vramTargets(void)
 	rdna4_buffer_t _vram;   // a depth or multisampled texture's, or a private render target's (_vramTarget)
 	BOOL _vramTarget;       // a MTLStorageModePrivate render target in the card's memory, laid out as one in host memory would be
 	uint64_t _depthBytes, _stencilBytes;
+	// A depth (and stencil) cube or array or one with mip levels: its images other than level 0 of slice 0 (that one is itself), each a
+	// depth texture of its own made at first use (depthLevel:slice:). ponytail: as attachments only (EnvironmentMapping's cube passes); a
+	// shader sampling it reads level 0 of slice 0.
+	NSUInteger _depthLevels, _depthSlices;
+	NSMutableDictionary<NSNumber *, RDNA4MTLTexture *> *_depthImages;
 	uint32_t _samples;
 }
 @synthesize label;
@@ -745,6 +753,9 @@ static BOOL vramTargets(void)
 	}
 	_isDepth = YES;
 	_type = d.textureType;
+	_depthLevels = d.mipmapLevelCount;
+	_depthSlices = d.textureType == MTLTextureTypeCube ? 6 : d.textureType == MTLTextureType2DArray ? d.arrayLength : 0;
+	_layers = d.textureType == MTLTextureType2DArray ? d.arrayLength : 0;   // (arrayLength)
 	_device = device;
 	_width = d.width;
 	_height = d.height;
@@ -754,11 +765,24 @@ static BOOL vramTargets(void)
 	return self;
 }
 
+// A 2D array's or a cube's level as a T# (a cube's typed CUBE, 11): the hardware's own pitches as a 3D image's
+- (void)arrayDescriptor:(uint32_t[8])t level:(NSUInteger)level
+{
+	const uint32_t w = (uint32_t)MAX(_width >> level, (NSUInteger)1), h = (uint32_t)MAX(_height >> level, (NSUInteger)1);
+	linearArray2d(t, self.gpuBase + _levelOffset[level], _fm->gfx, viewSel(_fm->sel, _swizzle), w, h, (uint32_t)_slices);
+	if (_type == MTLTextureTypeCube || _type == MTLTextureTypeCubeArray)
+		t[3] = (t[3] & 0x0fffffffu) | 11u << 28;
+}
+
 - (void)descriptor:(uint32_t[8])t level:(NSUInteger)level
 {
 	level = MIN(level, MAX(_levels, (NSUInteger)1) - 1);
 	if (!level || !self.gpuBase) {   // (no memory: descriptor: gives the spare texel)
 		[self descriptor:t];
+		return;
+	}
+	if (_slices) {
+		[self arrayDescriptor:t level:level];
 		return;
 	}
 	const uint32_t w = (uint32_t)MAX(_width >> level, (NSUInteger)1), h = (uint32_t)MAX(_height >> level, (NSUInteger)1);
@@ -919,10 +943,8 @@ static char gCopyKey;
 		msaaImage(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), (uint32_t)_width, (uint32_t)_height, _samples == 4 ? 2 : 1);
 		return;
 	}
-	if (_slices) {   // a 2D array's T#, a cube's typed CUBE (11): the hardware's own pitches as a 3D image's
-		linearArray2d(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), (uint32_t)_width, (uint32_t)_height, (uint32_t)_slices);
-		if (_type == MTLTextureTypeCube || _type == MTLTextureTypeCubeArray)
-			t[3] = (t[3] & 0x0fffffffu) | 11u << 28;
+	if (_slices) {
+		[self arrayDescriptor:t level:0];
 		return;
 	}
 	if (_type == MTLTextureType3D) {   // the hardware's own pitches (pvdraw.hpp linearVolume; the memory laid out so in the init)
@@ -1027,11 +1049,15 @@ static char gCopyKey;
 	// a BC format as its texture keeps it, RGBA8 (sRGB for the sRGB ones): Apple's GL-on-Metal renderer views every texture it binds,
 	// and with none for BC it sampled zeros ("formats are not castable"): OpenMW's world black (2026-11-22)
 	_fm = textureFormat(bcBlockBytes(format) ? (format & 1 ? 71u : 70u) : (uint32_t)format);
-	if (t->_isDepth || !t->_fm || !_fm || _fm->bpp != t->_fm->bpp || l >= have || slices.location || t->_type == MTLTextureType3D) {
+	// Of an array or a cube: as one (its slices from 0), or a 2D image of one of its slices (a render pass's attachment slice, a face).
+	const NSUInteger s = slices.location;
+	const BOOL layered = t->_slices && (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray || type == MTLTextureType2DArray);
+	if (t->_isDepth || !t->_fm || !_fm || _fm->bpp != t->_fm->bpp || l >= have || (s && (layered || s >= t->_slices)) ||
+	    t->_type == MTLTextureType3D) {
 		rdna4Error([NSString stringWithFormat:@"a view of format %lu, type %lu, levels %lu+%lu, slices %lu+%lu of a texture of format %lu: only colour "
-		                                      @"textures, the same size a pixel, from slice 0, not 3D, so far", (unsigned long)format,
-		                                      (unsigned long)type, (unsigned long)l, (unsigned long)levels.length,
-		                                      (unsigned long)slices.location, (unsigned long)slices.length, (unsigned long)t->_format], 0);
+		                                      @"textures, the same size a pixel, an array's slices from 0 or one of them, not 3D, so far",
+		                                      (unsigned long)format, (unsigned long)type, (unsigned long)l, (unsigned long)levels.length,
+		                                      (unsigned long)s, (unsigned long)slices.length, (unsigned long)t->_format], 0);
 		return nil;
 	}
 	_device = t->_device;
@@ -1044,19 +1070,23 @@ static char gCopyKey;
 	_plane = t->_plane;
 	_surfaceRows = l ? NULL : t->_surfaceRows;   // a level of a shadowed texture: ponytail, level 0 only is kept current
 	_surfaceRowBytes = t->_surfaceRowBytes;
-	_offset = t->_offset + t->_levelOffset[l];
-	_rowBytes = l ? t->_levelRow[l] : t->_rowBytes;
+	const NSUInteger base = t->_levelOffset[l] + s * t->_levelSlice[l];   // (_levelSlice is 0 but for arrays and cubes)
+	_offset = t->_offset + base;
+	_rowBytes = t->_levelRow[l] ?: t->_rowBytes;
 	_width = MAX(t->_width >> l, (NSUInteger)1);
 	_height = MAX(t->_height >> l, (NSUInteger)1);
 	_format = format;
 	_usage = t->_usage;
-	_type = t->_samples > 1 ? t->_type : type == MTLTextureType1DArray || type == MTLTextureType1D ? type : MTLTextureType2D;
-	_layers = t->_layers;
+	_type = layered ? type : t->_samples > 1 ? t->_type : type == MTLTextureType1DArray || type == MTLTextureType1D ? type : MTLTextureType2D;
+	_layers = layered || t->_type == MTLTextureType1DArray ? t->_layers : 1;
+	_slices = layered ? t->_slices : 0;
+	_slicePitch = layered ? t->_levelSlice[l] : 0;
 	_depth = 1;
 	_levels = MIN(levels.length ?: 1, have - l);
 	for (NSUInteger k = 0; k < _levels; k++) {
-		_levelOffset[k] = t->_levelOffset[l + k] - t->_levelOffset[l];
+		_levelOffset[k] = t->_levelOffset[l + k] + s * t->_levelSlice[l + k] - base;
 		_levelRow[k] = t->_levelRow[l + k] ?: t->_rowBytes;
+		_levelSlice[k] = layered ? t->_levelSlice[l + k] : 0;
 	}
 	_parent = t;
 	return self;
@@ -1085,9 +1115,31 @@ static char gCopyKey;
 
 - (id<MTLTexture>)parentTexture { return _parent; }
 
-- (RDNA4MTLTexture *)level:(NSUInteger)level
+- (RDNA4MTLTexture *)level:(NSUInteger)level { return [self level:level slice:0]; }
+
+- (RDNA4MTLTexture *)depthLevel:(NSUInteger)level slice:(NSUInteger)slice
 {
-	if (!level)
+	if (!_isDepth || (!level && !slice) || level >= MAX(_depthLevels, (NSUInteger)1) || slice >= MAX(_depthSlices, (NSUInteger)1))
+		return self;
+	@synchronized(self) {
+		NSNumber *key = @(level | slice << 8);
+		RDNA4MTLTexture *t = _depthImages[key];
+		if (!t) {
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:_format width:MAX(_width >> level, (NSUInteger)1)
+			                                                                            height:MAX(_height >> level, (NSUInteger)1) mipmapped:NO];
+			d.usage = _usage;
+			d.storageMode = MTLStorageModePrivate;
+			if ((t = [[RDNA4MTLTexture alloc] initDepthWithDevice:_device descriptor:d]))
+				(_depthImages = _depthImages ?: [NSMutableDictionary dictionary])[key] = t;
+		}
+		return t ?: self;
+	}
+}
+
+// A level of it, or of an array's or a cube's slice, as a 2D texture of its own (itself for level 0 of slice 0)
+- (RDNA4MTLTexture *)level:(NSUInteger)level slice:(NSUInteger)slice
+{
+	if (!level && !slice)
 		return self;
 	static char key;
 	@synchronized(self) {
@@ -1096,10 +1148,11 @@ static char gCopyKey;
 		NSMapTable *views = objc_getAssociatedObject(self, &key);
 		if (!views)
 			objc_setAssociatedObject(self, &key, views = [NSMapTable strongToWeakObjectsMapTable], OBJC_ASSOCIATION_RETAIN);
-		RDNA4MTLTexture *v = [views objectForKey:@(level)];
+		NSNumber *key = @(level | slice << 8);
+		RDNA4MTLTexture *v = [views objectForKey:key];
 		if (!v && (v = [[RDNA4MTLTexture alloc] initViewOf:self format:_format type:MTLTextureType2D levels:NSMakeRange(level, 1)
-		                                            slices:NSMakeRange(0, 1)]))
-			[views setObject:v forKey:@(level)];
+		                                            slices:NSMakeRange(slice, 1)]))
+			[views setObject:v forKey:key];
 		return v;
 	}
 }
@@ -1191,13 +1244,12 @@ static char gCopyKey;
 	// 2D arrays and cubes (VectorKit's: Maps aborted on a nil 8x8 cube, 2026-11-20), one level: their images as a 3D texture's slices
 	const BOOL cube = d.textureType == MTLTextureTypeCube || d.textureType == MTLTextureTypeCubeArray;
 	NSUInteger slices = 0;
-	// With mip levels (Daggerfall Unity's world textures: a 64x64 array of 56 layers, 7 levels): level 0 kept and sampled, uploads to the
-	// others left out (fits:), the count asked for reported. ponytail: no mipmapping in arrays and cubes (aliasing far away).
+	// With mip levels (Daggerfall Unity's world textures: a 64x64 array of 56 layers, 7 levels; MetalGraphicsPlayground's prefiltered
+	// environment cubes): each level its slices after the level before. ponytail: sampled at an implicit LOD, level 0 (aliasing far away).
 	if (d.mipmapLevelCount <= 15 && cube)
 		slices = 6 * MAX(d.arrayLength, (NSUInteger)1);
 	else if (d.mipmapLevelCount <= 15 && d.textureType == MTLTextureType2DArray)
 		slices = d.arrayLength;
-	_askedLevels = slices ? d.mipmapLevelCount : 0;
 	// 2x and 4x (Maps' 600x600 BGRA8 sRGB, 2026-11-20), 1, 2, 4 or 8 bytes a pixel (vkQuake's R8 through MoltenVK, 2026-11-21): the samples
 	// in the card's memory, as the PV host's msaaSurface
 	const BOOL msaa = d.textureType == MTLTextureType2DMultisample && (d.sampleCount == 2 || d.sampleCount == 4) && d.mipmapLevelCount == 1 &&
@@ -1224,13 +1276,20 @@ static char gCopyKey;
 		_slicePitch = ((d.width * _fm->bpp + 255) & ~(NSUInteger)255) * d.height;
 		bytes = _slicePitch * (slices ?: _depth);
 	}
-	_levels = twoD ? d.mipmapLevelCount : 1;
+	_levels = twoD || slices ? d.mipmapLevelCount : 1;
 	_levelRow[0] = _rowBytes;
-	for (NSUInteger l = 1; l < _levels; l++) {   // each level an image of its own after level 0, 256-byte aligned
+	_levelSlice[0] = _slicePitch;
+	for (NSUInteger l = 1; l < _levels; l++) {   // each level an image (or slices) of its own after the level before, 256-byte aligned
 		const NSUInteger w = MAX(d.width >> l, (NSUInteger)1), h = MAX(d.height >> l, (NSUInteger)1);
 		_levelOffset[l] = (bytes + 255) & ~(NSUInteger)255;
-		_levelRow[l] = (w * _fm->bpp + 255) & ~(NSUInteger)255;
-		bytes = _levelOffset[l] + _levelRow[l] * h;
+		if (slices) {   // the pitches the hardware takes for an array of this size (as level 0's above)
+			_levelRow[l] = (w * _fm->bpp + 127) & ~(NSUInteger)127;
+			_levelSlice[l] = ((w * _fm->bpp + 255) & ~(NSUInteger)255) * h;
+			bytes = _levelOffset[l] + _levelSlice[l] * slices;
+		} else {
+			_levelRow[l] = (w * _fm->bpp + 255) & ~(NSUInteger)255;
+			bytes = _levelOffset[l] + _levelRow[l] * h;
+		}
 	}
 	if (msaa) {   // 64KB_2D in whole 128x128 blocks (msaaSurface's), the colour block's pitch its width; drawn, cleared and resolved on the card
 		_samples = (uint32_t)d.sampleCount;
@@ -1256,12 +1315,12 @@ static char gCopyKey;
 }
 
 - (id<MTLDevice>)device { return _device; }
-- (MTLTextureType)textureType { return _type == MTLTextureType1D || _type == MTLTextureType1DArray || _type == MTLTextureType3D || _slices || _samples > 1 ? _type : MTLTextureType2D; }
+- (MTLTextureType)textureType { return _type == MTLTextureType1D || _type == MTLTextureType1DArray || _type == MTLTextureType3D || _slices || _depthSlices || _samples > 1 ? _type : MTLTextureType2D; }
 - (MTLPixelFormat)pixelFormat { return _format; }
 - (NSUInteger)width { return _width; }
 - (NSUInteger)height { return _height; }
 - (NSUInteger)depth { return _depth ?: 1; }
-- (NSUInteger)mipmapLevelCount { return _askedLevels ?: _levels ?: 1; }
+- (NSUInteger)mipmapLevelCount { return _levels ?: _depthLevels ?: 1; }
 - (NSUInteger)sampleCount { return MAX(_samples, 1u); }
 - (uint32_t)samples { return MAX(_samples, 1u); }
 - (NSUInteger)arrayLength { return _layers ?: 1; }
@@ -1305,7 +1364,7 @@ static char gCopyKey;
 // Where pixel (x, y, z) of `level` is for the CPU.
 - (uint8_t *)at:(NSUInteger)level x:(NSUInteger)x y:(NSUInteger)y z:(NSUInteger)z
 {
-	return self.bytes + _levelOffset[level] + z * _slicePitch + y * (level ? _levelRow[level] : _rowBytes) + x * self.bpp;
+	return self.bytes + _levelOffset[level] + z * (level ? _levelSlice[level] : _slicePitch) + y * (level ? _levelRow[level] : _rowBytes) + x * self.bpp;
 }
 
 // In VRAM only (depth, multisample): no CPU copy, CPU reads and writes are ignored. ponytail: ANGLE's zero fill of a new renderbuffer, which
@@ -1351,20 +1410,21 @@ static char gCopyKey;
 	for (NSUInteger l = 1; l < _levels; l++) {
 		const NSUInteger w = MAX(_width >> l, (NSUInteger)1), h = MAX(_height >> l, (NSUInteger)1);
 		const NSUInteger pw = MAX(_width >> (l - 1), (NSUInteger)1), ph = MAX(_height >> (l - 1), (NSUInteger)1);
-		for (NSUInteger y = 0; y < h; y++)
-			for (NSUInteger x = 0; x < w; x++) {
-				uint8_t *out = [self at:l x:x y:y z:0];
-				if (bpp != 4) {   // ponytail: nearest for formats of other than four 8-bit channels
-					memcpy(out, [self at:l - 1 x:MIN(2 * x, pw - 1) y:MIN(2 * y, ph - 1) z:0], bpp);
-					continue;
+		for (NSUInteger z = 0; z < MAX(_slices, (NSUInteger)1); z++)   // (each slice of an array or cube)
+			for (NSUInteger y = 0; y < h; y++)
+				for (NSUInteger x = 0; x < w; x++) {
+					uint8_t *out = [self at:l x:x y:y z:z];
+					if (bpp != 4) {   // ponytail: nearest for formats of other than four 8-bit channels
+						memcpy(out, [self at:l - 1 x:MIN(2 * x, pw - 1) y:MIN(2 * y, ph - 1) z:z], bpp);
+						continue;
+					}
+					for (int c = 0; c < 4; c++) {
+						unsigned sum = 0;
+						for (int k = 0; k < 4; k++)
+							sum += [self at:l - 1 x:MIN(2 * x + (k & 1), pw - 1) y:MIN(2 * y + (k >> 1), ph - 1) z:z][c];
+						out[c] = (uint8_t)((sum + 2) / 4);
+					}
 				}
-				for (int c = 0; c < 4; c++) {
-					unsigned sum = 0;
-					for (int k = 0; k < 4; k++)
-						sum += [self at:l - 1 x:MIN(2 * x + (k & 1), pw - 1) y:MIN(2 * y + (k >> 1), ph - 1) z:0][c];
-					out[c] = (uint8_t)((sum + 2) / 4);
-				}
-			}
 	}
 }
 
@@ -1375,9 +1435,9 @@ static char gCopyKey;
 		return;
 	if (_type == MTLTextureType1DArray && slice < _layers && !level && r.origin.x + r.size.width <= _width)   // a layer is a row
 		memcpy(self.bytes + slice * _rowBytes + r.origin.x * self.bpp, bytes, r.size.width * self.bpp);
-	else if (_slices && slice < _slices && !level && [self fits:r level:0])   // an array's or cube's image: a slice
+	else if (_slices && slice < _slices && [self fits:r level:level])   // an array's or cube's image: a slice of the level
 		for (NSUInteger y = 0; y < r.size.height; y++)
-			memcpy([self at:0 x:r.origin.x y:r.origin.y + y z:slice], (const uint8_t *)bytes + y * bpr, r.size.width * self.bpp);
+			memcpy([self at:level x:r.origin.x y:r.origin.y + y z:slice], (const uint8_t *)bytes + y * bpr, r.size.width * self.bpp);
 	else if (_type == MTLTextureType3D && [self fits:r level:level])
 		for (NSUInteger z = 0; z < MAX(r.size.depth, (NSUInteger)1); z++)
 			for (NSUInteger y = 0; y < r.size.height; y++)
@@ -1391,9 +1451,9 @@ static char gCopyKey;
 {
 	if (self.vramOnly || bcBlockBytes(_format))   // (a BC texture's CPU reads give nothing: see the 2D getBytes)
 		return;
-	if (_slices && slice < _slices && !level && [self fits:r level:0])
+	if (_slices && slice < _slices && [self fits:r level:level])
 		for (NSUInteger y = 0; y < r.size.height; y++)
-			memcpy((uint8_t *)bytes + y * bpr, [self at:0 x:r.origin.x y:r.origin.y + y z:slice], r.size.width * self.bpp);
+			memcpy((uint8_t *)bytes + y * bpr, [self at:level x:r.origin.x y:r.origin.y + y z:slice], r.size.width * self.bpp);
 	else if (_type == MTLTextureType3D && [self fits:r level:level])   // every slice of the region, as replaceRegion's (only z 0 before)
 		for (NSUInteger z = 0; z < MAX(r.size.depth, (NSUInteger)1); z++)
 			for (NSUInteger y = 0; y < r.size.height; y++)
@@ -2258,6 +2318,7 @@ typedef struct {
 	uint32_t scissor[4];                // x, y, width, height in pixels (the whole target when none was set)
 	uint32_t covered[4];                // what of it the draw can write: its vertices' bounds where those are known (bound:), else the scissor
 	uint32_t attachment;                // the colour attachment the draw goes into (RDNA4_MTLC_TABLE_ATTACHMENT)
+	uint32_t layer;                     // the layer + 1 of a layered pass the draw runs for, 0 all (RDNA4_MTLC_TABLE_LAYER)
 	const uint8_t *levelT;              // for shaders that sample explicit levels: per stage, levels 1-7, textures 0-15, a T# each (else NULL)
 	const uint64_t *handles;            // for shaders that use texture handles: per stage, textures 31-127's T# slots (else NULL)
 	float blendColour[4];
@@ -2727,7 +2788,8 @@ static BOOL integerFormat(MTLPixelFormat f)
 		if (_blob[k].length < 4 * kHead || h[0] != kRgfxMagic || h[1] != (uint32_t)k + 1 || h[2] > room[k] || (h[7] & 0xffff) > 16 ||
 		    4ull * kHead + h[2] + 8ull * (h[7] & 0xffff) > _blob[k].length)
 			return rdna4Error([NSString stringWithFormat:@"%@: not a %s shader that fits its slot", fn[k].name, k ? "fragment" : "vertex"], 0);
-		if (h[7] & 0x7fff0000u & ~(k ? 0x7fff0000u : 0x00030000u))   // (several attachments: the PV host's choice; bit 17 writes memory, 18 dual source, 19 depth)
+		// (several attachments: the PV host's choice; bit 17 writes memory, 18 dual source (vertex: picks its layer), 19 depth)
+		if (h[7] & 0x7fff0000u & ~(k ? 0x7fff0000u : 0x00070000u))
 			return rdna4Error([NSString stringWithFormat:@"%@: attributes 0x%x not supported yet", fn[k].name, h[7]], 0);
 	}
 	for (int k = 0; k < 2; k++) {   // the records after the values (TXRD, POSM)
@@ -3300,6 +3362,10 @@ RDNA4_ANSWER_MISSING
 @implementation RDNA4MTLRenderEncoder {
 	RDNA4MTLCommandBuffer *_commandBuffer;
 	RDNA4MTLTexture *_targets[8];   // the pass's colour attachments of this device
+	// A layered pass (renderTargetArrayLength): each colour attachment's array or cube and level, its layers _layerCount; a pipeline
+	// whose vertex shader writes [[render_target_array_index]] draws once into each layer (RDNA4_MTLC_TABLE_LAYER)
+	RDNA4MTLTexture *_layered[8];
+	NSUInteger _layeredLevel[8], _layerCount;
 	RDNA4MTLRenderPipeline *_pipeline;
 	uint64_t _addresses[2][kTableBuffers];
 	id<MTLBuffer> _bound[2][kTableBuffers];
@@ -3345,13 +3411,20 @@ RDNA4_ANSWER_MISSING
 			continue;
 		}
 		// a level of it (Core Animation's blurs draw each mip level from the one before): that level as a texture of its own
-		RDNA4MTLTexture *t = _targets[i] = [(RDNA4MTLTexture *)a.texture level:a.level];
+		RDNA4MTLTexture *t = _targets[i] = [(RDNA4MTLTexture *)a.texture level:a.level slice:a.slice];
 		if (!t)
 			continue;
+		NSMutableArray<RDNA4MTLTexture *> *layers = [NSMutableArray arrayWithObject:t];   // what a clear clears: a layered pass's every layer
+		if (pass.renderTargetArrayLength > 1 && a.texture.arrayLength * (a.texture.textureType == MTLTextureTypeCube ? 6 : 1) > 1) {
+			_layered[i] = (RDNA4MTLTexture *)a.texture, _layeredLevel[i] = a.level, _layerCount = pass.renderTargetArrayLength;
+			for (NSUInteger l = 1; l < _layerCount; l++)
+				if (RDNA4MTLTexture *layer = [_layered[i] level:a.level slice:l])
+					[layers addObject:layer];
+		}
 		first = first ?: t;
 		_store[i] = a.storeAction;
 		if (t.samples > 1 && [(id)a.resolveTexture isKindOfClass:[RDNA4MTLTexture class]])
-			_resolveTo[i] = [(RDNA4MTLTexture *)a.resolveTexture level:a.resolveLevel];
+			_resolveTo[i] = [(RDNA4MTLTexture *)a.resolveTexture level:a.resolveLevel slice:a.resolveSlice];
 		const MTLClearColor c = a.clearColor;
 		// on the card, behind the draws before it (a step of its own drained them all and the CPU filled up to 33 MB: Core Animation clears
 		// about 9 targets a frame, 2026-11-20); the CPU's for what a 32-bit pattern cannot fill
@@ -3364,23 +3437,25 @@ RDNA4_ANSWER_MISSING
 			clearAt[drawClears] = i, clearTo[drawClears++] = c;   // a draw once the pass is set up (below)
 			continue;
 		}
-		if ([t fillFor:c pattern:&pattern bytes:&bytes])
-			[commandBuffer recordDraw:^NSError * {
-				NSError *why = [t.held sync];
-				if (why)
-					return why;
-				[t wroteAll];
-				[commandBuffer drewInto:t];
-				[t heldRows:0 to:(uint32_t)t.height width:(uint32_t)t.width];
-				const RDNA4Copy fill = { 0, t.gpuBase, bytes, pattern };
-				return [device gpuBarrier:&fill count:1];
-			}];
-		else
-			[commandBuffer record:^NSError * {
-				[t clearTo:c];
-				[commandBuffer drewInto:t];
-				return nil;
-			}];
+		for (RDNA4MTLTexture *t in layers) {
+			if ([t fillFor:c pattern:&pattern bytes:&bytes])
+				[commandBuffer recordDraw:^NSError * {
+					NSError *why = [t.held sync];
+					if (why)
+						return why;
+					[t wroteAll];
+					[commandBuffer drewInto:t];
+					[t heldRows:0 to:(uint32_t)t.height width:(uint32_t)t.width];
+					const RDNA4Copy fill = { 0, t.gpuBase, bytes, pattern };
+					return [device gpuBarrier:&fill count:1];
+				}];
+			else
+				[commandBuffer record:^NSError * {
+					[t clearTo:c];
+					[commandBuffer drewInto:t];
+					return nil;
+				}];
+		}
 	}
 	RTRACE(40, @"render pass: attachment 0 %@ format %lu %lux%lu load %lu, attachment 1 %@, depth %@", pass.colorAttachments[0].texture ? NSStringFromClass([(id)pass.colorAttachments[0].texture class]) : @"-",
 	       (unsigned long)pass.colorAttachments[0].texture.pixelFormat, (unsigned long)pass.colorAttachments[0].texture.width,
@@ -3390,8 +3465,8 @@ RDNA4_ANSWER_MISSING
 	MTLRenderPassStencilAttachmentDescriptor *sa = pass.stencilAttachment;
 	[commandBuffer writesTo:z.texture];
 	[commandBuffer writesTo:sa.texture];
-	RDNA4MTLTexture *zt = [(id)z.texture isKindOfClass:[RDNA4MTLTexture class]] ? (RDNA4MTLTexture *)z.texture : nil;
-	RDNA4MTLTexture *st = [(id)sa.texture isKindOfClass:[RDNA4MTLTexture class]] ? (RDNA4MTLTexture *)sa.texture : nil;
+	RDNA4MTLTexture *zt = [(id)z.texture isKindOfClass:[RDNA4MTLTexture class]] ? [(RDNA4MTLTexture *)z.texture depthLevel:z.level slice:z.slice] : nil;
+	RDNA4MTLTexture *st = [(id)sa.texture isKindOfClass:[RDNA4MTLTexture class]] ? [(RDNA4MTLTexture *)sa.texture depthLevel:sa.level slice:sa.slice] : nil;
 	first = first ?: zt ?: st;   // a pass of depth (and stencil) only: its size theirs (empty before: every draw outside the scissor)
 	_viewport = (MTLViewport){ 0, 0, (double)first.width, (double)first.height, 0, 1 };
 	_scissor = (MTLScissorRect){ 0, 0, first.width, first.height };
@@ -3748,6 +3823,11 @@ RDNA4_ANSWER_MISSING
 		// (RDNA4_MTLC_TABLE_ATTACHMENT picks the value the shader exports). ponytail: a draw a target instead of the colour block's MRTs.
 		NSMutableArray<NSNumber *> *more = [NSMutableArray array];
 		NSMutableArray<RDNA4MTLTexture *> *moreTargets = [NSMutableArray array];
+		// (a layered draw: once a layer, into that layer of each attachment; ponytail: the depth attachment's layer 0 for all)
+		const NSUInteger layers = pipeline && (pipeline.vs[7] >> 18 & 1) && _layered[d.attachment] ? _layerCount : 0;
+		NSMutableArray *layerOf = [NSMutableArray array];   // {texture, level} of each attachment of a layered draw, or NSNull
+		for (uint32_t k = 0; k < 8; k++)
+			[layerOf addObject:layers && _layered[k] ? @[ _layered[k], @(_layeredLevel[k]) ] : (id)[NSNull null]];
 		for (uint32_t k = d.attachment + 1; k < 8; k++)
 			if ((writes >> k & 1) && [pipeline blendOf:k][9] && _targets[k]) {
 				[more addObject:@(k)];
@@ -3862,22 +3942,31 @@ RDNA4_ANSWER_MISSING
 				return nil;
 
 			const uint64_t t0 = nowUs();
-			why = [device draw:&dd pipeline:pipeline target:target];
-			if (!why)
-				[cb drewInto:target];
-			// the others: the same pixels (depth equal to what the first wrote, not written again; or, when it wrote none, the same test against
-			// the same depth: Quake II's view weapon, drawn without depth writes, was left out of its motion pass's colour; stencil tested, not
-			// written)
-			for (NSUInteger i = 0; i < more.count && !why; i++) {
-				RDNA4Draw again = dd;
-				again.attachment = more[i].unsignedIntValue;
-				if (again.depthGpu && again.depthWrite)
-					again.depthCompare = MTLCompareFunctionEqual, again.depthWrite = 0;
-				again.stencilWriteMask = 0;
-				RDNA4MTLTexture *t = moreTargets[i];
-				why = [device draw:&again pipeline:pipeline target:t];
+			// attachment k's texture for layer l of a layered draw, else `plain`
+			auto layerTarget = [&](uint32_t k, NSUInteger l, RDNA4MTLTexture *plain) -> RDNA4MTLTexture * {
+				NSArray *of = layerOf[k];
+				return [of isKindOfClass:[NSArray class]] ? [(RDNA4MTLTexture *)of[0] level:[of[1] unsignedIntegerValue] slice:l] : plain;
+			};
+			for (NSUInteger l = 0; l < MAX(layers, (NSUInteger)1) && !why; l++) {
+				dd.layer = layers ? (uint32_t)l + 1 : 0;
+				RDNA4MTLTexture *into = layerTarget(dd.attachment, l, target);
+				why = into ? [device draw:&dd pipeline:pipeline target:into] : nil;
 				if (!why)
-					[cb drewInto:t];
+					[cb drewInto:into];
+				// the others: the same pixels (depth equal to what the first wrote, not written again; or, when it wrote none, the same test
+				// against the same depth: Quake II's view weapon, drawn without depth writes, was left out of its motion pass's colour; stencil
+				// tested, not written)
+				for (NSUInteger i = 0; i < more.count && !why; i++) {
+					RDNA4Draw again = dd;
+					again.attachment = more[i].unsignedIntValue;
+					if (again.depthGpu && again.depthWrite)
+						again.depthCompare = MTLCompareFunctionEqual, again.depthWrite = 0;
+					again.stencilWriteMask = 0;
+					RDNA4MTLTexture *t = layerTarget(again.attachment, l, moreTargets[i]);
+					why = t ? [device draw:&again pipeline:pipeline target:t] : nil;
+					if (!why)
+						[cb drewInto:t];
+				}
 			}
 			if (!why && dd.depthWrite)   // a draw sampling it next waits for it (a shadow map: drawn, then read in the same command buffer)
 				[device drewDepth:depthTarget];
@@ -4109,7 +4198,7 @@ static RDNA4MTLTexture *cardOnly(id<MTLTexture> t)
       destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin
 {
 	[_commandBuffer writesTo:to];
-	if (RDNA4MTLTexture *t = !slice && size.depth <= 1 ? cardOnly([cardOnly(to) level:level]) : nil) {
+	if (RDNA4MTLTexture *t = size.depth <= 1 ? cardOnly([cardOnly(to) level:level slice:slice]) : nil) {
 		cardRowCopy(_commandBuffer, from.gpuAddress + offset, bpr, t.gpuBase + origin.y * t.rowBytes + origin.x * t.bpp, t.rowBytes,
 		            size.width * t.bpp, size.height);
 		return;
@@ -4138,7 +4227,7 @@ static RDNA4MTLTexture *cardOnly(id<MTLTexture> t)
              sourceSize:(MTLSize)size toBuffer:(id<MTLBuffer>)to destinationOffset:(NSUInteger)offset
  destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi
 {
-	if (RDNA4MTLTexture *t = !slice && size.depth <= 1 ? cardOnly([cardOnly(from) level:level]) : nil) {
+	if (RDNA4MTLTexture *t = size.depth <= 1 ? cardOnly([cardOnly(from) level:level slice:slice]) : nil) {
 		cardRowCopy(_commandBuffer, t.gpuBase + origin.y * t.rowBytes + origin.x * t.bpp, t.rowBytes, to.gpuAddress + offset, bpr,
 		            size.width * t.bpp, size.height);
 		return;
@@ -4148,8 +4237,8 @@ static RDNA4MTLTexture *cardOnly(id<MTLTexture> t)
 		if (!why && offset + bpr * (size.height - 1) + ((RDNA4MTLTexture *)from).bpp * size.width > to.length)
 			why = rdna4Error(@"a texture-to-buffer copy past the buffer's end", 0);
 		if (!why)
-			[from getBytes:(uint8_t *)to.contents + offset bytesPerRow:bpr
-			    fromRegion:MTLRegionMake2D(origin.x, origin.y, size.width, size.height) mipmapLevel:level];
+			[from getBytes:(uint8_t *)to.contents + offset bytesPerRow:bpr bytesPerImage:bpi
+			    fromRegion:MTLRegionMake2D(origin.x, origin.y, size.width, size.height) mipmapLevel:level slice:slice];
 		return why;
 	}];
 }
@@ -4168,9 +4257,9 @@ static RDNA4MTLTexture *cardOnly(id<MTLTexture> t)
 {
 	[_commandBuffer writesTo:to];
 	// either side in the card's memory only: rows copied on the card (the other side's memory is the card's to reach too)
-	if ((cardOnly(from) || cardOnly(to)) && !fromSlice && !toSlice && size.depth <= 1 && [(id)from isKindOfClass:[RDNA4MTLTexture class]] &&
+	if ((cardOnly(from) || cardOnly(to)) && size.depth <= 1 && [(id)from isKindOfClass:[RDNA4MTLTexture class]] &&
 	    [(id)to isKindOfClass:[RDNA4MTLTexture class]]) {
-		RDNA4MTLTexture *f = [(RDNA4MTLTexture *)from level:fromLevel], *t = [(RDNA4MTLTexture *)to level:toLevel];
+		RDNA4MTLTexture *f = [(RDNA4MTLTexture *)from level:fromLevel slice:fromSlice], *t = [(RDNA4MTLTexture *)to level:toLevel slice:toSlice];
 		if (f && t && f.bpp == t.bpp && f.samples == 1 && t.samples == 1 && !f.isDepth && !t.isDepth && f.gpuBase && t.gpuBase && !f.shadowed &&
 		    !t.shadowed) {
 			cardRowCopy(_commandBuffer, f.gpuBase + fromOrigin.y * f.rowBytes + fromOrigin.x * f.bpp, f.rowBytes,
@@ -4183,10 +4272,10 @@ static RDNA4MTLTexture *cardOnly(id<MTLTexture> t)
 		NSError *why = colourOnly(from) ?: colourOnly(to);
 		if (why)
 			return why;
-		RDNA4MTLTexture *f = [(RDNA4MTLTexture *)from level:fromLevel];
+		RDNA4MTLTexture *f = [(RDNA4MTLTexture *)from level:fromLevel slice:fromSlice];
 		[f refresh];   // (a shadowed surface's copy current)
-		[to replaceRegion:MTLRegionMake2D(toOrigin.x, toOrigin.y, size.width, size.height) mipmapLevel:toLevel
-		        withBytes:f.bytes + fromOrigin.y * f.rowBytes + f.bpp * fromOrigin.x bytesPerRow:f.rowBytes];
+		[to replaceRegion:MTLRegionMake2D(toOrigin.x, toOrigin.y, size.width, size.height) mipmapLevel:toLevel slice:toSlice
+		        withBytes:f.bytes + fromOrigin.y * f.rowBytes + f.bpp * fromOrigin.x bytesPerRow:f.rowBytes bytesPerImage:0];
 		return nil;
 	}];
 }
@@ -5827,6 +5916,7 @@ static void padSlot(uint32_t *page, uint32_t n)
 	memcpy((uint8_t *)misc + 0x400 + RDNA4_MTLC_TABLE_ATTRIBUTES, p.attributes, 16 * 16);   // the vertex descriptor
 	((uint32_t *)misc)[(0x800 + RDNA4_MTLC_TABLE_ATTACHMENT) / 4] = d->attachment;
 	((uint32_t *)misc)[(0x800 + RDNA4_MTLC_TABLE_ALPHA_TO_COVERAGE) / 4] = p.alphaToCoverage;
+	((uint32_t *)misc)[(0x400 + RDNA4_MTLC_TABLE_LAYER) / 4] = d->layer;
 	// the target as an image, for shaders that read it (framebuffer fetch: RDNA4_MTLC_TABLE_FRAMEBUFFER). ponytail: a pixel the same draw
 	// covers twice reads its first write, not the value from before the draw (the PV host's reads a staged copy).
 	[t descriptor:(uint32_t *)((uint8_t *)misc + 0x800 + RDNA4_MTLC_TABLE_FRAMEBUFFER)];
@@ -6235,7 +6325,8 @@ static void padSlot(uint32_t *page, uint32_t n)
 	const MTLPixelFormat f = descriptor.pixelFormat;
 	const NSUInteger n = descriptor.sampleCount;
 	if ((f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatStencil8 || f == MTLPixelFormatDepth32Float_Stencil8) &&
-	    ((descriptor.textureType == MTLTextureType2D && n == 1) || (descriptor.textureType == MTLTextureType2DMultisample && (n == 2 || n == 4))) &&
+	    ((descriptor.textureType == MTLTextureType2D && n == 1) || (descriptor.textureType == MTLTextureType2DMultisample && (n == 2 || n == 4)) ||
+	     ((descriptor.textureType == MTLTextureTypeCube || descriptor.textureType == MTLTextureType2DArray) && n == 1)) &&
 	    descriptor.width && descriptor.height && descriptor.width <= 16384 && descriptor.height <= 16384)
 		return [[RDNA4MTLTexture alloc] initDepthWithDevice:self descriptor:descriptor];
 	RDNA4MTLTexture *t = [[RDNA4MTLTexture alloc] initWithDevice:self descriptor:descriptor];

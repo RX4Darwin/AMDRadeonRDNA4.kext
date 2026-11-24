@@ -62,6 +62,10 @@ enum { kMtlcNext = 0, kMtlcDeliver = 1 };
 /* The fragment stage's u32 alpha to coverage (the pipeline's alphaToCoverageEnabled): non-zero, a fragment whose exported alpha is below 0.5
  * is discarded, as the hardware's alpha to mask does for one sample (Unity's billboards: AlphaToMask On). */
 #define RDNA4_MTLC_TABLE_ALPHA_TO_COVERAGE 0x504u
+/* The vertex stage's u32 layer + 1 of a draw run once for each layer of a layered pass (its RGFX header's bit 18: the shader writes
+ * [[render_target_array_index]]): a primitive of another layer is put outside the view; 0 draws them all. 0xd08 of the state page, past
+ * the fragment stage's alpha to coverage. */
+#define RDNA4_MTLC_TABLE_LAYER (0xd08u - 0x400u)
 #define RDNA4_MTLC_MAX_ATTRIBUTES 16u
 /* A shader that samples at an explicit LOD (its RGFX header's bit 16): level L (1-7) of texture n's T# at RDNA4_MTLC_LEVEL_FIRST
  * + RDNA4_MTLC_LEVEL_STRIDE (L - 1) past its level 0 T#, in both stages (the host's state page: the vertex stage's table at +0x400, the
