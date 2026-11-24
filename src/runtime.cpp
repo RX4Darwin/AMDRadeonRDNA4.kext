@@ -2392,6 +2392,16 @@ IOReturn RDNA4Compute::rtSensorsEx(const void *owner, RDNA4SensorsEx &out) {
 	return readSensorsEx(out) ? kIOReturnSuccess : kIOReturnNotResponding;
 }
 
+bool RDNA4Compute::statisticsSample(RDNA4Sensors &s, RDNA4SensorsEx &ex, uint64_t &heapBytes, uint64_t &heapFree) {
+	Locked g(rtLock);
+	if (!rtReady)
+		return false;
+	const GpuHeap::Heap &h = dmaReady && devHeap.size() ? devHeap : heap;   // (where buffers come from, as rtInfo)
+	heapBytes = h.size();
+	heapFree = h.freeBytes();
+	return readSensors(s) && readSensorsEx(ex);
+}
+
 IOReturn RDNA4Compute::rtSleepTest(const void *owner, uint32_t phase) {
 	uint32_t enabled = 0;
 	if (!requestedPowerManagement() ||

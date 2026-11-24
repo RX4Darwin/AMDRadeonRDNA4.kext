@@ -344,6 +344,9 @@ RDNA4_ACCEL_STRUCTORS(RDNA4Context2D, IOAccel2DContext2)
 // WindowServer's presents ask of a driver (AMD's pipe overrides these), before they go to the DCN.
 // IOAccelSysMemory::withMemoryDescriptor (static: no thunk), solved with the family (familyLoaded); our accelerator (below gAccel)
 mach_vm_address_t gWithMemoryDescriptor;
+// IOAccelStatistics2::writePerformanceStats and its vtable's last slot (the KDK's 36 and 47), solved with the family: our accelerator's
+// statistics object gets a copy of its vtable with slot 36 ours (patchStatistics)
+mach_vm_address_t gWritePerformanceStats, gStatisticsLastSlot;
 mach_vm_address_t gPlaneIOSurface;   // IOAccelDisplayPipeTransaction2::getPlaneIOSurface(unsigned, unsigned) const (not virtual)
 IOGraphicsAccelerator2 *ourAccelerator();
 const uint8_t *gPipes[8];   // (diagnostic, debug.rdna4_accelpipes) our display pipes by framebuffer index (init)
@@ -716,6 +719,7 @@ public:
 	IOAccelSysMemory *newSysMemory() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4SysMemory); }
 	IOAccelVidMemory *newVidMemory() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4VidMemory); }
 	uintptr_t newDisplayPipe() APPLE_KEXT_OVERRIDE { return reinterpret_cast<uintptr_t>(OSTypeAlloc(RDNA4DisplayPipe)); }
+	uintptr_t newStatistics() APPLE_KEXT_OVERRIDE;
 	IOAccelResource2 *newResource() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4Resource); }
 	IOAccelMemoryMap *newMemoryMap() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4MemoryMap); }
 };
@@ -745,6 +749,95 @@ IOAccelTask *RDNA4Accelerator::createKernelGPUTask()
 		OSSafeReleaseNULL(r);
 	rdna4Log("AMDRadeonRDNA4: accel: kernel task %s\n", t ? "made" : "NOT made");
 	return t;
+}
+
+// The card's sensors in the accelerator's PerformanceStatistics, under the keys Apple's AMD drivers use: Activity Monitor's GPU history,
+// AMD Power Gadget, iStat and the like read them there. The family builds the dictionary each time it is read (writePerformanceStats,
+// virtual in IOAccelStatistics2, whose object the family makes): that object gets a vtable whose slot 36 calls the family's, then adds
+// ours. The SMU is asked at most once a second.
+namespace {
+using WriteStats = uintptr_t (*)(OSObject *, OSDictionary *, bool);
+WriteStats gFamilyWriteStats;
+IOLock *gStatsLock;
+struct {
+	uint64_t at;   // mach_absolute_time of the sample, 0: none yet
+	bool ok;
+	RDNA4Sensors s;
+	RDNA4SensorsEx ex;
+	uint64_t heapBytes, heapFree;
+} gStats;
+
+void putNumber(OSDictionary *d, const char *key, uint64_t value)
+{
+	if (OSNumber *n = OSNumber::withNumber(value, 64)) {
+		d->setObject(key, n);
+		n->release();
+	}
+}
+
+uintptr_t writePerformanceStats(OSObject *self, OSDictionary *d, bool reset)
+{
+	const uintptr_t r = gFamilyWriteStats(self, d, reset);
+	if (!d || !gStatsLock)
+		return r;
+	IOLockLock(gStatsLock);
+	uint64_t second = 0;
+	nanoseconds_to_absolutetime(1000000000ull, &second);
+	const uint64_t now = mach_absolute_time();
+	if (!gStats.at || now - gStats.at >= second) {
+		RDNA4Compute *c = gComputeService ? gComputeService->compute : nullptr;
+		gStats.ok = c && c->statisticsSample(gStats.s, gStats.ex, gStats.heapBytes, gStats.heapFree);
+		gStats.at = now;
+	}
+	if (gStats.ok) {
+		putNumber(d, "Device Utilization %", gStats.ex.gfxActivity > 100 ? 100 : gStats.ex.gfxActivity);
+		putNumber(d, "Temperature(C)", gStats.s.edgeTempC);
+		putNumber(d, "Hotspot Temperature(C)", gStats.s.hotspotTempC);
+		putNumber(d, "Total Power(W)", gStats.s.socketPowerW);
+		putNumber(d, "Fan Speed(RPM)", gStats.s.fanRpm);
+		putNumber(d, "Core Clock(MHz)", gStats.s.gfxClockMHz);
+		putNumber(d, "Memory Clock(MHz)", gStats.s.memoryClockMHz);
+		putNumber(d, "inUseVidMemoryBytes", gStats.heapBytes - gStats.heapFree);
+		putNumber(d, "vramUsedBytes", gStats.heapBytes - gStats.heapFree);   // (the family writes its own inUseVidMemoryBytes after these)
+		putNumber(d, "vramFreeBytes", gStats.heapFree);
+		putNumber(d, "VRAM,totalBytes", gStats.heapBytes);
+	}
+	IOLockUnlock(gStatsLock);
+	return r;
+}
+
+// Only when slots 36 and 47 hold the family's functions (the KDK 26.5.2 layout); else the family's statistics as they are.
+void patchStatistics(OSObject *stats)
+{
+	constexpr size_t kStatSlots = 48, kAbove = 2;   // the vtable's functions, and the offset-to-top and type words before its address point
+	void **vt = *reinterpret_cast<void ***>(stats);
+	if (!gWritePerformanceStats || reinterpret_cast<mach_vm_address_t>(vt[36]) != gWritePerformanceStats ||
+	    reinterpret_cast<mach_vm_address_t>(vt[kStatSlots - 1]) != gStatisticsLastSlot) {
+		rdna4Log("AMDRadeonRDNA4: accel: statistics: not the layout known (slot 36 %p): no sensors in PerformanceStatistics\n", vt[36]);
+		return;
+	}
+	static void **copy;
+	if (!copy) {
+		gStatsLock = IOLockAlloc();
+		void **mem = gStatsLock ? static_cast<void **>(IOMalloc((kStatSlots + kAbove) * sizeof(void *))) : nullptr;   // kept for good
+		if (!mem)
+			return;
+		memcpy(mem, vt - kAbove, (kStatSlots + kAbove) * sizeof(void *));
+		gFamilyWriteStats = reinterpret_cast<WriteStats>(vt[36]);
+		copy = mem + kAbove;
+		copy[36] = reinterpret_cast<void *>(&writePerformanceStats);
+	}
+	*reinterpret_cast<void ***>(stats) = copy;
+	rdna4Log("AMDRadeonRDNA4: accel: statistics: the card's sensors added to PerformanceStatistics\n");
+}
+}   // namespace
+
+uintptr_t RDNA4Accelerator::newStatistics()
+{
+	const uintptr_t stats = super::newStatistics();
+	if (stats)
+		patchStatistics(reinterpret_cast<OSObject *>(stats));
+	return stats;
 }
 
 bool RDNA4Accelerator::start(IOService *provider)
@@ -821,6 +914,10 @@ void familyLoaded(uint32_t kext, KernelPatcher &patcher, size_t index, mach_vm_a
 		gEnableAccelerator = patcher.solveSymbol(index, "__ZN22IOGraphicsAccelerator217enableAcceleratorEv", address, size);
 		patcher.clearError();
 		gPlaneIOSurface = patcher.solveSymbol(index, "__ZNK30IOAccelDisplayPipeTransaction217getPlaneIOSurfaceEjj", address, size);
+		patcher.clearError();
+		gWritePerformanceStats = patcher.solveSymbol(index, "__ZN18IOAccelStatistics221writePerformanceStatsEP12OSDictionaryb", address, size);
+		patcher.clearError();
+		gStatisticsLastSlot = patcher.solveSymbol(index, "__ZN18IOAccelStatistics227_RESERVEDIOAccelStatistics5Ev", address, size);
 		patcher.clearError();
 		gWithMemoryDescriptor = patcher.solveSymbol(index,
 		                                            "__ZN16IOAccelSysMemory20withMemoryDescriptorEP22IOGraphicsAccelerator2P16IOAccelResource2P18IOMemoryDescriptor",

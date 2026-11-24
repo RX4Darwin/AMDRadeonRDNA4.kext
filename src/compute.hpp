@@ -718,6 +718,8 @@ public:
 	bool rtClientIsolated(const void *owner);
 	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
 	IOReturn rtSensorsEx(const void *owner, RDNA4SensorsEx &out);
+	// The accelerator's PerformanceStatistics (rdna4accel.cpp): the SMU's metrics and the buffers' heap; false while the runtime is not up.
+	bool statisticsSample(RDNA4Sensors &s, RDNA4SensorsEx &ex, uint64_t &heapBytes, uint64_t &heapFree);
 	// GRBM perf counters 0 and 1 counting GFX clocks (GRBM_PERF_SEL_COUNT) and busy clocks (GUI_ACTIVE): the counts since the call
 	// before (stopped and sampled, read, started again from zero).
 	bool rtGfxClocks(uint64_t &clocks, uint64_t &active)
