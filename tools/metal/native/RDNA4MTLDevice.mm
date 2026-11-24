@@ -88,7 +88,7 @@ extern "C" {
 }
 // Where WindowServer's time goes (window drags were slow, 2026-11-20): totals, logged every 5 s while there is work ("RDNA4MTL stats: ...").
 enum RDNA4Stat { kStatBuffers, kStatDraws, kStatDrawUs, kStatDrainUs, kStatShadowBytes, kStatShadowUs, kStatSelfReads, kStatSelfReadBytes,
-	             kStatDispatches, kStatDispatchUs, kStatSlotUs, kStatBuildUs, kStatWriteUs, kStatSubmitUs, kStatBarriers, kStatWaitUs, kStatRunUs, kStatEncodeUs, kStatRecordUs, kStatAllocs, kStatAllocUs, kStatFreeUs, kStatImports, kStatImportBytes, kStatAllocBytes, kStatSteps, kStatStepUs, kStatDrawnSurface, kStatDrawnOwn, kStatHeldIn, kStatHeldOut, kStatFramed, kStatVblMade, kStatVblCommitted, kStatVblDone, kStatMade0, kStatMade1, kStatMade2, kStatMade3, kStatMade4, kStatMade5, kStatCount };
+	             kStatDispatches, kStatDispatchUs, kStatSlotUs, kStatBuildUs, kStatWriteUs, kStatSubmitUs, kStatBarriers, kStatWaitUs, kStatRunUs, kStatEncodeUs, kStatRecordUs, kStatAllocs, kStatAllocUs, kStatFreeUs, kStatImports, kStatImportBytes, kStatAllocBytes, kStatSteps, kStatStepUs, kStatDrawnSurface, kStatDrawnOwn, kStatHeldIn, kStatHeldOut, kStatFramed, kStatVblMade, kStatVblCommitted, kStatVblDone, kStatMade0, kStatMade1, kStatMade2, kStatMade3, kStatMade4, kStatMade5, kStatIndexCpu, kStatIndexCpuUs, kStatIndexBusy, kStatCount };
 static std::atomic<uint64_t> gStats[kStatCount], gLatencyMaxUs, gEncodeMaxUs, gStepMaxUs;   // gLatencyMaxUs: the longest commit to done since the last report
 static std::atomic<int64_t> gHostLive, gHostCount, gOrderWaiting, gShadowLive, gShadowCount, gTexturesLive, gBuffersLive;   // gauges: host memory allocated (bytes, buffers), command buffers held back
 static uint64_t nowUs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000; }
@@ -129,6 +129,9 @@ static void statReport(void)
 	     v[kStatRunUs] / 1e3 / n, worst / 1e3, v[kStatEncodeUs] / 1e3 / n, v[kStatRecordUs] / 1e3 / n, worstEncode / 1e3);
 	RLOG(@"RDNA4MTL stats: drawn (covered) %.1f MB into IOSurfaces, %.1f MB into the device's own textures; surfaces held in VRAM: %.1f MB "
 	     @"filled, %.1f MB written back", v[kStatDrawnSurface] / 1e6, v[kStatDrawnOwn] / 1e6, v[kStatHeldIn] / 1e6, v[kStatHeldOut] / 1e6);
+	if (v[kStatIndexCpu] || v[kStatIndexBusy])
+		RLOG(@"RDNA4MTL stats: index jobs on the CPU %llu (%.1f ms), %llu left to the card for memory in flight", v[kStatIndexCpu],
+		     v[kStatIndexCpuUs] / 1e3, v[kStatIndexBusy]);
 	if (v[kStatFramed])
 		RLOG(@"RDNA4MTL stats: from display 0's VBL event (%llu command buffers within 20 ms of one): made %.2f ms, committed %.2f, done %.2f; "
 		     @"made under 1, 2, 4, 6, 8 ms and later: %llu/%llu/%llu/%llu/%llu/%llu", v[kStatFramed], v[kStatVblMade] / 1e3 / v[kStatFramed],
@@ -2054,10 +2057,13 @@ static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFun
 
 // ---- compute pipelines
 
+enum RDNA4IndexKind { kIndexTriSeq = 1, kIndexQuadSeq = 2, kIndexTri16 = 4 };
+
 @interface RDNA4MTLComputePipeline : NSObject <MTLComputePipelineState>
 @property (readonly) rdna4_program_t program;
 @property (readonly) uint32_t buffers;   // the kernargs' buffer addresses: indices 0 .. buffers - 1
 @property (readonly) BOOL indicesOnly;   // Apple's GL renderer's fixIndexBuffer: it touches nothing but index memory
+@property uint32_t indexKinds, indexChecks;   // which RDNA4IndexKind its results still match, after how many jobs (learnIndices)
 @end
 
 @implementation RDNA4MTLComputePipeline {
@@ -2071,6 +2077,7 @@ static NSError *translateFunctionNow(id<MTLFunction> function, NSArray<id<MTLFun
 		return nil;
 	_device = device;
 	_indicesOnly = [function.name isEqualToString:@"fixIndexBuffer"];
+	_indexKinds = kIndexTriSeq | kIndexQuadSeq | kIndexTri16;
 	NSError *why = [self loadFunction:function];
 	if (why && error)
 		*error = why;
@@ -2164,7 +2171,56 @@ typedef struct {
 	uint32_t depthOnly;                 // the pass has no colour attachment: drawn into a stand-in (standInFor:), colour not written
 } RDNA4Draw;
 
-typedef struct { uint64_t in, inBytes, out, outBytes; } RDNA4IndexJob;   // what a fixIndexBuffer dispatch reads and writes (outBytes 0: not one)
+typedef struct {
+	uint64_t in, inBytes, out, outBytes;   // what a fixIndexBuffer dispatch reads and writes (outBytes 0: not one)
+	const uint8_t *inCpu;                  // the same memory for the CPU (outCpu NULL: the job stays on the card)
+	uint8_t *outCpu;
+	const uint32_t *count;
+	uint64_t threads, inRoom, outRoom;     // primitives; the bytes left in the buffers from in and out
+} RDNA4IndexJob;
+
+// The forms of fixIndexBuffer seen in OpenMW (their LLVM read 2026-11-24). A pipeline runs on the CPU only once its results on the card
+// matched exactly one of them; any other form stays on the card. RDNA4_CPUINDEX=0 off, 2 keeps every job on the card and compares each.
+
+static int cpuIndexMode(void)
+{
+	static const char *const env = getenv("RDNA4_CPUINDEX");
+	static const int mode = env ? atoi(env) : 1;
+	return mode;
+}
+
+static void indexBytes(uint32_t kind, const RDNA4IndexJob &j, uint64_t *in, uint64_t *out)
+{
+	*in = kind == kIndexTri16 ? 2 * MIN(3 * j.threads, (uint64_t)*j.count) : 0;
+	*out = (kind == kIndexQuadSeq ? 24 : kind == kIndexTriSeq ? 12 : 6) * j.threads;
+}
+
+// As the kernel: a primitive whose vertices are not all below the count is left alone. Writes to `to`; NO when the job does not fit its buffers.
+static BOOL fixIndices(uint32_t kind, const RDNA4IndexJob &j, uint8_t *to)
+{
+	uint64_t inBytes, outBytes;
+	indexBytes(kind, j, &inBytes, &outBytes);
+	if (outBytes > j.outRoom || inBytes > j.inRoom || (kind == kIndexTri16 && !j.inCpu))
+		return NO;
+	const uint64_t count = *j.count;
+	if (kind == kIndexTriSeq) {
+		uint32_t *o = (uint32_t *)to;
+		for (uint64_t i = 0; i < 3 * j.threads && i + 2 < count; i += 3)
+			o[i] = (uint32_t)i + 2, o[i + 1] = (uint32_t)i, o[i + 2] = (uint32_t)i + 1;
+	} else if (kind == kIndexQuadSeq) {
+		uint32_t *o = (uint32_t *)to;
+		for (uint64_t p = 0, i = 0; p < j.threads && i + 3 < count; p++, i += 4) {
+			const uint32_t v = (uint32_t)i, q[6] = { v + 3, v, v + 1, v + 3, v + 1, v + 2 };
+			memcpy(o + 6 * p, q, sizeof q);
+		}
+	} else {
+		uint16_t *o = (uint16_t *)to;
+		const uint16_t *from = (const uint16_t *)j.inCpu;
+		for (uint64_t i = 0; i < 3 * j.threads && i + 2 < count; i += 3)
+			o[i] = from[i + 2], o[i + 1] = from[i], o[i + 2] = from[i + 1];
+	}
+	return YES;
+}
 typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // GPU addresses; src 0: a fill with the pattern
 
 @interface RDNA4MTLDevice ()
@@ -2187,6 +2243,8 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 - (BOOL)canDispatchOnRing:(const rdna4_program_t *)k;
 - (NSError *)dispatchOnRing:(const rdna4_program_t *)k groups:(const uint32_t[3])groups size:(const uint32_t[3])size args:(NSData *)args
                      indices:(RDNA4IndexJob)job;
+- (BOOL)indicesOnCpu:(RDNA4MTLComputePipeline *)k job:(const RDNA4IndexJob &)j;
+- (NSError *)learnIndices:(RDNA4MTLComputePipeline *)k job:(const RDNA4IndexJob &)j;
 @end
 
 // Whether the card is done with a resource, as Apple's GL-on-Metal renderer asks (-isComplete, -isWriteComplete, -waitUntilComplete,
@@ -2986,12 +3044,29 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 				const uint64_t in = *(const uint32_t *)((const uint8_t *)_bound[2].contents + (_addresses[2] - _bound[2].gpuAddress));
 				const uint64_t threads = grid.width * grid.height * grid.depth, out = (in == 3 * threads && threads != 2 ? 3 : 6) * threads;
 				job = { _bound[0] ? _addresses[0] : 0, _bound[0] ? 4 * in : 0, _addresses[1], 4 * out };
+				auto room = [&](int b) {
+					const uint64_t at = _addresses[b] - _bound[b].gpuAddress;
+					return at < _bound[b].length ? _bound[b].length - at : 0;
+				};
+				if (cpuIndexMode() && _bound[1].contents && room(1) && (!_bound[0] || (_bound[0].contents && room(0))) && !kernelTextures.count) {
+					job.inCpu = _bound[0] ? (const uint8_t *)_bound[0].contents + (_addresses[0] - _bound[0].gpuAddress) : NULL;
+					job.outCpu = (uint8_t *)_bound[1].contents + (_addresses[1] - _bound[1].gpuAddress);
+					job.count = (const uint32_t *)((const uint8_t *)_bound[2].contents + (_addresses[2] - _bound[2].gpuAddress));
+					job.threads = threads, job.inRoom = _bound[0] ? room(0) : 0, job.outRoom = room(1);
+				}
 			}
 			[_commandBuffer recordDraw:^NSError * {
 				(void)held;
 				const uint64_t t0 = nowUs();
+				if ([device indicesOnCpu:pipeline job:job]) {
+					statAdd(kStatIndexCpu, 1);
+					statAdd(kStatIndexCpuUs, nowUs() - t0);
+					return nil;
+				}
 				rdna4_program_t prog = pipeline.program;
 				NSError *why = [device dispatchOnRing:&prog groups:g.data() size:s.data() args:args indices:job];
+				if (!why)
+					why = [device learnIndices:pipeline job:job];
 				for (RDNA4MTLTexture *t in kernelTextures) {   // what the kernel may have written (as below)
 					[t wroteAll];
 					[t heldRows:0 to:(uint32_t)t.height width:(uint32_t)t.width];
@@ -4589,6 +4664,9 @@ RDNA4_ANSWER_MISSING
 	uint64_t _runColour, _runDepth;      // what the run draws into
 	uint64_t _runRange[kSlots][2];       // the index memory its draws read and its index jobs wrote, [start, end)
 	uint32_t _runRanges;
+	// What each slot's work may touch of memory the CPU's index jobs use, until the slot is taken again or a drain: [start, end) of what it
+	// writes or reads as indices, and of a copy's source. A slot whose work could write anywhere has the whole range.
+	uint64_t _slotUse[kSlots][2][2];
 	rdna4_program_t _resolve[2];
 }
 
@@ -4776,11 +4854,20 @@ static void abortStack(int sig)
 	if (kr)
 		return rdna4Error([NSString stringWithFormat:@"waiting for slot %u's earlier draw", *slot], kr);
 	_slotFence[*slot] = 0;
+	memset(_slotUse[*slot], 0, sizeof _slotUse[*slot]);
 	return nil;
 }
 
 // Slot `slot`'s IB (n dwords in its page) padded to the page's end with a NOP and added to the batch: the pages of consecutive slots are
 // then one IB. One submit (a kext call, 8 us) a draw was a third of WindowServer's wait for its frames' submits (2026-11-20).
+static void widenRange(uint64_t r[2], uint64_t at, uint64_t bytes)
+{
+	if (!bytes)
+		return;
+	r[0] = r[1] ? MIN(r[0], at) : at;
+	r[1] = MAX(r[1], at + bytes);
+}
+
 static void padSlot(uint32_t *page, uint32_t n)
 {
 	const uint32_t room = RDNA4_TRIRUN_PAGE / 4 - n;
@@ -4873,6 +4960,11 @@ static void padSlot(uint32_t *page, uint32_t n)
 	memcpy(_ibCpu + (uint64_t)slot * RDNA4_TRIRUN_PAGE, ib, n * 4);
 	[self queueSlot:slot dwords:n];   // (_lastSlot stays the last draw's: its stream fence is what drainGfx checks)
 	_slotPipe[slot] = nil;
+	for (uint32_t c = 0; c < count; c++) {
+		widenRange(_slotUse[slot][0], copies[c].dst, copies[c].bytes);
+		if (copies[c].src)
+			widenRange(_slotUse[slot][1], copies[c].src, copies[c].bytes);
+	}
 	_overlapRun = NO;
 	[_drawnInFlight removeAllObjects];
 	statAdd(kStatSelfReads, total ? 1 : 0);
@@ -5056,6 +5148,71 @@ static void padSlot(uint32_t *page, uint32_t n)
 	__sync_synchronize();
 	[self queueSlot:slot dwords:n];   // (_lastSlot stays the last draw's: its stream fence is what drainGfx checks)
 	_slotPipe[slot] = nil;   // (no stream fence of its own: the batch's fence is what drainGfx waits for)
+	if (job.outBytes) {
+		widenRange(_slotUse[slot][0], job.out, job.outBytes);
+		widenRange(_slotUse[slot][1], job.in, job.inBytes);
+	} else {
+		_slotUse[slot][0][0] = 0, _slotUse[slot][0][1] = UINT64_MAX;   // another kernel: it may write anything
+	}
+	return nil;
+}
+
+- (BOOL)indexMemoryBusy:(uint64_t)at bytes:(uint64_t)bytes
+{
+	for (uint32_t s = 0; s < kSlots; s++)
+		for (int r = 0; r < 2; r++)
+			if (at < _slotUse[s][r][1] && _slotUse[s][r][0] < at + bytes)
+				return YES;
+	return NO;
+}
+
+// A learned fixIndexBuffer on the CPU, ahead of the slots in its batch: no slot of its own on the ring. The memory must be none that work still in
+// flight reads or writes (GL reuses these outputs, see dispatchOnRing). The batch this job's draw goes in is submitted after this write and
+// opens with ACQUIRE_MEM, so the card's caches hold nothing older of it.
+- (BOOL)indicesOnCpu:(RDNA4MTLComputePipeline *)k job:(const RDNA4IndexJob &)j
+{
+	const uint32_t kind = k.indexKinds;
+	if (cpuIndexMode() != 1 || !j.outCpu || k.indexChecks < 16 || __builtin_popcount(kind) != 1)
+		return NO;
+	uint64_t inBytes, outBytes;
+	indexBytes(kind, j, &inBytes, &outBytes);
+	if (inBytes && j.in < j.out + outBytes && j.out < j.in + inBytes)
+		return NO;
+	if ([self indexMemoryBusy:j.out bytes:outBytes] || (inBytes && [self indexMemoryBusy:j.in bytes:inBytes])) {
+		statAdd(kStatIndexBusy, 1);
+		return NO;
+	}
+	return fixIndices(kind, j, j.outCpu);
+}
+
+// After a job on the card: which forms its result matches. The first 16 of a pipeline's jobs (more while two forms still match, up to 256);
+// RDNA4_CPUINDEX=2 every job, and logs a pipeline that stops matching.
+- (NSError *)learnIndices:(RDNA4MTLComputePipeline *)k job:(const RDNA4IndexJob &)j
+{
+	const int mode = cpuIndexMode();
+	const uint32_t before = k.indexKinds, checks = k.indexChecks;
+	const BOOL learning = checks < 16 || (__builtin_popcount(before) > 1 && checks < 256);
+	if (!j.outCpu || !j.threads || !before || !(mode == 2 || (mode == 1 && learning)))
+		return nil;
+	if (NSError *why = [self drainGfx])
+		return why;
+	const uint64_t bytes = MIN(24 * j.threads, j.outRoom);
+	std::vector<uint8_t> mine(bytes);
+	uint32_t kinds = before;
+	for (uint32_t kind = 1; kind <= kIndexTri16; kind <<= 1) {
+		if (!(kinds & kind))
+			continue;
+		memcpy(mine.data(), j.outCpu, bytes);
+		if (!fixIndices(kind, j, mine.data()) || memcmp(mine.data(), j.outCpu, bytes))
+			kinds &= ~kind;
+	}
+	k.indexKinds = kinds;
+	k.indexChecks = checks + 1;
+	if (kinds != before && (!kinds || mode == 2))
+		RLOG(@"RDNA4MTL: fixIndexBuffer %p: forms 0x%x -> 0x%x after %u jobs (this one %llu primitives, count %u)", k, before, kinds, checks + 1,
+		     j.threads, *j.count);
+	else if (checks + 1 == 16 && __builtin_popcount(kinds) == 1)
+		RLOG(@"RDNA4MTL: fixIndexBuffer %p: form 0x%x learned", k, kinds);
 	return nil;
 }
 
@@ -5114,6 +5271,7 @@ static void padSlot(uint32_t *page, uint32_t n)
 		return rdna4Error([NSString stringWithFormat:@"waiting for the draws (fence %llu; in flight: %@)", fence,
 		                                             [inFlight componentsJoinedByString:@"; "]], kr);
 	}
+	memset(_slotUse, 0, sizeof _slotUse);
 	if (drew && streamFence != 1)
 		return rdna4Error([NSString stringWithFormat:@"the draws finished but the last stream's fence reads %u", streamFence], 0);
 	return nil;
@@ -5363,6 +5521,10 @@ static void padSlot(uint32_t *page, uint32_t n)
 	pad.queued = true;
 	_lastSlot = slot;
 	_drawsInFlight = YES;
+	if (d->indexGpu)
+		widenRange(_slotUse[slot][0], d->indexGpu, (uint64_t)d->count * d->indexBytes);
+	if ((p.vs[7] | p.ps[7]) >> 17 & 1)
+		_slotUse[slot][1][0] = 0, _slotUse[slot][1][1] = UINT64_MAX;   // a shader that writes memory
 	if (overlap) {
 		_runRanges = _overlapRun ? _runRanges : 0;
 		_overlapRun = YES, _runColour = t.gpuBase, _runDepth = d->depthGpu;
