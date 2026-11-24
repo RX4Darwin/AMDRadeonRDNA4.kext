@@ -1,8 +1,9 @@
-// Views.swift: the popover: the card's readings, the driver (versions, update, removal) and its tuning.
+// Views.swift: the popover: the card's readings and the driver (versions, update, removal).
 
 import SwiftUI
 
 struct GadgetView: View {
+    static let size = NSSize(width: 360, height: 460)
     @ObservedObject var model: GadgetModel
     @State private var tab = 0
     @State private var confirmUninstall = false
@@ -13,14 +14,12 @@ struct GadgetView: View {
             readings
             Picker("", selection: $tab) {
                 Text("Driver").tag(0)
-                Text("Tuning").tag(1)
-                Text("Gadget").tag(2)
+                Text("Gadget").tag(1)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
             switch tab {
             case 0: driver
-            case 1: tuning
             default: gadget
             }
             if let busy = model.busy {
@@ -31,13 +30,13 @@ struct GadgetView: View {
                     Text(model.log).font(.system(size: 10, design: .monospaced)).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxHeight: 90)
+                .frame(maxHeight: 60)
                 .padding(6)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
             }
         }
         .padding(14)
-        .frame(width: 360)
+        .frame(width: GadgetView.size.width, height: GadgetView.size.height, alignment: .top)
     }
 
     private var header: some View {
@@ -121,48 +120,6 @@ struct GadgetView: View {
         }
     }
 
-    @ViewBuilder private var tuning: some View {
-        if model.tuning == nil {
-            Text("Tuning needs AMDRadeonRDNA4 0.5.0 or later running.").font(.caption).foregroundStyle(.secondary)
-        } else {
-            VStack(alignment: .leading, spacing: 5) {
-                if model.tuning?.turnedOff == true {
-                    Label("The driver turned these settings off after a boot that did not finish. Saving turns them on again.",
-                          systemImage: "exclamationmark.triangle")
-                        .font(.caption).foregroundStyle(.orange)
-                }
-                Switch(label: "Hardware cursor", isOn: $model.edited.hardwareCursor)
-                Switch(label: "OpenGL on the card", isOn: $model.edited.openGL)
-                Switch(label: "Second DisplayPort display", isOn: $model.edited.secondDisplayPort)
-                Switch(label: "Fast DisplayPort modes", isOn: $model.edited.fastModes)
-                Switch(label: "Display hot-plug", isOn: $model.edited.hotPlug)
-                Switch(label: "Limit the GPU clock", isOn: Binding(
-                    get: { model.edited.clockLimitMHz > 0 },
-                    set: { model.edited.clockLimitMHz = $0 ? 2400 : 0 }))
-                HStack {
-                    if model.edited.clockLimitMHz > 0 {
-                        Slider(value: Binding(get: { Double(model.edited.clockLimitMHz) }, set: { model.edited.clockLimitMHz = Int($0) }),
-                               in: 500...3200, step: 100)
-                        Text("\(model.edited.clockLimitMHz) MHz").font(.caption.monospacedDigit()).frame(width: 64, alignment: .trailing)
-                    }
-                }
-                HStack {
-                    Button("Save") { model.applyTuning() }.disabled(model.tuning == model.edited && model.tuning?.turnedOff != true)
-                    Button("Restart…") { model.restart() }
-                    Spacer()
-                    Button("Defaults") {
-                        let was = model.edited.clockLimitWasSet || model.edited.clockLimitMHz > 0
-                        model.edited = Tuning()
-                        model.edited.clockLimitWasSet = was
-                    }
-                }
-                Text("Taken at the next restart. A boot-arg of the same name still wins.").font(.caption2).foregroundStyle(.secondary)
-            }
-            .toggleStyle(.switch)
-            .controlSize(.small)
-        }
-    }
-
     private var gadget: some View {
         VStack(alignment: .leading, spacing: 6) {
             Toggle("Show power in the menu bar", isOn: $model.showPower)
@@ -173,19 +130,6 @@ struct GadgetView: View {
             }
         }
         .toggleStyle(.checkbox)
-    }
-}
-
-private struct Switch: View {
-    let label: String
-    @Binding var isOn: Bool
-
-    var body: some View {
-        HStack {
-            Text(label)
-            Spacer()
-            Toggle("", isOn: $isOn).labelsHidden()
-        }
     }
 }
 

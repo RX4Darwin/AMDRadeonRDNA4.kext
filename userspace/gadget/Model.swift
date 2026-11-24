@@ -14,8 +14,6 @@ final class GadgetModel: ObservableObject {
     @Published var build: String?
     @Published var releases: [Release] = []
     @Published var checkError: String?
-    @Published var tuning: Tuning?                  // nil: the driver's settings are not there (not running, or older than 0.5.0)
-    @Published var edited = Tuning()
     @Published var busy: String?                    // what is running (download, install, ...)
     @Published var log = ""
     @AppStorage("showPower") var showPower = true
@@ -55,8 +53,6 @@ final class GadgetModel: ObservableObject {
     func refreshDriver() {
         installed = Driver.installedVersion()
         build = Driver.build()
-        tuning = Tuning.current()
-        if let t = tuning { edited = t }
     }
 
     /// The newest release (pre-releases if asked for), and whether it is newer than what is installed.
@@ -112,20 +108,6 @@ final class GadgetModel: ObservableObject {
         }
         busy = nil
         refreshDriver()
-    }
-
-    func applyTuning() {
-        do {
-            try edited.apply()
-            log = "Settings saved: they apply at the next restart."
-        } catch {
-            log = "Settings not saved: \(error.localizedDescription)"
-        }
-        refreshDriver()
-    }
-
-    func restart() {
-        NSAppleScript(source: "tell application \"System Events\" to restart")?.executeAndReturnError(nil)
     }
 
     var launchAtLogin: Bool {

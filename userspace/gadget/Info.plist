@@ -23,7 +23,7 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>RDNA4 Gadget asks for an administrator's password to install, update or remove the driver and to save its settings, and asks System Events to restart.</string>
+	<string>RDNA4 Gadget asks for an administrator's password to install, update or remove the driver.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>AMDRadeonRDNA4 contributors</string>
 </dict>

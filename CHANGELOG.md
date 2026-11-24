@@ -8,7 +8,7 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - **GPU sensors where macOS tools look**: temperature, hotspot, power, fan, clocks, load and VRAM in the accelerator's
   `PerformanceStatistics` (AMD Power Gadget shows the card's temperature and power with no change to it).
 - **RDNA4 Gadget**: a menu bar app for the card's readings, driver updates (a notification when a release is out), install and
-  removal, and settings (`make gadget`).
+  removal (`make gadget`).
 - **Settings that last**: the `rdna4-settings` NVRAM variable (`debug.rdna4_settings`) for six options, turned off after a boot
   that does not last.
 - **OpenMW about 15 -> 24 fps**: GL command buffers end off the work queue, Apple's `fixIndexBuffer` jobs run on the CPU, GL's
