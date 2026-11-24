@@ -4,3 +4,7 @@
 [submodule "Lilu"]
 	path = lib/Lilu
 	url = https://github.com/acidanthera/Lilu.git
+[submodule "lib/Mesa"]
+	path = lib/Mesa
+	url = https://gitlab.freedesktop.org/mesa/mesa.git
+	shallow = true

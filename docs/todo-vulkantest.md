@@ -189,7 +189,7 @@ What failure looks like, from the bottom layer up:
 
 Only if boot 1 ended in `all ok`.
 
-The driver and its test program, on the development Mac (the first time this downloads Mesa, about 150 MB, into
+The driver and its test program, on the development Mac (the first time this fetches the `lib/Mesa` submodule, about 150 MB, and copies it into
 `Build/radv-build`, and needs clang, ninja, bison, flex, pkg-config and glslangValidator; `make distclean` removes all
 of it again):
 

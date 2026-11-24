@@ -223,7 +223,8 @@ $(BIN)/freeze-watch.sh: tools/rig/freeze-watch.sh
 	cp tools/rig/freeze-watch.sh $@
 
 # The Vulkan driver and its test programs for the card tests (docs/todo-vulkantest.md): Mesa with the patches of
-# userspace/vulkan/mesa-patches, fetched (about 150 MB, the first time) and built in $(BUILD)/radv-build by `make mesa`.
+# userspace/vulkan/mesa-patches on the lib/Mesa submodule (fetched the first time, about 150 MB), copied, patched and built in
+# $(BUILD)/radv-build by `make mesa`.
 # `make clean` keeps that tree. Once it is built, every `make` puts the library, vkprobe and swapprobe (built against
 # Mesa's headers) beside the other programs, for whichever configuration is being made.
 RADV_DIR     = $(BUILD)/radv-build

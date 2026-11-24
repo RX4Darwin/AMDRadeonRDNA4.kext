@@ -4,7 +4,8 @@
 #
 #   userspace/vulkan/build-mesa.sh <work directory>
 #
-# Fetches Mesa at the commit the patches are made for (about 150 MB), applies the patches, makes a private
+# Copies Mesa from the lib/Mesa submodule (the commit the patches are made for; `git submodule update --init lib/Mesa` fetches it,
+# about 150 MB, if it is not there yet) into the work directory, applies the patches to that copy, makes a private
 # Python environment with meson, and builds the AMD Vulkan driver alone: x86_64 (the card's machines; an
 # Apple-silicon Mac cross-builds it and runs it under Rosetta), for macOS 11 and later, with Mesa's Metal window-system
 # layer (VK_EXT_metal_surface: windows through CAMetalLayer, mesa-patches/0009). The result links IOKit, Metal,
@@ -17,13 +18,14 @@
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 W=${1:?usage: build-mesa.sh <work directory>}
-BASE=f5cb8ee032adabef599ae892ec4e42d796b84da9
+root=$(cd "$here/../.." && pwd)
+src=$root/lib/Mesa
+[ -e "$src/.git" ] || git -C "$root" submodule update --init --depth 1 lib/Mesa
+BASE=$(git -C "$src" rev-parse HEAD)   # the submodule's commit: the one the patches are made for
 mkdir -p "$W" && cd "$W" && W=$PWD
-if [ ! -d mesa/.git ]; then
-	git init -q mesa
-	git -C mesa remote add origin https://gitlab.freedesktop.org/mesa/mesa.git
-	git -C mesa fetch -q --depth 1 origin $BASE
-	git -C mesa checkout -q FETCH_HEAD
+if [ ! -d mesa/.git ]; then   # a local copy (no download): the patches go into it, the submodule stays as it is
+	git clone -q --no-checkout "$src" mesa
+	git -C mesa checkout -q $BASE
 fi
 # The patches the tree does not have yet: it has as many commits after the base as patches applied.
 have=$(git -C mesa rev-list --count $BASE..HEAD)
