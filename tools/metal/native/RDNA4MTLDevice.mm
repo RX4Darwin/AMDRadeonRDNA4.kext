@@ -749,7 +749,7 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 - (void)descriptor:(uint32_t[8])t level:(NSUInteger)level
 {
 	level = MIN(level, MAX(_levels, (NSUInteger)1) - 1);
-	if (!level) {
+	if (!level || !self.gpuBase) {   // (no memory: descriptor: gives the spare texel)
 		[self descriptor:t];
 		return;
 	}
@@ -899,6 +899,10 @@ static char gCopyKey;
 
 - (void)descriptor:(uint32_t[8])t
 {
+	if (!self.gpuBase) {   // no memory: an unbound slot's spare texel, never a T# at address 0 (a shader's read there faults and hangs its draw)
+		[_device spareImage:t];
+		return;
+	}
 	if (_isDepth) {   // its depth as the depth block wrote it: 32_FLOAT, 64KB_2D (Depth16Unorm is stored so too), read as (d, 0, 0, 1)
 		msaaImage(t, self.gpuBase, 22, 4 | 1u << 9, (uint32_t)_width, (uint32_t)_height, _samples == 4 ? 2 : _samples == 2 ? 1 : 0);
 		return;
@@ -1024,6 +1028,8 @@ static char gCopyKey;
 	}
 	_device = t->_device;
 	_memory = t->_memory;
+	_vram = t->_vram;         // a multisampled texture's samples (its only memory) and how many: without them a view of one had address 0 and
+	_samples = t->_samples;   // one sample, and Chess's (SceneKit's) read of its 4x MSAA image through a view faulted and hung the draw (issue 23)
 	_held = t->_held;
 	_surface = t->_surface;
 	_plane = t->_plane;
@@ -1035,7 +1041,7 @@ static char gCopyKey;
 	_height = MAX(t->_height >> l, (NSUInteger)1);
 	_format = format;
 	_usage = t->_usage;
-	_type = type == MTLTextureType1DArray || type == MTLTextureType1D ? type : MTLTextureType2D;
+	_type = t->_samples > 1 ? t->_type : type == MTLTextureType1DArray || type == MTLTextureType1D ? type : MTLTextureType2D;
 	_layers = t->_layers;
 	_depth = 1;
 	_levels = MIN(levels.length ?: 1, have - l);
