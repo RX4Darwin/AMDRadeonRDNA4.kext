@@ -29,4 +29,6 @@ A checklist for each binary release, from reading the build on 2026-11-23. It is
 - **APSL 2.0** asks that the source of the covered code is available. MacKernelSDK is public, and the repository pins its commit.
 - **Mesa's MIT notices** name many copyright holders, in each source file. The bundle carries Mesa's licence and the MIT text, not a list of
   every holder.
+- **AMD FidelityFX FSR 1 (MIT).** `src/shaders/fsr1.cl` is a port of `ffx_fsr1.h` (the `lib/FidelityFX-FSR` submodule) and carries
+  AMD's notice. Nothing ships it yet; once the kext or bundle embeds its code object, its licence text goes with the others above.
 - **LGPL references.** `docs/metal-spike.md` names reims-vgpu (LGPL-3.0-or-later) as read-only reference. Nothing here was compared against it.

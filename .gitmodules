@@ -8,3 +8,6 @@
 	path = lib/Mesa
 	url = https://gitlab.freedesktop.org/mesa/mesa.git
 	shallow = true
+[submodule "lib/FidelityFX-FSR"]
+	path = lib/FidelityFX-FSR
+	url = https://github.com/GPUOpen-Effects/FidelityFX-FSR.git
