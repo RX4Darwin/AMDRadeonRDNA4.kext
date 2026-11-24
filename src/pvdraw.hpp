@@ -58,6 +58,7 @@ static inline uint32_t colourInfo(uint32_t format, bool swap) {
 	case 104: return 0x0003050bu;   // RG32Sint
 	case 63: return 0x00030405u;    // RG16Uint: 16_16 UINT, BLEND_BYPASS (WindowServer's brim_init_lpf at 4K, Tahoe)
 	case 53: return 0x00030404u;    // R32Uint: 32 UINT, BLEND_BYPASS (clearOnCard's fills: the bits as exported)
+	case 54: return 0x00030504u;    // R32Sint: 32 SINT, BLEND_BYPASS
 	case 13: return 0x00030401u;    // R8Uint: 8 UINT, BLEND_BYPASS (Quake II's G-buffer materials, ref_metal)
 	case 55: return 0x00020704u;    // R32Float: 32 float (MoltenVK's, vkQuake)
 	case 105: return 0x0002070bu;   // RG32Float: 32_32 float
@@ -219,7 +220,7 @@ static inline const TextureFormat *textureFormat(uint32_t metal) {
 	static const TextureFormat fmts[] = {{70, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {71, 66, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},    // RGBA8 unorm, sRGB
 	                                     {80, 42, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4}, {81, 66, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // BGRA8 unorm, sRGB
 	                                     {55, 22, 4 | 0 << 3 | 0 << 6 | 1 << 9, 4}, {115, 57, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // R32Float, RGBA16Float
-	                                     {125, 63, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16},                                             // RGBA32Float
+	                                     {125, 63, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16}, {105, 50, 4 | 5 << 3 | 1 << 9, 8},           // RGBA32Float, RG32Float
 	                                     {110, 51, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},                                              // RGBA16 unorm
 	                                     {1, 1, 4 << 9, 1}, {10, 1, 4 | 1 << 9, 1}, {11, 64, 4 | 1 << 9, 1},         // A8, R8 unorm, sRGB
 	                                     {30, 14, 4 | 5 << 3 | 1 << 9, 2}, {31, 65, 4 | 5 << 3 | 1 << 9, 2},                      // RG8 unorm, sRGB
@@ -234,7 +235,7 @@ static inline const TextureFormat *textureFormat(uint32_t metal) {
 	                                     {33, 18, 4 | 5 << 3 | 1 << 9, 2},                                                         // RG8 uint
 	                                     {63, 27, 4 | 5 << 3 | 1 << 9, 4}, {73, 46, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},              // RG16, RGBA8 uint
 	                                     {103, 48, 4 | 5 << 3 | 1 << 9, 8}, {113, 55, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},            // RG32, RGBA16 uint
-	                                     {104, 49, 4 | 5 << 3 | 1 << 9, 8},                                                         // RG32 sint (32_32_SINT)
+	                                     {104, 49, 4 | 5 << 3 | 1 << 9, 8}, {54, 21, 4 | 1 << 9, 4},                                // RG32, R32 sint
 	                                     {123, 61, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16}};                                           // RGBA32 uint
 	for (const TextureFormat &e : fmts)
 		if (e.metal == metal)

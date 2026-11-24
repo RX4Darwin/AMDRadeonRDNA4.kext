@@ -508,11 +508,13 @@ static std::string legalize(Function &k) {
 	LLVMContext &ctx = k.getContext();
 	PointerType *global = PointerType::get(ctx, 1);
 	SmallVector<Instruction *, 32> gone;
-	// Constexpr samplers first: their state global (AIR's constant address space) becomes the S# constant of the call.
+	// Constexpr samplers first: their state global (AIR's constant address space) becomes the S# constant of the call. Every sampling call's,
+	// depth ones too (MetalGraphicsPlayground's shadow lookups: air.sample_depth_2d refused as "a constant table", 2026-11-24).
 	std::map<CallInst *, Constant *> constSampler;
 	for (Instruction &i : instructions(k))
-		if (auto *c = dyn_cast<CallInst>(&i); c && c->getCalledFunction() && c->getCalledFunction()->getName().starts_with("air.sample_texture") &&
-		                                        c->arg_size() > 1)
+		if (auto *c = dyn_cast<CallInst>(&i); c && c->getCalledFunction() && c->arg_size() > 1 &&
+		                                        (c->getCalledFunction()->getName().starts_with("air.sample_") ||
+		                                         c->getCalledFunction()->getName().starts_with("air.gather_")))
 			if (auto *g = dyn_cast<GlobalVariable>(c->getArgOperand(1)->stripPointerCasts()); g && g->hasInitializer()) {
 				// The state word: an i64, or the first of an array of them (both seen from the Metal compiler).
 				auto *a = dyn_cast<ConstantDataArray>(g->getInitializer());
@@ -543,8 +545,15 @@ static std::string legalize(Function &k) {
 				u.set(PoisonValue::get(to));
 			else if (isa<UndefValue>(u.get()))
 				u.set(from->isPointerTy() ? static_cast<Value *>(PoisonValue::get(to)) : UndefValue::get(to));
-			else
-				return "data in AIR's constant address space (a constant table) is not supported yet";
+			else {
+				std::string what;
+				raw_string_ostream os(what);
+				os << "data in AIR's constant address space (a constant table) is not supported yet: ";
+				u.get()->printAsOperand(os, false);
+				os << " in";
+				i.print(os);
+				return os.str();
+			}
 		}
 
 		if (Type *to = globalType(i.getType(), globalTypes); to != i.getType())
@@ -586,7 +595,7 @@ static std::string legalize(Function &k) {
 		{"sin", Intrinsic::sin}, {"cos", Intrinsic::cos}, {"fabs", Intrinsic::fabs}, {"floor", Intrinsic::floor}, {"ceil", Intrinsic::ceil},
 		{"trunc", Intrinsic::trunc}, {"rint", Intrinsic::rint}, {"round", Intrinsic::round}, {"fmax", Intrinsic::maxnum},
 		{"fmin", Intrinsic::minnum}, {"fma", Intrinsic::fma}, {"popcount", Intrinsic::ctpop}, {"min.s", Intrinsic::smin},
-		{"min.u", Intrinsic::umin}, {"max.s", Intrinsic::smax}, {"max.u", Intrinsic::umax}};
+		{"min.u", Intrinsic::umin}, {"max.s", Intrinsic::smax}, {"max.u", Intrinsic::umax}, {"reverse_bits", Intrinsic::bitreverse}};
 	static const std::map<std::string, std::pair<Intrinsic::ID, Intrinsic::ID>> clampOps = {   // clamp: its max and min
 		{"clamp", {Intrinsic::maxnum, Intrinsic::minnum}}, {"clamp.s", {Intrinsic::smax, Intrinsic::smin}}, {"clamp.u", {Intrinsic::umax, Intrinsic::umin}}};
 	static const std::map<std::string, AtomicRMWInst::BinOp> rmw = {
@@ -824,8 +833,11 @@ static std::string legalize(Function &k) {
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), d, 0), b.getInt8(0), 1);
 		} else if (tex.starts_with("read_depth_2d.f32")) {
 			// depth2d read (texture, sampler, i32, uint2 or ushort2, int2 offset, lod, i32): its depth as 32_FLOAT (as the sample
-			// above) through image_load(_mip). G-buffer depth in Quake II's ray-traced effects (BeauBender/quake2's ref_metal).
-			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(3), *offset = c->getArgOperand(4), *lod = c->getArgOperand(5);
+			// above) through image_load(_mip). G-buffer depth in Quake II's ray-traced effects (BeauBender/quake2's ref_metal). Without the
+			// sampler: (texture, i32, coord, lod, i32), no offset (MetalGraphicsPlayground's SSAO kernels).
+			const bool samplerless = !c->getArgOperand(1)->getType()->isPointerTy();
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(samplerless ? 2 : 3);
+			Value *offset = samplerless ? ConstantAggregateZero::get(xy->getType()) : c->getArgOperand(4), *lod = c->getArgOperand(samplerless ? 3 : 5);
 			Value *x = b.CreateZExt(b.CreateExtractElement(xy, uint64_t(0)), b.getInt32Ty());
 			Value *y = b.CreateZExt(b.CreateExtractElement(xy, 1), b.getInt32Ty());
 			if (!isa<ConstantAggregateZero>(offset)) {
@@ -1167,9 +1179,9 @@ static std::string legalize(Function &k) {
 			r = b.CreateIntrinsic(Intrinsic::ldexp, {c->getType(), c->getArgOperand(1)->getType()}, {c->getArgOperand(0), c->getArgOperand(1)});
 		} else if (op == "clz" || op == "ctz") {   // (x, is zero poison)
 			r = b.CreateIntrinsic(op == "clz" ? Intrinsic::ctlz : Intrinsic::cttz, {c->getType()}, {c->getArgOperand(0), b.getFalse()});
-		} else if (name.starts_with("get_width_texture_2d") || name.starts_with("get_height_texture_2d") || name.starts_with("get_width_depth_2d") ||
-		           name.starts_with("get_height_depth_2d")) {
-			// (texture, lod), a depth texture's too (the same fields): from the T# the host wrote (src/pvgpu.cpp): width - 1 in word1 [31:30]
+		} else if ((name.starts_with("get_width_") || name.starts_with("get_height_")) &&
+		           (name.contains("texture_2d") || name.contains("depth_2d") || name.contains("texture_cube") || name.contains("depth_cube"))) {
+			// (texture, lod), a depth or cube texture's too (the same fields): from the T# the host wrote (src/pvgpu.cpp): width - 1 in word1 [31:30]
 			// and word2 [13:0] << 2, height - 1 in word2 [27:14]; then >> lod, at least 1.
 			Value *t = descriptor(c->getArgOperand(0), 8), *w1 = b.CreateExtractElement(t, 1), *w2 = b.CreateExtractElement(t, 2);
 			Value *size = name.starts_with("get_width") ? b.CreateOr(b.CreateLShr(w1, 30), b.CreateShl(b.CreateAnd(w2, 0x3fff), 2))
@@ -1177,6 +1189,11 @@ static std::string legalize(Function &k) {
 			// a multisampled texture's (get_width_texture_2d_ms) has no LOD: level 0
 			Value *lod = c->arg_size() > 1 ? c->getArgOperand(1) : b.getInt32(0);
 			r = b.CreateIntrinsic(Intrinsic::umax, {b.getInt32Ty()}, {b.CreateLShr(b.CreateAdd(size, b.getInt32(1)), lod), b.getInt32(1)});
+		} else if (name.starts_with("get_num_mip_levels_")) {
+			// (texture): LAST_LEVEL (word3 [19:15]) + 1. ponytail: BASE_LEVEL taken as 0, as the T#s the host and the bundle write
+			// (a view of a later level is an image of its own); subtract it if views ever start at a level in the T#.
+			Value *w3 = b.CreateExtractElement(descriptor(c->getArgOperand(0), 8), 3);
+			r = b.CreateAdd(b.CreateAnd(b.CreateLShr(w3, 15), 0x1f), b.getInt32(1));
 		} else if (name.starts_with("get_array_size_texture_1d_array") || name.starts_with("get_array_size_texture_2d_array")) {
 			// (texture): the T#'s layers - 1 in word4 [13:0] (pvdraw.hpp linearArray1d / linearArray2d), plus one (Quake II's water)
 			Value *t = descriptor(c->getArgOperand(0), 8);

@@ -5,6 +5,10 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- **More Metal shaders translate**: depth sampling with a sampler declared in the shader, `reverse_bits`, a cube texture's size and
+  mip count, and depth reads without a sampler; RG32Float and R32Sint textures; a pipeline with no format at a colour attachment the
+  pass has draws without writing it there, as Metal does (it was refused: MetalQuake's 5000 refused draws a run). Four of
+  MetalGraphicsPlayground's samples that were black now draw (shadow mapping, IZB shadows, the scene graph, post-processing's lighting).
 - **3D apps much faster: render targets in VRAM, clears on the card**: MetalQuake at 4K went from about 18 to about 110 fps. Private
   render targets were in host memory and drawn over PCIe; clear colours no 32-bit fill makes (16-bit float targets) were cleared by the
   CPU every frame with the card idle.

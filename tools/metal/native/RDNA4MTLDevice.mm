@@ -5704,9 +5704,13 @@ static void padSlot(uint32_t *page, uint32_t n)
 {
 	if (d->type > 4 || !d->count || !d->instances || d->count > (1u << 24))
 		return rdna4Error([NSString stringWithFormat:@"a draw of %u vertices, type %u, %u instances: not run", d->count, d->type, d->instances], 0);
-	if (!d->depthOnly && [p formatOf:d->attachment] != t.pixelFormat)
+	// a pipeline with no format at the attachment the pass has a texture for: Metal writes no colour there (MetalGraphicsPlayground's
+	// depth prepasses into its G-buffer pass)
+	const MTLPixelFormat format = [p formatOf:d->attachment];
+	const BOOL unformatted = format == MTLPixelFormatInvalid;
+	if (!d->depthOnly && !unformatted && format != t.pixelFormat)
 		return rdna4Error([NSString stringWithFormat:@"the pipeline's colour attachment %u format %lu is not the target's %lu", d->attachment,
-		                                             (unsigned long)[p formatOf:d->attachment], (unsigned long)t.pixelFormat], 0);
+		                                             (unsigned long)format, (unsigned long)t.pixelFormat], 0);
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];   // built here and copied into the slot's pages: draws are made on the work queue only
 	static uint64_t misc[kMiscBytes / 8];
 	// A GL app's draws into the same targets overlap on the card: each used to wait for everything before it and flush the caches behind
@@ -5733,7 +5737,7 @@ static void padSlot(uint32_t *page, uint32_t n)
 	kern_return_t kr = KERN_SUCCESS;
 	const uint64_t miscGpu = _misc.gpu + (uint64_t)slot * kMiscBytes, ibOffset = (uint64_t)slot * RDNA4_TRIRUN_PAGE;
 	const uint32_t *vs = p.vs, *ps = p.ps, outs = p.outs, ins = p.ins;
-	const BOOL noColour = (ps[7] >> 31) || p.exportsNothing || d->depthOnly;
+	const BOOL noColour = (ps[7] >> 31) || p.exportsNothing || d->depthOnly || unformatted;
 	// dual-source blending (the fragment header's bit 18: the colour and its [[color(0), index(1)]]; Sublime Text's subpixel text through
 	// Apple's GL-on-Metal renderer), as the PV host: both exports in the colour's format and in CB_SHADER_MASK, DISABLE_DUAL_QUAD, no SX
 	// blend optimisation
