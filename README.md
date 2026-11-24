@@ -126,7 +126,16 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 
 - The power-management firmware runs its features: the graphics clock follows the load (3.2 GHz under load, about
   250 MHz idle), the display clocks are held at what the displays need.
-- Sensors: temperature, power, clocks and activity (`rdna4-run sensors`).
+- Sensors: temperature, power, clocks and activity (`rdna4-run sensors`), also in the accelerator's `PerformanceStatistics` under
+  the keys Apple's AMD drivers use, so Activity Monitor's GPU history, AMD Power Gadget and iStat read them.
+- **RDNA4 Gadget** (`make gadget`, `userspace/gadget`): a menu bar app with the card's temperature and power, its readings in a
+  popover, the installed driver against the latest release (with a notification when one is out), install, update and removal
+  (the kext into the EFI OpenCore booted from, through `efi.sh` and its backup), and settings: hardware cursor, OpenGL on the card,
+  the second DisplayPort display, fast DisplayPort modes, hot-plug and a GPU clock limit. A VirtualSMC GPU plug-in's SMC keys
+  (`TGDD`, `TG0P`, ...) are shown where there is one.
+- Settings that last: `sudo sysctl debug.rdna4_settings="on rdna4-gfxcap=2000"` (the NVRAM variable `rdna4-settings`), taken at
+  every boot below a boot-arg of the same name, for `rdna4-pvcursor`, `rdna4-accelgl`, `rdna4-head2dp`, `rdna4-pvfast`,
+  `rdna4-hotplug` and `rdna4-gfxcap`. A boot that does not last two minutes turns them off.
 
 ### Not implemented yet
 

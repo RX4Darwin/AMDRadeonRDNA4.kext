@@ -5,6 +5,14 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- **GPU sensors where macOS tools look**: temperature, hotspot, power, fan, clocks, load and VRAM in the accelerator's
+  `PerformanceStatistics` (AMD Power Gadget shows the card's temperature and power with no change to it).
+- **RDNA4 Gadget**: a menu bar app for the card's readings, driver updates (a notification when a release is out), install and
+  removal, and settings (`make gadget`).
+- **Settings that last**: the `rdna4-settings` NVRAM variable (`debug.rdna4_settings`) for six options, turned off after a boot
+  that does not last.
+- **OpenMW about 15 -> 24 fps**: GL command buffers end off the work queue, Apple's `fixIndexBuffer` jobs run on the CPU, GL's
+  flush commits no longer wait for the work queue (at most 4 behind), buffer copies run on the graphics ring.
 - **Vulkan apps survive a system sleep**: RADV sessions are kept with the rest of the runtime (their page tables and buffers are
   in the saved VRAM); each gets its address space back at the wake, and its calls during the sleep wait for the wake instead of
   failing (a refused submit froze vkcube). The VRAM saved at sleep goes to host memory in 64 MiB pieces: one 542 MiB buffer
