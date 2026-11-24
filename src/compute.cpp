@@ -1154,7 +1154,7 @@ uint32_t RDNA4Compute::requestedGfxPm() {
 // rdna4-gfxcap=0 (soft max back to automatic) or a cold power cycle.
 bool RDNA4Compute::requestedGfxCap(uint32_t &mhz) {
 	uint32_t v = 0;
-	if (!PE_parse_boot_argn("rdna4-gfxcap", &v, sizeof(v)))
+	if (!Trial::option("rdna4-gfxcap", v))
 		return false;
 	mhz = v;
 	return true;

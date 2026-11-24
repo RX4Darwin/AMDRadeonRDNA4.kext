@@ -17,6 +17,7 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
+#include <sys/sysctl.h>
 
 #define TLOG(fmt, ...) \
 	rdna4Log("AMDRadeonRDNA4: trial: " fmt "\n", ##__VA_ARGS__)
@@ -26,41 +27,45 @@ namespace
 
 /* Lilu's vendor GUID, as compute.cpp's breadcrumbs use it. */
 const char *kKey = "4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trial";
+const char *kSettingsKey = "4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-settings";
+const char *kGuardKey = "4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-accel-guard";   // (rdna4accel.cpp's)
 const char *kForceSync = "IONVRAM-FORCESYNCNOW-PROPERTY";
 
 bool gLoaded;
 bool gArmed;
 char gText[Trial::kMaxText];
+bool gSettingsOn;
+char gSettings[Trial::kMaxText];
 
-/* The variable's text into gText, empty if there is none. */
-void readVariable(IORegistryEntry *nvram)
+/* Variable `key`'s text into `text` (`size` bytes), empty if there is none. */
+void readVariable(IORegistryEntry *nvram, const char *key = kKey, char *text = gText, size_t size = sizeof(gText))
 {
-	OSObject *v = nvram->copyProperty(kKey);
+	OSObject *v = nvram->copyProperty(key);
 	size_t n;
 
-	gText[0] = 0;
+	text[0] = 0;
 
 	if (!v)
 		return;
 
 	if (auto *s = OSDynamicCast(OSString, v)) {
-		strlcpy(gText, s->getCStringNoCopy(), sizeof(gText));
+		strlcpy(text, s->getCStringNoCopy(), size);
 	} else if (auto *d = OSDynamicCast(OSData, v)) {
 		n = d->getLength();
-		if (n > sizeof(gText) - 1)
-			n = sizeof(gText) - 1;
+		if (n > size - 1)
+			n = size - 1;
 
-		memcpy(gText, d->getBytesNoCopy(), n);
-		gText[n] = 0;
+		memcpy(text, d->getBytesNoCopy(), n);
+		text[n] = 0;
 	}
 
 	v->release();
 }
 
 /* Write `text` to the variable and commit it now. */
-void writeVariable(IORegistryEntry *nvram, const char *text)
+void writeVariable(IORegistryEntry *nvram, const char *text, const char *name = kKey)
 {
-	const OSSymbol *key = OSSymbol::withCString(kKey);
+	const OSSymbol *key = OSSymbol::withCString(name);
 	OSString *value = OSString::withCString(text);
 	OSDictionary *sync = OSDictionary::withCapacity(1);
 	OSString *yes = OSString::withCString("1");
@@ -90,6 +95,30 @@ void markUsed(IORegistryEntry *nvram)
 	writeVariable(nvram, used);
 }
 
+// debug.rdna4_settings: the rdna4-settings variable; written (by root, as every sysctl write), it is committed to NVRAM at once (the RDNA4
+// app's way to its settings, and the test rig's: no nvram without a password there). Taken at the next boot.
+int settingsSysctl SYSCTL_HANDLER_ARGS
+{
+	IORegistryEntry *nvram = IORegistryEntry::fromPath("/options", gIODTPlane);
+	if (!nvram)
+		return ENOENT;
+	char value[Trial::kMaxText];
+	readVariable(nvram, kSettingsKey, value, sizeof(value));
+	int err = sysctl_handle_string(oidp, value, sizeof(value), req);
+	if (!err && req->newptr) {
+		for (const char *c = value; *c && !err; c++)   // words of letters, digits, '-', '=', and spaces
+			if (!(*c == ' ' || *c == '-' || *c == '=' || (*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z')))
+				err = EINVAL;
+		if (!err)
+			writeVariable(nvram, value, kSettingsKey);
+	}
+	nvram->release();
+	return err;
+}
+
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_settings, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, settingsSysctl, "A",
+            "AMDRadeonRDNA4: the persistent settings (\"on rdna4-pvcursor=0 ...\", trial.hpp), taken at the next boot");
+
 void load()
 {
 	IORegistryEntry *nvram;
@@ -114,7 +143,32 @@ void load()
 		TLOG("none armed (%s)", gText[0] ? gText : "no variable");
 	}
 
+	sysctl_register_oid(&sysctl__debug_rdna4_settings);   // (load() reaches here once)
+	readVariable(nvram, kSettingsKey, gSettings, sizeof(gSettings));
+	gSettingsOn = Trial::firstWordIs(gSettings, Trial::kOn);
+	if (gSettingsOn) {
+		char guard[32] = "";
+		readVariable(nvram, kGuardKey, guard, sizeof(guard));
+		if (!strcmp(guard, "pending")) {
+			char off[Trial::kMaxText + 8];
+			const char *rest = gSettings;
+			while (*rest == ' ')
+				rest++;
+			snprintf(off, sizeof(off), "off%s", rest + sizeof(Trial::kOn) - 1);
+			writeVariable(nvram, off, kSettingsKey);
+			gSettingsOn = false;
+			TLOG("settings turned off: the boot before did not last (%s)", gSettings);
+		} else {
+			TLOG("settings: %s", gSettings);
+		}
+	}
+
 	nvram->release();
+}
+
+bool setting(const char *key, uint32_t &value)
+{
+	return gSettingsOn && Trial::settingAllowed(key) && Trial::find(gSettings, key, value);
 }
 
 } /* namespace */
@@ -153,7 +207,7 @@ static bool builtIn(const char *key, uint32_t &value)
 
 bool Trial::bootArg(const char *key, uint32_t &value)
 {
-	return PE_parse_boot_argn(key, &value, sizeof(value)) || builtIn(key, value);
+	return PE_parse_boot_argn(key, &value, sizeof(value)) || (gLoaded && setting(key, value)) || builtIn(key, value);
 }
 
 bool Trial::option(const char *key, uint32_t &value)
@@ -163,5 +217,5 @@ bool Trial::option(const char *key, uint32_t &value)
 
 	load();
 
-	return (gArmed && find(gText, key, value)) || builtIn(key, value);
+	return (gArmed && find(gText, key, value)) || setting(key, value) || builtIn(key, value);
 }

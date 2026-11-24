@@ -1935,7 +1935,7 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	// Both kinds of hot-plug start their HPD poll when IOFramebuffer opens.
 	uint32_t hotplug = second >= 2 ? 2 : 0, dptrain = 0;
 	if (second >= 2)
-		PE_parse_boot_argn("rdna4-hotplug", &hotplug, sizeof(hotplug));
+		(void)Trial::option("rdna4-hotplug", hotplug);
 	PE_parse_boot_argn("rdna4-dptrain", &dptrain, sizeof(dptrain));
 	if (hotplug || dptrain) {
 		KernelPatcher::RouteRequest connect {

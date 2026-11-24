@@ -2583,7 +2583,7 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 #else
 	uint32_t pvCursor = 0;
 #endif
-	PE_parse_boot_argn("rdna4-pvcursor", &pvCursor, sizeof(pvCursor));
+	(void)Trial::option("rdna4-pvcursor", pvCursor);
 	hwCursorRequested = ndrvCursorRequested || pvCursor != 0;
 	if (hwCursorRequested)
 		FBLOG("cursor: hardware cursor plane requested (%s)", ndrvCursorRequested ? "rdna4-cursor=1" : "the paravirtual displays'");
