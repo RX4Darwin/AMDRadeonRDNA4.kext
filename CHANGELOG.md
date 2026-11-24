@@ -5,8 +5,10 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
-- Batch sparse page-table updates when a GPU client closes. An instrumented test1 build ran on an RX 9070 XT
-  on Tahoe 26.7.3. The reduction in page copies was measured in the host test.
+- **Apps that use multisampling no longer hang the GPU**: a view of a multisampled texture had address 0, so a shader reading
+  through it faulted and its draw hung the graphics ring (Chess, within a few launches; issue 23).
+- **Closing an app holds the driver's lock for less time**: its page-table changes are published once instead of once per
+  buffer (PR 25 by cosminolaru-collab). In the PR's host test, 562 buffers took 18 page copies instead of 562.
 - **GPU sensors where macOS tools look**: temperature, hotspot, power, fan, clocks, load and VRAM in the accelerator's
   `PerformanceStatistics` (AMD Power Gadget shows the card's temperature and power with no change to it).
 - **RDNA4 Gadget**: a menu bar app for the card's readings, driver updates (a notification when a release is out), install and
