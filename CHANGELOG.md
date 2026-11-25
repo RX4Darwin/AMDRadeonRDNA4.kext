@@ -5,6 +5,19 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- **Fan Control** in RDNA4Gadget's new Fans tab: Auto (the card's own) or a custom five-point curve, zero RPM and its stop
+  temperature, within the card's limits, through the SMU's OverDrive table as Linux's amdgpu sets it. The package's root job
+  `org.rdna4.fan` applies the settings at once and at every boot, without a password; each Apply is one change on the card.
+- **Super Resolution (AMD FSR 1)**: games that draw below the screen's resolution are upscaled on the card with FSR 1 and sharpened,
+  instead of stretched; a render scale (Ultra Quality 77 % to Performance 50 %) makes games draw fewer pixels for more frames. Off by
+  default: RDNA4Gadget's Tweaks tab.
+- **Anti-Lag**: keeps a game's CPU at most one frame ahead of the card (Tweaks tab). Anti-Lag 2 for Vulkan games that build it in, through
+  Mesa's Anti-Lag layer, which the package now installs.
+- **Faster page-table updates when apps allocate memory**: a changed page of an app's sparse page tables is staged through the
+  write-combined mapping (PR 26 by cosminolaru-collab). In the PR's Quick Look test, the driver's lock was held 84 µs instead of 855 µs
+  per allocation.
+- **Apps no longer fail now and then at the end of a frame**: the last draw's own fence could show 2 µs after the batch's, and the command
+  buffer failed with "the last stream's fence reads 0" (MetalGraphicsPlayground's MSAA sample, about one drain in a thousand).
 - **Cube and array textures with mip levels, layered render passes**: every level of a cube or 2D array is kept (only level 0 was),
   drawn into a face and level at a time, sampled at an explicit LOD and counted by `get_num_mip_levels`; mipmapped depth cubes as
   attachments; a vertex shader's `[[render_target_array_index]]` draws into that layer (all six cube faces went into the first). With these
