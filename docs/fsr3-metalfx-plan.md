@@ -67,8 +67,9 @@ Windows DLLs, and the macOS port that exists extracts its model from that DLL (s
    RDNA4Gadget's Tweaks tab: "MetalFX upscaling: AMD FSR" (`MetalFXFSR`, on unless set off); off gives Apple's own (card-run).
    Jitter sign settled (card, Quake II, still view, the game window captured twice 1 s apart): as given, frame-to-frame difference 0.13;
    flipped (`RDNA4_FSR3_JITTER=-1,-1`) 0.98, a visible shimmer; zero 0.14. MetalFX's convention is FSR's: the default stays.
-   Left: a window resize and display sleep (need the rig free: the key tool types into the frontmost app), and the reconstructed depth
-   and SPD counter, still buffers in host memory (prepare inputs 0.48 ms, prepare reactivity 0.63 ms: putting buffers in VRAM is a
+   Window resize (card, `vid_restart` to 1280x720 and back): a new scaler each time (1280x720 -> 2560x1440, then 1600x900 -> 3200x1800),
+   both pictures correct. Display sleep (`pmset displaysleepnow`, off 12 s, woken): the game kept running, frames correct, no hang.
+   Left: the reconstructed depth and SPD counter, still buffers in host memory (prepare inputs 0.48 ms, prepare reactivity 0.63 ms: putting buffers in VRAM is a
    device-wide change, not worth it for this alone).
 4. **Hooks:** the two descriptor methods replaced once a process (as Super Resolution's CAMetalLayer methods), only for our device; any
    other device gets Apple's. A switch in RDNA4Gadget's Tweaks tab ("MetalFX: AMD FSR"), on by default once it works (without it, MetalFX
