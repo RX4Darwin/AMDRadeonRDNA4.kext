@@ -391,6 +391,21 @@ bool RDNA4Device::raiseDisplayClocks()
 	return met;
 }
 
+bool RDNA4Device::refreshClockSupport() {
+	return smu && smu->hardMinStatus && dispclkTargetKHz() == 650000 &&
+	       topDpmLevel(kPpclkDispclk) >= 720 && topDpmLevel(kPpclkDppclk) >= 720;
+}
+bool RDNA4Device::setRefreshClocks(bool high) {
+	if (!smu || !smu->hardMinStatus || dispclkTargetKHz() != 650000) return false;
+	if (high && (topDpmLevel(kPpclkDispclk) < 720 || topDpmLevel(kPpclkDppclk) < 720)) return false;
+	refreshClocksPending = true; // even a timeout can mean firmware accepted the first write
+	const uint32_t mhz = high ? 720 : 650;
+	const bool display = smuSetHardMin(kPpclkDispclk, "DISPCLK", mhz);
+	const bool plane = (!high || display) && smuSetHardMin(kPpclkDppclk, "DPPCLK", mhz);
+	if (!high && display && plane) refreshClocksPending = false;
+	return display && plane;
+}
+
 void RDNA4Device::logDisplayClocks()
 {
 	uint32_t on = 0;

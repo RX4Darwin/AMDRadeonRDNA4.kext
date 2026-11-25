@@ -37,6 +37,7 @@
 #include <IOKit/ndrvsupport/IONDRVLibraries.h>
 #include <pexpert/pexpert.h>
 #include <kern/thread_call.h>
+#include <sys/sysctl.h>
 #include <mach/kmod.h>
 
 #include "accelcensus.hpp"
@@ -298,10 +299,16 @@ ScaledMemory gBootScaledMemory;
 bool gScaledOffered { false };                  // our accelerator serves WindowServer: it can present their frames
 bool gApertureRouted { false };                 // wrapGetApertureRange is in: without it a scaled mode's aperture would be cut from BAR0
 
-// Ndrv::Backend over RDNA4Device. Every mode reuses the boot surface: modes
-// never exceed the GOP framebuffer and keep its pitch (see device.hpp).
+mach_vm_address_t orgGetVRAMRange { 0 };
+#include "qhdtrial.inc"
+
+// The normal modes retain the GOP pitch. The two opt-in DP modes share their own aperture.
 bool deviceSurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) {
 	auto *dev = static_cast<RDNA4Device *>(ctx);
+	if (QhdTrial::state && &QhdTrial::state->dev == dev && (m.id == QhdTrial::lowId || m.id == QhdTrial::highId)) {
+		out = QhdTrial::plane;
+		return true;
+	}
 	if (m.source == Modes::SourceScaled) {
 		out = { dev->fbPhysBase, m.t.hActive * 4u, m.t.hActive, m.t.vActive };   // (the base is only reported: wrapGetApertureRange)
 		return true;
@@ -314,6 +321,9 @@ bool deviceSurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out)
 
 int32_t deviceSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 	auto *dev = static_cast<RDNA4Device *>(ctx);
+	if (QhdTrial::state && &QhdTrial::state->dev == dev &&
+	    (QhdTrial::rate() || QhdTrial::armed || m.id == QhdTrial::lowId || m.id == QhdTrial::highId))
+		return QhdTrial::change(m);
 	if (m.source != Modes::SourceScaled)
 		return dev->applyMode(m);
 	// the head stays on (or goes to) its largest mode; the present path scales the frames down to it
@@ -472,7 +482,7 @@ uint32_t head2Level { 0 };
 // exists without a monitor too, offline.
 uint32_t hotplugLevel { 0 };
 mach_vm_address_t orgStart { 0 };
-mach_vm_address_t orgGetVRAMRange { 0 };
+
 mach_vm_address_t orgGetApertureRange { 0 };
 mach_vm_address_t orgRegisterForInterruptType { 0 };
 
@@ -582,7 +592,8 @@ void createHeads(IOPCIDevice *pci) {
 constexpr uint64_t kHeadSlotBytes = 34ull << 20;
 
 uint64_t surfaceFloor(const Head2 *h, const RDNA4Device &dev) {
-	return dev.fbPhysBase + dev.fbLength + h->slot * kHeadSlotBytes;
+	const uint64_t reserved = QhdTrial::state && &QhdTrial::state->dev == &dev ? QhdTrial::span : dev.fbLength;
+	return dev.fbPhysBase + reserved + h->slot * kHeadSlotBytes;
 }
 
 // Once head 0's device exists: what head 2 serves.
@@ -1288,6 +1299,13 @@ IOReturn head2DriverIO(Head2 *h, void *contents, UInt32 commandCode, uint16_t &c
 // nothing for head 2: hand out its surface instead (retained, as the original
 // does).
 IODeviceMemory *wrapGetVRAMRange(void *fb) {
+	if (QhdTrial::state) {
+		for (const auto &entry : fbTable)
+			if (entry.fb == fb && entry.state == QhdTrial::state) {
+				QhdTrial::vram->retain();
+				return QhdTrial::vram;
+			}
+	}
 	Head2 *h = headFor(fb);
 	if (h && h->vram) {
 		h->vram->retain();
@@ -1300,6 +1318,13 @@ IODeviceMemory *wrapGetVRAMRange(void *fb) {
 // the other heads and the compute pool. Retained, as the original's is; a descriptor passed as IODeviceMemory, as the original does.
 IODeviceMemory *wrapGetApertureRange(void *fb, IOPixelAperture aperture) {
 	if (aperture == kIOFBSystemAperture) {
+		if (QhdTrial::state && QhdTrial::rate()) {
+			for (const auto &entry : fbTable)
+				if (entry.fb == fb && entry.state == QhdTrial::state) {
+					QhdTrial::surface->retain();
+					return QhdTrial::surface;
+				}
+		}
 		uint32_t width, height;
 		ScaledMemory *memory = nullptr;
 		if (Head2 *h = headFor(fb)) {
@@ -1361,7 +1386,8 @@ void attach(FbEntry &e) {
 		}
 	}
 #endif
-	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidData, dev.edidLen, be);
+	QhdTrial::prepare(*st, pci);
+	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidData, dev.fullEdidLen(), be);
 #ifdef AMDRadeonRDNA4_PVGPU
 	// A test boot's level (rdna4-trial) is only known once NVRAM is; the heads' framebuffers are told before macOS asks.
 	uint32_t pvTrial = 0, pvDisp = 0;
@@ -1396,8 +1422,9 @@ void attach(FbEntry &e) {
 #endif
 	e.state = st;
 	bootState = st;
+	if (QhdTrial::state == st) QhdTrial::registerControls();
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
-	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
+	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.fullEdidLen()));
 	fillHeads(dev);
 	// Behind the extra heads' slots, below the compute pool (128 MiB).
 	VramBench::run(dev.fbPhysBase, ((dev.fbLength + (1ull << 20) - 1) & ~((1ull << 20) - 1)) +
@@ -1478,8 +1505,10 @@ IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 comma
 		code = pb->code;
 		if (e->state) {
 			int32_t r = 0;
+			if (QhdTrial::state == e->state) IORecursiveLockLock(e->state->dev.extraLock);
 			answered = isStatus ? e->state->ndrv.status(code, pb->params, r)
 			                    : e->state->ndrv.control(code, pb->params, r);
+			if (QhdTrial::state == e->state) IORecursiveLockUnlock(e->state->dev.extraLock);
 			if (answered)
 				ret = static_cast<IOReturn>(r);
 		}
@@ -2666,6 +2695,8 @@ bool PvScanout::cursorMove(uint32_t port, int32_t x, int32_t y, bool visible)
 	});
 }
 
+bool PvScanout::fixedFrontBuffer(uint32_t port) { return port == 0 && QhdTrial::state && QhdTrial::state == bootState; }
+
 bool PvScanout::head(uint32_t port, Head &out)
 {
 	if (port == 0 && pvBootHead) {
@@ -2683,6 +2714,11 @@ bool PvScanout::head(uint32_t port, Head &out)
 		if (!bootState)
 			return false;
 
+		if (fixedFrontBuffer(port) && QhdTrial::rate()) {
+			const auto &plane = QhdTrial::plane;
+			out = { plane.physBase, plane.rowBytes, plane.width, plane.height };
+			return true;
+		}
 		// the mode it runs in now (bootModes), from the console's start at its pitch (deviceSurfaceFor); else the console's size
 		const RDNA4Device &dev = bootState->dev;
 		const Modes::Mode *table;

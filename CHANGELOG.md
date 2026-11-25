@@ -5,6 +5,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- **Native 2560×1440 desktop over DisplayPort (opt-in preview)**: `rdna4-qhdtrial=1` exposes a separate desktop
+  framebuffer through the native display mode interface on the supported single-head setup. An unconfirmed preview
+  restores the previous mode. On a Radeon RX 9070 XT with an Alienware AW2724DM and macOS Tahoe 26.7.3 (25G342),
+  CoreGraphics reported native 2560×1440 at both rates and both modes were visually confirmed. Hardware scanout
+  measured 59.948 Hz in RGB 10 bpc and 164.943 Hz in RGB 8 bpc. The tested build also included the separate PR #26 change.
 - **MetalFX's spatial upscaler works on the card, as AMD FSR 1**: MetalFX's own came back empty on our device, so games that ask
   for it got no upscaling. Quake II's Metal port with `r_metalfx 1` draws its view at half size and FSR brings it to full size, in 8-bit
   and in HDR colour.

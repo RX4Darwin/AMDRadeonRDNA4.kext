@@ -315,6 +315,11 @@ $(ATOMDUMP): test/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery
 
 atomdump: $(ATOMDUMP)
 
+DP_SURFACE_TEST = $(HOST)/dp-surface-test
+$(DP_SURFACE_TEST): test/dp-surface-test.cpp src/desktoptrial.hpp src/refresh_dml.inc $(ATOMDUMP)
+	@mkdir -p $(HOST)
+	$(CXX) -std=c++17 -Wall -O2 -Isrc -Iinclude -o $@ test/dp-surface-test.cpp src/modeset.cpp src/edid.cpp src/otgtiming.cpp src/pipe2.cpp src/dpphy.cpp
+
 PVSTREAM_TEST = $(HOST)/pvstream-test
 PVDRAW_TEST   = $(HOST)/pvdraw-test
 $(PVDRAW_TEST): test/pvdraw-test.cpp src/pvdraw.hpp
@@ -349,8 +354,9 @@ $(HOST)/test-w12k-pm4: test/test-w12k-pm4.cpp src/pm4.cpp src/pm4.hpp
 check-isa:
 	bash test/check-isa.sh
 
-test: $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(FSR1_TEST) $(DMUBLOAD_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
+test: $(DP_SURFACE_TEST) $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(FSR1_TEST) $(DMUBLOAD_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
 	@if [ -f $(ROM) ]; then echo "$(ATOMDUMP) $(ROM)"; $(ATOMDUMP) $(ROM); else echo "$(ATOMDUMP)   (no $(ROM))"; $(ATOMDUMP); fi
+	$(DP_SURFACE_TEST)
 	$(PVSTREAM_TEST)
 	$(PVDRAW_TEST)
 	$(FSR1_TEST)

@@ -219,6 +219,10 @@ bool build(const Target &t, Plan &out, const char **why) {
 		err = "target timing not programmable";
 		return false;
 	}
+	if (t.dpBpc && (!t.dp || (t.dpBpc != 8 && t.dpBpc != 10))) {
+		err = "invalid DisplayPort component depth";
+		return false;
+	}
 	if (t.dp) {
 		// More pixels per second than the link was trained for may not fit it.
 		if (t.to.pixelClockKHz == 0 || t.to.pixelClockKHz > t.dpMaxKHz) {
@@ -262,7 +266,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 		// --- dce110_blank_stream: enc1_stream_encoder_dp_blank, then idle pattern for the sink ---
 		b.update(kDpVidStreamCntl + dig, 0x300, 0x200, "dp stream off at the next vblank");
 		b.update(kDpVidStreamCntl + dig, 0x1, 0, "dp video stream off");
-		b.waitClear(kDpVidStreamCntl + dig, 1u << 16, 100200, "dp stream idle", true);
+		b.waitClear(kDpVidStreamCntl + dig, 1u << 16, 100200, "dp stream idle", !t.dpBpc);
 		b.update(kDpSteerFifo + dig, 0x2, 0x2, "dp steer fifo reset");
 		b.delay(60 * kMs, "idle pattern");
 	} else {
@@ -347,6 +351,12 @@ bool build(const Target &t, Plan &out, const char **why) {
 	b.update(kDigFeCntl + dig, 0x7, t.otg, "dig source otg");
 
 	if (t.dp) {
+		// Program the stream encoder and the receiver's MSA together while the stream is idle.
+		if (t.dpBpc) {
+			const uint32_t depth = t.dpBpc == 8 ? 1u : 2u;
+			b.update(0x211f + dig, 0x700u, depth << 8, "DP uncompressed component depth");
+			b.update(0x2120 + dig, 0xe0000000u, depth << 29, "DP MSA MISC0 component depth");
+		}
 		// --- enc401_stream_encoder_dp_set_stream_attribute: the MSA ---
 		static const char *const msaWhat[4] = { "msa totals", "msa active start", "msa sync", "msa active size" };
 		uint32_t msa[4];

@@ -64,14 +64,11 @@ public:
 	uint32_t            fbRowBytes { 0 };
 	uint32_t            fbDepth    { 32 };
 
-	// EDID of the boot display's sink: base block plus one CTA extension if
-	// present. 0 length = no DDC sink found.
-	uint8_t edidData[256] {};
-	size_t  edidLen { 0 };
-	// Its blocks 2 and 3 (E-DDC segment 1; DisplayID on a 144 Hz DisplayPort monitor), for the mode table only:
-	// macOS is given the two above.
-	uint8_t edidMore[256] {};
-	size_t  edidMoreLen { 0 };
+	// Base EDID and up to three extension blocks, in wire order. edidLen covers
+	// the base and first extension also used by legacy callers.
+	uint8_t edidData[512] {};
+	size_t edidLen { 0 }, edidMoreLen { 0 };
+	size_t fullEdidLen() const { return edidLen == 256 ? edidLen + edidMoreLen : edidLen; }
 	// A display beyond the boot one (rdna4-head2, plugin.cpp): the sink on
 	// another connector, the pipe it is lit on and what the kext lit for it.
 	// The second-pipe functions below act on the selected one (selectExtra).
@@ -173,6 +170,13 @@ public:
 	// Program mode `m` on the lit HDMI pipe (modeset.hpp). On failure the
 	// previous timing is programmed back and an error returned.
 	IOReturn applyMode(const Modes::Mode &m);
+	bool startDesktopTrial(uint64_t mc);
+	bool restoreDesktopTrial();
+	bool supportsNativeRefresh() const;
+	bool setDesktopRefresh(uint64_t mc, bool highRate);
+	bool trialMemoryOK(uint64_t bytes);
+	int trialRate() const;
+	int trialDepth() const;
 	// rdna4-boot4k: the boot display behind a passive DP++ adapter, which the
 	// firmware lights at what the adapter carries (2560x1440), taken over by a
 	// head's pipe that lights its connector at 3840x2160 in YCbCr 4:2:0, as
@@ -506,6 +510,13 @@ private:
 	Edid::DetailedTiming reqTiming {};
 	bool reqTimingValid { false };
 	ModeSet::Plan modePlan {};
+	ModeSet::Plan trialReturn {}, refreshReturn {};
+	uint64_t refreshSurface {}, trialHome {};
+	bool refreshReturnPending {}, refreshClocksPending {}, trialNeedsRestore {};
+	bool refreshLink(Edid::DetailedTiming &);
+	bool setRefreshClocks(bool high);
+	bool refreshClockSupport();
+	bool trialReadback(uint32_t width, uint32_t height, uint64_t mc, bool highRate = false);
 	bool pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out, uint8_t *ddcLine = nullptr);
 	// The lit pipe and its connector's wiring as a mode-set target (timings not filled in).
 	bool bootPipeTarget(ModeSet::Target &t);

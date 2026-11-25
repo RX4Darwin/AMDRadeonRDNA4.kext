@@ -125,6 +125,7 @@ struct Target {
 	// otherwise: at the monitor's native size the firmware runs the scaler
 	// 1:1 (DSCL_MODE 1), and its request timing goes with that.
 	bool        scalerOff;
+	uint8_t dpBpc {};         // zero preserves the firmware format; used only in the desktop refresh plans
 };
 
 // The first DP_VID_M (against a DP_VID_N of 0x8000) of a stream on a link with

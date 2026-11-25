@@ -38,6 +38,12 @@ constexpr uint64_t surfaceBytes(uint32_t pitchPixels, uint32_t height) {
 		: 0;
 }
 
+// A modeset may have requested a new primary surface one vblank before
+// the display stops reading the old one. Both register values matter.
+constexpr bool backBufferInUse(uint64_t requested, uint64_t shown, uint64_t a, uint64_t b) {
+	return (a && (a == requested || a == shown)) || (b && (b == requested || b == shown));
+}
+
 constexpr uint32_t addressLo(uint64_t address) {
 	return static_cast<uint32_t>(address);
 }

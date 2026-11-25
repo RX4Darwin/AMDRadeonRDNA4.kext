@@ -16,6 +16,7 @@
 #include "pvscanout.hpp"
 #include "sku.hpp"
 #include "compute.hpp"
+#include "flip.hpp"
 #include "isa.hpp"
 #include "mtlkernels.h"
 #include "nggfill_kernel.h"
@@ -8535,6 +8536,22 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	if (sm.phys != h.phys || sm.bytes != scanBytes || sm.mode != gPresentOnCard) {   // set up again when rdna4_pvpresent changed too
 		const uint32_t triedW = sm.triedW, triedH = sm.triedH;
 
+		if (!mNub && sm.phys && sm.phys != h.phys) {
+			// The native framebuffer already switched its home. Stop submitting
+			// flips to the old one. Keep our buffers through the last copy and
+			// the vblank at which the hardware actually leaves them.
+			sm.flips = sm.paused = false;
+			sm.queued = 0;
+			uint64_t requested = 0, shown = 0;
+			if ((sm.fence && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(sm.fence))) ||
+			    ((sm.mc[1] || sm.mc[2]) &&
+			     (!gCompute->rtScanoutShown(sm.hubp, requested, shown) ||
+			      Flip::backBufferInUse(requested, shown, sm.mc[1], sm.mc[2])))) {
+				if (s)
+					static_cast<OSObject *>(s)->release();
+				return false;
+			}
+		}
 		dropScanout(sm);
 		sm.triedW = triedW;
 		sm.triedH = triedH;
@@ -8775,7 +8792,7 @@ void RDNA4PvHost::setUpFlips(ScanoutMap &sm, uint32_t port)
 	uint8_t hubp = 0;
 	uint64_t mc = 0;
 
-	if (gPresentOnCard != 1 || !gCompute->rtScanoutHubp(sm.phys, hubp, mc))
+	if (PvScanout::fixedFrontBuffer(port) || gPresentOnCard != 1 || !gCompute->rtScanoutHubp(sm.phys, hubp, mc))
 		return;
 
 	sm.hubp = hubp;
@@ -8916,6 +8933,15 @@ void RDNA4PvHost::flipDone()
 		if (!sm.flips || !sm.queued || !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(sm.flipFence)))
 			continue;
 
+		if (!mNub) {
+			// displayTick can fire after the head moves but before the first
+			// present for its new surface. Discard that old queued flip.
+			PvScanout::Head head;
+			if (!PvScanout::head(static_cast<uint32_t>(&sm - mScanout), head) || head.phys != sm.phys) {
+				sm.queued = 0;
+				continue;
+			}
+		}
 		gCompute->rtScanoutFlip(sm.hubp, sm.mc[sm.queued - 1]);
 		sm.queued = 0;
 	}

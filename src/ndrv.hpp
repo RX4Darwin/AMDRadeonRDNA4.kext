@@ -273,6 +273,7 @@ public:
 	bool status(uint16_t code, void *params, int32_t &ret);
 	bool control(uint16_t code, void *params, int32_t &ret);
 
+	void adoptMode(const Modes::Mode &m) { current = idFor(m); }
 	int32_t currentModeId() const { return current; }
 
 	// Whether a display is on the connector. Without one cscGetConnection
