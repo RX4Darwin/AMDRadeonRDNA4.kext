@@ -1,6 +1,6 @@
 # Fan Control (RDNA4Gadget tab), plan
 
-Status, 2026-11-25: steps 1 and 2 done and card-run; steps 3 and 4 built (78cbe45), the root job not yet run on the test machine (below). Asked for by Sunneva with the Anti-Lag work.
+Status, 2026-11-25: steps 1 to 4 done and card-run (below); left: the tab clicked in the menu bar, system sleep. Asked for by Sunneva with the Anti-Lag work.
 
 ## What the card offers
 
@@ -65,8 +65,9 @@ Built as a root job rather than a property (Sunneva's choice): RDNA4Gadget's Fan
 `org.rdna4.fan` runs `Helpers/rdna4-fan-apply` as root when the file changes and at boot. The kext's read-only `debug.rdna4_fan_limits`
 gives the tab the card's limits. On a machine without the package: `sudo sh tools/rig/add-fan-helper.sh`.
 
-Card-run: the limits as a user; the tab's default curve applied line by line as the job does: 251 -> ~1500 RPM, reset to auto. Still to
-run: the job itself, the tab clicked, a reboot with custom settings (applied at boot), system sleep.
+Card-run: the limits as a user; the job (installed with add-fan-helper.sh) applied a file written by the user within 4 s: 0 -> ~1500 RPM;
+after a reboot it applied the saved curve 23 s into boot (`fan: applied` in the kernel log); writing `reset` brought back the card's
+settings. Still to run: the tab clicked in the menu bar (its writes are the same file), system sleep.
 
 ## Safety and open questions
 
