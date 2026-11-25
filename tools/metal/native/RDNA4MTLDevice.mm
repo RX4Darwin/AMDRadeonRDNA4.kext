@@ -4366,6 +4366,7 @@ static void eventWait(id event, uint64_t value)
 	NSUInteger _chunkUsed;
 	_Atomic MTLCommandBufferStatus _status;
 	uint64_t _createdUs, _committedUs;   // (the stats)
+	uint64_t _startedUs, _doneUs;        // when the work queue began and finished it: GPUStartTime / GPUEndTime
 	NSError *_error;
 }
 + (instancetype)allocWithZone:(NSZone *)zone
@@ -4564,8 +4565,9 @@ static int64_t earlyBacklog(void)   // RDNA4_EARLYBACKLOG=n: another cap, for me
 	[self waitUntilScheduled];
 }
 - (void)waitUntilCompleted { if (_status >= MTLCommandBufferStatusCommitted) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }
-- (CFTimeInterval)GPUStartTime { return 0; }
-- (CFTimeInterval)GPUEndTime { return 0; }
+// (CACurrentMediaTime's clock, as Metal's. ponytail: the work queue's run, so building the packets counts too: an upper bound of the GPU's)
+- (CFTimeInterval)GPUStartTime { return _startedUs / 1e6; }
+- (CFTimeInterval)GPUEndTime { return _doneUs / 1e6; }
 - (CFTimeInterval)kernelStartTime { return 0; }
 - (CFTimeInterval)kernelEndTime { return 0; }
 
@@ -4624,6 +4626,7 @@ static int64_t earlyBacklog(void)   // RDNA4_EARLYBACKLOG=n: another cap, for me
 	NSArray *waits = [_waits copy];   // (a command buffer is submitted once)
 	dispatch_block_t run = ^{
 		const uint64_t started = nowUs();
+		self->_startedUs = started;
 		statAdd(kStatWaitUs, started - self->_committedUs);
 		dispatch_queue_t handlers = self->_queue.handlers;
 		NSError *why = nil;
@@ -4701,6 +4704,7 @@ static int64_t earlyBacklog(void)   // RDNA4_EARLYBACKLOG=n: another cap, for me
 			if (shadowsDrawn)
 				scheduledNow();
 			const uint64_t done = nowUs();
+			self->_doneUs = done;
 			statAdd(kStatRunUs, done - started);
 			uint64_t vblNs = 0;   // the kext's last VBL event on display 0 (the same clock): where in the frame this one was made, committed, done
 			size_t vblLen = sizeof vblNs;
@@ -7051,9 +7055,17 @@ static void antiLagPace(id<MTLCommandBuffer> presenting)
 typedef id (*NewScalerFn)(id, SEL, id) __attribute__((ns_returns_retained));
 static NewScalerFn gRealNewSpatialScaler;
 
+// RDNA4Gadget's "MetalFX upscaling: AMD FSR" (on unless turned off): off, MetalFX's own scalers are asked (none that work on the card)
+static BOOL metalFXWanted(void)
+{
+	Boolean set = false;
+	const Boolean on = CFPreferencesGetAppBooleanValue(CFSTR("MetalFXFSR"), kGadgetDomain, &set);
+	return !set || on;
+}
+
 __attribute__((ns_returns_retained)) static id fxNewSpatialScaler(MTLFXSpatialScalerDescriptor *d, SEL sel, id<MTLDevice> device)
 {
-	if (![(id)device isKindOfClass:[RDNA4MTLDevice class]])
+	if (![(id)device isKindOfClass:[RDNA4MTLDevice class]] || !metalFXWanted())
 		return gRealNewSpatialScaler(d, sel, device);
 	if (fsrPixelFormat(d.colorTextureFormat) < 0 || d.colorTextureFormat != d.outputTextureFormat || !d.inputWidth || !d.inputHeight ||
 	    !d.outputWidth || !d.outputHeight) {
@@ -7073,7 +7085,7 @@ static NewScalerFn gRealNewTemporalScaler;
 
 __attribute__((ns_returns_retained)) static id fxNewTemporalScaler(MTLFXTemporalScalerDescriptor *d, SEL sel, id<MTLDevice> device)
 {
-	if (![(id)device isKindOfClass:[RDNA4MTLDevice class]])
+	if (![(id)device isKindOfClass:[RDNA4MTLDevice class]] || !metalFXWanted())
 		return gRealNewTemporalScaler(d, sel, device);
 	return rdna4NewTemporalScaler(d, device);
 }

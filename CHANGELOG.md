@@ -10,8 +10,10 @@ otherwise). The newest version is on top. How versions and branches work is in `
   and in HDR colour.
 - **MetalFX's temporal upscaler works on the card, as AMD FSR 3.1**: MetalFX's own ran nothing on our device. Its temporal scaler is
   now FSR 3.1's upscaler from AMD's FidelityFX SDK (v1.1.4, a submodule), its passes built into the driver bundle. Quake II's Metal port
-  with `r_metalfx 2` draws at half size and gets a full-size, temporally anti-aliased picture. Building it needs glslang and
-  spirv-cross (Homebrew).
+  with `r_metalfx 2` draws at half size and gets a full-size, temporally anti-aliased picture, about 2.4 ms a frame at 3200x1800,
+  in 8-bit and HDR colour; MetalQuake's MetalFX presets work too. RDNA4Gadget's Tweaks tab has a switch for it ("MetalFX upscaling:
+  AMD FSR", on by default). Building it needs glslang and spirv-cross (Homebrew).
+- **Command buffers report GPU start and end times** (`GPUStartTime`, `GPUEndTime`), so games' own frame timings work.
 - **Fan Control** in RDNA4Gadget's new Fans tab: Auto (the card's own) or a custom five-point curve, zero RPM and its stop
   temperature, within the card's limits, through the SMU's OverDrive table as Linux's amdgpu sets it. The package's root job
   `org.rdna4.fan` applies the settings at once and at every boot, without a password; each Apply is one change on the card.

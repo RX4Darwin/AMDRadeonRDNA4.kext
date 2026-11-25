@@ -1,6 +1,6 @@
 # MetalFX on our device, backed by AMD FSR, plan
 
-Status: steps 2 (spatial, FSR 1) and 3 (temporal, FSR 3.1) built and card-run 2026-11-25; motion, MetalQuake and the Gadget switch left. Asked for by Sunneva after the FSR 1 work (docs/fsr1-upscaling-plan.md).
+Status: steps 2 (spatial, FSR 1), 3 (temporal, FSR 3.1) and 4 (the Gadget switch) built and card-run 2026-11-25, with motion, HDR, cost and MetalQuake. Asked for by Sunneva after the FSR 1 work (docs/fsr1-upscaling-plan.md).
 
 ## Why
 
@@ -58,6 +58,15 @@ Windows DLLs, and the macOS port that exists extracts its model from that DLL (s
    `RDNA4_FSR3_JITTER="sx,sy"` scales it for a game that differs). Card: Quake II `r_metalfx 2`, 1600x900 -> 3200x1800 BGRA8, correct
    still frames, smoother edges than spatial. Not yet: motion (ghosting, disocclusion), cost per pass, HDR colour, MetalQuake, resize.
    The GPU faults seen during these runs (VMID 0, VA 0) come with `r_metalfx 0` as well: Quake II's own path, not the scaler.
+   **Follow-ups, 2026-11-25 evening (card):** motion (the player turning 40 degrees a second): edges clean, no doubling or trails.
+   Cost by the game's `metal_stats 2` (the scaler alone in a command buffer, now that our command buffers report GPUStartTime/EndTime:
+   the work queue's run, an upper bound): spatial 0.5 ms, temporal 8.9 ms at first, 2.3-2.4 ms once the scaler's textures were made
+   render targets (our device keeps only those in VRAM; per pass in host memory vs VRAM: accumulate 4.4 -> 0.73 ms, luma instability
+   2.8 -> 0.15, prepare inputs 1.0 -> 0.48, prepare reactivity 1.1 -> 0.63). HDR (`r_hdr 1`, RGBA16Float): correct, 2.3-2.6 ms.
+   MetalQuake: both presets (spatial and temporal, 2880x1620 -> 3840x2160 RGBA16Float) draw correctly during its attract demo.
+   RDNA4Gadget's Tweaks tab: "MetalFX upscaling: AMD FSR" (`MetalFXFSR`, on unless set off); off gives Apple's own (card-run).
+   Left: the reconstructed depth and SPD counter live in buffers (host memory: prepare inputs and reactivity could gain), jitter sign
+   untested with a game whose convention differs, a window resize, display sleep.
 4. **Hooks:** the two descriptor methods replaced once a process (as Super Resolution's CAMetalLayer methods), only for our device; any
    other device gets Apple's. A switch in RDNA4Gadget's Tweaks tab ("MetalFX: AMD FSR"), on by default once it works (without it, MetalFX
    does nothing on our device today).

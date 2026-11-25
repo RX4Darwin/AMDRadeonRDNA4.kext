@@ -77,7 +77,8 @@ static const float kNear = 0.1f, kFar = 1000.0f, kFovY = 1.2f;   // ponytail: Me
 	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:MAX(w, 1u) height:MAX(h, 1u)
 	                                                                         mipmapped:NO];
 	d.mipmapLevelCount = levels;
-	d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+	// a render target too: our device keeps those in VRAM (others in host memory, read over PCIe: the passes took 4x as long)
+	d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView | (levels == 1 ? MTLTextureUsageRenderTarget : 0);
 	d.storageMode = MTLStorageModePrivate;
 	return [_device newTextureWithDescriptor:d];
 }

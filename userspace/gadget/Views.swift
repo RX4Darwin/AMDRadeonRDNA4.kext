@@ -185,6 +185,7 @@ struct TweaksView: View {
     @AppStorage("Sharpness") private var sharpness = 200         // RCAS, thousandths of a stop below the sharpest
     @AppStorage("AntiLag") private var antiLag = false          // the Metal driver keeps the CPU at most a frame ahead
     @AppStorage("AntiLag2") private var antiLag2 = false        // Mesa's Anti-Lag layer loaded into Vulkan games
+    @AppStorage("MetalFXFSR") private var metalFXFSR = true     // MetalFX's scalers answered by AMD FSR 1 (spatial) and FSR 3.1 (temporal)
 
     // Anti-Lag 2: Mesa's layer is an implicit one loaded while ENABLE_LAYER_MESA_ANTI_LAG=1, set for the login session's apps
     static func applyAntiLag2(_ on: Bool) {
@@ -216,6 +217,10 @@ struct TweaksView: View {
             }
             .disabled(!superResolution)
             Text("Games drawing below the screen's resolution are upscaled with FSR 1 instead of stretched; a render scale makes them draw fewer pixels for more frames (turn it off for a game that then draws the wrong size).")
+                .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Divider()
+            Toggle("MetalFX upscaling: AMD FSR", isOn: $metalFXFSR).toggleStyle(.switch)
+            Text("Games that use Apple's MetalFX upscaling get AMD FSR on the card: FSR 1 for its spatial mode, FSR 3.1 for its temporal mode. Off, MetalFX's own scalers are used, which do not run on this card.")
                 .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Divider()
             Toggle("Anti-Lag", isOn: $antiLag).toggleStyle(.switch)
