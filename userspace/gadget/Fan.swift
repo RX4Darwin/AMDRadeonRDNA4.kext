@@ -87,6 +87,9 @@ struct FanView: View {
                     Text("Custom curve").tag(true)
                 }
                 .pickerStyle(.segmented).labelsHidden()
+                // a curve with zero RPM on stays stopped below the stop temperature (the card's rule, as in Adrenalin): choosing a
+                // curve turns zero RPM off, and it can be turned on again
+                .onChange(of: custom) { if $0 { zeroRPM = false } }
                 if custom {
                     Chart {
                         ForEach(Array(points.enumerated()), id: \.offset) { _, pt in
@@ -118,20 +121,30 @@ struct FanView: View {
                         Stepper("below \(stopTemp) °C", value: $stopTemp, in: stops).disabled(!zeroRPM).monospacedDigit()
                     }
                     .font(.caption)
+                    if custom && zeroRPM {
+                        Text("With zero RPM on, the fan stays stopped below \(stopTemp) °C whatever the curve says; the curve applies above it.")
+                            .font(.caption2).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 HStack {
                     Button("Apply") { apply() }
                     Button("Reset to the card's") { reset() }
                     Spacer()
                     if let g = model.gpus.first {
-                        Text(g.fanRPM.map { $0 == 0 ? "fan stopped" : String(format: "%.0f RPM", $0) } ?? "")
-                            .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                        Text(fanStatus(g)).font(.caption).monospacedDigit().foregroundStyle(.secondary)
                     }
                 }
                 Text(message ?? "Now: \(applied)").font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         }
         .onAppear { refresh() }
+    }
+
+    /// The fan's speed, and why it stands when zero RPM holds it (on in what is applied, the card below its stop temperature)
+    private func fanStatus(_ g: GPUReading) -> String {
+        guard let rpm = g.fanRPM else { return "" }
+        if rpm > 0 { return String(format: "%.0f RPM", rpm) }
+        return applied.contains("zero 1") || applied.hasPrefix("auto (") ? "fan stopped (zero RPM)" : "fan stopped"
     }
 
     private func refresh() {
