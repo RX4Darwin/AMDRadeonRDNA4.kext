@@ -1,6 +1,6 @@
 # Fan Control (RDNA4Gadget tab), plan
 
-Status, 2026-11-25: steps 1 and 2 done and card-run (below); the app interface and the tab are next. Asked for by Sunneva with the Anti-Lag work.
+Status, 2026-11-25: steps 1 and 2 done and card-run; steps 3 and 4 built (78cbe45), the root job not yet run on the test machine (below). Asked for by Sunneva with the Anti-Lag work.
 
 ## What the card offers
 
@@ -57,6 +57,16 @@ driver table is now held by a lock for each transfer (`smuTableLock`): sensor re
 On the card: idle with zero RPM 0 RPM at 48 C; `zero 0` -> 960 RPM within 15 s; `curve 25:40,40:50,60:60,80:80,100:100` -> about 2200-2340
 RPM, 48 -> 38 C; a 10 % point refused (EINVAL), nothing changed; `reset` -> the vBIOS's settings, fan stopped again. Not tested yet:
 applying again after system sleep (the rig cannot be woken remotely).
+
+## Steps 3 and 4 (2026-11-25)
+
+Built as a root job rather than a property (Sunneva's choice): RDNA4Gadget's Fans tab writes its settings as `debug.rdna4_fan` commands
+(`reset` first) to `/Library/Application Support/AMDRadeonRDNA4/fan.conf` (group admin, made by the package); the package's LaunchDaemon
+`org.rdna4.fan` runs `Helpers/rdna4-fan-apply` as root when the file changes and at boot. The kext's read-only `debug.rdna4_fan_limits`
+gives the tab the card's limits. On a machine without the package: `sudo sh tools/rig/add-fan-helper.sh`.
+
+Card-run: the limits as a user; the tab's default curve applied line by line as the job does: 251 -> ~1500 RPM, reset to auto. Still to
+run: the job itself, the tab clicked, a reboot with custom settings (applied at boot), system sleep.
 
 ## Safety and open questions
 
