@@ -28,6 +28,7 @@
 #include "../src/modeset.hpp"
 #include "../src/pipe2.hpp"
 #include "../src/dptrain.hpp"
+#include "../src/desktoptrial.hpp"
 #include "../src/dpphy.hpp"
 #include "../src/dpdual.hpp"
 #include "../src/amdfw.hpp"
@@ -539,6 +540,49 @@ static int testModes() {
 		failures += check(q144 && f144 && !uhdFast && dm[0].native && dm[0].t.pixelClockKHz == 533250,
 		                  "Samsung with its DisplayID block on HBR2: 1440p144 %d, 1080p144 %d, a faster 4K %d (%zu modes)",
 		                  q144, f144, uhdFast, dmn);
+		Pipe2::use(1, false, 0, true);
+		DesktopTrial::Choice low {}, fast {};
+		DesktopTrial::chooseModes(full, sizeof(full), 576000, 650000, true, low, fast);
+		failures += check(low.hz() == 60 && low.source == Modes::SourceCtaDtd && low.block == 1 &&
+		                  fast.hz() == 144 && fast.source == Modes::SourceDisplayId && fast.block == 2,
+		                  "QHD preview: CTA 60 Hz and highest compatible DisplayID rate");
+		DesktopTrial::chooseModes(full, sizeof(full), 420000, 500000, false, low, fast);
+		failures += check(low.hz() == 60 && fast.hz() == 120 && fast.source == Modes::SourceCtaDtd,
+		                  "QHD preview: bandwidth falls back to the CTA 120 Hz descriptor");
+		DesktopTrial::chooseModes(full, sizeof(full), 240000, 650000, true, low, fast);
+		failures += check(!low.hz() && !fast.hz(), "QHD preview: fast mode requires a viable 60 Hz fallback");
+
+		// Advertise the exact 165 Hz raised-clock raster in the first DisplayID descriptor.
+		memcpy(b2 + 8, b2 + 8 + 3 * 20, 20);
+		const uint32_t clock165 = 699500 / 10 - 1;
+		b2[8] = clock165 & 0xff;
+		b2[9] = (clock165 >> 8) & 0xff;
+		b2[10] = clock165 >> 16;
+		b2[22] = 119 - 1;
+		fixChecksum(b2);
+		DesktopTrial::chooseModes(full, sizeof(full), 576000, 720000, true, low, fast);
+		failures += check(low.hz() == 60 && fast.hz() == 165, "QHD preview: select the exact raised-clock raster");
+		DesktopTrial::chooseModes(full, sizeof(full), 576000, 720000, false, low, fast);
+		failures += check(low.hz() == 60 && fast.hz() == 144, "QHD preview: reject 165 Hz without raised clocks");
+		b2[16]--;   // Change the horizontal front porch without changing the advertised rate.
+		fixChecksum(b2);
+		DesktopTrial::chooseModes(full, sizeof(full), 576000, 720000, true, low, fast);
+		failures += check(low.hz() == 60 && fast.hz() == 144, "QHD preview: reject an unmatched 165 Hz raster");
+
+		b2[127] ^= 1;
+		DesktopTrial::chooseModes(full, sizeof(full), 300000, 650000, true, low, fast);
+		failures += check(low.hz() == 60 && fast.hz() == 120, "QHD preview: skip extension with bad checksum");
+		DesktopTrial::chooseModes(full, sizeof(full), 300000, 300000, false, low, fast);
+		failures += check(low.hz() == 60 && !fast.hz(), "QHD preview: 60 Hz works without a fast mode");
+		memcpy(full + 54, full + 128 + full[130], 18);
+		full[126] = 0;
+		fixChecksum(full);
+		DesktopTrial::chooseModes(full, sizeof(full), 300000, 720000, true, low, fast);
+		failures += check(low.hz() == 60 && low.source == Modes::SourceDtd && low.block == 0 && !fast.hz(),
+		                  "QHD preview: accept a base-block-only monitor and ignore unannounced extensions");
+		full[127] ^= 1;
+		DesktopTrial::chooseModes(full, sizeof(full), 300000, 650000, true, low, fast);
+		failures += check(!low.hz() && !fast.hz(), "QHD preview: reject EDID with bad base checksum");
 	}
 
 	Mode sm[Modes::MaxModes];
@@ -1499,6 +1543,32 @@ struct TrainRig {
 static int testDpTrain() {
 	int failures = 0;
 	const DpTrain::Link hbr2x4 { 4, DpTrain::kHbr2 };
+	{
+		uint8_t base[16] {0x12, DpTrain::kHbr2, 0xc4};
+		uint8_t extended[16] {0x14, DpTrain::kHbr3, 0xc4, 0x80};
+		extended[6] = 1;
+		DpTrain::Sink sink {};
+		DpTrain::Link target {};
+		failures += check(DesktopTrial::receiverCaps(base, extended, sink) && sink.maxRate == DpTrain::kHbr2 &&
+		                  DesktopTrial::chooseRgb10Link(sink, hbr2x4, 497750, target) && target.rate == DpTrain::kHbr2 &&
+		                  !DesktopTrial::chooseRgb10Link(sink, hbr2x4, 699500, target),
+		                  "QHD boot: base DPCD limits 165 Hz to RGB8 but allows 120 Hz RGB10");
+		base[0x0e] = 0x80;
+		failures += check(DesktopTrial::receiverCaps(base, extended, sink) && sink.maxRate == DpTrain::kHbr3 &&
+		                  DesktopTrial::chooseRgb10Link(sink, hbr2x4, 699500, target) && target.rate == DpTrain::kHbr3 &&
+		                  target.lanes == 4 && !DesktopTrial::chooseRgb10Link(sink, {2, DpTrain::kHbr2}, 699500, target),
+		                  "QHD boot: extended DPCD enables HBR3 x4 and does not change lane topology");
+		extended[6] = 0;
+		failures += check(!DesktopTrial::receiverCaps(base, extended, sink),
+		                  "QHD boot: reject malformed advertised extended DPCD");
+		base[0x0e] = 0;
+		base[1] = DpTrain::kHbr3;
+		base[3] = 0x80;
+		failures += check(DesktopTrial::receiverCaps(base, extended, sink) &&
+		                  DesktopTrial::chooseRgb10Link(sink, {4, DpTrain::kHbr3}, 699500, target) &&
+		                  target.rate == DpTrain::kHbr3 && !DesktopTrial::chooseRgb10Link(sink, hbr2x4, 900000, target),
+		                  "QHD boot: base-only HBR3 works and over-budget timings are rejected");
+	}
 	size_t events = 0, regWrites = 0;
 	for (const TrainRun &run : kTrainRuns) {
 		TrainRig rig(run.kind, run.swing, run.pre);

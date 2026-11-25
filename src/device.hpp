@@ -26,6 +26,7 @@
 #include "dmub.hpp"
 #include "ipdiscovery.hpp"
 #include "modes.hpp"
+#include "desktoptrial.hpp"
 #include "modeset.hpp"
 #include "ndrv.hpp"
 #include "pipe.hpp"
@@ -173,12 +174,13 @@ public:
 	bool startDesktopTrial(uint64_t mc);
 	bool prepareDesktopStartup();
 	bool restoreDesktopTrial();
-	bool supportsNativeRefresh() const;
+	bool chooseDesktopModes(DesktopTrial::Choice &low, DesktopTrial::Choice &fast);
 	bool setDesktopRefresh(uint64_t mc, bool highRate);
 	bool startDesktopDeepColor(uint64_t mc);
 	bool restoreDesktopDeepColor();
 	bool verifyDesktopDeepColor();
 	bool verifyDesktopRgb8();
+	bool readTrialLink(DpTrain::Link &link, DpTrain::Sink *receiver = nullptr);
 	bool trialMemoryOK(uint64_t bytes);
 	int trialRate() const;
 	int trialDepth() const;
@@ -525,13 +527,18 @@ private:
 	bool deepReturnPending {};
 	uint32_t deepSavedVidM {};
 	DpTrain::Sink deepSink {};
+	DpTrain::Link deepPrevious {}, deepTarget {};
 	uint8_t deepConnector {};
-	bool verifyDeepColorLink(uint8_t rate, int bpc);
-	bool programDeepColorLink(uint8_t rate, uint8_t bpc, uint32_t vidM);
-	bool refreshLink(Edid::DetailedTiming &);
+	bool verifyDeepColorLink(const DpTrain::Link &expected, int bpc);
+	bool programDeepColorLink(const DpTrain::Link &link, uint8_t bpc, uint32_t vidM, bool restoring);
+	DesktopTrial::Choice trialLow {}, trialFast {};
+	int trialHomeBpc {};
+	bool trialSinglePipe();
+	bool trialSinkMatches(const DesktopTrial::Choice &mode);
+	uint32_t trialLinkKbps();
 	bool setRefreshClocks(bool high);
 	bool refreshClockSupport();
-	bool trialReadback(uint32_t width, uint32_t height, uint64_t mc, bool highRate = false);
+	bool trialReadback(uint64_t mc, const Edid::DetailedTiming &timing, bool desktop, int bpc = 0);
 	bool pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out, uint8_t *ddcLine = nullptr);
 	// The lit pipe and its connector's wiring as a mode-set target (timings not filled in).
 	bool bootPipeTarget(ModeSet::Target &t);

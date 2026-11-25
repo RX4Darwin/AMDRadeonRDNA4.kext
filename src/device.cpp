@@ -3614,14 +3614,8 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 }
 
 
-static bool matchesHigh(const Edid::DetailedTiming &t) {
-	return t.pixelClockKHz == 699500 && t.hActive == 2560 && t.hBlank == 160 &&
-	       t.hSyncOffset == 48 && t.hSyncWidth == 32 && t.vActive == 1440 && t.vBlank == 119 &&
-	       t.vSyncOffset == 3 && t.vSyncWidth == 5 && t.hSyncPositive && !t.vSyncPositive && !t.interlaced;
-}
 // Last OTG rate measured over ten hardware frame edges by the private-plane check.
 static int rx4MeasuredMilliHz = 0;
-static int rx4RefreshCheck = 0;
 static int rx4VerifiedBpc = 0;
 
 // DIG0 RGB on a legacy MSA stream. With MISC1 bit 6 set the sink gets
@@ -3635,115 +3629,115 @@ static int rgbStreamBpc(uint32_t format, uint32_t color, uint32_t misc) {
 		return 0;
 	return depth == 1 ? 8 : depth == 2 ? 10 : 0;
 }
-static unsigned int rx4RefreshLinkValue = 0;
 // Port 0 only. Both immutable plans exist before the first register write.
-bool RDNA4Device::trialReadback(uint32_t w, uint32_t h, uint64_t mc, bool highRate) {
-	Pipe::State s {};
-	Edid::DetailedTiming t {};
-	if (!Pipe::discover(pipeRead, this, s) || !Pipe::timingFromOtg(s, t) ||
-	    s.otg || s.opp || s.hubp || s.dig || s.link || s.hpd != 1 || s.signal != Pipe::Signal::DpSst ||
-	    s.viewportW != w || s.viewportH != h || s.pitchPx != w ||
-	    t.hActive != (w == 1920 ? liveTiming.hActive : w) || t.vActive != (w == 1920 ? liveTiming.vActive : h))
+bool RDNA4Device::trialSinglePipe() {
+	if (!pipe.valid() || pipe.signal != Pipe::Signal::DpSst || pipe.otg || pipe.opp || pipe.hubp ||
+	    pipe.dig || pipe.link || pipe.hpd != 1)
 		return false;
-	const uint64_t period = measureFramePeriodNs();
-	const uint64_t shown = (static_cast<uint64_t>(regReadDmu(2, 0x061d) & 0xffff) << 32) |
-	                       (regReadDmu(2, 0x061c) & 0xffffff00u);
-	const bool rateOk = highRate ? (period >= 6000000 && period <= 6130000 && t.hTotal() == 2720 && t.vTotal() == 1559)
-	                             : period >= 16393442 && period <= 16949153;
-	const bool verified = rateOk && bootScanout() == mc && shown == mc;
-	if (verified) {
-		__atomic_store_n(&rx4MeasuredMilliHz, static_cast<int>(1000000000000ull / period), __ATOMIC_RELEASE);
-		const int bpc = rgbStreamBpc(regReadDmu(2, 0x211f), regReadDmu(2, 0x2120), regReadDmu(2, 0x2124));
-		__atomic_store_n(&rx4VerifiedBpc, bpc, __ATOMIC_RELEASE);
+	for (unsigned i = 1; i < 4; ++i) {
+		const uint32_t control = regReadDmu(2, Pipe::Reg::kOtgControl + i * Pipe::Reg::kOtgStride);
+		if ((control & 1) || control == ~0u)
+			return false;
 	}
-	return verified;
-}
-
-bool RDNA4Device::refreshLink(Edid::DetailedTiming &high) {
-	rx4RefreshCheck = 1;
-	if (!trialNeedsRestore || bootReleased || !uhdClocks || !sinkAuxValid || !bootSinkPresent() ||
-	    edidLen < 128 || edidData[8] != 0x10 || edidData[9] != 0xac || edidData[10] != 0x23 || edidData[11] != 0xa2)
-		return false;
-	// Read the monitor connected now. E-DDC block 2 is segment 1, offset 0.
-	rx4RefreshCheck = 2;
-	uint8_t block[128];
-	if (!readEDID(sinkAuxInst, block, sizeof(block), 0) || !Edid::baseBlockValid(block, sizeof(block)) ||
-	    memcmp(block, edidData, sizeof(block)) || block[126] < 2 ||
-	    !readEDID(sinkAuxInst, block, sizeof(block), 0, 1) || block[0] != 0x70 || !Edid::blockChecksumOk(block)) {
-		FBLOG("refresh: current Dell DisplayID unavailable");
-		return false;
-	}
-	Edid::DetailedTiming timings[6] {};
-	const size_t count = Edid::displayIdTimings(block, timings, 6);
-	bool found = false;
-	for (size_t i = 0; i < count; ++i)
-		if (matchesHigh(timings[i])) { high = timings[i]; found = true; break; }
-	DpTrain::Sink sink {};
-	DpTrain::Link link {};
-	uint8_t status[3] {};
-	// This plan is for uncompressed RGB8 on an already-trained single stream.
-	uint8_t compression = 0xff;
-	rx4RefreshCheck = 3;
-	if (!found) return false;
-	// Keep the tested link policy and its short-circuit read order. Preserve the
-	// first failed check and its raw value for the console diagnostic after rollback.
-	auto refused = [](int reason, unsigned int value) {
-		__atomic_store_n(&rx4RefreshLinkValue, value, __ATOMIC_RELAXED);
-		__atomic_store_n(&rx4RefreshCheck, reason, __ATOMIC_RELEASE);
-		FBLOG("refresh: link check %d refused, observed 0x%08x", reason, value);
-		return false;
-	};
-	__atomic_store_n(&rx4RefreshLinkValue, 0, __ATOMIC_RELAXED);
-	if (!readBootDpLink(sink, link)) return refused(40, 0);
-	if (link.lanes != 4) return refused(41, link.lanes);
-	if (link.rate != DpTrain::kHbr2 && link.rate != DpTrain::kHbr3) return refused(42, link.rate);
-	const uint32_t available = DpTrain::bandwidthKbps(link);
-	if (available < high.pixelClockKHz * 24) return refused(43, available);
-	if (!dpcdRead(sinkAuxInst, 0x202, status, sizeof(status))) return refused(44, 0x202);
-	if (!DpTrain::linkUp(status, 4))
-		return refused(45, status[0] | (uint32_t(status[1]) << 8) | (uint32_t(status[2]) << 16));
-	if (!dpcdRead(sinkAuxInst, 0x160, &compression, 1)) return refused(46, 0x160);
-	if (compression & 1) return refused(47, compression);
-	const uint32_t format = regReadDmu(2, 0x211f);
-	if (format == 0xffffffffu) return refused(48, format);
-	if ((format & 0x10731) != 0x200) return refused(49, format);
-	const uint32_t misc = regReadDmu(2, 0x2124);
-	if (misc == ~0u || (misc & 0xc0)) return refused(50, misc);
-	const uint32_t color = regReadDmu(2, 0x2120);
-	if (rgbStreamBpc(format, color, misc) != 10) return refused(51, color);
 	return true;
 }
 
-// Advertise the two modes from the initial framebuffer enumeration. Use only
-// cached monitor data here; AUX, clock and format checks run again on a modeset.
-bool RDNA4Device::supportsNativeRefresh() const {
-	if (!sinkAuxValid || !pipe.valid() || pipe.signal != Pipe::Signal::DpSst ||
-	    pipe.dig || pipe.link || pipe.hpd != 1 || edidLen < 128 ||
-	    edidData[8] != 0x10 || edidData[9] != 0xac || edidData[10] != 0x23 || edidData[11] != 0xa2)
+bool RDNA4Device::trialReadback(uint64_t mc, const Edid::DetailedTiming &timing, bool desktop, int bpc) {
+	Pipe::State s {};
+	Edid::DetailedTiming t {};
+	const uint32_t w = desktop ? DesktopTrial::width : fbWidth;
+	const uint32_t h = desktop ? DesktopTrial::height : fbHeight;
+	if (!Pipe::discover(pipeRead, this, s) || !Pipe::timingFromOtg(s, t) ||
+	    s.otg || s.opp || s.hubp || s.dig || s.link || s.hpd != 1 || s.signal != Pipe::Signal::DpSst ||
+	    s.viewportW != w || s.viewportH != h || s.pitchPx != w ||
+	    t.hActive != timing.hActive || t.vActive != timing.vActive)
 		return false;
-	for (size_t n = 0; n + 128 <= edidMoreLen; n += 128) {
-		const uint8_t *block = edidData + 256 + n;
-		if (block[0] != 0x70 || !Edid::blockChecksumOk(block)) continue;
-		Edid::DetailedTiming timings[6] {};
-		const size_t count = Edid::displayIdTimings(block, timings, 6);
-		for (size_t i = 0; i < count; ++i)
-			if (matchesHigh(timings[i])) return true;
-	}
-	return false;
+	t.pixelClockKHz = timing.pixelClockKHz;
+	if (desktop && !Edid::sameTiming(t, timing))
+		return false;
+	const uint64_t period = measureFramePeriodNs();
+	const uint32_t expected = timing.refreshMilliHz();
+	const uint64_t measured = period ? 1000000000000ull / period : 0;
+	const uint64_t shown = (static_cast<uint64_t>(regReadDmu(2, 0x061d) & 0xffff) << 32) |
+	                       (regReadDmu(2, 0x061c) & 0xffffff00u);
+	const int depth = rgbStreamBpc(regReadDmu(2, 0x211f), regReadDmu(2, 0x2120), regReadDmu(2, 0x2124));
+	if (!expected || measured * 100 < expected * 99ull || measured * 100 > expected * 101ull ||
+	    bootScanout() != mc || shown != mc || !depth || (bpc && depth != bpc))
+		return false;
+	__atomic_store_n(&rx4MeasuredMilliHz, static_cast<int>(measured), __ATOMIC_RELEASE);
+	__atomic_store_n(&rx4VerifiedBpc, depth, __ATOMIC_RELEASE);
+	return true;
 }
 
-bool RDNA4Device::verifyDeepColorLink(uint8_t rate, int bpc) {
-	uint8_t set[3] {}, status[3] {}, compression = 0xff;
+bool RDNA4Device::trialSinkMatches(const DesktopTrial::Choice &mode) {
+	uint8_t block[Edid::BlockSize];
+	if (!bootSinkPresent() || !readEDID(sinkAuxInst, block, sizeof(block), 0) ||
+	    memcmp(block, edidData, sizeof(block)))
+		return false;
+	return !mode.block ||
+	       (readEDID(sinkAuxInst, block, sizeof(block), (mode.block & 1) * Edid::BlockSize, mode.block / 2) &&
+	        !memcmp(block, edidData + mode.block * Edid::BlockSize, sizeof(block)));
+}
+
+bool RDNA4Device::readTrialLink(DpTrain::Link &link, DpTrain::Sink *receiver) {
+	DpTrain::Sink sink {};
+	uint8_t base[16] {}, extended[16] {}, set[3] {};
+	uint8_t status[3] {}, compression = 0;
+	if (!sinkAuxValid || !bootSinkPresent() || !dpcdRead(sinkAuxInst, 0, base, sizeof(base)) ||
+	    ((base[0x0e] & 0x80) && !dpcdRead(sinkAuxInst, 0x2200, extended, sizeof(extended))) ||
+	    !DesktopTrial::receiverCaps(base, extended, sink) ||
+	    !dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) || (set[2] & 0x0f))
+		return false;
+	link = {static_cast<uint8_t>(set[1] & 0x1f), set[0]};
+	if ((link.lanes != 1 && link.lanes != 2 && link.lanes != 4) ||
+	    link.lanes > sink.maxLanes || link.rate > sink.maxRate ||
+	    (link.rate != DpTrain::kRbr && link.rate != DpTrain::kHbr &&
+	     link.rate != DpTrain::kHbr2 && link.rate != DpTrain::kHbr3) ||
+	    !dpcdRead(sinkAuxInst, 0x202, status, sizeof(status)) || !DpTrain::linkUp(status, link.lanes) ||
+	    (sink.rev >= 0x14 && (!dpcdRead(sinkAuxInst, 0x160, &compression, 1) || (compression & 1))))
+		return false;
+	if (receiver)
+		*receiver = sink;
+	return true;
+}
+
+uint32_t RDNA4Device::trialLinkKbps() {
+	DpTrain::Link link {};
+	return readTrialLink(link) ? DpTrain::bandwidthKbps(link) : 0;
+}
+
+bool RDNA4Device::chooseDesktopModes(DesktopTrial::Choice &low, DesktopTrial::Choice &fast) {
+	ExtraHold hold(*this);
+	if (!extraLock || !sinkAuxValid || !trialSinglePipe() || !Pipe2::use(1, false, 0, true))
+		return false;
+	struct ResetTable { RDNA4Device &d; ~ResetTable() { d.useSlotTable(); } } reset {*this};
+	const uint32_t link = trialLinkKbps();
+	const int depth = rgbStreamBpc(regReadDmu(2, 0x211f), regReadDmu(2, 0x2120), regReadDmu(2, 0x2124));
+	if (!link || !depth)
+		return false;
+	const uint32_t dispclk = dispclkTargetKHz();
+	const uint32_t clock = max(bootTiming.pixelClockKHz, dispclk);
+	const bool raised = dispclk == DesktopTrial::standardClockKHz;
+	DesktopTrial::chooseModes(edidData, fullEdidLen(), min(clock, link / (3u * static_cast<uint32_t>(depth))),
+	                          min(raised ? DesktopTrial::raisedClockKHz : min(clock, DesktopTrial::standardClockKHz),
+	                              link / 24),
+	                          raised, low, fast);
+	if (!low.hz())
+		return false;
+	trialLow = low;
+	trialFast = fast;
+	return true;
+}
+
+bool RDNA4Device::verifyDeepColorLink(const DpTrain::Link &expected, int bpc) {
+	DpTrain::Link current {};
 	const uint32_t stream = regReadDmu(2, 0x2122);
-	return bootSinkPresent() && stream != ~0u && (stream & 0x10001) == 0x10001 &&
-	       dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) && set[0] == rate &&
-	       (set[1] & 0x1f) == 4 && !(set[2] & 0x0f) &&
-	       dpcdRead(sinkAuxInst, 0x202, status, sizeof(status)) && DpTrain::linkUp(status, 4) &&
-	       dpcdRead(sinkAuxInst, 0x160, &compression, 1) && !(compression & 1) &&
-	       trialReadback(2560, 1440, refreshSurface, true) && trialDepth() == bpc;
+	return stream != ~0u && (stream & 0x10001) == 0x10001 &&
+	       readTrialLink(current) && current.rate == expected.rate && current.lanes == expected.lanes &&
+	       trialReadback(refreshSurface, trialFast.timing, true, bpc);
 }
 
-bool RDNA4Device::programDeepColorLink(uint8_t rate, uint8_t bpc, uint32_t vidM) {
+bool RDNA4Device::programDeepColorLink(const DpTrain::Link &link, uint8_t bpc, uint32_t vidM, bool restoring) {
 	if (!bootSinkPresent() || !ModeSet::buildDpStreamOff(pipe.dig, modePlan))
 		return false;
 	if (!runPlan(modePlan)) {
@@ -3751,149 +3745,156 @@ bool RDNA4Device::programDeepColorLink(uint8_t rate, uint8_t bpc, uint32_t vidM)
 		// During rollback only, retrain with ENABLE clear and require idle
 		// again after restoring the clock, before touching the RGB format.
 		const uint32_t stream = regReadDmu(2, 0x2122);
-		if (rate != DpTrain::kHbr2 || stream == ~0u || (stream & 1))
+		if (!restoring || stream == ~0u || (stream & 1))
 			return false;
 	}
 	DpTrain::Report report {};
-	const auto result = trainLink(sinkAuxInst, pipe.link, pipe.hpd, deepConnector, deepSink, {4, rate}, true, report);
-	FBLOG("QHD 10 bpc: link 0x%02x training %s after %u attempt(s)", rate, DpTrain::resultName(result), report.attempts);
+	const auto result = trainLink(sinkAuxInst, pipe.link, pipe.hpd, deepConnector, deepSink, link, true, report);
+	FBLOG("QHD 10 bpc: link 0x%02x x%u training %s after %u attempt(s)",
+	      link.rate, link.lanes, DpTrain::resultName(result), report.attempts);
 	if (result != DpTrain::Result::Ok)
 		return false;
 	ModeSet::Step steps[DpPhy::kMaxSteps];
 	return runSteps(steps, DpPhy::streamSteps(pipe.dig, pipe.link, steps), nullptr, 0, "deep color", otgOff()) &&
 	       ModeSet::buildDpStreamOn(pipe.dig, bpc, vidM, modePlan) && runPlan(modePlan) &&
-	       verifyDeepColorLink(rate, bpc);
+	       verifyDeepColorLink(link, bpc);
 }
 
 bool RDNA4Device::startDesktopDeepColor(uint64_t mc) {
 	ExtraHold hold(*this);
-	constexpr uint32_t kPixelClockKHz = 699500;
-	constexpr DpTrain::Link target {4, DpTrain::kHbr3};
-	static_assert(DpTrain::bandwidthKbps(target) >= kPixelClockKHz * 30, "HBR3 fits uncompressed RGB10");
-	if (!extraLock || deepReturnPending || !refreshReturnPending || !refreshClocksPending ||
+	const uint32_t clock = trialFast.timing.pixelClockKHz;
+	if (!extraLock || deepReturnPending || !refreshReturnPending ||
 	    !mc || mc != refreshSurface || bootReleased || !displayPowerOn || dpTrainLevel >= 2 ||
-	    !supportsNativeRefresh() || !verifyDeepColorLink(DpTrain::kHbr2, 8))
+	    !trialSinglePipe() || !trialSinkMatches(trialFast))
 		return false;
-	for (unsigned i = 1; i < Pipe::kMaxOtg; ++i) {
-		const uint32_t ctl = regReadDmu(2, Pipe::Reg::kOtgControl + i * Pipe::Reg::kOtgStride);
-		if (ctl == ~0u || (ctl & 1))
-			return false;
-	}
-	BootDpcdSnapshot caps {};
+	// EDID 1.4 may declare depth. A verified firmware RGB10 stream also
+	// establishes sink support when EDID leaves that field undefined.
+	const unsigned depthCode = (edidData[20] >> 4) & 7;
+	const bool advertised10 = edidData[18] == 1 && edidData[19] >= 4 && depthCode >= 3 && depthCode <= 6;
+	if (!advertised10 && trialHomeBpc != 10)
+		return false;
+	DpTrain::Link current {}, target {};
 	DpTrain::Sink sink {};
 	AtomBios::DisplayPath path {};
-	uint8_t edid[128];
-	if (!readBootDpcdSnapshot(caps) || caps.link[0] != DpTrain::kHbr2 || (caps.link[1] & 0x1f) != 4 ||
-	    !DpTrain::parseExtendedCaps(caps.base, caps.extended, sink) ||
-	    sink.maxRate < target.rate || sink.maxLanes < target.lanes || !sink.tps4 ||
-	    !pathForHpd(pipe.hpd, path) || !readEDID(sinkAuxInst, edid, sizeof(edid), 0) ||
-	    memcmp(edid, edidData, sizeof(edid)))
+	if (!readTrialLink(current, &sink) || !DesktopTrial::chooseRgb10Link(sink, current, clock, target) ||
+	    !verifyDeepColorLink(current, 8) || !pathForHpd(pipe.hpd, path))
 		return false;
 	const uint32_t savedM = regReadDmu(2, 0x2128);
 	if (savedM == ~0u || !(savedM & 0xffffff))
 		return false;
 	deepSink = sink;
+	deepPrevious = current;
+	deepTarget = target;
 	deepConnector = static_cast<uint8_t>(path.connectorObjId & 0xff);
 	deepSavedVidM = savedM & 0xffffff;
 	// A failed transmitter command or stream write may have changed hardware.
 	deepReturnPending = true;
-	return programDeepColorLink(target.rate, 10, ModeSet::dpVidM(kPixelClockKHz, DpTrain::symbolClockKHz(target.rate)));
+	return programDeepColorLink(target, 10, ModeSet::dpVidM(clock, DpTrain::symbolClockKHz(target.rate)), false);
 }
 
 bool RDNA4Device::restoreDesktopDeepColor() {
 	ExtraHold hold(*this);
 	if (!deepReturnPending)
 		return true;
-	if (!programDeepColorLink(DpTrain::kHbr2, 8, deepSavedVidM))
+	if (!programDeepColorLink(deepPrevious, 8, deepSavedVidM, true))
 		return false;
 	deepReturnPending = false;
-	FBLOG("QHD 10 bpc: HBR2 x4, RGB 8 bpc and QHD 165 Hz restored");
+	FBLOG("QHD 10 bpc: DP rate 0x%02x x%u and RGB 8 bpc restored at QHD %d mHz",
+	      deepPrevious.rate, deepPrevious.lanes, trialRate());
 	return true;
 }
 
 bool RDNA4Device::verifyDesktopDeepColor() {
 	ExtraHold hold(*this);
-	return deepReturnPending && verifyDeepColorLink(DpTrain::kHbr3, 10);
+	return deepReturnPending && verifyDeepColorLink(deepTarget, 10);
 }
 
 bool RDNA4Device::verifyDesktopRgb8() {
 	ExtraHold hold(*this);
-	return refreshReturnPending && verifyDeepColorLink(DpTrain::kHbr2, 8);
+	DpTrain::Link current {};
+	return refreshReturnPending && readTrialLink(current) && verifyDeepColorLink(current, 8);
 }
 
 bool RDNA4Device::setDesktopRefresh(uint64_t mc, bool highRate) {
 	ExtraHold hold(*this);
+	const auto &low = trialLow.timing;
+	const auto &high = trialFast.timing;
 	if (!highRate) {
-		if (!restoreDesktopDeepColor())
-			return false;
+		if (!restoreDesktopDeepColor()) return false;
 		if (refreshReturnPending) {
 			uint32_t lock = regReadDmu(2, 0x1b89);
 			if (lock == 0xffffffff) return false;
 			if (lock & 1) regWriteDmu(2, 0x1b89, lock & ~1u);
-			if (!runPlan(refreshReturn) || !trialReadback(2560, 1440, refreshSurface) ||
-			    __atomic_load_n(&rx4VerifiedBpc, __ATOMIC_ACQUIRE) != 10) return false;
+			if (!runPlan(refreshReturn) || !trialReadback(refreshSurface, low, true, trialHomeBpc))
+				return false;
 			refreshReturnPending = false;
 		}
 		return !refreshClocksPending || setRefreshClocks(false);
 	}
-	Edid::DetailedTiming high {}, low {}, observed {};
-	Pipe::State pipeNow {};
-	rx4RefreshCheck = 5;
-	if (!refreshClockSupport()) return false;
-	if (refreshReturnPending || refreshClocksPending || !mc || !refreshLink(high) ||
-	    !Edid::preferredTiming(edidData, edidLen, low) || low.pixelClockKHz != 241500 ||
-	    !Pipe::discover(pipeRead, this, pipeNow) || !Pipe::timingFromOtg(pipeNow, observed)) return false;
-	observed.pixelClockKHz = low.pixelClockKHz;
-	rx4RefreshCheck = 6;
-	if (!Edid::sameTiming(low, observed) || !trialReadback(2560, 1440, mc) || !Pipe2::use(1, false, 0, true)) return false;
+
+	const bool raised = DesktopTrial::raisedClockMode(high);
+	if (!trialNeedsRestore || bootReleased || !uhdClocks || refreshReturnPending || refreshClocksPending ||
+	    !mc || !trialFast.hz() || !trialSinglePipe() || !trialSinkMatches(trialFast) ||
+	    !trialReadback(mc, low, true, trialHomeBpc) || (raised && !refreshClockSupport()) ||
+	    !Pipe2::use(1, false, 0, true))
+		return false;
 	struct ResetTable { RDNA4Device &d; ~ResetTable() { d.useSlotTable(); } } reset {*this};
+	const uint32_t link = trialLinkKbps();
+	const uint32_t cap = min(link / 24, raised ? DesktopTrial::raisedClockKHz : dispclkTargetKHz());
+	if (high.pixelClockKHz > cap || low.pixelClockKHz > link / (3u * static_cast<uint32_t>(trialHomeBpc)))
+		return false;
 	ModeSet::Target to {};
-	// DPP clock must follow DPPREFCLK one to one, as in the modeled one-head plan.
-	const auto &cfg = Pipe2::config();
-	uint32_t otherDet = (regReadDmu(cfg.detSeg, 0x04ba) >> 8) & 31;
-	for (unsigned i = 1; i < 4; ++i) otherDet += regReadDmu(cfg.detSeg, cfg.detCtrl[i]) & 31;
-	const unsigned budget = detShare(11, otherDet);
-	const unsigned segments = budget >= 11 ? 11 : budget >= 8 ? 8 : budget >= 6 ? 6 : budget >= 4 ? 4 : 0;
-	rx4RefreshCheck = 7;
 	const uint32_t vtg = regReadDmu(2, 0x530), n = regReadDmu(2, 0x2127), enable = regReadDmu(1, 0xa8);
-	if (!segments || vtg == 0xffffffff || !(vtg & 0x80000000) || (n & 0xffffff) != 0x8000 ||
-	    enable == 0xffffffff || !(enable & 1) || !bootPipeTarget(to) || (regReadDmu(2, 0x1b89) & 1)) return false;
-	to.dp = true; to.dpMaxKHz = 720000; to.from = low; to.to = high;
+	if (vtg == 0xffffffff || !(vtg & 0x80000000) || (n & 0xffffff) != 0x8000 ||
+	    enable == 0xffffffff || !(enable & 1) || !bootPipeTarget(to) || (regReadDmu(2, 0x1b89) & 1))
+		return false;
+	to.dp = true; to.dpMaxKHz = cap; to.from = low; to.to = high;
 	ModeSet::Target back = to;
 	back.from = high; back.to = low;
+	back.dpBpc = static_cast<uint8_t>(trialHomeBpc);
 	to.dpBpc = 8;
-	back.dpBpc = 10;   // verified before building the plans; all other format bits are preserved
-	if (!readDpDto(0, back.dto) || !ModeSet::scaleDpDto(back.dto, low.pixelClockKHz, high.pixelClockKHz, to.dto)) return false;
+	if (!readDpDto(0, back.dto) || !ModeSet::scaleDpDto(back.dto, low.pixelClockKHz, high.pixelClockKHz, to.dto))
+		return false;
 	const uint32_t m = regReadDmu(2, 0x2128);
 	if (m == 0xffffffff || !(m & 0xffffff)) return false;
 	back.vidM = m & 0xffffff;
 	const uint64_t scaled = uint64_t(back.vidM) * high.pixelClockKHz / low.pixelClockKHz;
 	if (!scaled || scaled > 0xffffff) return false;
 	to.vidM = static_cast<uint32_t>(scaled);
-	static const ModeSet::Step dml[] = {
-#include "refresh_dml.inc"
-		{ModeSet::Op::Update, 1, false, 0x0099, 0xffffffff, 0x00ff00ff, 0, "DPP0 DTO one to one"},
-	};
+
 	static DesktopTrial::Work work;
-	static_assert(sizeof(dml)/sizeof(dml[0]) < Pipe2::kMaxModeSteps, "high refresh DML plan fits");
-	memcpy(work.change, dml, sizeof(dml));
-	// Four one-head DML solutions differ only in the DET count.
-	clampDet(work.change, sizeof(dml)/sizeof(dml[0]), segments);
+	size_t steps = 0;
+	if (raised) {
+		const auto &cfg = Pipe2::config();
+		uint32_t otherDet = (regReadDmu(cfg.detSeg, 0x04ba) >> 8) & 31;
+		for (unsigned i = 1; i < 4; ++i) otherDet += regReadDmu(cfg.detSeg, cfg.detCtrl[i]) & 31;
+		const unsigned budget = detShare(11, otherDet);
+		const unsigned segments = budget >= 11 ? 11 : budget >= 8 ? 8 : budget >= 6 ? 6 : budget >= 4 ? 4 : 0;
+		if (!segments) return false;
+		static const ModeSet::Step dml[] = {
+#include "refresh_dml.inc"
+			{ModeSet::Op::Update, 1, false, 0x0099, 0xffffffff, 0x00ff00ff, 0, "DPP0 DTO one to one"},
+		};
+		static_assert(sizeof(dml)/sizeof(dml[0]) < Pipe2::kMaxModeSteps, "high refresh DML plan fits");
+		memcpy(work.change, dml, sizeof(dml));
+		steps = sizeof(dml)/sizeof(dml[0]);
+		clampDet(work.change, steps, segments);
+	} else {
+		const uint32_t det = secondPipeDet(high);
+		if (!det || det < Pipe2::modeDetSegments(high)) return false;
+		steps = Pipe2::modeSteps(high, work.change, Pipe2::kMaxModeSteps);
+	}
 	auto read = [this](uint8_t seg, uint32_t reg) { return regReadDmu(seg, reg); };
-	if (!DesktopTrial::build(to, back, mc, 2560, 2560ull * 4 * 1440, work, sizeof(dml)/sizeof(dml[0]), read, modePlan, refreshReturn)) return false;
-	rx4RefreshCheck = 8;
-	if (!setRefreshClocks(true)) {
+	if (!DesktopTrial::build(to, back, mc, DesktopTrial::width, DesktopTrial::width * 4ull * DesktopTrial::height,
+	                         work, steps, read, modePlan, refreshReturn))
+		return false;
+	if (raised && !setRefreshClocks(true)) {
 		if (refreshClocksPending) (void)setRefreshClocks(false);
 		return false;
 	}
 	refreshSurface = mc;
 	refreshReturnPending = true;
-	rx4RefreshCheck = 9;
-	__atomic_store_n(&rx4VerifiedBpc, 0, __ATOMIC_RELEASE);
-	if (!runPlan(modePlan) || !trialReadback(2560, 1440, mc, true) ||
-	    __atomic_load_n(&rx4VerifiedBpc, __ATOMIC_ACQUIRE) != 8) return false;
-	rx4RefreshCheck = 0;
-	return true;
+	return runPlan(modePlan) && trialReadback(mc, high, true, 8);
 }
 
 bool RDNA4Device::restoreDesktopTrial() {
@@ -3908,7 +3909,7 @@ bool RDNA4Device::restoreDesktopTrial() {
 		return false;
 	if (lock & 1)
 		regWriteDmu(2, 0x1b89, lock & ~1u);
-	if (!runPlan(trialReturn) || !trialReadback(1920, 1080, trialHome))
+	if (!runPlan(trialReturn) || !trialReadback(trialHome, liveTiming, false, trialHomeBpc))
 		return false;
 	trialNeedsRestore = false;
 	FBLOG("desktop trial: original 1920x1080 plane verified");
@@ -3920,13 +3921,15 @@ bool RDNA4Device::startDesktopTrial(uint64_t mc) {
 	if (trialNeedsRestore || bootReleased || !liveTimingValid || !bootTimingValid ||
 	    fbWidth != 1920 || fbHeight != 1080 || fbRowBytes != 7680 || fbLength < 8294400 ||
 	    !mc || (mc & 255) || (mc >> 48) || !consoleMcAddress(trialHome) || mc == trialHome ||
-	    !trialReadback(1920, 1080, trialHome) ||
+	    !trialSinglePipe() || !trialReadback(trialHome, liveTiming, false) || !trialSinkMatches(trialLow) ||
 	    !((liveTiming.hActive == 1920 && liveTiming.vActive == 1080) ||
-	      (liveTiming.hActive == 2560 && liveTiming.vActive == 1440)))
+	      (liveTiming.hActive == DesktopTrial::width && liveTiming.vActive == DesktopTrial::height)))
 		return false;
-	Edid::DetailedTiming preferred {};
-	if (!Edid::preferredTiming(edidData, edidLen, preferred) || preferred.hActive != 2560 || preferred.vActive != 1440 ||
-	    preferred.refreshMilliHz() < 59500 || preferred.refreshMilliHz() > 60500 || preferred.pixelClockKHz != 241500 ||
+	trialHomeBpc = trialDepth();
+	const auto &preferred = trialLow.timing;
+	const uint32_t cap = min(trialLinkKbps() / (3u * static_cast<uint32_t>(trialHomeBpc)),
+	                         uhdClocks ? max(bootTiming.pixelClockKHz, dispclkTargetKHz()) : bootTiming.pixelClockKHz);
+	if (!trialLow.hz() || preferred.pixelClockKHz > cap || liveTiming.pixelClockKHz > cap ||
 	    !Pipe2::use(1, false, 0, true))
 		return false;
 	struct ResetTable { RDNA4Device &d; ~ResetTable() { d.useSlotTable(); } } reset { *this };
@@ -3936,7 +3939,7 @@ bool RDNA4Device::startDesktopTrial(uint64_t mc) {
 	target.from = liveTiming;
 	target.to = preferred;
 	target.dp = true;
-	target.dpMaxKHz = uhdClocks ? bootDpMaxKHz() : bootTiming.pixelClockKHz;
+	target.dpMaxKHz = cap;
 	ModeSet::Target undo = target;
 	undo.from = preferred;
 	undo.to = liveTiming;
@@ -3949,29 +3952,28 @@ bool RDNA4Device::startDesktopTrial(uint64_t mc) {
 	target.vidM = static_cast<uint32_t>(static_cast<uint64_t>(undo.vidM) * preferred.pixelClockKHz / liveTiming.pixelClockKHz);
 	static DesktopTrial::Work work;
 	const size_t n = Pipe2::modeSteps(preferred, work.change, Pipe2::kMaxModeSteps);
-	clampDet(work.change, n, secondPipeDet(preferred));
+	const uint32_t det = secondPipeDet(preferred);
+	if (!det)
+		return false;
+	clampDet(work.change, n, det);
 	auto read = [this](uint8_t seg, uint32_t reg) { return regReadDmu(seg, reg); };
-	if (regReadDmu(2, 0x1b89) & 1 || !DesktopTrial::build(target, undo, mc, 2560, 2560ull * 4 * 1440, work, n, read, modePlan, trialReturn))
+	if (regReadDmu(2, 0x1b89) & 1 ||
+	    !DesktopTrial::build(target, undo, mc, DesktopTrial::width, DesktopTrial::width * 4ull * DesktopTrial::height,
+	                         work, n, read, modePlan, trialReturn))
 		return false;
 	trialNeedsRestore = true;
-	const bool ok = runPlan(modePlan) && trialReadback(2560, 1440, mc);
-	FBLOG("desktop trial: private 2560x1440 DP plane %s", ok ? "latched at 60 Hz" : "failed");
+	const bool ok = runPlan(modePlan) && trialReadback(mc, preferred, true, trialHomeBpc);
+	FBLOG("desktop trial: private 2560x1440 DP plane %s", ok ? "latched" : "failed");
 	return ok;
 }
 
-
 bool RDNA4Device::trialMemoryOK(uint64_t bytes) {
 	uint64_t home;
-	if (!consoleMcAddress(home) || bootScanout() != home || !extraLock || !supportsNativeRefresh() ||
+	if (!consoleMcAddress(home) || bootScanout() != home || !extraLock || !trialSinglePipe() ||
 	    !liveTimingValid || !bootTimingValid || fbWidth != 1920 || fbHeight != 1080 ||
 	    fbRowBytes != 7680 || fbLength != 8294400 || bytes > (32u << 20) ||
-	    !trialReadback(1920, 1080, home))
+	    !trialReadback(home, liveTiming, false))
 		return false;
-	for (unsigned i = 1; i < 4; ++i) {
-		const uint32_t control = regReadDmu(2, Pipe::Reg::kOtgControl + i * Pipe::Reg::kOtgStride);
-		if ((control & 1) || control == ~0u)
-			return false;
-	}
 	const uint64_t mailbox = regReadDmu(2, kDmcubRegion4Offset) |
 	                         (uint64_t(regReadDmu(2, kDmcubRegion4OffsetHigh)) << 32);
 	return mailbox > home + bytes && mailbox < (1ull << 48);

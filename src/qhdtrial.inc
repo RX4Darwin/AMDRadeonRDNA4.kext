@@ -1,7 +1,8 @@
 // Included by plugin.cpp beside its boot-framebuffer hooks. The two apertures
 // remain allocated for the lifetime of the framebuffer, including after rollback.
 namespace QhdTrial {
-enum Rate { home = 0, low = 60, high = 165 };
+constexpr int home = 0, low = DesktopTrial::baseHz;
+int high {};
 constexpr uint32_t timeoutSeconds = 40;
 FbState *state {};
 IODeviceMemory *vram {}, *surface {};
@@ -70,7 +71,7 @@ int control(struct sysctl_oid *oid, void *, int, struct sysctl_req *req) {
 		return 0;
 	}
 	if (armed || !((value == low && rate() == home && state->dev.currentModeId == state->dev.defaultModeId) ||
-	               (value == high && rate() == low))) return EINVAL;
+	               (high && value == high && rate() == low))) return EINVAL;
 	fallback = rate();
 	armed = value;
 	switched = false;
@@ -80,7 +81,7 @@ int control(struct sysctl_oid *oid, void *, int, struct sysctl_req *req) {
 	return 0;
 }
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_qhdtrial, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-            nullptr, 0, control, "I", "Desktop DP preview: arm 60 or 165, confirm 1, cancel 0");
+            nullptr, 0, control, "I", "Desktop DP preview: arm 60 or EDID fast rate, confirm 1, cancel 0");
 
 int readMeasurement(struct sysctl_oid *oid, void *, int depth, struct sysctl_req *req) {
 	int reading = depth ? state->dev.trialDepth() : state->dev.trialRate();
@@ -192,7 +193,7 @@ int change(const Modes::Mode &mode) {
 			return kIOReturnIOError;
 		}
 	}
-	if (!armed && target == high && rate() == high)
+	if (!armed && high && target == high && rate() == high)
 		return kIOReturnSuccess;
 	if (armed && target != armed) {
 		const uint32_t previous = fallback == low ? lowId : dev.defaultModeId;
@@ -205,7 +206,7 @@ int change(const Modes::Mode &mode) {
 		if (!rate()) return dev.applyMode(mode);
 		if (!dev.restoreDesktopTrial()) return kIOReturnIOError;
 		publish(home);
-	} else if (rate() == high && target == low && !armed) {
+	} else if (high && rate() == high && target == low && !armed) {
 		if (!dev.setDesktopRefresh(0, false)) return kIOReturnIOError;
 		publish(low);
 	} else if (!armed && ((target == low && confirmedLow) || (target == high && confirmedHigh))) {
@@ -241,6 +242,7 @@ void prepare(FbState &fb, IOPCIDevice *pci) {
 	uint32_t enabled = 1;
 #else
 	uint32_t enabled = 0;
+	(void)Trial::option("rdna4-qhdboot", enabled);
 #endif
 	(void)Trial::option("rdna4-qhdtrial", enabled);
 	auto &dev = fb.dev;
@@ -248,30 +250,21 @@ void prepare(FbState &fb, IOPCIDevice *pci) {
 	if (!enabled || state || !gApertureRouted || !orgGetVRAMRange || !dev.isAmd ||
 	    !dev.modesetRequested || pvGpu || (Trial::option("rdna4-pvgpu", guest) && guest) ||
 	    (Trial::option("rdna4-coldboot", cold) && cold) ||
-	    (Trial::option("rdna4-vrambench", bench) && bench) || dev.modeCount + 2 > Modes::MaxModes)
+	    (Trial::option("rdna4-vrambench", bench) && bench))
 		return;
+	for (const auto &extra : dev.extra)
+		if (extra.edidLen)
+			return;
 	const Modes::Mode *boot = dev.findMode(dev.defaultModeId);
-	Edid::DetailedTiming preferred {}, fast {};
+	DesktopTrial::Choice preferred {}, fast {};
 	if (!boot || boot->t.hActive != 1920 || boot->t.vActive != 1080 ||
-	    !Edid::preferredTiming(dev.edidData, dev.edidLen, preferred) ||
-	    preferred.hActive != 2560 || preferred.vActive != 1440 || preferred.pixelClockKHz != 241500)
+	    !dev.chooseDesktopModes(preferred, fast) || dev.modeCount + (fast.hz() ? 2 : 1) > Modes::MaxModes)
 		return;
-	for (size_t off = 256; off + 128 <= dev.fullEdidLen(); off += 128) {
-		const uint8_t *block = dev.edidData + off;
-		if (!Edid::blockChecksumOk(block)) break;
-		Edid::DetailedTiming timings[8] {};
-		size_t n = Edid::displayIdTimings(block, timings, 8);
-		for (size_t i = 0; i < n; ++i)
-			if (timings[i].hActive == 2560 && timings[i].vActive == 1440 &&
-			    timings[i].pixelClockKHz == 699500 && timings[i].refreshMilliHz() == 164957)
-				fast = timings[i];
-	}
-	if (!fast.pixelClockKHz) return;
 	auto *bar = pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
 	if (!bar || bar->getPhysicalAddress() != dev.fbPhysBase ||
 	    !Ndrv::spareSurface(dev.fbPhysBase, dev.fbLength, dev.fbPhysBase,
 	                        min(uint64_t(bar->getLength()), RDNA4Compute::kPoolFloor),
-	                        2560, 1440, plane)) return;
+	                        DesktopTrial::width, DesktopTrial::height, plane)) return;
 	const uint64_t offset = plane.physBase - dev.fbPhysBase;
 	const uint64_t bytes = (uint64_t(plane.rowBytes) * plane.height + 128 + PAGE_MASK) & ~uint64_t(PAGE_MASK);
 	span = offset + bytes;
@@ -292,19 +285,22 @@ void prepare(FbState &fb, IOPCIDevice *pci) {
 	bzero(reinterpret_cast<void *>(map->getVirtualAddress()), bytes);
 	__asm__ volatile("sfence" ::: "memory");
 	map->release();
-	const size_t oldCount = dev.modeCount;
-	const int l = Modes::ensure(dev.modeTable, dev.modeCount, Modes::MaxModes, preferred, Modes::SourceDtd);
-	const int h = Modes::ensure(dev.modeTable, dev.modeCount, Modes::MaxModes, fast, Modes::SourceDisplayId);
-	if (l < 0 || h < 0 || l == h) {
-		dev.modeCount = oldCount;
+	const int l = Modes::ensure(dev.modeTable, dev.modeCount, Modes::MaxModes, preferred.timing, preferred.source);
+	if (l < 0) {
 		OSSafeReleaseNULL(vram); OSSafeReleaseNULL(surface); thread_call_free(timer); timer = nullptr;
 		return;
 	}
 	lowId = dev.modeTable[l].id;
-	highId = dev.modeTable[h].id;
+	if (fast.hz()) {
+		const int h = Modes::ensure(dev.modeTable, dev.modeCount, Modes::MaxModes, fast.timing, fast.source);
+		if (h >= 0) {
+			highId = dev.modeTable[h].id;
+			high = static_cast<int>(fast.hz());
+		}
+	}
 	state = &fb;
-	FBLOG("native DP: desktop preview ready: separate %ux%u surface, pitch %u, modes %u/%u",
-	      plane.width, plane.height, plane.rowBytes, lowId, highId);
+	FBLOG("native DP: desktop preview ready: separate %ux%u surface, pitch %u, 60 Hz mode %u, fast %d Hz mode %u",
+	      plane.width, plane.height, plane.rowBytes, lowId, high, highId);
 }
 
 bool requestInitialMode(FbState &fb, uint32_t computeStage) {
@@ -329,7 +325,7 @@ void startInitialMode(RDNA4Device &dev) {
 	int selected = home;
 	if (dev.startDesktopTrial(mc)) {
 		selected = low;
-		if (dev.setDesktopRefresh(mc, true)) {
+		if (high && dev.setDesktopRefresh(mc, true)) {
 			if (dev.startDesktopDeepColor(mc)) {
 				deepColor = deepConfirmed;
 				selected = high;
@@ -338,7 +334,7 @@ void startInitialMode(RDNA4Device &dev) {
 			} else {
 				selected = home;
 			}
-		} else if (!dev.setDesktopRefresh(0, false)) {
+		} else if (high && !dev.setDesktopRefresh(0, false)) {
 			selected = home;
 		}
 	}
@@ -363,9 +359,13 @@ void startInitialMode(RDNA4Device &dev) {
 	}
 	dev.modeCount = count;
 	publish(selected);
-	FBLOG("native DP startup: initial mode %u, 2560x1440, %d mHz, RGB %d bpc%s",
-	      dev.currentModeId, dev.trialRate(), dev.trialDepth(),
-	      deepColor == deepConfirmed ? ", HBR3 x4" : selected == high ? ", HBR2 x4" : "");
+	DpTrain::Link link {};
+	if (dev.readTrialLink(link))
+		FBLOG("native DP startup: initial mode %u, 2560x1440, %d mHz, RGB %d bpc, DP rate 0x%02x x%u",
+		      dev.currentModeId, dev.trialRate(), dev.trialDepth(), link.rate, link.lanes);
+	else
+		FBLOG("native DP startup: initial mode %u, 2560x1440, %d mHz, RGB %d bpc, DP link readback unavailable",
+		      dev.currentModeId, dev.trialRate(), dev.trialDepth());
 }
 
 uint64_t finishInitialMode(RDNA4Device &dev) {

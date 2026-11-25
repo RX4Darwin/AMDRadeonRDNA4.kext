@@ -1,8 +1,84 @@
 #ifndef RDNA4_DESKTOP_TRIAL_HPP
 #define RDNA4_DESKTOP_TRIAL_HPP
+#include "modes.hpp"
 #include "pipe2.hpp"
+#include "dptrain.hpp"
 
 namespace DesktopTrial {
+constexpr uint16_t width = 2560, height = 1440;
+constexpr unsigned baseHz = 60;
+constexpr uint32_t standardClockKHz = 650000, raisedClockKHz = 720000;
+
+struct Choice {
+	Edid::DetailedTiming timing {};
+	Modes::Source source {};
+	uint8_t block {};
+	unsigned hz() const { return (timing.refreshMilliHz() + 500) / 1000; }
+};
+
+// The dedicated RGB8 DML plan has only been modeled for this exact raster.
+inline bool raisedClockMode(const Edid::DetailedTiming &t) {
+	return Edid::sameTiming(t, {699500, width, 160, 48, 32, height, 119, 3, 5, true, false, false});
+}
+
+inline bool receiverCaps(const uint8_t (&base)[16], const uint8_t (&extended)[16], DpTrain::Sink &sink) {
+	return base[0x0e] & 0x80 ? DpTrain::parseExtendedCaps(base, extended, sink)
+	                        : DpTrain::parseCaps(base, sizeof(base), sink);
+}
+
+inline bool chooseRgb10Link(const DpTrain::Sink &sink, const DpTrain::Link &current,
+                            uint32_t pixelClockKHz, DpTrain::Link &target) {
+	// Only change link parameters on the modeled four-lane transmitter path.
+	if (!pixelClockKHz || current.lanes != 4 || sink.maxLanes < current.lanes ||
+	    (current.rate != DpTrain::kHbr2 && current.rate != DpTrain::kHbr3) ||
+	    current.rate > sink.maxRate)
+		return false;
+	target = current;
+	const uint64_t required = 30ull * pixelClockKHz;
+	if (DpTrain::bandwidthKbps(target) < required)
+		target.rate = DpTrain::kHbr3;
+	return target.rate <= sink.maxRate && (target.rate != DpTrain::kHbr3 || sink.tps4) &&
+	       DpTrain::bandwidthKbps(target) >= required;
+}
+
+// The caller selects the primary DP pipe's table. Filter before ranking so an
+// unusable preferred timing cannot hide a usable descriptor at the same rate.
+inline void chooseModes(const uint8_t *edid, size_t len, uint32_t lowMaxKHz, uint32_t fastMaxKHz,
+                        bool raisedClock, Choice &low, Choice &fast) {
+	low = fast = {};
+	Edid::BaseInfo base {};
+	if (!Edid::parseBaseBlock(edid, len, base) || !base.digital)
+		return;
+	auto consider = [&](const Edid::DetailedTiming &t, Modes::Source source, uint8_t block) {
+		if (t.hActive != width || t.vActive != height || !Modes::usable(t))
+			return;
+		const Choice mode {t, source, block};
+		if (mode.hz() == baseHz && !low.hz() && t.pixelClockKHz <= lowMaxKHz && Pipe2::modeKnown(t))
+			low = mode;
+		if (mode.hz() > baseHz && mode.hz() > fast.hz() && t.pixelClockKHz <= fastMaxKHz &&
+		    ((t.pixelClockKHz <= standardClockKHz && Pipe2::modeKnown(t)) || (raisedClock && raisedClockMode(t))))
+			fast = mode;
+	};
+	for (size_t i = 0; i < base.dtdCount; ++i)
+		consider(base.dtds[i], Modes::SourceDtd, 0);
+	for (uint8_t i = 1; i <= base.extensionCount && i < Edid::MaxBlocks && (i + 1u) * Edid::BlockSize <= len; ++i) {
+		const uint8_t *block = edid + i * Edid::BlockSize;
+		if (!Edid::blockChecksumOk(block))
+			continue;
+		Edid::CtaCaps cta {};
+		if (Edid::parseCtaBlock(block, cta)) {
+			for (size_t j = 0; j < cta.dtdCount; ++j)
+				consider(cta.dtds[j], Modes::SourceCtaDtd, i);
+		} else {
+			Edid::DetailedTiming timings[Edid::MaxCtaDtds];
+			const size_t n = Edid::displayIdTimings(block, timings, Edid::MaxCtaDtds);
+			for (size_t j = 0; j < n; ++j)
+				consider(timings[j], Modes::SourceDisplayId, i);
+		}
+	}
+	if (!low.hz()) fast = {};
+}
+
 struct Work {
 	ModeSet::Step change[Pipe2::kMaxModeSteps + 3], saved[Pipe2::kMaxModeSteps + 12];
 };
