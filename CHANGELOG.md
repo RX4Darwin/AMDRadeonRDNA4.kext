@@ -13,6 +13,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
   with `r_metalfx 2` draws at half size and gets a full-size, temporally anti-aliased picture, about 2.4 ms a frame at 3200x1800,
   in 8-bit and HDR colour; MetalQuake's MetalFX presets work too. RDNA4Gadget's Tweaks tab has a switch for it ("MetalFX upscaling:
   AMD FSR", on by default). Building it needs glslang and spirv-cross (Homebrew).
+- **OpenGL games run further ahead of the card**: an OpenGL app may queue up to 32 command buffers while it holds under 3000 driver
+  buffers (4 before). OpenMW at Seyda Neen: 21 -> 25 fps; a dozen cell loads in a row with no allocation failures.
 - **Command buffers report GPU start and end times** (`GPUStartTime`, `GPUEndTime`), so games' own frame timings work.
 - **Fan Control** in RDNA4Gadget's new Fans tab: Auto (the card's own) or a custom five-point curve, zero RPM and its stop
   temperature, within the card's limits, through the SMU's OverDrive table as Linux's amdgpu sets it. The package's root job

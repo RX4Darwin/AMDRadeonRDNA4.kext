@@ -4546,10 +4546,16 @@ static void eventWait(id event, uint64_t value)
 // wait: only another process (WindowServer reading the window's surface) needs its draws on the ring first. RDNA4_EARLYSUBMIT=0 or 1 decides
 // for a process. ponytail: buffers are not looked at (an IOSurface-backed buffer written and handed to another process would need it).
 static std::atomic<int64_t> gUnscheduled;   // command buffers committed and not yet scheduled, in the process
-static int64_t earlyBacklog(void)   // RDNA4_EARLYBACKLOG=n: another cap, for measuring
+// How many may wait unscheduled: 32 while the process holds under 3000 host buffers, 4 past that. What runs out is the kext's buffer
+// table (16384 slots for all processes, src/compute.hpp kMaxBuffers), not memory: the command buffers in between hold small buffers,
+// and with 32 always OpenMW reached ~4600 buffers (428 MB) and Apple's GL crashed on a refused 4.6 KB one during cell loads (2026-11-25).
+// RDNA4_EARLYBACKLOG=n: a fixed cap, for measuring.
+static int64_t earlyBacklog(void)
 {
-	static const int64_t n = getenv("RDNA4_EARLYBACKLOG") ? atoll(getenv("RDNA4_EARLYBACKLOG")) : 4;
-	return n;
+	static const char *const env = getenv("RDNA4_EARLYBACKLOG");
+	if (env)
+		return atoll(env);
+	return gHostCount.load() < 3000 ? 32 : 4;
 }
 - (void)commitAndWaitUntilSubmitted
 {
@@ -4557,8 +4563,8 @@ static int64_t earlyBacklog(void)   // RDNA4_EARLYBACKLOG=n: another cap, for me
 	static const char *const env = getenv("RDNA4_EARLYSUBMIT");
 	// At most earlyBacklog() not yet scheduled: with none, GL's render thread ran ahead of the work queue while loading a cell, the
 	// command buffers in between held their memory until the client's buffers ran out (resource shortage), and Apple's GL renderer crashed
-	// on the texture it did not get (GLRTextureResource::getGLViewResource, OpenMW, 2026-11-24); with 16 or 32 it still did, with 4 not. One
-	// with scheduled handlers waits as before.
+	// on the texture it did not get (GLRTextureResource::getGLViewResource, OpenMW, 2026-11-24); with 16 or 32 always it still did (the kext's
+	// buffer table, earlyBacklog). One with scheduled handlers waits as before.
 	if ((env ? atoi(env) == 1 : gGlPrograms.load()) && !_writesSurface && !_drawables.count && !_scheduled.count &&
 	    gUnscheduled.load() <= earlyBacklog())
 		return;
