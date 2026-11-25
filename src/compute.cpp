@@ -2323,7 +2323,9 @@ bool RDNA4Compute::stageGfx() {
 	put("SmuFeatures", running);
 	if (env.smuReady) {
 		trail("s3: smuReady (display clocks, cold start)");
-		env.smuReady(env.cursorProbeCtx);
+		const uint64_t frameNs = env.smuReady(env.cursorProbeCtx);
+		if (frameNs)
+			env.scanoutFrameNs = frameNs;
 	}
 
 	// 4. gfx_v12_0_wait_for_rlc_autoload_complete: CP idle and the RLC

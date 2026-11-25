@@ -3024,6 +3024,22 @@ static int testNdrv() {
 	                  ti.csTimingFlags == (Ndrv::kDisplayModeValidFlag | Ndrv::kDisplayModeSafeFlag),
 	                  "ndrv: mode %d timing flags 0x%x", otherId, ti.csTimingFlags);
 
+	// A verified initial modeset owns the NDRV startup ID, including when
+	// WindowServer explicitly selects it during initialization.
+	Ndrv::Translator startup;
+	startup.init(table, n, bootId, lenovo, sizeof(lenovo), fb.backend(), other->id);
+	Ndrv::VDSwitchInfoRec startupMode {};
+	const int32_t firmwareId = startup.idFor(table[bootIdx]);
+	failures += check(firmwareId != Ndrv::kBootModeId &&
+	                  startup.status(Ndrv::cscGetCurMode, &startupMode, ret) && ret == Ndrv::kSuccess &&
+	                  startupMode.csData == Ndrv::kBootModeId, "ndrv: initial mode lost");
+	ti.csTimingMode = Ndrv::kBootModeId;
+	failures += check(startup.status(Ndrv::cscGetModeTiming, &ti, ret) && ret == Ndrv::kSuccess &&
+	                  (ti.csTimingFlags & Ndrv::kDisplayModeDefaultFlag), "ndrv: initial mode is not the default");
+	ti.csTimingMode = firmwareId;
+	failures += check(startup.status(Ndrv::cscGetModeTiming, &ti, ret) && ret == Ndrv::kSuccess &&
+	                  !(ti.csTimingFlags & Ndrv::kDisplayModeDefaultFlag), "ndrv: firmware mode is still the default");
+
 	// Detailed timing mirrors the table entry.
 	Ndrv::VDDetailedTimingRec dt {};
 	dt.csTimingSize = sizeof(dt);

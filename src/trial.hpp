@@ -160,6 +160,7 @@ inline bool settingAllowed(const char *key)
 {
 	static const char *const kKeys[] = {
 		"rdna4-pvcursor", "rdna4-accelgl", "rdna4-head2dp", "rdna4-pvfast", "rdna4-hotplug", "rdna4-gfxcap",
+		"rdna4-qhdboot",
 	};
 
 	for (const char *k : kKeys) {

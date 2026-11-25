@@ -381,6 +381,8 @@ bool RDNA4Device::raiseDisplayClocks()
 		(void)Trial::option(c.option, mhz);
 		if (mhz == kTopLevel)
 			mhz = topDpmLevel(c.id);
+		if (refreshClocksPending && (c.id == kPpclkDispclk || c.id == kPpclkDppclk))
+			mhz = 720; // The startup modeset can already be scanning at 165 Hz.
 
 		if (mhz && !smuSetHardMin(c.id, c.name, mhz) && c.required)
 			met = false;
@@ -395,6 +397,15 @@ bool RDNA4Device::refreshClockSupport() {
 	return smu && smu->hardMinStatus && dispclkTargetKHz() == 650000 &&
 	       topDpmLevel(kPpclkDispclk) >= 720 && topDpmLevel(kPpclkDppclk) >= 720;
 }
+
+bool RDNA4Device::prepareDesktopStartup() {
+	// The compute thread loaded the SMU and raised the display clocks.
+	if (!uhdClocks || !refreshClockSupport())
+		return false;
+	ensureUpdateLatch();
+	return true;
+}
+
 bool RDNA4Device::setRefreshClocks(bool high) {
 	if (!smu || !smu->hardMinStatus || dispclkTargetKHz() != 650000) return false;
 	if (high && (topDpmLevel(kPpclkDispclk) < 720 || topDpmLevel(kPpclkDppclk) < 720)) return false;
@@ -426,9 +437,11 @@ void RDNA4Device::logDisplayClocks()
  */
 void RDNA4Device::smuStarted()
 {
-	smu = smuFind();
-	if (!smu)
+	ExtraHold hold(*this);
+	const auto *found = smuFind();
+	if (!found)
 		return;
+	smu = found;
 
 	logDisplayClocks();
 	uhdClocks = raiseDisplayClocks();

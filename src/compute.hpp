@@ -130,7 +130,8 @@ public:
 		void *cursorProbeCtx { nullptr };
 		// Once the power-management firmware runs its features (stage 3), on the bring-up thread before
 		// it sends anything else: the display device may talk to the firmware (ctx: cursorProbeCtx).
-		void (*smuReady)(void *ctx) { nullptr };
+		// Return the new scanout period in ns if the startup mode changed.
+		uint64_t (*smuReady)(void *ctx) { nullptr };
 		// The VBIOS image the display device read (rdna4-dmubload: the display firmware gets a copy).
 		const uint8_t *vbios { nullptr };
 		size_t vbiosSize { 0 };

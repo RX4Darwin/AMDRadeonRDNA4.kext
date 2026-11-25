@@ -171,12 +171,14 @@ public:
 	// previous timing is programmed back and an error returned.
 	IOReturn applyMode(const Modes::Mode &m);
 	bool startDesktopTrial(uint64_t mc);
+	bool prepareDesktopStartup();
 	bool restoreDesktopTrial();
 	bool supportsNativeRefresh() const;
 	bool setDesktopRefresh(uint64_t mc, bool highRate);
 	bool startDesktopDeepColor(uint64_t mc);
 	bool restoreDesktopDeepColor();
 	bool verifyDesktopDeepColor();
+	bool verifyDesktopRgb8();
 	bool trialMemoryOK(uint64_t bytes);
 	int trialRate() const;
 	int trialDepth() const;

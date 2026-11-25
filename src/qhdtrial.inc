@@ -10,6 +10,7 @@ uint64_t mc {}, span {}, expires {};
 uint32_t lowId {}, highId {};
 int active {}, armed {}, fallback {}, retries {};
 bool switched {}, confirmedLow {}, confirmedHigh {};
+bool nativeStartup {}, startupPending {};
 thread_call_t timer {};
 enum DeepColor { deepIdle = 0, deepRecovering = -1, deepPreview = -10, deepConfirmed = 10 };
 DeepColor deepColor {deepIdle};
@@ -68,7 +69,7 @@ int control(struct sysctl_oid *oid, void *, int, struct sysctl_req *req) {
 		thread_call_cancel(timer);
 		return 0;
 	}
-	if (armed || !((value == low && rate() == home && state->ndrv.currentModeId() == Ndrv::kBootModeId) ||
+	if (armed || !((value == low && rate() == home && state->dev.currentModeId == state->dev.defaultModeId) ||
 	               (value == high && rate() == low))) return EINVAL;
 	fallback = rate();
 	armed = value;
@@ -304,5 +305,91 @@ void prepare(FbState &fb, IOPCIDevice *pci) {
 	state = &fb;
 	FBLOG("native DP: desktop preview ready: separate %ux%u surface, pitch %u, modes %u/%u",
 	      plane.width, plane.height, plane.rowBytes, lowId, highId);
+}
+
+bool requestInitialMode(FbState &fb, uint32_t computeStage) {
+	uint32_t enabled = 0;
+	if (!Trial::option("rdna4-qhdboot", enabled) || enabled != 1)
+		return false;
+	if (state != &fb || computeStage < RDNA4Compute::StageGfx) {
+		FBLOG("native DP startup: QHD surface or SMU bring-up unavailable, keeping firmware mode");
+		return false;
+	}
+	startupPending = true;
+	return true;
+}
+
+void startInitialMode(RDNA4Device &dev) {
+	// Finish all hardware changes before IONDRV asks for current mode,
+	// aperture and row pitch. Only publish a verified native surface.
+	if (!dev.prepareDesktopStartup()) {
+		FBLOG("native DP startup: display clocks unavailable, keeping firmware mode");
+		return;
+	}
+	int selected = home;
+	if (dev.startDesktopTrial(mc)) {
+		selected = low;
+		if (dev.setDesktopRefresh(mc, true)) {
+			if (dev.startDesktopDeepColor(mc)) {
+				deepColor = deepConfirmed;
+				selected = high;
+			} else if (dev.restoreDesktopDeepColor() && dev.verifyDesktopRgb8()) {
+				selected = high;
+			} else {
+				selected = home;
+			}
+		} else if (!dev.setDesktopRefresh(0, false)) {
+			selected = home;
+		}
+	}
+	if (selected == home) {
+		const bool restored = dev.restoreDesktopTrial() || dev.restoreDesktopTrial();
+		FBLOG("native DP startup: firmware mode rollback %s", restored ? "verified" : "failed");
+		return;
+	}
+
+	nativeStartup = true;
+	confirmedLow = true;
+	confirmedHigh = selected == high;
+	dev.currentModeId = selected == high ? highId : lowId;
+	// This scanout can switch only among the two native modes and the
+	// firmware surface. Drop the other GOP-pitch entries at publication so
+	// WindowServer cannot restore an unusable mode saved on an earlier boot.
+	size_t count = 0;
+	for (size_t i = 0; i < dev.modeCount; ++i) {
+		const auto &mode = dev.modeTable[i];
+		if (mode.id == dev.defaultModeId || mode.id == lowId || mode.id == highId)
+			dev.modeTable[count++] = mode;
+	}
+	dev.modeCount = count;
+	publish(selected);
+	FBLOG("native DP startup: initial mode %u, 2560x1440, %d mHz, RGB %d bpc%s",
+	      dev.currentModeId, dev.trialRate(), dev.trialDepth(),
+	      deepColor == deepConfirmed ? ", HBR3 x4" : selected == high ? ", HBR2 x4" : "");
+}
+
+uint64_t finishInitialMode(RDNA4Device &dev) {
+	if (!state || &state->dev != &dev)
+		return 0;
+	RDNA4Device::ExtraHold hold(dev);
+	if (!startupPending)
+		return 0;
+	startInitialMode(dev);
+	startupPending = false;
+	IORecursiveLockWakeup(dev.extraLock, &startupPending, true);
+	const int measured = nativeStartup ? dev.trialRate() : 0;
+	return measured > 0 ? 1000000000000ull / measured : 0;
+}
+
+void waitForInitialMode(RDNA4Device &dev) {
+	RDNA4Device::ExtraHold hold(dev);
+	uint64_t deadline;
+	clock_interval_to_deadline(12, kSecondScale, &deadline);
+	while (startupPending && !RDNA4Compute::bringupEnded() && mach_absolute_time() < deadline)
+		IORecursiveLockSleepDeadline(dev.extraLock, &startupPending, deadline, THREAD_UNINT);
+	if (startupPending) {
+		startupPending = false;
+		FBLOG("native DP startup: SMU did not become ready in time, keeping firmware mode");
+	}
 }
 } // namespace QhdTrial

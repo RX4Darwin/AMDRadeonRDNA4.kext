@@ -261,11 +261,13 @@ struct Backend {
 
 class Translator {
 public:
-	// `modes` (count entries, bootModeId = Modes::Mode::id of the live
-	// mode) and `edid` must outlive the Translator. count 0 leaves every
+	// bootModeId identifies the firmware surface. The NDRV startup ID
+	// refers to initialModeId when that mode is already running.
+	// `modes` and `edid` must outlive the Translator. count 0 leaves every
 	// mode request to IOBootNDRV; edidLen 0 leaves the DDC request to it.
 	void init(const Modes::Mode *modes, size_t count, uint32_t bootModeId,
-	          const uint8_t *edid, size_t edidLen, const Backend &backend);
+	          const uint8_t *edid, size_t edidLen, const Backend &backend,
+	          uint32_t initialModeId = 0);
 
 	// Handle one csc Status/Control request. Returns false if the request
 	// is not ours to answer (the caller then passes it on to IOBootNDRV);
@@ -294,6 +296,7 @@ private:
 	const Modes::Mode *scaledModes { nullptr };
 	size_t   scaledCount { 0 };
 	uint32_t bootModeId { 0 };
+	uint32_t initialModeId { 0 };
 	const uint8_t *edid { nullptr };
 	size_t   edidLen { 0 };
 	Backend  be {};

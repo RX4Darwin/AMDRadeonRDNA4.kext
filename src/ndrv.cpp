@@ -112,12 +112,14 @@ bool prepareCursor(void *cursorRef, void *descriptor, void *info) {
 }
 
 void Translator::init(const Modes::Mode *table, size_t n, uint32_t bootId,
-                      const uint8_t *edidBytes, size_t edidBytesLen, const Backend &backend) {
+                      const uint8_t *edidBytes, size_t edidBytesLen, const Backend &backend,
+                      uint32_t startupId) {
 	modes = table;
 	count = table ? n : 0;
 	__atomic_store_n(&scaledCount, 0, __ATOMIC_RELEASE);
 	scaledModes = nullptr;
 	bootModeId = bootId;
+	initialModeId = bootId;
 	edid = edidBytes;
 	edidLen = edidBytes ? (edidBytesLen / 128) * 128 : 0;
 	// Keep the original DDC reply for short EDIDs. Advertise additional blocks
@@ -135,14 +137,17 @@ void Translator::init(const Modes::Mode *table, size_t n, uint32_t bootId,
 	// Without the boot entry the IDs could not be tied to what IOBootNDRV
 	// already reported, so the mode requests stay with it.
 	bool haveBoot = false;
-	for (size_t i = 0; i < count; i++)
+	for (size_t i = 0; i < count; i++) {
 		haveBoot |= modes[i].id == bootModeId;
+		if (startupId && modes[i].id == startupId)
+			initialModeId = startupId;
+	}
 	if (!haveBoot)
 		count = 0;
 }
 
 int32_t Translator::idFor(const Modes::Mode &m) const {
-	return m.id == bootModeId ? kBootModeId : kBootModeId + static_cast<int32_t>(m.id);
+	return m.id == initialModeId ? kBootModeId : kBootModeId + static_cast<int32_t>(m.id);
 }
 
 const Modes::Mode *Translator::modeFor(int32_t id) const {
@@ -360,7 +365,7 @@ int32_t Translator::getModeTiming(VDTimingInfoRec &r) const {
 	// of the default mode instead ("Using a scaled resolution..."), so the
 	// driver would never see the switch.
 	r.csTimingFlags = kDisplayModeValidFlag | kDisplayModeSafeFlag;
-	if (m->id == bootModeId)
+	if (r.csTimingMode == kBootModeId)
 		r.csTimingFlags |= kDisplayModeDefaultFlag;
 	return kSuccess;
 }

@@ -342,6 +342,14 @@ void deviceSetPower(void *ctx, bool on) {
 	auto &dev = *static_cast<RDNA4Device *>(ctx);
 	if (QhdTrial::state && &QhdTrial::state->dev == &dev) {
 		RDNA4Device::ExtraHold hold(dev);
+		if (QhdTrial::nativeStartup && QhdTrial::deepColor == QhdTrial::deepConfirmed) {
+			const bool waking = on && !dev.displayPowerOn;
+			dev.setDisplayPower(on);
+			if (waking && dev.displayPowerOn && !dev.verifyDesktopDeepColor() &&
+			    !QhdTrial::cancelDeepColor())
+				QhdTrial::retryDeepColorRollback();
+			return;
+		}
 		if (!on && !QhdTrial::cancelDeepColor()) {
 			QhdTrial::retryDeepColorRollback();
 			return;
@@ -390,14 +398,16 @@ void deviceCursorProbe(void *ctx, const char *why) {
 
 void coldStartHeads(RDNA4Device &dev);
 
-void deviceSmuReady(void *ctx) {
+uint64_t deviceSmuReady(void *ctx) {
 	RDNA4Device &dev = *static_cast<RDNA4Device *>(ctx);
 
 	dev.breadcrumb("smuReady: display clocks");
 	dev.smuStarted();
 	dev.breadcrumb("smuReady: cold start");
 	coldStartHeads(dev);   // rdna4-dcninit=1 only
+	const uint64_t frameNs = QhdTrial::finishInitialMode(dev);
 	dev.breadcrumb("smuReady: done");
+	return frameNs;
 }
 
 int32_t deviceGetHardwareCursorDrawState(void *ctx,
@@ -1398,7 +1408,24 @@ void attach(FbEntry &e) {
 	}
 #endif
 	QhdTrial::prepare(*st, pci);
-	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidData, dev.fullEdidLen(), be);
+	auto startCompute = [&] {
+		RDNA4Compute::Env env { pci, svc, dev.mmioBase(), dev.mmioSize(), dev.discovery(),
+		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
+		                        createVblankService, deviceCursorProbe, &dev };
+		env.smuReady = deviceSmuReady;
+		dev.compute = &st->compute;
+		env.vbios = dev.vbiosBytes(env.vbiosSize);
+		st->compute.start(env, computeStage);
+	};
+	const bool nativeBoot = QhdTrial::requestInitialMode(*st, computeStage);
+	if (nativeBoot) {
+		startCompute();
+		QhdTrial::waitForInitialMode(dev);
+	}
+	if (QhdTrial::state == st && QhdTrial::nativeStartup)
+		svc->setProperty("Modes,Count", static_cast<uint64_t>(dev.modeCount), 32);
+	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidData, dev.fullEdidLen(), be,
+	              dev.currentModeId);
 #ifdef AMDRadeonRDNA4_PVGPU
 	// A test boot's level (rdna4-trial) is only known once NVRAM is; the heads' framebuffers are told before macOS asks.
 	uint32_t pvTrial = 0, pvDisp = 0;
@@ -1456,17 +1483,9 @@ void attach(FbEntry &e) {
 		RDNA4PvNub::setCompute(&st->compute);
 #endif
 
-	// Compute bring-up runs after the display is answered for, and only
-	// when asked for: it must never be the reason the desktop is missing.
-	if (computeStage && dev.isAmd) {
-		RDNA4Compute::Env env { pci, svc, dev.mmioBase(), dev.mmioSize(), dev.discovery(),
-		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
-		                        createVblankService, deviceCursorProbe, &dev };
-		env.smuReady = deviceSmuReady;
-		dev.compute = &st->compute;   // its sleep and wake from the device's notifiers (rdna4-syssleep without rdna4-pm)
-		env.vbios = dev.vbiosBytes(env.vbiosSize);
-		st->compute.start(env, computeStage);
-	}
+	// Ordinary boots keep compute bring-up off the framebuffer's open path.
+	if (computeStage && dev.isAmd && !nativeBoot)
+		startCompute();
 }
 
 const char *commandName(UInt32 code) {
@@ -2362,6 +2381,11 @@ bool bootModes(const Modes::Mode *&table, size_t &n, uint32_t &width, uint32_t &
 
 	table = dev.modeTable;
 	n = dev.modeCount;
+	if (QhdTrial::state == bootState && QhdTrial::rate()) {
+		width = QhdTrial::plane.width;
+		height = QhdTrial::plane.height;
+		return true;
+	}
 	width = live ? liveW : dev.fbWidth;
 	height = live ? liveH : dev.fbHeight;
 	return true;

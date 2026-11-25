@@ -3816,6 +3816,11 @@ bool RDNA4Device::verifyDesktopDeepColor() {
 	return deepReturnPending && verifyDeepColorLink(DpTrain::kHbr3, 10);
 }
 
+bool RDNA4Device::verifyDesktopRgb8() {
+	ExtraHold hold(*this);
+	return refreshReturnPending && verifyDeepColorLink(DpTrain::kHbr2, 8);
+}
+
 bool RDNA4Device::setDesktopRefresh(uint64_t mc, bool highRate) {
 	ExtraHold hold(*this);
 	if (!highRate) {
