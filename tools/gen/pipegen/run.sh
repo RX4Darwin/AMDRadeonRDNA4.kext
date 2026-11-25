@@ -16,9 +16,11 @@
 # through DIG0 on link 0 (HPD1) and DIG1 on link 1 (HPD2) into
 # src/pipe2_linux_dp1.inc and _dp2.inc. With one it writes only the first.
 #
-# The Linux tree only needs the display driver and its headers. A sparse
-# checkout is enough (the commit the checked-in table was made from is in its
-# first line):
+# The Linux tree only needs the display driver and its headers: lib/linux, a
+# submodule at the commit the checked-in tables were made from (sparse, and
+# "update = none" so that a recursive clone does not fetch all of Linux; set it
+# up with the commands below inside lib/linux, then git checkout <commit>).
+# A sparse checkout is enough (the commit is in each table's first line):
 #
 #   git clone --depth 1 --filter=blob:none --no-checkout https://github.com/torvalds/linux.git
 #   cd linux && git sparse-checkout init --no-cone && git sparse-checkout set \

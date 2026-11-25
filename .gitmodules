@@ -15,3 +15,8 @@
 	path = lib/FidelityFX-SDK
 	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
 	shallow = true
+[submodule "lib/linux"]
+	path = lib/linux
+	url = https://github.com/torvalds/linux.git
+	shallow = true
+	update = none
