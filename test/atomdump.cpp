@@ -1621,6 +1621,29 @@ static int testDpTrain() {
 		                  !DpTrain::parseCaps(zeros, 16, bad) && !DpTrain::parseCaps(rig.dpcd, 3, bad),
 		                  "dptrain: a link beyond the sink, or no sink, was accepted");
 	}
+	// A DP 1.4 sink's DSC decoder (DPCD 0x060..0x06F), decoded as Linux's dc_dsc_parse_dsc_dpcd does: a typical 4K monitor's
+	// (DSC 1.1, 12 KiB rate buffer, 1/2/4 slices, 11-bit line buffer, RGB at 8 and 10 bpc, 340 MPixels/s, slices up to
+	// 5120 wide, 1/16 bpp steps), the DP 2.1a throughput delta, a sink without DSC and the values Linux refuses.
+	{
+		const uint8_t dsc[16] = { 0x01, 0x11, 0x00, 0x0b, 0x0b, 0x02, 0x01, 0x00, 0x00, 0x01, 0x06, 0x11, 0x10, 0x00, 0x00, 0x00 };
+		DpTrain::DscCaps c {};
+		failures += check(DpTrain::parseDscCaps(dsc, c) && c.version == 0x11 && c.rcBufferBytes == 12288 && c.sliceCaps1 == 0x0b &&
+		                  c.lineBufferBits == 11 && c.blockPrediction && c.colorFormats == 1 && c.colorDepths == 6 &&
+		                  c.throughputMode0 == 340 && c.throughputMode1 == 340 && c.maxSliceWidth == 5120 && c.bppIncrementDiv == 16,
+		                  "dsc caps: a typical DP 1.4 DSC sink decoded wrong");
+		uint8_t d2[16];
+		memcpy(d2, dsc, 16);
+		d2[0x2] = 0x03 | (5 << 3);   // 64 KiB blocks, a mode 0 delta of 5 x 2 MPixels/s
+		d2[0xb] = 0xf8;              // mode 0: 700, mode 1: 170
+		d2[0xf] = 0x04;              // whole bits per pixel
+		failures += check(DpTrain::parseDscCaps(d2, c) && c.rcBufferBytes == 12u * 65536 && c.throughputMode0 == 710 &&
+		                  c.throughputMode1 == 170 && c.bppIncrementDiv == 1, "dsc caps: block size, throughput delta or step wrong");
+		uint8_t none[16] {}, badDepth[16], badInc[16];
+		memcpy(badDepth, dsc, 16), badDepth[0x5] = 9;
+		memcpy(badInc, dsc, 16), badInc[0xf] = 5;
+		failures += check(!DpTrain::parseDscCaps(none, c) && !DpTrain::parseDscCaps(badDepth, c) && !DpTrain::parseDscCaps(badInc, c),
+		                  "dsc caps: no decoder, a line buffer depth of 9 or a bpp increment of 5 was accepted");
+	}
 	// The link for a stream: the smallest that carries it, lanes before rate.
 	// The firmware trains this card's 4K monitor at four HBR2 lanes for
 	// 3840x2160@60 at 10 bpc, which is what this gives.

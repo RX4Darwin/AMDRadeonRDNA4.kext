@@ -213,6 +213,46 @@ bool parseCaps(const uint8_t *caps, size_t len, Sink &out) {
 	return out.rev >= 0x10 && rate && lanes;
 }
 
+// dc_dsc_parse_dsc_dpcd and its helpers (dsc_buff_block_size_from_dpcd, dsc_line_buff_depth_from_dpcd,
+// dsc_throughput_from_dpcd, dsc_bpp_increment_div_from_dpcd), dsc[i] = DPCD 0x060 + i.
+bool parseDscCaps(const uint8_t dsc[16], DscCaps &out) {
+	out = DscCaps {};
+	if (!dsc || !(dsc[0x0] & 0x01))                                      // DP_DSC_DECOMPRESSION_IS_SUPPORTED
+		return false;
+	out.version = dsc[0x1];
+	static constexpr uint32_t kBlock[4] = { 1024, 4 * 1024, 16 * 1024, 64 * 1024 };
+	out.rcBufferBytes = (dsc[0x3] + 1u) * kBlock[dsc[0x2] & 0x03];
+	out.sliceCaps1 = dsc[0x4];
+	const uint8_t depth = dsc[0x5];
+	if (depth <= 7)
+		out.lineBufferBits = static_cast<uint8_t>(depth + 9);
+	else if (depth == 8)
+		out.lineBufferBits = 8;
+	else
+		return false;
+	out.blockPrediction = dsc[0x6] & 0x01;
+	out.maxBitsPerPixel16 = static_cast<uint16_t>(dsc[0x7] | dsc[0x8] << 8);
+	out.colorFormats = dsc[0x9];
+	out.colorDepths = dsc[0xa];
+	// 0 unsupported, 1-14: 340 to 1000 in steps of 50 (1: 340, 2: 400), 15: 170 (DP 1.4a)
+	auto throughput = [](uint8_t code, uint32_t &mps) {
+		if (code > 15)
+			return false;
+		mps = code == 0 ? 0 : code == 15 ? 170 : code == 1 ? 340 : 400 + (code - 2u) * 50;
+		return true;
+	};
+	if (!throughput(dsc[0xb] & 0x0f, out.throughputMode0) || !throughput(dsc[0xb] >> 4, out.throughputMode1))
+		return false;
+	out.throughputMode0 += (dsc[0x2] >> 3) * 2u;                       // DP 2.1a: the mode 0 delta, in 2 MPixels/s
+	out.maxSliceWidth = dsc[0xc] * 320u;
+	out.sliceCaps2 = dsc[0xd];
+	static constexpr uint8_t kDiv[5] = { 16, 8, 4, 2, 1 };
+	if ((dsc[0xf] & 0x7) > 4)
+		return false;
+	out.bppIncrementDiv = kDiv[dsc[0xf] & 0x7];
+	return true;
+}
+
 bool pickLink(const Sink &sink, uint32_t pixelClockKHz, uint32_t bitsPerPixel, Link &out) {
 	static constexpr uint8_t rates[] = { kRbr, kHbr, kHbr2, kHbr3 };
 	const uint64_t need = static_cast<uint64_t>(pixelClockKHz) * bitsPerPixel;

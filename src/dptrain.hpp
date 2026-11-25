@@ -53,14 +53,39 @@ static_assert(symbolClockKHz(kHbr2) == 540000 && bandwidthKbps(Link { 4, kHbr2 }
 enum Pattern : uint8_t { Video = 0, Tps1 = 1, Tps2 = 2, Tps3 = 3, Tps4 = 7 };
 
 // What training needs to know of the sink: its receiver capability field.
+// A DP 1.4 sink's Display Stream Compression decoder, from DPCD 0x060..0x06F (DP_DSC_SUPPORT on), as Linux's
+// dc_dsc_parse_dsc_dpcd (dc/dsc/dc_dsc.c) reads it; a branch device's extra caps (0x0A0) are not read.
+struct DscCaps {
+	uint8_t  version;            // DP_DSC_REV: major in [3:0], minor in [7:4] (0x11 = 1.1, 0x21 = 1.2)
+	uint32_t rcBufferBytes;      // the rate buffer: (RC_BUF_SIZE + 1) blocks of 1, 4, 16 or 64 KiB
+	uint8_t  sliceCaps1;         // DP_DSC_SLICE_CAP_1: 1, 2, 4, 6, 8, 10, 12 slices per line, bit 0 on
+	uint8_t  sliceCaps2;         // DP_DSC_SLICE_CAP_2: 16, 20, 24 slices
+	uint8_t  lineBufferBits;     // line buffer bit depth, 8 to 16
+	bool     blockPrediction;
+	uint16_t maxBitsPerPixel16;  // DP_DSC_MAX_BITS_PER_PIXEL (eDP: bits per pixel in 1/16, 0 for DP)
+	uint8_t  colorFormats;       // DP_DSC_DEC_COLOR_FORMAT_CAP: RGB 1, 4:4:4 2, simple 4:2:2 4, native 4:2:2 8, native 4:2:0 16
+	uint8_t  colorDepths;        // DP_DSC_DEC_COLOR_DEPTH_CAP: 8 bpc 2, 10 bpc 4, 12 bpc 8
+	uint32_t throughputMode0;    // MPixels/s with one pixel per clock (plus the DP 2.1 delta)
+	uint32_t throughputMode1;    // ... with two (4:2:0 and native 4:2:2)
+	uint32_t maxSliceWidth;      // pixels (DP_DSC_MAX_SLICE_WIDTH x 320)
+	uint8_t  bppIncrementDiv;    // the bits-per-pixel step is 1 / this: 16, 8, 4, 2 or 1
+};
+// False if the sink has no DSC decoder or a field holds a value Linux refuses.
+
 struct Sink {
 	uint8_t rev;        // DPCD_REV, 0x12 = 1.2
 	uint8_t maxRate;    // MAX_LINK_RATE
 	uint8_t maxLanes;   // MAX_LANE_COUNT
 	bool    tps3, tps4; // training patterns it supports beyond TPS2
+	bool    hasDsc;     // a DSC decoder (DPCD 1.4 and DP_DSC_SUPPORT), described by dsc
+	DscCaps dsc;
 };
 // From DPCD 0x000 on (at least four bytes). False if they are not a sink's.
 bool parseCaps(const uint8_t *caps, size_t len, Sink &out);
+// From DPCD 0x060 on: false if the sink has no DSC decoder or a field holds a value Linux refuses.
+bool parseDscCaps(const uint8_t dsc[16], DscCaps &out);
+
+
 
 // Whether a link is up, from the sink's LANE0_1_STATUS, LANE2_3_STATUS and
 // LANE_ALIGN_STATUS_UPDATED (DPCD 0x202..0x204): clock recovery, equalisation

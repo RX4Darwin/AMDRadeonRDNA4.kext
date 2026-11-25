@@ -3026,6 +3026,8 @@ bool RDNA4Device::readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link) {
 		return false;
 	}
 	const bool parsed = DpTrain::parseCaps(caps, sizeof(caps), sink);
+	if (parsed)
+		readDscCaps(sinkAuxInst, sink, "dptrain");
 	link = DpTrain::Link { static_cast<uint8_t>(set[1] & 0x1f), set[0] };
 	FBLOG("dptrain: sink DPCD %u.%u, up to %u lane(s) at rate 0x%02x%s%s, reading interval 0x%02x; the firmware's "
 	      "link: %u lane(s) at rate 0x%02x (LANE_COUNT_SET 0x%02x); lanes %02x %02x, aligned %u", caps[0] >> 4,
@@ -3965,7 +3967,27 @@ bool RDNA4Device::readSecondDpSink(uint8_t aux) {
 	FBLOG("pipe2: DisplayPort sink on AUX%u: DPCD %u.%u, up to %u lane(s) at rate 0x%02x%s%s", aux, caps[0] >> 4,
 	      caps[0] & 0xf, xp().sink.maxLanes, xp().sink.maxRate, xp().sink.tps3 ? ", TPS3" : "",
 	      xp().sink.tps4 ? ", TPS4" : "");
+	readDscCaps(aux, xp().sink, "pipe2");
 	return true;
+}
+
+// A DPCD 1.4 sink's DSC decoder (DPCD 0x060..0x06F, docs/dsc-plan.md step 1): into sink.dsc, logged. Read only; nothing uses
+// it yet.
+void RDNA4Device::readDscCaps(uint8_t aux, DpTrain::Sink &sink, const char *who) {
+	uint8_t dsc[16] {};
+	sink.hasDsc = false;
+	if (sink.rev < 0x14 || !dpcdRead(aux, 0x060, dsc, sizeof(dsc)))
+		return;
+	sink.hasDsc = DpTrain::parseDscCaps(dsc, sink.dsc);
+	if (!sink.hasDsc) {
+		FBLOG("%s: DPCD %u.%u sink on AUX%u: no DSC decoder (DP_DSC_SUPPORT 0x%02x)", who, sink.rev >> 4, sink.rev & 0xf, aux, dsc[0]);
+		return;
+	}
+	const DpTrain::DscCaps &c = sink.dsc;
+	FBLOG("%s: DSC decoder on AUX%u: version %u.%u, rate buffer %u bytes, slices 0x%02x/0x%02x up to %u wide, line buffer %u bits%s, "
+	      "colour formats 0x%02x depths 0x%02x, %u/%u MPixels/s, bpp step 1/%u", who, aux, c.version & 0xf, c.version >> 4,
+	      c.rcBufferBytes, c.sliceCaps1, c.sliceCaps2, c.maxSliceWidth, c.lineBufferBits, c.blockPrediction ? ", block prediction" : "",
+	      c.colorFormats, c.colorDepths, c.throughputMode0, c.throughputMode1, c.bppIncrementDiv);
 }
 
 // The smallest link of the sink's that carries a mode at 8 bpc: what the next
