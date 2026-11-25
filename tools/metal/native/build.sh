@@ -58,6 +58,13 @@ EOF
 else
 	echo "build.sh: $dir/bin/libvulkan_radeon.dylib not built (make mesa), left out" >&2
 fi
+# Mesa's Anti-Lag layer (Anti-Lag 2 for Vulkan games): its manifest is an implicit layer's, loaded while ENABLE_LAYER_MESA_ANTI_LAG=1
+# (RDNA4Gadget sets it for the session); the package puts it where Khronos's loader looks
+if [ -f "$dir/bin/libVkLayer_MESA_anti_lag.dylib" ]; then
+	cp "$dir/bin/libVkLayer_MESA_anti_lag.dylib" "$c/Frameworks/"
+	sed "s|@library_path@|$installed/Contents/Frameworks/libVkLayer_MESA_anti_lag.dylib|" \
+		lib/Mesa/src/vulkan/anti-lag-layer/VkLayer_MESA_anti_lag.json.in > "$c/Resources/VkLayer_MESA_anti_lag.json"
+fi
 
 xcrun -sdk macosx metal -c tools/metal/native/rdna4.metal -o Build/native/rdna4.air
 xcrun -sdk macosx metallib Build/native/rdna4.air -o "$c/Resources/rdna4.metallib"

@@ -242,6 +242,8 @@ static NSError *rdna4Error(NSString *what, kern_return_t kr)
 	return [NSError errorWithDomain:@"RDNA4MTL" code:kr userInfo:@{ NSLocalizedDescriptionKey : text }];
 }
 
+static void antiLagPace(id<MTLCommandBuffer> presenting);   // (Anti-Lag, at the end of the file)
+
 // ---- buffers
 
 @interface RDNA4MTLBuffer : NSObject <MTLBuffer>
@@ -4603,6 +4605,8 @@ static int64_t earlyBacklog(void)   // RDNA4_EARLYBACKLOG=n: another cap, for me
 	gUnscheduled++;
 	dispatch_group_enter(_done);
 	[_queue committed:self];
+	if (_drawables.count)
+		antiLagPace(self);
 }
 
 // Its steps on the device's work queue (the queue calls it in enqueue order).
@@ -6932,4 +6936,38 @@ static void superResolutionInstall(void)
 		gRealDrawableSize = (CGSize (*)(id, SEL))method_setImplementation(class_getInstanceMethod(c, @selector(drawableSize)), (IMP)fsrDrawableSize);
 		gRealNextDrawable = (id (*)(id, SEL))method_setImplementation(class_getInstanceMethod(c, @selector(nextDrawable)), (IMP)fsrNextDrawable);
 	});
+}
+
+// ---- Anti-Lag (1): the CPU kept at most one frame ahead of the card
+//
+// A game whose CPU runs frames ahead of the card shows each frame later than the input it read: Metal lets it queue up to three
+// drawables. With Anti-Lag on (RDNA4Gadget's setting, or RDNA4_ANTILAG=1), a commit that presents returns only once the frame before it has
+// finished on the card, so the next frame (and its input) starts as late as it can and still keep the card busy, as AMD's Radeon Anti-Lag
+// does in its Windows driver. Anti-Lag 2 (VK_AMD_anti_lag, games that mark their frames) is Mesa's layer for Vulkan apps instead.
+
+static BOOL antiLagWanted(void)
+{
+	if (const char *env = getenv("RDNA4_ANTILAG"))
+		return atoi(env) != 0;
+	return CFPreferencesGetAppBooleanValue(CFSTR("AntiLag"), kGadgetDomain, NULL);
+}
+
+static void antiLagPace(id<MTLCommandBuffer> presenting)
+{
+	static std::mutex lock;
+	static id<MTLCommandBuffer> previous;   // the last frame committed before this one (ponytail: one for the process, not each layer)
+	static const bool windowServer = !strcmp(getprogname(), "WindowServer");
+	if (windowServer || !antiLagWanted())
+		return;
+	id<MTLCommandBuffer> wait;
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		wait = previous;
+		previous = presenting;
+	}
+	static std::atomic<bool> said;
+	const uint64_t t0 = nowUs();
+	[wait waitUntilCompleted];
+	if (wait && !said.exchange(true))
+		RLOG(@"RDNA4MTL: Anti-Lag: frames paced (the first waited %llu us for the frame before)", nowUs() - t0);
 }

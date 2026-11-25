@@ -9,7 +9,7 @@ for l in org.rdna4.air2amdgpu org.rdna4.iop org.rdna4.logd; do
 	launchctl bootout "system/$l" 2> /dev/null || true
 	rm -f "/Library/LaunchDaemons/$l.plist"
 done
-rm -f /usr/local/share/vulkan/icd.d/radeon_icd.json /usr/local/bin/rdna4-run
+rm -f /usr/local/share/vulkan/icd.d/radeon_icd.json /usr/local/share/vulkan/implicit_layer.d/VkLayer_MESA_anti_lag.json /usr/local/bin/rdna4-run
 rm -rf /Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle /Applications/RDNA4Gadget.app
 for c in core logd vulkan gadget; do
 	pkgutil --forget "com.rx4darwin.AMDRadeonRDNA4.$c" > /dev/null 2>&1 || true

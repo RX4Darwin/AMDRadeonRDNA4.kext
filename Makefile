@@ -241,6 +241,8 @@ vulkan-products:
 	@[ -f $(RADV_BUILT) ] || exit 0; \
 	mkdir -p $(BIN); \
 	cmp -s $(RADV_BUILT) $(RADV_LIB) || { echo "cp $(RADV_BUILT) $(RADV_LIB)"; cp $(RADV_BUILT) $(RADV_LIB); }; \
+	al=$(RADV_DIR)/build/src/vulkan/anti-lag-layer/libVkLayer_MESA_anti_lag.dylib; \
+	[ ! -f $$al ] || cmp -s $$al $(BIN)/libVkLayer_MESA_anti_lag.dylib || { echo "cp $$al $(BIN)/"; cp $$al $(BIN)/; }; \
 	for p in vkprobe swapprobe; do \
 		if [ ! -f $(BIN)/$$p ] || [ $(VULKAN)/$$p.c -nt $(BIN)/$$p ]; then \
 			echo "$(CXX) -x c ... $(VULKAN)/$$p.c -o $(BIN)/$$p"; \

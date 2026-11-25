@@ -40,4 +40,6 @@ export PATH=$W/venv/bin:$PATH MACOSX_DEPLOYMENT_TARGET=11.0
 	-Dvulkan-drivers=amd -Dgallium-drivers= -Dplatforms=macos -Dglx=disabled -Degl=disabled -Dopengl=false \
 	-Dgles1=disabled -Dgles2=disabled -Dllvm=disabled -Dvideo-codecs= -Dzstd=disabled -Dexpat=disabled \
 	-Dxmlconfig=disabled -Dbuild-tests=false -Dbuildtype=debugoptimized
+# Mesa's Anti-Lag layer (VK_AMD_anti_lag, AMD's Anti-Lag 2 for Vulkan games that mark their frames); also set on trees set up before it
+meson configure build -Dvulkan-layers=anti-lag
 ninja -C build

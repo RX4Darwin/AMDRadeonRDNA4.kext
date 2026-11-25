@@ -81,6 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var status: StatusItem?
 
     @MainActor func applicationDidFinishLaunching(_ notification: Notification) {
+        TweaksView.applyAntiLag2(UserDefaults.standard.bool(forKey: "AntiLag2"))   // (the session's variable, set again each login)
         status = StatusItem(model: GadgetModel())
     }
 }

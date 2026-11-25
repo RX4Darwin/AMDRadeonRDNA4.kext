@@ -5,7 +5,8 @@
 #                       for WindowServer, whose sandbox cannot start it) and org.rdna4.iop (CoreDisplay's setup each boot), both run from
 #                       the bundle's Contents/Helpers; /usr/local/bin/rdna4-run
 #   logd    (chosen)    the LaunchDaemon org.rdna4.logd: each boot's kernel log in /var/log/rdna4
-#   vulkan  (chosen)    RADV's manifest in /usr/local/share/vulkan/icd.d, where Khronos's Vulkan loader looks
+#   vulkan  (chosen)    RADV's manifest in /usr/local/share/vulkan/icd.d, where Khronos's Vulkan loader looks, and Mesa's Anti-Lag
+#                       layer's in implicit_layer.d
 #   gadget  (chosen)    /Applications/RDNA4Gadget.app, the menu bar app (`make gadget`)
 # The scripts stop and remove what the per-component install.sh scripts of 0.3 put in place first. Unsigned (packaging-plan.md:
 # no Developer ID while the driver needs AMFI relaxed). The kext is not in it: OpenCore injects it (README, Installing).
@@ -74,6 +75,10 @@ daemon "$r/Library/LaunchDaemons/org.rdna4.logd.plist" org.rdna4.logd "$helpers/
 r=$w/vulkan-root
 mkdir -p "$r/usr/local/share/vulkan/icd.d"
 cp "$dir/$bundle/Contents/Resources/radeon_icd.json" "$r/usr/local/share/vulkan/icd.d/radeon_icd.json"
+if [ -f "$dir/$bundle/Contents/Resources/VkLayer_MESA_anti_lag.json" ]; then   # (Anti-Lag 2: loaded while RDNA4Gadget's switch is on)
+	mkdir -p "$r/usr/local/share/vulkan/implicit_layer.d"
+	cp "$dir/$bundle/Contents/Resources/VkLayer_MESA_anti_lag.json" "$r/usr/local/share/vulkan/implicit_layer.d/"
+fi
 
 # gadget
 r=$w/gadget-root

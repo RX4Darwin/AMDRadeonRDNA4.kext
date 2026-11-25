@@ -3,7 +3,7 @@
 import SwiftUI
 
 struct GadgetView: View {
-    static let size = NSSize(width: 360, height: 460)
+    static let size = NSSize(width: 360, height: 600)
     @ObservedObject var model: GadgetModel
     @State private var tab = 0
     @State private var confirmUninstall = false
@@ -181,6 +181,16 @@ struct TweaksView: View {
     @AppStorage("SuperResolution") private var superResolution = false
     @AppStorage("RenderScale") private var renderScale = 100     // percent of the size a game asks for; 100: its own size
     @AppStorage("Sharpness") private var sharpness = 200         // RCAS, thousandths of a stop below the sharpest
+    @AppStorage("AntiLag") private var antiLag = false          // the Metal driver keeps the CPU at most a frame ahead
+    @AppStorage("AntiLag2") private var antiLag2 = false        // Mesa's Anti-Lag layer loaded into Vulkan games
+
+    // Anti-Lag 2: Mesa's layer is an implicit one loaded while ENABLE_LAYER_MESA_ANTI_LAG=1, set for the login session's apps
+    static func applyAntiLag2(_ on: Bool) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = on ? ["setenv", "ENABLE_LAYER_MESA_ANTI_LAG", "1"] : ["unsetenv", "ENABLE_LAYER_MESA_ANTI_LAG"]
+        try? p.run()
+    }
 
     // FSR 1's quality modes (AMD's names and scales)
     private static let modes: [(String, Int)] = [("Off: the game's own size", 100), ("Ultra Quality (77 %)", 77), ("Quality (67 %)", 67),
@@ -203,8 +213,15 @@ struct TweaksView: View {
                 }
             }
             .disabled(!superResolution)
-            Text("Games that draw below the screen's resolution are upscaled with FSR 1 and sharpened instead of stretched. A render scale below the game's own size makes games draw fewer pixels for more frames. Applies to games started after a change; a game that draws to the wrong size at a render scale needs it off.")
+            Text("Games drawing below the screen's resolution are upscaled with FSR 1 instead of stretched; a render scale makes them draw fewer pixels for more frames (turn it off for a game that then draws the wrong size).")
                 .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Divider()
+            Toggle("Anti-Lag", isOn: $antiLag).toggleStyle(.switch)
+            Toggle("Anti-Lag 2 (Vulkan games that support it)", isOn: Binding(get: { antiLag2 }, set: { antiLag2 = $0; Self.applyAntiLag2($0) }))
+                .toggleStyle(.switch)
+            Text("Anti-Lag keeps a game's CPU at most one frame ahead of the card: frames show sooner after input. Anti-Lag 2 is for Vulkan games that build it in (VK_AMD_anti_lag).")
+                .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text("All of these apply to games started after a change.").font(.caption2).foregroundStyle(.secondary)
         }
     }
 }
