@@ -19,6 +19,7 @@
 #include "probe_kernel.h"
 #include "sdma.hpp"
 #include "smu_metrics.h"
+#include "smu_overdrive.h"
 #include "vadd_codeobj.h"
 
 #include <kern/clock.h>
@@ -2406,6 +2407,7 @@ uint64_t RDNA4Compute::smuEnableFeatures(uint64_t allowed, uint32_t domain) {
 	// (2026-11-15, trail "s3: SMU features (display-safe mask)"); these name the message.
 	trail("s3: SMU GetDriverIfVersion");
 	resp = smuSend(kSmuMsgGetDriverIfVersion, 0, ret, 100);
+	const uint32_t driverIf = resp == kSmuRespOk ? ret : 0;
 	CLOG("smu: driver interface version 0x%x (resp 0x%02x; amdgpu expects 0x2e)", ret, resp);
 	CLOG("smu: running features before: 0x%016llx", running());
 
@@ -2441,7 +2443,61 @@ uint64_t RDNA4Compute::smuEnableFeatures(uint64_t allowed, uint32_t domain) {
 	     "FCLK DPM %s, DCN DPM %s, GFXOFF %s, FW_CTF %s, fan %s (DisallowGfxOff 0x%02x)", now,
 	     on(kSmuFeatGfxImu), on(kSmuFeatDpmGfxclk), on(kSmuFeatDpmUclk), on(kSmuFeatDpmFclk),
 	     on(kSmuFeatDpmDcn), on(kSmuFeatGfxoff), on(kSmuFeatFwCtf), on(kSmuFeatFanControl), resp);
+	// The OverDrive layouts are 0x2E's; retail RX 9070 firmware reports 0x33 and amdgpu drives its fans with them (no public 0x33 header)
+	if (driverIf == RDNA4_SMU_DRIVER_IF_VERSION || driverIf == RDNA4_SMU_DRIVER_IF_RETAIL)
+		logOverdrive();
+	else
+		CLOG("smu: OverDrive not read: driver interface 0x%x, the layouts known are 0x%x's", driverIf, RDNA4_SMU_DRIVER_IF_VERSION);
 	return now;
+}
+
+// Fan control, step 1 (docs/fan-control-plan.md): what the board allows (the basic OverDrive limits of the PPTable in the combo table)
+// and what the SMU runs (its OverDrive table), logged; nothing is written. Both arrive in the driver table, where the sensor reads land
+// too: run at start, before anything reads sensors (ponytail: no lock across the transfer and the reads; one when this runs later).
+void RDNA4Compute::logOverdrive() {
+	const uint8_t *t = poolCpu + kSmuTableOffset;
+	auto u8 = [t](uint32_t off) -> uint32_t { return *reinterpret_cast<const volatile uint8_t *>(t + off); };
+	auto u16 = [t](uint32_t off) -> uint32_t { return *reinterpret_cast<const volatile uint16_t *>(t + off); };
+	auto u32 = [t](uint32_t off) -> uint32_t { return *reinterpret_cast<const volatile uint32_t *>(t + off); };
+	auto fetch = [this](uint32_t table) {
+		uint32_t ret = 0;
+		flushHdp();
+		const uint32_t resp = smuSend(kSmuMsgGetMetricsTable, table, ret, 100);   // (0x12: TransferTableSmu2Dram, any table)
+		flushHdp();
+		return resp;
+	};
+	if (const uint32_t resp = fetch(RDNA4_SMU_TABLE_COMBO_PPTABLE); resp != kSmuRespOk) {
+		CLOG("smu: combo pptable not read (resp 0x%02x)", resp);
+		return;
+	}
+	const uint32_t pp = RDNA4_SMU_COMBO_PPTABLE;
+	CLOG("smu: pptable FeaturesToRun 0x%08x%08x (fan control %s)", u32(pp + RDNA4_SMU_PP_FEATURES_TO_RUN + 4),
+	     u32(pp + RDNA4_SMU_PP_FEATURES_TO_RUN), u32(pp + RDNA4_SMU_PP_FEATURES_TO_RUN) >> kSmuFeatFanControl & 1 ? "on" : "off");
+	static const uint32_t kLimits[] = { RDNA4_SMU_PP_OD_LIMITS_MIN, RDNA4_SMU_PP_OD_LIMITS_MAX };
+	for (const uint32_t which : kLimits) {
+		const uint32_t l = pp + which;
+		CLOG("smu: OverDrive limits %s: features 0x%x (fan curve %u, fan legacy %u, zero fan %u); fan curve PWM %u %u %u %u %u %u %%, "
+		     "temperatures %u %u %u %u %u %u C; minimum PWM %u, acoustic target %u, limit %u RPM, target temperature %u C, zero RPM %u",
+		     which == RDNA4_SMU_PP_OD_LIMITS_MIN ? "min" : "max", u32(l + RDNA4_SMU_ODL_FEATURE_MASK),
+		     u32(l) >> RDNA4_SMU_OD_FEATURE_FAN_CURVE & 1, u32(l) >> RDNA4_SMU_OD_FEATURE_FAN_LEGACY & 1, u32(l) >> RDNA4_SMU_OD_FEATURE_ZERO_FAN & 1,
+		     u8(l + RDNA4_SMU_ODL_FAN_PWM), u8(l + RDNA4_SMU_ODL_FAN_PWM + 1), u8(l + RDNA4_SMU_ODL_FAN_PWM + 2), u8(l + RDNA4_SMU_ODL_FAN_PWM + 3),
+		     u8(l + RDNA4_SMU_ODL_FAN_PWM + 4), u8(l + RDNA4_SMU_ODL_FAN_PWM + 5), u8(l + RDNA4_SMU_ODL_FAN_TEMP), u8(l + RDNA4_SMU_ODL_FAN_TEMP + 1),
+		     u8(l + RDNA4_SMU_ODL_FAN_TEMP + 2), u8(l + RDNA4_SMU_ODL_FAN_TEMP + 3), u8(l + RDNA4_SMU_ODL_FAN_TEMP + 4), u8(l + RDNA4_SMU_ODL_FAN_TEMP + 5),
+		     u16(l + RDNA4_SMU_ODL_FAN_MIN_PWM), u16(l + RDNA4_SMU_ODL_ACOUSTIC_TARGET), u16(l + RDNA4_SMU_ODL_ACOUSTIC_LIMIT),
+		     u16(l + RDNA4_SMU_ODL_FAN_TARGET_TEMP), u8(l + RDNA4_SMU_ODL_FAN_ZERO_RPM));
+	}
+	if (const uint32_t resp = fetch(RDNA4_SMU_TABLE_OVERDRIVE); resp != kSmuRespOk) {
+		CLOG("smu: OverDrive table not read (resp 0x%02x)", resp);
+		return;
+	}
+	CLOG("smu: OverDrive table: features 0x%x, fan mode %u (0 auto, 1 curve); fan curve PWM %u %u %u %u %u %u %%, temperatures %u %u %u %u %u %u C; "
+	     "minimum PWM %u, acoustic target %u, limit %u RPM, target temperature %u C, zero RPM %u (stop %u C), max operating %u C",
+	     u32(RDNA4_SMU_OD_FEATURE_MASK), u8(RDNA4_SMU_OD_FAN_MODE), u8(RDNA4_SMU_OD_FAN_PWM), u8(RDNA4_SMU_OD_FAN_PWM + 1),
+	     u8(RDNA4_SMU_OD_FAN_PWM + 2), u8(RDNA4_SMU_OD_FAN_PWM + 3), u8(RDNA4_SMU_OD_FAN_PWM + 4), u8(RDNA4_SMU_OD_FAN_PWM + 5),
+	     u8(RDNA4_SMU_OD_FAN_TEMP), u8(RDNA4_SMU_OD_FAN_TEMP + 1), u8(RDNA4_SMU_OD_FAN_TEMP + 2), u8(RDNA4_SMU_OD_FAN_TEMP + 3),
+	     u8(RDNA4_SMU_OD_FAN_TEMP + 4), u8(RDNA4_SMU_OD_FAN_TEMP + 5), u16(RDNA4_SMU_OD_FAN_MIN_PWM), u16(RDNA4_SMU_OD_ACOUSTIC_TARGET),
+	     u16(RDNA4_SMU_OD_ACOUSTIC_LIMIT), u16(RDNA4_SMU_OD_FAN_TARGET_TEMP), u8(RDNA4_SMU_OD_FAN_ZERO_RPM), u8(RDNA4_SMU_OD_FAN_ZERO_RPM_STOP),
+	     u8(RDNA4_SMU_OD_MAX_OP_TEMP));
 }
 
 // ---------------------------------------------------------------------------

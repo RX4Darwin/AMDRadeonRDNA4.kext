@@ -1,6 +1,6 @@
 # Fan Control (RDNA4Gadget tab), plan
 
-Status: plan, 2026-11-25. Nothing built. Asked for by Sunneva with the Anti-Lag work.
+Status, 2026-11-25: step 1 done and card-run (below). Asked for by Sunneva with the Anti-Lag work.
 
 ## What the card offers
 
@@ -33,6 +33,17 @@ which the vBIOS sets; a value outside them is refused or clamped by the SMU.
    (from the readings the app already shows); Apply and Reset to defaults. Settings kept by the app and applied again at login.
 5. **Card tests:** a curve that raises the fan at idle (RPM follows within seconds), zero-RPM off then on, reset, a value outside the
    limits refused, system sleep and wake (settings kept), a reboot (back to the vBIOS's unless re-applied).
+
+## Step 1 result (2026-11-25, rig: RX 9070 XT)
+
+The SMU reports driver interface **0x33** (Linux's header, the layouts used here, is 0x2E; amdgpu runs retail RX 9070 cards with it, and
+every value read is plausible, so the layout holds). Logged at start (`smu: OverDrive ...`, `src/smu_overdrive.h` offsets):
+
+- PPTable FeaturesToRun 0x048cf19e3afffcfb: fan control on.
+- Limits (basic): OverDrive features 0x1b39 (fan curve, fan legacy and zero fan all allowed); fan curve PWM 15-100 %, temperatures
+  25-100 C; minimum PWM 15-100; acoustic target and limit 500-5000 RPM; target temperature 25-105 C; zero RPM 0-1.
+- Running (the vBIOS's): features 0, fan mode 0 (auto), curve all zero (the firmware's own), minimum PWM 15, acoustic target 1750 and
+  limit 5000 RPM, target temperature 85 C, zero RPM on (stops below 50 C), max operating 110 C.
 
 ## Safety and open questions
 

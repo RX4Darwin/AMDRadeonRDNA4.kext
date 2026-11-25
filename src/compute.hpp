@@ -317,6 +317,7 @@ private:
 	static constexpr uint32_t kSmuTableOffset = 6u << 20;            // driver table, 64 KiB
 	bool readSensors(RDNA4Sensors &out);
 	bool readSensorsEx(RDNA4SensorsEx &out);
+	void logOverdrive();   // fan control step 1: the board's OverDrive limits and the SMU's OverDrive table, logged (nothing written)
 
 	// Stage 4: the GC hub, then SDMA0 queue 0 and a VRAM fill. Pool layout
 	// past the PSP's first 4 MiB (offsets within the pool).
