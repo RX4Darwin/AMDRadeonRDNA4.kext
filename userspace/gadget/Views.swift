@@ -15,13 +15,15 @@ struct GadgetView: View {
             Picker("", selection: $tab) {
                 Text("Driver").tag(0)
                 Text("Tweaks").tag(1)
-                Text("Gadget").tag(2)
+                Text("Fans").tag(2)
+                Text("Gadget").tag(3)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
             switch tab {
             case 0: driver
             case 1: TweaksView()
+            case 2: FanView(model: model)
             default: gadget
             }
             if let busy = model.busy {

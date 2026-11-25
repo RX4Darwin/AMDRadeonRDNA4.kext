@@ -2,8 +2,9 @@
 # package.sh <product dir> <version>: AMDRadeonRDNA4-<version>.pkg in the product dir (`make package`; docs/packaging-plan.md), from the
 # driver bundle `make metal-driver` built. Three components, one installer:
 #   core    (required)  /Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle; the LaunchDaemons org.rdna4.air2amdgpu (the shader translator
-#                       for WindowServer, whose sandbox cannot start it) and org.rdna4.iop (CoreDisplay's setup each boot), both run from
-#                       the bundle's Contents/Helpers; /usr/local/bin/rdna4-run
+#                       for WindowServer, whose sandbox cannot start it), org.rdna4.iop (CoreDisplay's setup each boot) and org.rdna4.fan
+#                       (RDNA4Gadget's fan settings, at boot and when /Library/Application Support/AMDRadeonRDNA4/fan.conf changes), all run
+#                       from the bundle's Contents/Helpers; /usr/local/bin/rdna4-run
 #   logd    (chosen)    the LaunchDaemon org.rdna4.logd: each boot's kernel log in /var/log/rdna4
 #   vulkan  (chosen)    RADV's manifest in /usr/local/share/vulkan/icd.d, where Khronos's Vulkan loader looks, and Mesa's Anti-Lag
 #                       layer's in implicit_layer.d
@@ -61,6 +62,9 @@ codesign -s - -f "$r/Library/GPUBundles/$bundle" > /dev/null 2>&1   # (the scrip
 daemon "$r/Library/LaunchDaemons/org.rdna4.air2amdgpu.plist" org.rdna4.air2amdgpu "$helpers/air2amdgpu" --serve -- \
 	'<key>KeepAlive</key><true/>' '<key>ProcessType</key><string>Interactive</string>' '<key>ThrottleInterval</key><integer>10</integer>' \
 	'<key>StandardErrorPath</key><string>/var/log/rdna4-air2amdgpu.log</string>'
+daemon "$r/Library/LaunchDaemons/org.rdna4.fan.plist" org.rdna4.fan "$helpers/rdna4-fan-apply" -- \
+	'<key>WatchPaths</key><array><string>/Library/Application Support/AMDRadeonRDNA4/fan.conf</string></array>' \
+	'<key>StandardErrorPath</key><string>/var/log/rdna4-fan.log</string>' '<key>StandardOutPath</key><string>/var/log/rdna4-fan.log</string>'
 daemon "$r/Library/LaunchDaemons/org.rdna4.iop.plist" org.rdna4.iop "$helpers/rdna4-iop" -- \
 	'<key>StandardOutPath</key><string>/var/log/rdna4-iop.log</string>' '<key>StandardErrorPath</key><string>/var/log/rdna4-iop.log</string>'
 ln -s "$helpers/rdna4-run" "$r/usr/local/bin/rdna4-run"
@@ -95,11 +99,14 @@ script() {
 	chmod 755 "$w/$1-scripts/$2"
 }
 script core preinstall '
-for l in org.rdna4.air2amdgpu org.rdna4.iop com.hackintosh.AMDRadeonRDNA4.air2amdgpu; do launchctl bootout system/$l 2> /dev/null; done
+for l in org.rdna4.air2amdgpu org.rdna4.iop org.rdna4.fan com.hackintosh.AMDRadeonRDNA4.air2amdgpu; do launchctl bootout system/$l 2> /dev/null; done
 rm -f /Library/LaunchDaemons/com.hackintosh.AMDRadeonRDNA4.air2amdgpu.plist /usr/local/libexec/rdna4-air2amdgpu /usr/local/libexec/rdna4-iop
 rm -rf /Library/GPUBundles/AMDRadeonRDNA4Metal.bundle /Library/Frameworks/AMDRadeonRDNA4.framework '"$installed"
 script core postinstall '
-for l in org.rdna4.air2amdgpu org.rdna4.iop; do launchctl bootstrap system /Library/LaunchDaemons/$l.plist; done'
+# RDNA4Gadget writes the fan settings here as an administrator (group admin), org.rdna4.fan applies them as root
+d="/Library/Application Support/AMDRadeonRDNA4"
+mkdir -p "$d" && touch "$d/fan.conf" && chown root:admin "$d" "$d/fan.conf" && chmod 775 "$d" && chmod 664 "$d/fan.conf"
+for l in org.rdna4.air2amdgpu org.rdna4.iop org.rdna4.fan; do launchctl bootstrap system /Library/LaunchDaemons/$l.plist; done'
 script logd preinstall '
 launchctl bootout system/org.rdna4.logd 2> /dev/null
 rm -f /usr/local/libexec/rdna4-logd'

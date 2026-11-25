@@ -47,6 +47,7 @@ clang++ -std=c++17 -arch x86_64 -mmacosx-version-min=13.0 -fobjc-arc -Wall -Wno-
 for p in "$dir/bin/rdna4-run" "$dir/bin/rdna4-iop" "$dir/bin/rdna4-logd" Build/m3/x86_64/air2amdgpu; do
 	if [ -x "$p" ]; then cp "$p" "$c/Helpers/"; else echo "build.sh: $p not built, left out of Helpers/" >&2; fi
 done
+cp tools/package/fan-apply.sh "$c/Helpers/rdna4-fan-apply"   # (RDNA4Gadget's fan settings, as root: the LaunchDaemon org.rdna4.fan)
 if [ -f "$dir/bin/libvulkan_radeon.dylib" ]; then
 	cp "$dir/bin/libvulkan_radeon.dylib" "$c/Frameworks/"
 	cat > "$c/Resources/radeon_icd.json" <<EOF

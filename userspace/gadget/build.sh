@@ -14,7 +14,7 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 xcrun swiftc -O -target x86_64-apple-macos13.0 -sdk "$(xcrun --show-sdk-path)" -module-name RDNA4Gadget \
 	-o "$app/Contents/MacOS/RDNA4Gadget" "$here"/main.swift "$here"/Model.swift "$here"/Views.swift "$here"/Sensors.swift \
-	"$here"/Driver.swift
+	"$here"/Driver.swift "$here"/Fan.swift
 sed "s/@VERSION@/$version/g" "$here/Info.plist" > "$app/Contents/Info.plist"
 # The icon: an asset catalog's (Assets.car, and AppIcon.icns for older systems) from AppIcon.png, a full-bleed square that macOS masks
 # itself (an icon with its own rounded corners and transparency sat on a white plate on Tahoe)

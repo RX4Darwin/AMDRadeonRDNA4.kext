@@ -331,6 +331,7 @@ public:   // (debug.rdna4_fan's handler)
 	int fanCommand(const char *cmd);             // debug.rdna4_fan: reset | curve T:P,T:P,T:P,T:P,T:P | zero 0|1 | stop C | target C |
 	                                             // minpwm P | acoustic TARGET LIMIT; 0 or an errno
 	void fanDescribe(char *out, size_t size);    // what is applied, for reading debug.rdna4_fan
+	void fanLimits(char *out, size_t size);      // the board's limits, for reading debug.rdna4_fan_limits
 private:
 	bool uploadOverdrive();                      // odCur with odMask to the SMU (TransferTableDram2Smu)
 	bool readOverdrive();                        // (logOverdrive) the tables read and logged

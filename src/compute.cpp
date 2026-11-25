@@ -2563,6 +2563,19 @@ bool RDNA4Compute::uploadOverdrive() {
 	return true;
 }
 
+// The board's limits as "key min max" pairs for the app: curve temperatures and speeds, the zero-RPM stop temperature, target
+// temperature, minimum speed, acoustic target and limit, and which OverDrive features it allows (curve, legacy, zero RPM: 0 or 1)
+void RDNA4Compute::fanLimits(char *out, size_t size) {
+	auto lo16 = [this](uint32_t off) { return static_cast<uint32_t>(odMin[off] | odMin[off + 1] << 8); };
+	auto hi16 = [this](uint32_t off) { return static_cast<uint32_t>(odMax[off] | odMax[off + 1] << 8); };
+	const uint32_t features = static_cast<uint32_t>(odMax[0] | odMax[1] << 8 | odMax[2] << 16 | odMax[3] << 24);
+	snprintf(out, size, "temp %u %u; pwm %u %u; stop %u %u; target %u %u; minpwm %u %u; acoustic %u %u; curve %u; legacy %u; zero %u",
+	         odMin[RDNA4_SMU_ODL_FAN_TEMP], odMax[RDNA4_SMU_ODL_FAN_TEMP], odMin[RDNA4_SMU_ODL_FAN_PWM], odMax[RDNA4_SMU_ODL_FAN_PWM],
+	         odStopMin, odStopMax, lo16(RDNA4_SMU_ODL_FAN_TARGET_TEMP), hi16(RDNA4_SMU_ODL_FAN_TARGET_TEMP), lo16(RDNA4_SMU_ODL_FAN_MIN_PWM),
+	         hi16(RDNA4_SMU_ODL_FAN_MIN_PWM), lo16(RDNA4_SMU_ODL_ACOUSTIC_TARGET), hi16(RDNA4_SMU_ODL_ACOUSTIC_LIMIT),
+	         features >> RDNA4_SMU_OD_FEATURE_FAN_CURVE & 1, features >> RDNA4_SMU_OD_FEATURE_FAN_LEGACY & 1, features >> RDNA4_SMU_OD_FEATURE_ZERO_FAN & 1);
+}
+
 void RDNA4Compute::fanDescribe(char *out, size_t size) {
 	const uint8_t *c = odCur;
 	auto u16at = [c](uint32_t off) { return static_cast<uint32_t>(c[off] | c[off + 1] << 8); };
@@ -2685,6 +2698,15 @@ int fanSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 }
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_fan, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, fanSysctl, "A",
             "AMDRadeonRDNA4: the fan (root to set): reset | curve T:P,T:P,T:P,T:P,T:P | zero 0|1 | stop C | target C | minpwm P | acoustic T L");
+
+int fanLimitsSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	char value[200] = "";
+	if (gFanCompute)
+		gFanCompute->fanLimits(value, sizeof(value));
+	return sysctl_handle_string(oidp, value, sizeof(value), req);
+}
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_fan_limits, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, fanLimitsSysctl, "A",
+            "AMDRadeonRDNA4: the board's fan limits (RDNA4Gadget's Fan Control tab)");
 }
 
 void RDNA4Compute::registerFanSysctl() {
@@ -2692,6 +2714,7 @@ void RDNA4Compute::registerFanSysctl() {
 	if (!done) {
 		done = true;
 		sysctl_register_oid(&sysctl__debug_rdna4_fan);
+		sysctl_register_oid(&sysctl__debug_rdna4_fan_limits);
 	}
 }
 
