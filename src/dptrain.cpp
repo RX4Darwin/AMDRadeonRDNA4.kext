@@ -213,6 +213,11 @@ bool parseCaps(const uint8_t *caps, size_t len, Sink &out) {
 	return out.rev >= 0x10 && rate && lanes;
 }
 
+bool parseExtendedCaps(const uint8_t (&base)[16], const uint8_t (&extended)[16], Sink &out) {
+	return (base[0x0e] & 0x80) && extended[0] >= 0x13 && extended[0] >= base[0] &&
+	       (extended[6] & 1) && parseCaps(extended, sizeof(extended), out);
+}
+
 bool pickLink(const Sink &sink, uint32_t pixelClockKHz, uint32_t bitsPerPixel, Link &out) {
 	static constexpr uint8_t rates[] = { kRbr, kHbr, kHbr2, kHbr3 };
 	const uint64_t need = static_cast<uint64_t>(pixelClockKHz) * bitsPerPixel;

@@ -170,6 +170,10 @@ constexpr uint32_t tmdsKHz(uint32_t pixelClockKHz, bool y420) { return y420 ? pi
 // Build the plan for `t`. Returns false (and `why`) if the target or the
 // timings cannot be expressed.
 bool build(const Target &t, Plan &out, const char **why);
+// Quiesce and restart a DP encoder around link training, keeping the OTG,
+// framebuffer and MSA geometry of the already-running timing intact.
+bool buildDpStreamOff(uint8_t dig, Plan &out);
+bool buildDpStreamOn(uint8_t dig, uint8_t bpc, uint32_t vidM, Plan &out);
 
 // Display sleep of an HDMI pipe running `t.to`: what amdgpu's DPMS off comes
 // down to for the sink. AVMUTE, the stream encoder off, and the PHY's clock

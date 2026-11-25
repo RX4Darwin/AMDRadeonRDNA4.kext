@@ -10,6 +10,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
   restores the previous mode. On a Radeon RX 9070 XT with an Alienware AW2724DM and macOS Tahoe 26.7.3 (25G342),
   CoreGraphics reported native 2560×1440 at both rates and both modes were visually confirmed. Hardware scanout
   measured 59.948 Hz in RGB 10 bpc and 164.943 Hz in RGB 8 bpc. The tested build also included the separate PR #26 change.
+- **HBR3 and RGB 10 bpc at native QHD 165 Hz (opt-in preview)**: the Alienware AW2724DM reports HBR2 in its base DPCD
+  block and HBR3 in the extended block. The preview can retrain to HBR3 on four lanes while keeping the existing
+  2560×1440 desktop mode. On RX 9070 XT with Tahoe 26.7.3 (25G342), RGB 10 bpc was visually confirmed and measured
+  164.956 Hz. Letting the preview expire restored HBR2 on four lanes and RGB 8 bpc at 164.956 Hz with the same
+  CoreGraphics mode. The hardware build also included the separate WC staging change from PR #26.
 - **MetalFX's spatial upscaler works on the card, as AMD FSR 1**: MetalFX's own came back empty on our device, so games that ask
   for it got no upscaling. Quake II's Metal port with `r_metalfx 1` draws its view at half size and FSR brings it to full size, in 8-bit
   and in HDR colour.

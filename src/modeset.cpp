@@ -170,6 +170,53 @@ void hdmiPixelClock(Builder &b, const Target &t) {
 	Dmub::buildSetPixelClock(*c, pc);
 }
 
+void blankDp(Builder &b, uint32_t dig, bool requireIdle) {
+	// --- dce110_blank_stream: enc1_stream_encoder_dp_blank, then idle pattern for the sink ---
+	b.update(kDpVidStreamCntl + dig, 0x300, 0x200, "dp stream off at the next vblank");
+	b.update(kDpVidStreamCntl + dig, 0x1, 0, "dp video stream off");
+	b.waitClear(kDpVidStreamCntl + dig, 1u << 16, 100200, "dp stream idle", !requireIdle);
+	b.update(kDpSteerFifo + dig, 0x2, 0x2, "dp steer fifo reset");
+	b.delay(60 * kMs, "idle pattern");
+}
+
+void programDpDepth(Builder &b, uint32_t dig, uint8_t bpc) {
+	const uint32_t depth = bpc == 8 ? 1u : 2u;
+	b.update(0x211f + dig, 0x700u, depth << 8, "DP uncompressed component depth");
+	b.update(0x2120 + dig, 0xe0000000u, depth << 29, "DP MSA MISC0 component depth");
+}
+
+void resumeDp(Builder &b, uint32_t dig, uint32_t vidM) {
+	// --- setup_dio_stream_encoder: enc35_enable_fifo ---
+	b.update(kDigFifoCtrl0 + dig, 0x1fu << 2, 7u << 2, "dig fifo start level 7");
+	b.update(kDigFifoCtrl0 + dig, 0x2, 0x2, "dig fifo reset");
+	b.delay(10, "dig fifo reset");
+	b.update(kDigFifoCtrl0 + dig, 0x2, 0, "dig fifo reset release");
+	b.delay(10, "dig fifo reset release");
+	b.update(kDigFifoCtrl0 + dig, 0x1, 0x1, "dig fifo enable");
+
+	// --- enc401_stream_encoder_dp_unblank ---
+	b.update(kDpVidTiming + dig, 1u << 8, 0, "dp m/n measurement off");
+	b.update(kDpVidN + dig, 0xffffff, 0x8000, "dp vid n");
+	b.update(kDpVidM + dig, 0xffffff, vidM & 0xffffff, "dp vid m (first value)");
+	b.update(kDpVidTiming + dig, 1u << 8, 1u << 8, "dp m/n measurement on");
+	b.update(kDpVidStreamCntl + dig, 0x1, 0, "dp video stream off");
+	b.waitClear(kDpVidStreamCntl + dig, 1u << 16, 50 * kMs, "dp stream idle", true);
+	b.update(kDpSteerFifo + dig, 0x2, 0x2, "dp steer fifo reset");
+	b.delay(10, "dp steer fifo reset");
+	b.update(kDpSteerFifo + dig, 0x2, 0, "dp steer fifo reset release");
+	b.update(kDpSteerFifo + dig, 0x1, 0x1, "dp steer fifo enable");
+	b.update(kDpVidStreamCntl + dig, 0x301, 0x201, "dp video stream on");
+	b.delay(200, "dp video stream on");
+	b.update(kDigFifoCtrl0 + dig, 0x1fu << 2, 7u << 2, "dig fifo start level 7");
+	b.update(kDigFifoCtrl0 + dig, 0x2, 0x2, "dig fifo reset");
+	b.waitSet(kDigFifoCtrl0 + dig, 1u << 20, 50 * kMs, "dig fifo reset done", true);
+	b.update(kDigFifoCtrl0 + dig, 0x2, 0, "dig fifo reset release");
+	b.waitClear(kDigFifoCtrl0 + dig, 1u << 20, 50 * kMs, "dig fifo reset done clear", true);
+	b.update(kDigFifoCtrl0 + dig, 0x1, 0x1, "dig fifo enable");
+	b.delay(100, "dp encoder primes");
+	b.update(kDpVidStreamCntl + dig, 0x1, 0x1, "dp video stream on");
+}
+
 } // namespace
 
 bool scaleDpDto(const DpDto &now, uint32_t fromKHz, uint32_t toKHz, DpDto &out) {
@@ -202,6 +249,26 @@ uint32_t vstartupLines(const Edid::DetailedTiming &to) {
 	// just inside the vertical blank, 2 lines clear of its start.
 	uint32_t lines = to.vBlank > 4 ? to.vBlank - 2u : 2u;
 	return lines > 0x3ff ? 0x3ff : lines;
+}
+
+bool buildDpStreamOff(uint8_t dig, Plan &out) {
+	out.count = out.ncmds = 0;
+	if (dig >= 4) return false;
+	Builder b {out};
+	blankDp(b, dig * kDigStride, true);
+	return !b.full;
+}
+
+bool buildDpStreamOn(uint8_t dig, uint8_t bpc, uint32_t vidM, Plan &out) {
+	out.count = out.ncmds = 0;
+	if (dig >= 4 || (bpc != 8 && bpc != 10) || !vidM || vidM > 0xffffff) return false;
+	Builder b {out};
+	const uint32_t off = dig * kDigStride;
+	b.waitClear(kDpVidStreamCntl + off, 1u << 16, 100200, "dp stream idle before depth change");
+	programDpDepth(b, off, bpc);
+	resumeDp(b, off, vidM);
+	b.waitSet(kDpVidStreamCntl + off, 1u << 16, 150 * kMs, "dp stream active");
+	return !b.full;
 }
 
 bool build(const Target &t, Plan &out, const char **why) {
@@ -263,12 +330,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 	b.update(kDpgControl + opp, 0x71, (kDpgModeBars << 4) | 1, "dpg blank");
 
 	if (t.dp) {
-		// --- dce110_blank_stream: enc1_stream_encoder_dp_blank, then idle pattern for the sink ---
-		b.update(kDpVidStreamCntl + dig, 0x300, 0x200, "dp stream off at the next vblank");
-		b.update(kDpVidStreamCntl + dig, 0x1, 0, "dp video stream off");
-		b.waitClear(kDpVidStreamCntl + dig, 1u << 16, 100200, "dp stream idle", !t.dpBpc);
-		b.update(kDpSteerFifo + dig, 0x2, 0x2, "dp steer fifo reset");
-		b.delay(60 * kMs, "idle pattern");
+		blankDp(b, dig, t.dpBpc != 0);
 	} else {
 		hdmiStreamOff(b, t);
 	}
@@ -353,9 +415,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 	if (t.dp) {
 		// Program the stream encoder and the receiver's MSA together while the stream is idle.
 		if (t.dpBpc) {
-			const uint32_t depth = t.dpBpc == 8 ? 1u : 2u;
-			b.update(0x211f + dig, 0x700u, depth << 8, "DP uncompressed component depth");
-			b.update(0x2120 + dig, 0xe0000000u, depth << 29, "DP MSA MISC0 component depth");
+			programDpDepth(b, dig, t.dpBpc);
 		}
 		// --- enc401_stream_encoder_dp_set_stream_attribute: the MSA ---
 		static const char *const msaWhat[4] = { "msa totals", "msa active start", "msa sync", "msa active size" };
@@ -364,35 +424,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 		for (uint32_t i = 0; i < 4; i++)
 			b.write(kDpMsaParam1 + dig + i, msa[i], msaWhat[i]);
 
-		// --- setup_dio_stream_encoder: enc35_enable_fifo ---
-		b.update(kDigFifoCtrl0 + dig, 0x1fu << 2, 7u << 2, "dig fifo start level 7");
-		b.update(kDigFifoCtrl0 + dig, 0x2, 0x2, "dig fifo reset");
-		b.delay(10, "dig fifo reset");
-		b.update(kDigFifoCtrl0 + dig, 0x2, 0, "dig fifo reset release");
-		b.delay(10, "dig fifo reset release");
-		b.update(kDigFifoCtrl0 + dig, 0x1, 0x1, "dig fifo enable");
-
-		// --- enc401_stream_encoder_dp_unblank ---
-		b.update(kDpVidTiming + dig, 1u << 8, 0, "dp m/n measurement off");
-		b.update(kDpVidN + dig, 0xffffff, 0x8000, "dp vid n");
-		b.update(kDpVidM + dig, 0xffffff, t.vidM & 0xffffff, "dp vid m (first value)");
-		b.update(kDpVidTiming + dig, 1u << 8, 1u << 8, "dp m/n measurement on");
-		b.update(kDpVidStreamCntl + dig, 0x1, 0, "dp video stream off");
-		b.waitClear(kDpVidStreamCntl + dig, 1u << 16, 50 * kMs, "dp stream idle", true);
-		b.update(kDpSteerFifo + dig, 0x2, 0x2, "dp steer fifo reset");
-		b.delay(10, "dp steer fifo reset");
-		b.update(kDpSteerFifo + dig, 0x2, 0, "dp steer fifo reset release");
-		b.update(kDpSteerFifo + dig, 0x1, 0x1, "dp steer fifo enable");
-		b.update(kDpVidStreamCntl + dig, 0x301, 0x201, "dp video stream on");
-		b.delay(200, "dp video stream on");
-		b.update(kDigFifoCtrl0 + dig, 0x1fu << 2, 7u << 2, "dig fifo start level 7");
-		b.update(kDigFifoCtrl0 + dig, 0x2, 0x2, "dig fifo reset");
-		b.waitSet(kDigFifoCtrl0 + dig, 1u << 20, 50 * kMs, "dig fifo reset done", true);
-		b.update(kDigFifoCtrl0 + dig, 0x2, 0, "dig fifo reset release");
-		b.waitClear(kDigFifoCtrl0 + dig, 1u << 20, 50 * kMs, "dig fifo reset done clear", true);
-		b.update(kDigFifoCtrl0 + dig, 0x1, 0x1, "dig fifo enable");
-		b.delay(100, "dp encoder primes");
-		b.update(kDpVidStreamCntl + dig, 0x1, 0x1, "dp video stream on");
+		resumeDp(b, dig, t.vidM);
 	} else {
 		// --- dcn401_link_encoder_setup: back-end in HDMI mode ---
 		b.update(kDigBeClkCntl + t.link * kDigStride, 0x17, 0x10 | kModeHdmi, "dig be hdmi + clock");

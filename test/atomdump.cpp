@@ -1640,6 +1640,33 @@ static int testDpTrain() {
 		                  !DpTrain::pickLink(sink, 1066500, 30, l), "dptrain: smallest and too-large links");
 	}
 
+	// The AW2724DM reports HBR2 in the base block and HBR3 in the extended block.
+	{
+		uint8_t base[16] {0x12, 0x14, 0xc4, 0x81, 0, 0, 1, 0xc0, 2, 2, 0, 0, 0, 0, 0x81, 0};
+		uint8_t extended[16] {0x14, 0x1e, 0xc4, 0x81, 0, 0, 1, 0xc0, 2, 2, 0, 0, 0, 0, 0x81, 0};
+		DpTrain::Sink sink {};
+		const DpTrain::Link hbr3x4 {4, DpTrain::kHbr3};
+		failures += check(DpTrain::parseExtendedCaps(base, extended, sink) && sink.maxRate == hbr3x4.rate &&
+		                  sink.maxLanes == hbr3x4.lanes && sink.tps4,
+		                  "dptrain: prefer the AW2724DM's advertised HBR3 extended capabilities");
+		base[14] &= 0x7f;
+		DpTrain::Sink ignored {};
+		failures += check(!DpTrain::parseExtendedCaps(base, extended, ignored),
+		                  "dptrain: extended capability block must be advertised");
+		TrainRig rig('a', 1, 1);
+		auto io = rig.io();
+		failures += check(DpTrain::bringUp(io, sink, hbr3x4) == DpTrain::Result::Ok && rig.dpcd[0x100] == hbr3x4.rate &&
+		                  (rig.dpcd[0x101] & 31) == 4 && DpTrain::linkUp(&rig.dpcd[0x202], 4),
+		                  "dptrain: simulated HBR3 x4 with TPS4");
+		io.phyOn = [](void *ctx, const DpTrain::Link &l) {
+			return l.rate != DpTrain::kHbr3 && TrainRig::phyOn(ctx, l);
+		};
+		failures += check(DpTrain::bringUp(io, sink, hbr3x4) == DpTrain::Result::Io &&
+		                  DpTrain::bringUp(io, sink, hbr2x4) == DpTrain::Result::Ok &&
+		                  rig.dpcd[0x100] == hbr2x4.rate && (rig.dpcd[0x101] & 31) == 4 &&
+		                  DpTrain::linkUp(&rig.dpcd[0x202], 4), "dptrain: HBR2 x4 retraining after failure at HBR3");
+	}
+
 	printf("\ndptrain: %zu runs, %zu events and %zu register writes as Linux has them %s\n",
 	       sizeof(kTrainRuns) / sizeof(kTrainRuns[0]), events, regWrites, failures ? "MISMATCH" : "ok");
 	return failures;

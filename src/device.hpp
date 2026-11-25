@@ -174,6 +174,9 @@ public:
 	bool restoreDesktopTrial();
 	bool supportsNativeRefresh() const;
 	bool setDesktopRefresh(uint64_t mc, bool highRate);
+	bool startDesktopDeepColor(uint64_t mc);
+	bool restoreDesktopDeepColor();
+	bool verifyDesktopDeepColor();
 	bool trialMemoryOK(uint64_t bytes);
 	int trialRate() const;
 	int trialDepth() const;
@@ -266,6 +269,10 @@ public:
 	// DpTrain::bringUp, stream encoder tied to the link, video restarted.
 	void noteBootDpLink();
 	bool readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link);
+	struct BootDpcdSnapshot {
+		uint8_t base[16], extended[16], link[2];
+	};
+	bool readBootDpcdSnapshot(BootDpcdSnapshot &snapshot);
 	// What a DisplayPort boot display's mode may clock at: what its trained link carries at 8 bpc, and the DISPCLK
 	// the kext holds (dispclkTargetKHz); the boot pixel clock if either is not known. The link is not retrained.
 	uint32_t bootDpMaxKHz();
@@ -513,6 +520,12 @@ private:
 	ModeSet::Plan trialReturn {}, refreshReturn {};
 	uint64_t refreshSurface {}, trialHome {};
 	bool refreshReturnPending {}, refreshClocksPending {}, trialNeedsRestore {};
+	bool deepReturnPending {};
+	uint32_t deepSavedVidM {};
+	DpTrain::Sink deepSink {};
+	uint8_t deepConnector {};
+	bool verifyDeepColorLink(uint8_t rate, int bpc);
+	bool programDeepColorLink(uint8_t rate, uint8_t bpc, uint32_t vidM);
 	bool refreshLink(Edid::DetailedTiming &);
 	bool setRefreshClocks(bool high);
 	bool refreshClockSupport();

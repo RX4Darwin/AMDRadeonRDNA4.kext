@@ -35,7 +35,37 @@ static void execute(const ModeSet::Plan &p, size_t count, Registers &regs) {
 			v = s.value;
 	}
 }
+
+static void testDeepColorStream() {
+	ModeSet::Plan off {}, rgb10 {}, rgb8 {};
+	const uint32_t oldM = ModeSet::dpVidM(699500, 540000), newM = ModeSet::dpVidM(699500, 810000);
+	assert(ModeSet::buildDpStreamOff(0, off) && ModeSet::buildDpStreamOn(0, 10, newM, rgb10) &&
+	       ModeSet::buildDpStreamOn(0, 8, oldM, rgb8));
+	const Registers baseline { {key(2, 0x2122), 0x201}, {key(2, 0x211f), 0x04000100},
+	                           {key(2, 0x2120), 0x28001234}, {key(2, 0x2128), oldM},
+	                           {key(2, 0x060a), 0x43800000}, {key(2, 0x0607), 2559},
+	                           {key(2, 0x1b2f), 1558}, {key(2, 0x2162), 2720u << 16 | 1559} };
+	auto regs = baseline;
+	execute(off, off.count, regs);
+	execute(rgb10, rgb10.count, regs);
+	assert(regs.at(key(2, 0x211f)) == 0x04000200 && regs.at(key(2, 0x2120)) == 0x48001234 &&
+	       regs.at(key(2, 0x2128)) == newM);
+	for (size_t cut = 0; cut <= off.count + rgb10.count; ++cut) {
+		regs = baseline;
+		execute(off, cut < off.count ? cut : off.count, regs);
+		if (cut > off.count)
+			execute(rgb10, cut - off.count, regs);
+		execute(off, off.count, regs);
+		execute(rgb8, rgb8.count, regs);
+		for (const auto &entry : baseline)
+			assert(regs.at(entry.first) == entry.second);
+	}
+	printf("PASS %zu RGB10 stream interruption points restored RGB8, M/N and the native QHD surface\n",
+	       off.count + rgb10.count + 1);
+}
+
 int main() {
+	testDeepColorStream();
 	ModeSet::Target to{};
 	to.dp = true;
 	to.hpd = 1;

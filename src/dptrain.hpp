@@ -61,6 +61,7 @@ struct Sink {
 };
 // From DPCD 0x000 on (at least four bytes). False if they are not a sink's.
 bool parseCaps(const uint8_t *caps, size_t len, Sink &out);
+bool parseExtendedCaps(const uint8_t (&base)[16], const uint8_t (&extended)[16], Sink &out);
 
 // Whether a link is up, from the sink's LANE0_1_STATUS, LANE2_3_STATUS and
 // LANE_ALIGN_STATUS_UPDATED (DPCD 0x202..0x204): clock recovery, equalisation

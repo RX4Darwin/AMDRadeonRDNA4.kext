@@ -11,6 +11,11 @@ uint32_t lowId {}, highId {};
 int active {}, armed {}, fallback {}, retries {};
 bool switched {}, confirmedLow {}, confirmedHigh {};
 thread_call_t timer {};
+enum DeepColor { deepIdle = 0, deepRecovering = -1, deepPreview = -10, deepConfirmed = 10 };
+DeepColor deepColor {deepIdle};
+thread_call_t deepTimer {};
+uint64_t deepExpires {};
+unsigned deepRetries {};
 
 int rate() { return __atomic_load_n(&active, __ATOMIC_ACQUIRE); }
 
@@ -85,15 +90,109 @@ SYSCTL_PROC(_debug, OID_AUTO, rdna4_qhdmhz, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_L
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_qhdbpc, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
             nullptr, 1, readMeasurement, "I", "Verified DisplayPort bits per channel");
 
+int readDpcdSnapshot(struct sysctl_oid *, void *, int, struct sysctl_req *req) {
+	RDNA4Device::BootDpcdSnapshot snapshot {};
+	static_assert(sizeof(snapshot) == 34, "DPCD snapshot layout");
+	if (req->oldptr && !state->dev.readBootDpcdSnapshot(snapshot))
+		return EIO;
+	return SYSCTL_OUT(req, &snapshot, sizeof(snapshot));
+}
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_dpcd_caps, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
+            nullptr, 0, readDpcdSnapshot, "S,BootDpcdSnapshot",
+            "Read DPCD base and extended receiver capabilities and current DP link");
+
+bool cancelDeepColor() {
+	if (deepColor == deepIdle)
+		return true;
+	deepColor = deepRecovering;
+	if (!state->dev.restoreDesktopDeepColor())
+		return false;
+	deepColor = deepIdle;
+	thread_call_cancel(deepTimer);
+	return true;
+}
+
+void retryDeepColorRollback() {
+	if (++deepRetries <= 3) {
+		clock_interval_to_deadline(2, kSecondScale, &deepExpires);
+		thread_call_enter_delayed(deepTimer, deepExpires);
+	}
+	FBLOG("QHD 10 bpc: HBR2 rollback not verified (attempt %u)", deepRetries);
+}
+
+void deepColorExpired(thread_call_param_t, thread_call_param_t) {
+	RDNA4Device::ExtraHold hold(state->dev);
+	if ((deepColor == deepPreview || deepColor == deepRecovering) && mach_absolute_time() >= deepExpires &&
+	    !cancelDeepColor())
+		retryDeepColorRollback();
+}
+
+int controlDeepColor(struct sysctl_oid *oid, void *, int, struct sysctl_req *req) {
+	auto &dev = state->dev;
+	RDNA4Device::ExtraHold hold(dev);
+	int value = deepColor;
+	const int err = sysctl_handle_int(oid, &value, 0, req);
+	if (err || !req->newptr)
+		return err;
+	if (value == 0) {
+		deepRetries = 0;
+		if (cancelDeepColor()) return 0;
+		retryDeepColorRollback();
+		return EIO;
+	}
+	if (value == 1) {
+		if (deepColor != deepPreview)
+			return EAGAIN;
+		if (mach_absolute_time() < deepExpires && dev.verifyDesktopDeepColor() &&
+		    mach_absolute_time() < deepExpires) {
+			deepColor = deepConfirmed;
+			thread_call_cancel(deepTimer);
+			return 0;
+		}
+		if (!cancelDeepColor()) retryDeepColorRollback();
+		return EIO;
+	}
+	if (value != 10 || deepColor != deepIdle || armed || !confirmedHigh || rate() != high ||
+	    dev.currentModeId != highId)
+		return EINVAL;
+	deepColor = deepRecovering;
+	deepRetries = 0;
+	clock_interval_to_deadline(timeoutSeconds, kSecondScale, &deepExpires);
+	thread_call_enter_delayed(deepTimer, deepExpires);
+	if (!dev.startDesktopDeepColor(mc) || mach_absolute_time() >= deepExpires) {
+		if (!cancelDeepColor()) retryDeepColorRollback();
+		return EIO;
+	}
+	deepColor = deepPreview;
+	return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_qhd10, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+            nullptr, 0, controlDeepColor, "I", "QHD RGB10 trial: start 10, confirm 1, restore HBR2 RGB8 with 0");
+
 void registerControls() {
 	sysctl_register_oid(&sysctl__debug_rdna4_qhdtrial);
 	sysctl_register_oid(&sysctl__debug_rdna4_qhdmhz);
 	sysctl_register_oid(&sysctl__debug_rdna4_qhdbpc);
+	sysctl_register_oid(&sysctl__debug_rdna4_dpcd_caps);
+	deepTimer = thread_call_allocate(deepColorExpired, nullptr);
+	if (deepTimer)
+		sysctl_register_oid(&sysctl__debug_rdna4_qhd10);
 }
 
 int change(const Modes::Mode &mode) {
 	auto &dev = state->dev;
+	RDNA4Device::ExtraHold hold(dev);
 	const int target = mode.id == highId ? high : mode.id == lowId ? low : home;
+	if (deepColor != deepIdle) {
+		if (deepColor != deepRecovering && target == high)
+			return kIOReturnSuccess; // Same CoreGraphics mode, already running.
+		if (!cancelDeepColor()) {
+			retryDeepColorRollback();
+			return kIOReturnIOError;
+		}
+	}
+	if (!armed && target == high && rate() == high)
+		return kIOReturnSuccess;
 	if (armed && target != armed) {
 		const uint32_t previous = fallback == low ? lowId : dev.defaultModeId;
 		if (mode.id != previous) return kIOReturnNotPermitted;

@@ -339,7 +339,17 @@ void deviceSetPower(void *ctx, bool on) {
 	if (pvHeads && !on)
 		return;
 
-	static_cast<RDNA4Device *>(ctx)->setDisplayPower(on);
+	auto &dev = *static_cast<RDNA4Device *>(ctx);
+	if (QhdTrial::state && &QhdTrial::state->dev == &dev) {
+		RDNA4Device::ExtraHold hold(dev);
+		if (!on && !QhdTrial::cancelDeepColor()) {
+			QhdTrial::retryDeepColorRollback();
+			return;
+		}
+		dev.setDisplayPower(on);
+		return;
+	}
+	dev.setDisplayPower(on);
 }
 
 void createVblankService(IOService *framebuffer) {
@@ -1069,6 +1079,7 @@ void bootDpPoll(OSObject *, IOTimerEventSource *timer) {
 		bootDp.gone = true;
 	if (present && bootDp.gone && bootDp.same == 2) {
 		bootDp.gone = false;
+		RDNA4Device::ExtraHold hold(dev);
 		dev.logBootLink("the display is back");
 	}
 	// rdna4-dptrain=2: once, 15 s after the framebuffer opened, with the

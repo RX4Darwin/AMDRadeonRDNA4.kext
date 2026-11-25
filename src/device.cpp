@@ -3009,6 +3009,22 @@ void RDNA4Device::noteBootDpLink() {
 	bootDpLinkKnown = readBootDpLink(bootDpSink, bootDpLink);
 }
 
+bool RDNA4Device::readBootDpcdSnapshot(BootDpcdSnapshot &out) {
+	ExtraHold hold(*this);
+	if (!extraLock || !sinkAuxValid || bootReleased || !pipe.valid() ||
+	    pipe.signal != Pipe::Signal::DpSst || !bootSinkPresent())
+		return false;
+	const uint8_t aux = sinkAuxInst;
+	// Native AUX reads only. Read the programmed link again after the
+	// capability blocks so the caller can reject a changing connection.
+	uint8_t linkBefore[sizeof(out.link)] {};
+	return dpcdRead(aux, 0x100, linkBefore, sizeof(linkBefore)) &&
+	       dpcdRead(aux, 0x000, out.base, sizeof(out.base)) &&
+	       dpcdRead(aux, 0x2200, out.extended, sizeof(out.extended)) &&
+	       dpcdRead(aux, 0x100, out.link, sizeof(out.link)) &&
+	       !memcmp(linkBefore, out.link, sizeof(out.link)) && bootSinkPresent();
+}
+
 // The boot display's sink capabilities and the link the firmware trained (DPCD reads): whether that is a link the
 // sink says it has.
 bool RDNA4Device::readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link) {
@@ -3716,9 +3732,95 @@ bool RDNA4Device::supportsNativeRefresh() const {
 	return false;
 }
 
+bool RDNA4Device::verifyDeepColorLink(uint8_t rate, int bpc) {
+	uint8_t set[3] {}, status[3] {}, compression = 0xff;
+	const uint32_t stream = regReadDmu(2, 0x2122);
+	return bootSinkPresent() && stream != ~0u && (stream & 0x10001) == 0x10001 &&
+	       dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) && set[0] == rate &&
+	       (set[1] & 0x1f) == 4 && !(set[2] & 0x0f) &&
+	       dpcdRead(sinkAuxInst, 0x202, status, sizeof(status)) && DpTrain::linkUp(status, 4) &&
+	       dpcdRead(sinkAuxInst, 0x160, &compression, 1) && !(compression & 1) &&
+	       trialReadback(2560, 1440, refreshSurface, true) && trialDepth() == bpc;
+}
+
+bool RDNA4Device::programDeepColorLink(uint8_t rate, uint8_t bpc, uint32_t vidM) {
+	if (!bootSinkPresent() || !ModeSet::buildDpStreamOff(pipe.dig, modePlan))
+		return false;
+	if (!runPlan(modePlan)) {
+		// An interrupted link can leave STATUS set without the symbol clock.
+		// During rollback only, retrain with ENABLE clear and require idle
+		// again after restoring the clock, before touching the RGB format.
+		const uint32_t stream = regReadDmu(2, 0x2122);
+		if (rate != DpTrain::kHbr2 || stream == ~0u || (stream & 1))
+			return false;
+	}
+	DpTrain::Report report {};
+	const auto result = trainLink(sinkAuxInst, pipe.link, pipe.hpd, deepConnector, deepSink, {4, rate}, true, report);
+	FBLOG("QHD 10 bpc: link 0x%02x training %s after %u attempt(s)", rate, DpTrain::resultName(result), report.attempts);
+	if (result != DpTrain::Result::Ok)
+		return false;
+	ModeSet::Step steps[DpPhy::kMaxSteps];
+	return runSteps(steps, DpPhy::streamSteps(pipe.dig, pipe.link, steps), nullptr, 0, "deep color", otgOff()) &&
+	       ModeSet::buildDpStreamOn(pipe.dig, bpc, vidM, modePlan) && runPlan(modePlan) &&
+	       verifyDeepColorLink(rate, bpc);
+}
+
+bool RDNA4Device::startDesktopDeepColor(uint64_t mc) {
+	ExtraHold hold(*this);
+	constexpr uint32_t kPixelClockKHz = 699500;
+	constexpr DpTrain::Link target {4, DpTrain::kHbr3};
+	static_assert(DpTrain::bandwidthKbps(target) >= kPixelClockKHz * 30, "HBR3 fits uncompressed RGB10");
+	if (!extraLock || deepReturnPending || !refreshReturnPending || !refreshClocksPending ||
+	    !mc || mc != refreshSurface || bootReleased || !displayPowerOn || dpTrainLevel >= 2 ||
+	    !supportsNativeRefresh() || !verifyDeepColorLink(DpTrain::kHbr2, 8))
+		return false;
+	for (unsigned i = 1; i < Pipe::kMaxOtg; ++i) {
+		const uint32_t ctl = regReadDmu(2, Pipe::Reg::kOtgControl + i * Pipe::Reg::kOtgStride);
+		if (ctl == ~0u || (ctl & 1))
+			return false;
+	}
+	BootDpcdSnapshot caps {};
+	DpTrain::Sink sink {};
+	AtomBios::DisplayPath path {};
+	uint8_t edid[128];
+	if (!readBootDpcdSnapshot(caps) || caps.link[0] != DpTrain::kHbr2 || (caps.link[1] & 0x1f) != 4 ||
+	    !DpTrain::parseExtendedCaps(caps.base, caps.extended, sink) ||
+	    sink.maxRate < target.rate || sink.maxLanes < target.lanes || !sink.tps4 ||
+	    !pathForHpd(pipe.hpd, path) || !readEDID(sinkAuxInst, edid, sizeof(edid), 0) ||
+	    memcmp(edid, edidData, sizeof(edid)))
+		return false;
+	const uint32_t savedM = regReadDmu(2, 0x2128);
+	if (savedM == ~0u || !(savedM & 0xffffff))
+		return false;
+	deepSink = sink;
+	deepConnector = static_cast<uint8_t>(path.connectorObjId & 0xff);
+	deepSavedVidM = savedM & 0xffffff;
+	// A failed transmitter command or stream write may have changed hardware.
+	deepReturnPending = true;
+	return programDeepColorLink(target.rate, 10, ModeSet::dpVidM(kPixelClockKHz, DpTrain::symbolClockKHz(target.rate)));
+}
+
+bool RDNA4Device::restoreDesktopDeepColor() {
+	ExtraHold hold(*this);
+	if (!deepReturnPending)
+		return true;
+	if (!programDeepColorLink(DpTrain::kHbr2, 8, deepSavedVidM))
+		return false;
+	deepReturnPending = false;
+	FBLOG("QHD 10 bpc: HBR2 x4, RGB 8 bpc and QHD 165 Hz restored");
+	return true;
+}
+
+bool RDNA4Device::verifyDesktopDeepColor() {
+	ExtraHold hold(*this);
+	return deepReturnPending && verifyDeepColorLink(DpTrain::kHbr3, 10);
+}
+
 bool RDNA4Device::setDesktopRefresh(uint64_t mc, bool highRate) {
 	ExtraHold hold(*this);
 	if (!highRate) {
+		if (!restoreDesktopDeepColor())
+			return false;
 		if (refreshReturnPending) {
 			uint32_t lock = regReadDmu(2, 0x1b89);
 			if (lock == 0xffffffff) return false;
