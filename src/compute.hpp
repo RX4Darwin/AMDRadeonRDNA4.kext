@@ -42,6 +42,7 @@
 #ifndef RDNA4Compute_hpp
 #define RDNA4Compute_hpp
 
+#include "smu_overdrive.h"
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOService.h>
 #include <IOKit/pci/IOPCIDevice.h>
@@ -317,7 +318,23 @@ private:
 	static constexpr uint32_t kSmuTableOffset = 6u << 20;            // driver table, 64 KiB
 	bool readSensors(RDNA4Sensors &out);
 	bool readSensorsEx(RDNA4SensorsEx &out);
-	void logOverdrive();   // fan control step 1: the board's OverDrive limits and the SMU's OverDrive table, logged (nothing written)
+	void logOverdrive();   // fan control: the board's OverDrive limits and the SMU's OverDrive table, logged; custom fan settings applied again
+	// Fan control (docs/fan-control-plan.md): the SMU's OverDrive table as first read (odBoot) and as applied (odCur, with the OverDrive
+	// features odMask: 0 = the vBIOS's settings), the board's basic limits and zero-RPM stop temperature limits; applied again at each SMU
+	// start (a wake, a reset).
+	uint8_t odBoot[RDNA4_SMU_OD_TABLE_BYTES] = {}, odCur[RDNA4_SMU_OD_TABLE_BYTES] = {}, odMin[RDNA4_SMU_ODL_BYTES] = {},
+	        odMax[RDNA4_SMU_ODL_BYTES] = {};
+	uint16_t odStopMin = 0, odStopMax = 0;
+	uint32_t odMask = 0;
+	bool odKnown = false;
+public:   // (debug.rdna4_fan's handler)
+	int fanCommand(const char *cmd);             // debug.rdna4_fan: reset | curve T:P,T:P,T:P,T:P,T:P | zero 0|1 | stop C | target C |
+	                                             // minpwm P | acoustic TARGET LIMIT; 0 or an errno
+	void fanDescribe(char *out, size_t size);    // what is applied, for reading debug.rdna4_fan
+private:
+	bool uploadOverdrive();                      // odCur with odMask to the SMU (TransferTableDram2Smu)
+	bool readOverdrive();                        // (logOverdrive) the tables read and logged
+	void registerFanSysctl();
 
 	// Stage 4: the GC hub, then SDMA0 queue 0 and a VRAM fill. Pool layout
 	// past the PSP's first 4 MiB (offsets within the pool).
@@ -586,6 +603,7 @@ private:
 	bool gcSnapValid { false };
 	IOLock *gcLock { nullptr };
 	IOLock *smuLock { nullptr };                // serializes the SMU mailbox
+	IOLock *smuTableLock { nullptr };           // the SMU driver table: one transfer and the reads of it at a time
 	void gcWake(uint32_t what) const;
 	void gfxOffAfterWake(uint32_t what);
 	bool gcEnsureAwake(uint32_t what);          // wake GFX before a submitter emits into pm4Queue; false = still held

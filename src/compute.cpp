@@ -23,6 +23,7 @@
 #include "vadd_codeobj.h"
 
 #include <kern/clock.h>
+#include <sys/sysctl.h>
 
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
@@ -522,6 +523,8 @@ uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 		rtLock = IOLockAlloc();
 	if (!smuLock)
 		smuLock = IOLockAlloc();
+	if (!smuTableLock)
+		smuTableLock = IOLockAlloc();
 	if (!gcLock)
 		gcLock = IOLockAlloc();
         if (!resultLock)
@@ -1040,9 +1043,20 @@ uint32_t RDNA4Compute::smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint
 	return resp == kBad ? 0 : resp;
 }
 
+namespace {
+// The SMU driver table held for one transfer and the reads of it (smuTableLock): the sensor reads and fan control share it
+struct TableHold {
+	IOLock *lock;
+	explicit TableHold(IOLock *l) : lock(l) { if (lock) IOLockLock(lock); }
+	~TableHold() { if (lock) IOLockUnlock(lock); }
+};
+RDNA4Compute *gFanCompute;   // debug.rdna4_fan's (set once the OverDrive table was read)
+}
+
 bool RDNA4Compute::readSensors(RDNA4Sensors &out) {
 	if (!poolCpu || kSmuTableOffset + 0x1000 > pool.size)
 		return false;
+	TableHold hold(smuTableLock);
 	uint32_t ret = 0;
 	// TABLE_SMU_METRICS is table 5 in smu14_driver_if_v14_0.h. Table 0 is
 	// PPTABLE and is not the telemetry transfer requested by this reader.
@@ -1082,6 +1096,7 @@ bool RDNA4Compute::readSensors(RDNA4Sensors &out) {
 bool RDNA4Compute::readSensorsEx(RDNA4SensorsEx &out) {
 	if (!poolCpu || kSmuTableOffset + 0x1000 > pool.size)
 		return false;
+	TableHold hold(smuTableLock);
 	uint8_t *table = poolCpu + kSmuTableOffset;
 	constexpr uint32_t kPoison = 0xFFFFFFFFu;
 	*reinterpret_cast<volatile uint32_t *>(table + RDNA4_SMU_METRICS_COUNTER) = kPoison;
@@ -2451,10 +2466,20 @@ uint64_t RDNA4Compute::smuEnableFeatures(uint64_t allowed, uint32_t domain) {
 	return now;
 }
 
-// Fan control, step 1 (docs/fan-control-plan.md): what the board allows (the basic OverDrive limits of the PPTable in the combo table)
-// and what the SMU runs (its OverDrive table), logged; nothing is written. Both arrive in the driver table, where the sensor reads land
-// too: run at start, before anything reads sensors (ponytail: no lock across the transfer and the reads; one when this runs later).
+// Fan control (docs/fan-control-plan.md): what the board allows (the basic OverDrive limits of the PPTable in the combo table) and what
+// the SMU runs (its OverDrive table), logged and, the first time, kept; custom fan settings are applied again after (a wake, a reset).
 void RDNA4Compute::logOverdrive() {
+	{
+		TableHold hold(smuTableLock);
+		if (!readOverdrive())
+			return;
+	}
+	if (odMask && !uploadOverdrive())
+		CLOG("fan: the custom fan settings could not be applied again: the vBIOS's run");
+}
+
+// (logOverdrive, under smuTableLock) the reads and the log; false when a table could not be read
+bool RDNA4Compute::readOverdrive() {
 	const uint8_t *t = poolCpu + kSmuTableOffset;
 	auto u8 = [t](uint32_t off) -> uint32_t { return *reinterpret_cast<const volatile uint8_t *>(t + off); };
 	auto u16 = [t](uint32_t off) -> uint32_t { return *reinterpret_cast<const volatile uint16_t *>(t + off); };
@@ -2468,7 +2493,7 @@ void RDNA4Compute::logOverdrive() {
 	};
 	if (const uint32_t resp = fetch(RDNA4_SMU_TABLE_COMBO_PPTABLE); resp != kSmuRespOk) {
 		CLOG("smu: combo pptable not read (resp 0x%02x)", resp);
-		return;
+		return false;
 	}
 	const uint32_t pp = RDNA4_SMU_COMBO_PPTABLE;
 	CLOG("smu: pptable FeaturesToRun 0x%08x%08x (fan control %s)", u32(pp + RDNA4_SMU_PP_FEATURES_TO_RUN + 4),
@@ -2486,9 +2511,15 @@ void RDNA4Compute::logOverdrive() {
 		     u16(l + RDNA4_SMU_ODL_FAN_MIN_PWM), u16(l + RDNA4_SMU_ODL_ACOUSTIC_TARGET), u16(l + RDNA4_SMU_ODL_ACOUSTIC_LIMIT),
 		     u16(l + RDNA4_SMU_ODL_FAN_TARGET_TEMP), u8(l + RDNA4_SMU_ODL_FAN_ZERO_RPM));
 	}
+	if (!odKnown) {   // the board's limits, kept
+		memcpy(odMin, t + pp + RDNA4_SMU_PP_OD_LIMITS_MIN, sizeof(odMin));
+		memcpy(odMax, t + pp + RDNA4_SMU_PP_OD_LIMITS_MAX, sizeof(odMax));
+		odStopMin = static_cast<uint16_t>(u16(pp + RDNA4_SMU_PP_FAN_STOP_TEMP_MIN));
+		odStopMax = static_cast<uint16_t>(u16(pp + RDNA4_SMU_PP_FAN_STOP_TEMP_MAX));
+	}
 	if (const uint32_t resp = fetch(RDNA4_SMU_TABLE_OVERDRIVE); resp != kSmuRespOk) {
 		CLOG("smu: OverDrive table not read (resp 0x%02x)", resp);
-		return;
+		return false;
 	}
 	CLOG("smu: OverDrive table: features 0x%x, fan mode %u (0 auto, 1 curve); fan curve PWM %u %u %u %u %u %u %%, temperatures %u %u %u %u %u %u C; "
 	     "minimum PWM %u, acoustic target %u, limit %u RPM, target temperature %u C, zero RPM %u (stop %u C), max operating %u C",
@@ -2498,6 +2529,170 @@ void RDNA4Compute::logOverdrive() {
 	     u8(RDNA4_SMU_OD_FAN_TEMP + 4), u8(RDNA4_SMU_OD_FAN_TEMP + 5), u16(RDNA4_SMU_OD_FAN_MIN_PWM), u16(RDNA4_SMU_OD_ACOUSTIC_TARGET),
 	     u16(RDNA4_SMU_OD_ACOUSTIC_LIMIT), u16(RDNA4_SMU_OD_FAN_TARGET_TEMP), u8(RDNA4_SMU_OD_FAN_ZERO_RPM), u8(RDNA4_SMU_OD_FAN_ZERO_RPM_STOP),
 	     u8(RDNA4_SMU_OD_MAX_OP_TEMP));
+	if (!odKnown) {   // the vBIOS's settings, kept as the way back (reset) and as what custom settings start from
+		memcpy(odBoot, t, sizeof(odBoot));
+		memcpy(odCur, t, sizeof(odCur));
+		odKnown = true;
+		CLOG("smu: zero-RPM stop temperature limits %u-%u C; debug.rdna4_fan sets the fan (docs/fan-control-plan.md)", odStopMin, odStopMax);
+		gFanCompute = this;
+		registerFanSysctl();
+	}
+	return true;
+}
+
+// odCur with the OverDrive features odMask (filtered by what the board allows) to the SMU. The SMU checks every value too: a refusal
+// comes back as TABLE_TRANSFER_FAILED (0xff) with an OD_FAIL_e code in bits 16 and up.
+bool RDNA4Compute::uploadOverdrive() {
+	TableHold hold(smuTableLock);
+	uint8_t *t = poolCpu + kSmuTableOffset;
+	uint32_t supported = 0;
+	memcpy(&supported, odMax + RDNA4_SMU_ODL_FEATURE_MASK, sizeof(supported));
+	const uint32_t mask = odMask & supported;
+	for (uint32_t i = 0; i < sizeof(odCur); i++)
+		reinterpret_cast<volatile uint8_t *>(t)[i] = i < 4 ? static_cast<uint8_t>(mask >> (8 * i)) : odCur[i];
+	flushHdp();
+	uint32_t ret = 0;
+	const uint32_t resp = smuSend(kSmuMsgTransferTableDram2Smu, RDNA4_SMU_TABLE_OVERDRIVE, ret, 500);
+	if (resp != kSmuRespOk || (ret & 0xff) == 0xff) {
+		CLOG("fan: OverDrive table refused (resp 0x%02x, 0x%x: OD error %u)", resp, ret, ret >> 16);
+		return false;
+	}
+	char what[160];
+	fanDescribe(what, sizeof(what));
+	CLOG("fan: applied: %s (OverDrive features 0x%x)", what, mask);
+	return true;
+}
+
+void RDNA4Compute::fanDescribe(char *out, size_t size) {
+	const uint8_t *c = odCur;
+	auto u16at = [c](uint32_t off) { return static_cast<uint32_t>(c[off] | c[off + 1] << 8); };
+	if (!odKnown) {
+		snprintf(out, size, "unknown (the OverDrive table was not read)");
+		return;
+	}
+	if (!odMask) {
+		snprintf(out, size, "auto (the vBIOS's settings)");
+		return;
+	}
+	if (c[RDNA4_SMU_OD_FAN_MODE] == 1)
+		snprintf(out, size, "curve %u:%u,%u:%u,%u:%u,%u:%u,%u:%u; zero %u stop %u", c[RDNA4_SMU_OD_FAN_TEMP], c[RDNA4_SMU_OD_FAN_PWM],
+		         c[RDNA4_SMU_OD_FAN_TEMP + 1], c[RDNA4_SMU_OD_FAN_PWM + 1], c[RDNA4_SMU_OD_FAN_TEMP + 2], c[RDNA4_SMU_OD_FAN_PWM + 2],
+		         c[RDNA4_SMU_OD_FAN_TEMP + 3], c[RDNA4_SMU_OD_FAN_PWM + 3], c[RDNA4_SMU_OD_FAN_TEMP + 4], c[RDNA4_SMU_OD_FAN_PWM + 4],
+		         c[RDNA4_SMU_OD_FAN_ZERO_RPM], c[RDNA4_SMU_OD_FAN_ZERO_RPM_STOP]);
+	else
+		snprintf(out, size, "auto: target %u C, acoustic %u/%u RPM, minimum %u %%; zero %u stop %u", u16at(RDNA4_SMU_OD_FAN_TARGET_TEMP),
+		         u16at(RDNA4_SMU_OD_ACOUSTIC_TARGET), u16at(RDNA4_SMU_OD_ACOUSTIC_LIMIT), u16at(RDNA4_SMU_OD_FAN_MIN_PWM),
+		         c[RDNA4_SMU_OD_FAN_ZERO_RPM], c[RDNA4_SMU_OD_FAN_ZERO_RPM_STOP]);
+}
+
+// One change on top of what is applied, as amdgpu's od_edit_dpm_table and its commit: each value checked against the board's limits,
+// the feature bits amdgpu sets for it (a curve: FAN_CURVE, manual mode; the minimum speed: FAN_LEGACY, which excludes the curve; the
+// target and acoustic values: FAN_CURVE in auto mode; zero RPM: ZERO_FAN), then uploaded; nothing changes when the SMU refuses it.
+int RDNA4Compute::fanCommand(const char *cmd) {
+	if (!odKnown)
+		return ENODEV;
+	auto word = [&cmd](const char *w) {
+		const size_t n = strlen(w);
+		if (strncmp(cmd, w, n) || (cmd[n] && cmd[n] != ' '))
+			return false;
+		cmd += n;
+		return true;
+	};
+	auto number = [&cmd](uint32_t &v) {
+		while (*cmd == ' ' || *cmd == ',' || *cmd == ':')
+			cmd++;
+		if (*cmd < '0' || *cmd > '9')
+			return false;
+		for (v = 0; *cmd >= '0' && *cmd <= '9' && v < 100000; cmd++)
+			v = v * 10 + static_cast<uint32_t>(*cmd - '0');
+		return true;
+	};
+	auto lim16 = [this](uint32_t off, uint32_t v) {
+		return v >= static_cast<uint32_t>(odMin[off] | odMin[off + 1] << 8) && v <= static_cast<uint32_t>(odMax[off] | odMax[off + 1] << 8);
+	};
+	auto put16 = [](uint8_t *t, uint32_t off, uint32_t v) { t[off] = static_cast<uint8_t>(v), t[off + 1] = static_cast<uint8_t>(v >> 8); };
+	constexpr uint32_t kCurve = 1u << RDNA4_SMU_OD_FEATURE_FAN_CURVE, kLegacy = 1u << RDNA4_SMU_OD_FEATURE_FAN_LEGACY,
+	                   kZero = 1u << RDNA4_SMU_OD_FEATURE_ZERO_FAN;
+	uint8_t next[sizeof(odCur)];
+	memcpy(next, odCur, sizeof(next));
+	uint32_t mask = odMask, a = 0, b = 0;
+	if (word("reset")) {
+		memcpy(next, odBoot, sizeof(next));
+		mask = 0;
+	} else if (word("curve")) {   // five points T:P, temperatures rising, speeds not falling, each within the limits
+		for (uint32_t i = 0, lastT = 0, lastP = 0; i < 5; i++, lastT = a, lastP = b) {
+			if (!number(a) || !number(b) || a < odMin[RDNA4_SMU_ODL_FAN_TEMP] || a > odMax[RDNA4_SMU_ODL_FAN_TEMP] ||
+			    b < odMin[RDNA4_SMU_ODL_FAN_PWM] || b > odMax[RDNA4_SMU_ODL_FAN_PWM] || (i && (a <= lastT || b < lastP)))
+				return EINVAL;
+			next[RDNA4_SMU_OD_FAN_TEMP + i] = static_cast<uint8_t>(a);
+			next[RDNA4_SMU_OD_FAN_PWM + i] = static_cast<uint8_t>(b);
+		}
+		next[RDNA4_SMU_OD_FAN_MODE] = 1;
+		mask = (mask | kCurve) & ~kLegacy;
+	} else if (word("zero")) {
+		if (!number(a) || a < odMin[RDNA4_SMU_ODL_FAN_ZERO_RPM] || a > odMax[RDNA4_SMU_ODL_FAN_ZERO_RPM])
+			return EINVAL;
+		next[RDNA4_SMU_OD_FAN_ZERO_RPM] = static_cast<uint8_t>(a);
+		mask |= kZero;
+	} else if (word("stop")) {
+		if (!number(a) || a < odStopMin || a > odStopMax)
+			return EINVAL;
+		next[RDNA4_SMU_OD_FAN_ZERO_RPM_STOP] = static_cast<uint8_t>(a);
+		mask |= kZero;
+	} else if (word("target")) {
+		if (!number(a) || !lim16(RDNA4_SMU_ODL_FAN_TARGET_TEMP, a))
+			return EINVAL;
+		put16(next, RDNA4_SMU_OD_FAN_TARGET_TEMP, a);
+		next[RDNA4_SMU_OD_FAN_MODE] = 0;
+		mask = (mask | kCurve) & ~kLegacy;
+	} else if (word("minpwm")) {
+		if (!number(a) || !lim16(RDNA4_SMU_ODL_FAN_MIN_PWM, a))
+			return EINVAL;
+		put16(next, RDNA4_SMU_OD_FAN_MIN_PWM, a);
+		next[RDNA4_SMU_OD_FAN_MODE] = 0;
+		mask = (mask | kLegacy) & ~kCurve;
+	} else if (word("acoustic")) {
+		if (!number(a) || !number(b) || !lim16(RDNA4_SMU_ODL_ACOUSTIC_TARGET, a) || !lim16(RDNA4_SMU_ODL_ACOUSTIC_LIMIT, b) || a > b)
+			return EINVAL;
+		put16(next, RDNA4_SMU_OD_ACOUSTIC_TARGET, a);
+		put16(next, RDNA4_SMU_OD_ACOUSTIC_LIMIT, b);
+		next[RDNA4_SMU_OD_FAN_MODE] = 0;
+		mask = (mask | kCurve) & ~kLegacy;
+	} else {
+		return EINVAL;
+	}
+	uint8_t was[sizeof(odCur)];
+	const uint32_t wasMask = odMask;
+	memcpy(was, odCur, sizeof(was));
+	memcpy(odCur, next, sizeof(odCur));
+	odMask = mask;
+	if (uploadOverdrive())
+		return 0;
+	memcpy(odCur, was, sizeof(odCur));
+	odMask = wasMask;
+	return EIO;
+}
+
+namespace {
+int fanSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	char value[160] = "";
+	if (gFanCompute)
+		gFanCompute->fanDescribe(value, sizeof(value));
+	const int err = sysctl_handle_string(oidp, value, sizeof(value), req);
+	if (err || !req->newptr)
+		return err;
+	return gFanCompute ? gFanCompute->fanCommand(value) : ENODEV;
+}
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_fan, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, fanSysctl, "A",
+            "AMDRadeonRDNA4: the fan (root to set): reset | curve T:P,T:P,T:P,T:P,T:P | zero 0|1 | stop C | target C | minpwm P | acoustic T L");
+}
+
+void RDNA4Compute::registerFanSysctl() {
+	static bool done;
+	if (!done) {
+		done = true;
+		sysctl_register_oid(&sysctl__debug_rdna4_fan);
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -18,6 +18,13 @@
 #define RDNA4_SMU_PP_OD_LIMITS_MIN    (28u + 2720u)
 #define RDNA4_SMU_PP_OD_LIMITS_MAX    (28u + 2816u)
 
+/* SkuTable.MsgLimits.FanStopTempMin / Max (uint16_t, degrees C): the zero-RPM stop temperature's limits, from the PPTable */
+#define RDNA4_SMU_PP_FAN_STOP_TEMP_MIN (28u + 2664u)
+#define RDNA4_SMU_PP_FAN_STOP_TEMP_MAX (28u + 2666u)
+
+#define RDNA4_SMU_OD_TABLE_BYTES      156u    /* sizeof(OverDriveTable_t) */
+#define RDNA4_SMU_ODL_BYTES           96u     /* sizeof(OverDriveLimits_t) */
+
 /* OverDriveLimits_t (96 bytes) */
 #define RDNA4_SMU_ODL_FEATURE_MASK    0u
 #define RDNA4_SMU_ODL_FAN_PWM         36u     /* uint8_t [6] */

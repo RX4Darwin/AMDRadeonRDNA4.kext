@@ -484,7 +484,8 @@ constexpr uint32_t kSmuMsgGetRunningFeaturesLow = 0x0c;
 constexpr uint32_t kSmuMsgGetRunningFeaturesHigh = 0x0d;
 constexpr uint32_t kSmuMsgSetDriverDramAddrHigh = 0x0e;
 constexpr uint32_t kSmuMsgSetDriverDramAddrLow  = 0x0f;
-constexpr uint32_t kSmuMsgGetMetricsTable       = 0x12;
+constexpr uint32_t kSmuMsgGetMetricsTable       = 0x12;   // PPSMC_MSG_TransferTableSmu2Dram: param = the table id
+constexpr uint32_t kSmuMsgTransferTableDram2Smu = 0x13;   // the other way (fan control: TABLE_OVERDRIVE)
 constexpr uint32_t kSmuMsgSetSoftMinByFreq      = 0x19;   // param (PPCLK_e << 16) | MHz
 constexpr uint32_t kSmuMsgSetSoftMaxByFreq      = 0x1a;
 constexpr uint32_t kSmuMsgSetWorkloadMask       = 0x24;   // param: WORKLOAD_PPLIB_*_BIT mask

@@ -1,6 +1,6 @@
 # Fan Control (RDNA4Gadget tab), plan
 
-Status, 2026-11-25: step 1 done and card-run (below). Asked for by Sunneva with the Anti-Lag work.
+Status, 2026-11-25: steps 1 and 2 done and card-run (below); the app interface and the tab are next. Asked for by Sunneva with the Anti-Lag work.
 
 ## What the card offers
 
@@ -44,6 +44,19 @@ every value read is plausible, so the layout holds). Logged at start (`smu: Over
   25-100 C; minimum PWM 15-100; acoustic target and limit 500-5000 RPM; target temperature 25-105 C; zero RPM 0-1.
 - Running (the vBIOS's): features 0, fan mode 0 (auto), curve all zero (the firmware's own), minimum PWM 15, acoustic target 1750 and
   limit 5000 RPM, target temperature 85 C, zero RPM on (stops below 50 C), max operating 110 C.
+
+## Step 2 result (2026-11-25, rig)
+
+`sysctl debug.rdna4_fan` (root to set) reads what is applied and takes one change at a time: `reset`, `curve T:P,T:P,T:P,T:P,T:P` (five
+points, temperatures rising, speeds not falling), `zero 0|1`, `stop C` (30-80 C here), `target C`, `minpwm P` (excludes the curve, as in
+amdgpu), `acoustic TARGET LIMIT`. Each value is checked against the board's limits, the feature bits set as amdgpu's od_edit_dpm_table
+does, and the table uploaded (TransferTableDram2Smu 0x13, table 8); a refusal by the SMU (0xff, OD_FAIL_e in bits 16+) keeps what was
+applied. The kext keeps the table read at the first start (the way back) and applies custom settings again at every SMU start. The
+driver table is now held by a lock for each transfer (`smuTableLock`): sensor reads and fan control share it.
+
+On the card: idle with zero RPM 0 RPM at 48 C; `zero 0` -> 960 RPM within 15 s; `curve 25:40,40:50,60:60,80:80,100:100` -> about 2200-2340
+RPM, 48 -> 38 C; a 10 % point refused (EINVAL), nothing changed; `reset` -> the vBIOS's settings, fan stopped again. Not tested yet:
+applying again after system sleep (the rig cannot be woken remotely).
 
 ## Safety and open questions
 
