@@ -606,7 +606,8 @@ bool RDNA4Compute::sparseSync(RtClient &c) {
 	uint32_t id = 0;
 	uint64_t *shadow = nullptr, heapOffset = 0;
 	while (c.sp->s.nextDirty(id, shadow, heapOffset)) {
-		memcpy(poolCpu + kVmTableStage, shadow, 0x1000);
+		memcpy(poolWc + kVmTableStage, shadow, 0x1000);
+		__builtin_ia32_sfence();
 		(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + kVmTableStage);
 		flushHdp();
 		uint32_t pkt[Sdma::kCopyDwords];
