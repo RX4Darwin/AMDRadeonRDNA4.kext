@@ -8,6 +8,7 @@
 #       Frameworks/libvulkan_radeon.dylib RADV, when `make mesa` built it; Resources/radeon_icd.json names it where it is installed
 #       Helpers/                          air2amdgpu (when `make metal-helper` built it), rdna4-run, rdna4-iop, rdna4-logd
 #       Resources/rdna4.metallib          the driver's own functions (rdna4.metal)
+#       Resources/fsr3.metallib           AMD FSR 3.1's upscaler for MetalFX's temporal scaler (tools/gen/build-fsr3.sh)
 # Everything stays inside /Library/GPUBundles: WindowServer's sandbox maps libraries from there but not from /Library/Frameworks
 # ("file system sandbox blocked mmap()", 2026-11-22: no desktop with the driver linked against a framework there).
 # Also the test functions Build/native/probe.metallib (Xcode's Metal toolchain). Signed ad hoc.
@@ -41,7 +42,7 @@ for l in AMDRadeonRDNA4 Headers Resources; do
 	ln -s "Versions/Current/$l" "$fw/$l"
 done
 clang++ -std=c++17 -arch x86_64 -mmacosx-version-min=13.0 -fobjc-arc -Wall -Wno-protocol -Wno-objc-protocol-property-synthesis -Wno-objc-protocol-method-implementation -bundle \
-	-Iinclude -Iuserspace/rdna4-run -Isrc tools/metal/native/RDNA4MTLDevice.mm -F"$c/Frameworks" -framework AMDRadeonRDNA4 -Wl,-rpath,@loader_path/../Frameworks \
+	-Iinclude -Iuserspace/rdna4-run -Isrc tools/metal/native/RDNA4MTLDevice.mm tools/metal/native/RDNA4FXTemporal.mm -F"$c/Frameworks" -framework AMDRadeonRDNA4 -Wl,-rpath,@loader_path/../Frameworks \
 	-framework Foundation -framework Metal -framework IOKit -framework IOSurface -framework QuartzCore -o "$c/MacOS/$name"
 
 for p in "$dir/bin/rdna4-run" "$dir/bin/rdna4-iop" "$dir/bin/rdna4-logd" Build/m3/x86_64/air2amdgpu; do
@@ -69,6 +70,12 @@ fi
 
 xcrun -sdk macosx metal -c tools/metal/native/rdna4.metal -o Build/native/rdna4.air
 xcrun -sdk macosx metallib Build/native/rdna4.air -o "$c/Resources/rdna4.metallib"
+# FSR 3.1's passes for the MetalFX temporal scaler (needs glslang and spirv-cross; without them the scaler is left out: nil)
+if command -v glslangValidator > /dev/null && command -v spirv-cross > /dev/null; then
+	sh tools/gen/build-fsr3.sh "$c/Resources/fsr3.metallib"
+else
+	echo "build.sh: glslangValidator or spirv-cross missing (brew install glslang spirv-cross): fsr3.metallib left out" >&2
+fi
 sh tools/package/licenses.sh bundle "$out"
 for f in "$c/Frameworks/"* "$c/Helpers/"*; do
 	[ -e "$f" ] && codesign -s - -f "$f" > /dev/null 2>&1

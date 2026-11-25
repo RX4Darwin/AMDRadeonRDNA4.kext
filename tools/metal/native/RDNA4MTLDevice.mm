@@ -7067,14 +7067,27 @@ __attribute__((ns_returns_retained)) static id fxNewSpatialScaler(MTLFXSpatialSc
 	return [[RDNA4FXSpatialScaler alloc] initWithDescriptor:d device:(RDNA4MTLDevice *)device];
 }
 
+// The temporal one: FSR 3.1's upscaler (RDNA4FXTemporal.mm)
+__attribute__((ns_returns_retained)) id rdna4NewTemporalScaler(MTLFXTemporalScalerDescriptor *d, id<MTLDevice> device);
+static NewScalerFn gRealNewTemporalScaler;
+
+__attribute__((ns_returns_retained)) static id fxNewTemporalScaler(MTLFXTemporalScalerDescriptor *d, SEL sel, id<MTLDevice> device)
+{
+	if (![(id)device isKindOfClass:[RDNA4MTLDevice class]])
+		return gRealNewTemporalScaler(d, sel, device);
+	return rdna4NewTemporalScaler(d, device);
+}
+
 static void metalFXInstall(void)
 {
 	static std::atomic<bool> done;
 	if (done.load(std::memory_order_relaxed))
 		return;
-	Class c = NSClassFromString(@"MTLFXSpatialScalerDescriptor");
+	Class c = NSClassFromString(@"MTLFXSpatialScalerDescriptor"), t = NSClassFromString(@"MTLFXTemporalScalerDescriptor");
 	Method m = c ? class_getInstanceMethod(c, @selector(newSpatialScalerWithDevice:)) : nullptr;
-	if (!m || done.exchange(true))
+	Method mt = t ? class_getInstanceMethod(t, @selector(newTemporalScalerWithDevice:)) : nullptr;
+	if (!m || !mt || done.exchange(true))
 		return;
 	gRealNewSpatialScaler = (NewScalerFn)method_setImplementation(m, (IMP)fxNewSpatialScaler);
+	gRealNewTemporalScaler = (NewScalerFn)method_setImplementation(mt, (IMP)fxNewTemporalScaler);
 }

@@ -31,6 +31,9 @@ bundle)
 		put userspace/vulkan/LICENSE-Navi48-MacOS "$d/Navi48-MacOS"
 		put userspace/vulkan/LICENSE-Navi48-bringup "$d/Navi48-bringup"
 	fi
+	if [ -e "$b/Contents/Resources/fsr3.metallib" ]; then
+		put lib/FidelityFX-SDK/LICENSE.txt "$d/FidelityFX-SDK"   # FSR 3.1's upscaler passes (MIT)
+	fi
 	if [ -e "$b/Contents/Helpers/air2amdgpu" ]; then
 		l=Build/llvm/src/llvm/LICENSE.TXT
 		[ -f "$l" ] || l=${LLVM:-/opt/homebrew/opt/llvm}/LICENSE.TXT

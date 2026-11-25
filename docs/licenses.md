@@ -12,6 +12,7 @@ A checklist for each binary release, from reading the build on 2026-11-23. It is
 | bundle, `bin/` | Mesa's RADV | MIT, one file BSL-1.0 | `Contents/Resources/Licenses/Mesa-*` |
 | bundle, `bin/` | The Mesa patches and ABI header from Navi48-MacOS and Navi48-bringup | MIT, BSD 3-Clause | `Contents/Resources/Licenses/Navi48-*` |
 | bundle | LLVM and lld, linked statically into `air2amdgpu` | Apache-2.0 with LLVM exception | `Contents/Resources/Licenses/LLVM` |
+| bundle | AMD FidelityFX SDK's FSR 3.1 upscaler passes, compiled into `fsr3.metallib` (`lib/FidelityFX-SDK`) | MIT | `Contents/Resources/Licenses/FidelityFX-SDK` |
 
 `tools/package/licenses.sh` copies these at build time and stops the build when a component is there without its licence.
 

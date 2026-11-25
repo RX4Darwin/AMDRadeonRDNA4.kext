@@ -177,7 +177,7 @@ static Value *packOp(IRBuilder<> &b, StringRef op, CallInst *c) {
 	return b.CreateBitCast(v, c->getType());
 }
 
-// A Metal SIMD-group function (simd_<op>[.u|.s]) on a wave of 32, Metal's SIMD-group width; null if not supported. Measured on Apple's
+// A Metal SIMD-group function (simd_<op>[.u|.s], quad_shuffle_xor) on a wave of 32, Metal's SIMD-group width; null if not supported. Measured on Apple's
 // GPU: a shuffle up or down past the group's edge keeps the lane's own value; reductions, ballots and any/all see the active lanes only.
 // Prefix sums shuffle upwards, so they are right when the inactive lanes are the top ones (a group cut by the grid's edge).
 static Value *simdOp(IRBuilder<> &b, StringRef op, CallInst *c) {
@@ -185,8 +185,19 @@ static Value *simdOp(IRBuilder<> &b, StringRef op, CallInst *c) {
 	Value *x = c->arg_size() ? c->getArgOperand(0) : nullptr;
 	Value *lane = b.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {b.getInt32(-1), b.getInt32(0)});
 	auto index = [&]() { return b.CreateZExtOrTrunc(c->getArgOperand(1), b.getInt32Ty()); };
-	auto shuffle = [&](Value *v, Value *from) -> Value * {   // lane `from`'s v: 32-bit types directly, smaller ones through i32
+	std::function<Value *(Value *, Value *)> shuffle = [&](Value *v, Value *from) -> Value * {
+		// lane `from`'s v: 32-bit types directly, smaller ones through i32, vectors by element
 		Type *vt = v->getType();
+		if (auto *vec = dyn_cast<FixedVectorType>(vt)) {
+			Value *r = PoisonValue::get(vt);
+			for (unsigned e = 0; e < vec->getNumElements(); e++) {
+				Value *s = shuffle(b.CreateExtractElement(v, e), from);
+				if (!s)
+					return nullptr;
+				r = b.CreateInsertElement(r, s, e);
+			}
+			return r;
+		}
 		const unsigned bits = vt->getPrimitiveSizeInBits();
 		if (bits == 32)
 			return b.CreateIntrinsic(Intrinsic::amdgcn_wave_shuffle, {vt}, {v, from});
@@ -1116,7 +1127,7 @@ static std::string legalize(Function &k) {
 			r = packOp(b, op, c);
 			if (!r)
 				return f->getName().str() + " is not supported yet";
-		} else if (op.starts_with("simd_")) {
+		} else if (op.starts_with("simd_") || op == "quad_shuffle_xor") {   // (a quad's xor: index 0-3 keeps the lane in its quad)
 			r = simdOp(b, op, c);
 			if (!r)
 				return f->getName().str() + " is not supported yet";
@@ -1191,6 +1202,23 @@ static std::string legalize(Function &k) {
 			r = b.CreateIntrinsic(Intrinsic::ldexp, {c->getType(), c->getArgOperand(1)->getType()}, {c->getArgOperand(0), c->getArgOperand(1)});
 		} else if (op == "clz" || op == "ctz") {   // (x, is zero poison)
 			r = b.CreateIntrinsic(op == "clz" ? Intrinsic::ctlz : Intrinsic::cttz, {c->getType()}, {c->getArgOperand(0), b.getFalse()});
+		} else if (op == "extract_bits.u" || op == "extract_bits.s") {   // (x, offset, bits): bits 0 -> 0 (SPIRV-Cross's MSL, FSR 3)
+			// the field shifted to the top, then down to bit 0 (sign-filled for .s); shifts of the full width are poison: selects
+			Type *t = c->getType();
+			Value *x = c->getArgOperand(0), *off = c->getArgOperand(1), *bits = c->getArgOperand(2);
+			Value *width = ConstantInt::get(t, t->getScalarSizeInBits()), *zero = ConstantInt::get(t, 0);
+			auto shift = [&](Value *n) { return b.CreateSelect(b.CreateICmpUGE(n, width), zero, n); };
+			Value *top = b.CreateShl(x, shift(b.CreateSub(b.CreateSub(width, off), bits)));
+			Value *down = shift(b.CreateSub(width, bits));
+			Value *field = op == "extract_bits.s" ? b.CreateAShr(top, down) : b.CreateLShr(top, down);
+			r = b.CreateSelect(b.CreateICmpEQ(bits, zero), zero, field);
+		} else if (op == "insert_bits.u" || op == "insert_bits.s") {   // (base, insert, offset, bits): bits 0 -> base
+			Type *t = c->getType();
+			Value *base = c->getArgOperand(0), *ins = c->getArgOperand(1), *off = c->getArgOperand(2), *bits = c->getArgOperand(3);
+			Value *width = ConstantInt::get(t, t->getScalarSizeInBits()), *zero = ConstantInt::get(t, 0);
+			Value *ones = b.CreateLShr(Constant::getAllOnesValue(t), b.CreateSelect(b.CreateICmpEQ(bits, zero), zero, b.CreateSub(width, bits)));
+			Value *mask = b.CreateSelect(b.CreateICmpEQ(bits, zero), zero, b.CreateShl(ones, off));
+			r = b.CreateOr(b.CreateAnd(base, b.CreateNot(mask)), b.CreateAnd(b.CreateShl(ins, off), mask));
 		} else if ((name.starts_with("get_width_") || name.starts_with("get_height_")) &&
 		           (name.contains("texture_2d") || name.contains("depth_2d") || name.contains("texture_cube") || name.contains("depth_cube"))) {
 			// (texture, lod), a depth or cube texture's too (the same fields): from the T# the host wrote (src/pvgpu.cpp): width - 1 in word1 [31:30]

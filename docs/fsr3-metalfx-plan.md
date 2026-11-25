@@ -1,6 +1,6 @@
 # MetalFX on our device, backed by AMD FSR, plan
 
-Status: step 2 (the spatial scaler) built and card-run 2026-11-25; the temporal scaler (FSR 3.1) is next. Asked for by Sunneva after the FSR 1 work (docs/fsr1-upscaling-plan.md).
+Status: steps 2 (spatial, FSR 1) and 3 (temporal, FSR 3.1) built and card-run 2026-11-25; motion, MetalQuake and the Gadget switch left. Asked for by Sunneva after the FSR 1 work (docs/fsr1-upscaling-plan.md).
 
 ## Why
 
@@ -48,6 +48,16 @@ Windows DLLs, and the macOS port that exists extracts its model from that DLL (s
    reactiveMask on macOS 14+, reset, depthReversed, inputContentWidth/Height); `encodeToCommandBuffer:` records the passes as compute
    dispatches on our command buffer, FSR's own resources (history, lock and luma textures, the SPD counter) kept by the scaler. Report
    `supportedInputContentMin/MaxScaleForDevice` as FSR's (1x to 3x).
+   **Done 2026-11-25:** `tools/metal/native/RDNA4FXTemporal.mm`. `lib/FidelityFX-SDK` (v1.1.4, shallow, checked out sparse here: the
+   shaders and the host code, 4 MB of 427) -> `tools/gen/build-fsr3.sh` -> `Resources/fsr3.metallib`: seven passes (prepare inputs, luma
+   pyramid, shading change pyramid, shading change, prepare reactivity, luma instability, accumulate) in four permutations (HDR for float
+   colour, inverted depth from `depthReversed`), plus two clears of ours (`fsr3.metal`). The translator needed `extract_bits`,
+   `insert_bits`, `quad_shuffle_xor` and vector shuffles; SPIRV-Cross's texture-atomic emulation gets its row alignment fixed at 256
+   (those textures are made from buffers). Host side as the SDK's `fsr3upscalerDispatch`; no sharpening (no RCAS), the camera MetalFX does
+   not give is fixed (near 0.1, far 1000, 69 degrees), frame time 1/60 s. Jitter as given (MetalFX's and FSR's convention agree;
+   `RDNA4_FSR3_JITTER="sx,sy"` scales it for a game that differs). Card: Quake II `r_metalfx 2`, 1600x900 -> 3200x1800 BGRA8, correct
+   still frames, smoother edges than spatial. Not yet: motion (ghosting, disocclusion), cost per pass, HDR colour, MetalQuake, resize.
+   The GPU faults seen during these runs (VMID 0, VA 0) come with `r_metalfx 0` as well: Quake II's own path, not the scaler.
 4. **Hooks:** the two descriptor methods replaced once a process (as Super Resolution's CAMetalLayer methods), only for our device; any
    other device gets Apple's. A switch in RDNA4Gadget's Tweaks tab ("MetalFX: AMD FSR"), on by default once it works (without it, MetalFX
    does nothing on our device today).

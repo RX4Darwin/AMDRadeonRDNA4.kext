@@ -11,3 +11,7 @@
 [submodule "lib/FidelityFX-FSR"]
 	path = lib/FidelityFX-FSR
 	url = https://github.com/GPUOpen-Effects/FidelityFX-FSR.git
+[submodule "lib/FidelityFX-SDK"]
+	path = lib/FidelityFX-SDK
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
+	shallow = true
