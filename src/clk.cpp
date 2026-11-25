@@ -89,12 +89,15 @@ constexpr Clock kClocks[] = {
 /*
  * The hard minimums the display asks the firmware for once it runs. DISPCLK,
  * DPPCLK and DCFCLK: above what Linux's DML asks for one 3840x2160@60 pipe
- * (621, 598 and 228 MHz); they are required for 4K. UCLK at its top level:
- * the firmware idles memory at 97 MHz, and two 4K planes underflowed there
- * (card, 2026-11-04); the display does not take part in memory clock
- * switches, so like Linux in that case it holds the memory clock. FCLK is
- * the firmware's. Each has an option to set it instead (0 for DISPCLK:
- * leave the clocks alone, and no 4K).
+ * (621, 598 and 228 MHz); they are required for 4K. UCLK: held at its top
+ * level only while an extra display runs a 4K-class mode beside the boot one
+ * (memoryClockFollowDisplays): the firmware idles memory at 97 MHz, and two 4K
+ * planes underflowed there (card, 2026-11-04); the display does not take part
+ * in memory clock switches. A 4K boot display with a 1080p one beside it ran
+ * clean with memory free (58-2500 MHz, idle 47 -> 21 W, watched through load
+ * changes and display sleep, 2026-11-25). FCLK is the firmware's. Each has an
+ * option to set it instead (0 for DISPCLK: leave the clocks alone, and no 4K;
+ * rdna4-uclk=<MHz>: that minimum always).
  */
 constexpr uint32_t kTopLevel = ~0u;
 
@@ -110,7 +113,7 @@ constexpr HardMin kRaised[] = {   /* DISPCLK first: dispclkTargetKHz */
 	{ kPpclkDispclk, "DISPCLK", "rdna4-dispclk", 650, true },
 	{ kPpclkDppclk, "DPPCLK", "rdna4-dispclk", 650, true },
 	{ kPpclkDcfclk, "DCFCLK", "rdna4-dcfclk", 600, true },
-	{ kPpclkUclk, "UCLK", "rdna4-uclk", kTopLevel, false },
+	{ kPpclkUclk, "UCLK", "rdna4-uclk", 0, false },   /* (memoryClockFollowDisplays) */
 	{ kPpclkFclk, "FCLK", "rdna4-fclk", 0, false },
 };
 
@@ -414,4 +417,39 @@ void RDNA4Device::smuStarted()
 
 	logDisplayClocks();
 	uhdClocks = raiseDisplayClocks();
+	memoryClockFollowDisplays();
+}
+
+/*
+ * UCLK's hard minimum: the top DPM level while an extra display is lit (asleep
+ * or not) in a 4K-class mode (its 3840x2160 table, or 500 MHz of pixel clock
+ * and more), the lowest otherwise, so the firmware scales memory. Not with
+ * rdna4-uclk set: raiseDisplayClocks asked for that.
+ * ponytail: lit only (not on/off), and no lock against a pipe lit while
+ * smuStarted reads the flags; the next lighting or take-down asks again.
+ */
+void RDNA4Device::memoryClockFollowDisplays()
+{
+	uint32_t asked = 0;
+
+	if (!smu || Trial::option("rdna4-uclk", asked))
+		return;
+
+	bool hold = false;
+
+	for (const ExtraPipe &p : extra)
+		hold = hold || (p.lit && (p.uhd || p.target.now.pixelClockKHz >= 500000));
+
+	if (uclkHeld == hold && uclkKnown)
+		return;
+
+	uint32_t lowest = 0;   // (DPM level 0's frequency)
+
+	if (!hold && !smuSend(*smu, smu->getDpmFreq, kPpclkUclk << 16, &lowest))
+		return;
+
+	const uint32_t mhz = hold ? topDpmLevel(kPpclkUclk) : lowest & 0xffff;
+
+	if (mhz && smuSetHardMin(kPpclkUclk, hold ? "UCLK (a 4K display beside the boot one)" : "UCLK (free)", mhz))
+		uclkHeld = hold, uclkKnown = true;
 }

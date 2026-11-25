@@ -3230,6 +3230,7 @@ void RDNA4Device::takeExtraDown() {
 		(void)runSteps(off, 1, nullptr, 0, "dcninit: extra off", c.pipe * Pipe::Reg::kOtgStride);
 	}
 	xp().lit = xp().on = false;
+	memoryClockFollowDisplays();
 }
 
 bool RDNA4Device::systemSleepWanted() {
@@ -3353,7 +3354,7 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 		if (!xp().lit)
 			continue;
 		if (Pipe2::config().dp && coldBoot)
-			xp().lit = xp().on = false;
+			xp().lit = xp().on = false, memoryClockFollowDisplays();
 		else
 			takeExtraDown();
 		relight |= 1u << i;
@@ -3846,6 +3847,7 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", c.pipe * Pipe::Reg::kOtgStride,
 		              plan->aux);
 		xp().lit = xp().on = ok;
+		memoryClockFollowDisplays();
 		xp().target.rgb = false;
 		// Whether it runs: the frame rate of its timing generator, and the
 		// underflow flags of the plane and the OPTC (HUBPn_DCHUBP_CNTL,
@@ -4743,6 +4745,7 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 		// The sink's side of a scrambled link once more, with its clock
 		// running, as after a wake.
 		scdcRefresh();
+		memoryClockFollowDisplays();   // (a 4K-class mode holds the memory clock)
 		logUnderflow("pipe2: after the switch");
 		diffAfterWake();
 	}

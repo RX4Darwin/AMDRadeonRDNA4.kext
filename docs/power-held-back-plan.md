@@ -1,6 +1,6 @@
 # The power features held back under lit displays, plan
 
-Status, 2026-11-25: read-only findings on the rig; nothing changed yet. Asked for by Sunneva after the OpenMW speed work: display DPM,
+Status, 2026-11-25: step 1 done and on by default (memory free unless an extra display runs a 4K-class mode); GFXOFF open. Asked for by Sunneva after the OpenMW speed work: display DPM,
 memory and fabric deep sleep, GFXOFF.
 
 ## What holds them back today (rig: RX 9070 XT, two displays lit, desktop idle)
@@ -19,6 +19,16 @@ memory and fabric deep sleep, GFXOFF.
 - **GFXOFF:** the kext sends `DisallowGfxOff` for the whole boot. An opt-in exists (`rdna4-gfxoff=1`, the W27 guard: every GC access wakes
   GFX first, an NVRAM flag covers the next boot), but it is refused while the gfx ring or any runtime client is open (section 10 of the
   audit): with WindowServer on our accelerator, that is always. GFXOFF needs the HQD/ring state saved and restored across power-down first.
+
+## Step 1 result (2026-11-25, rig: Samsung 4K on DP as the boot display, Lenovo 1080p on DP lit by the kext)
+
+`rdna4-uclk=0` in config.plist for one boot, Sunneva watching both displays: memory 230-860 MHz at the idle desktop (was 2505), socket
+21-33 W (was 47), up to 2495 MHz / 142 W under Quake II and back, 58 MHz / 18 W with the displays asleep, both back after the wake; no
+flicker, line or blank seen, the kext's underflow checks 0. Made the default: `memoryClockFollowDisplays` (`src/clk.cpp`) holds UCLK at
+its top level only while an extra display runs a 4K-class mode (its 3840x2160 table or 500 MHz of pixel clock and more: the two-4K case
+that underflowed on 2026-11-04, commit 6c0e4d9), the lowest level otherwise; re-checked when an extra display is lit, taken down or
+switches mode. Default boot after: `UCLK (free)`, memory 96-400 MHz, 19-24 W. Not run: two 4K displays (no second 4K panel here); the hold
+itself ran (a build that held it for any second display: 2505 MHz, 46 W), its 4K-class condition did not.
 
 ## Plan
 

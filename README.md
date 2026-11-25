@@ -146,8 +146,9 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 - Variable refresh (FreeSync), DisplayPort MST, HDR output to the monitor.
 - Audio over HDMI and DisplayPort.
 - Hardware video decode and encode (VCN).
-- Fan control; the power features held back so that they do not retune clocks under the lit displays (display DPM,
-  memory and fabric deep sleep, GFXOFF).
+- GFXOFF (the graphics block powered down when idle). Memory clock scaling with two 4K displays lit: the memory clock is
+  held at its top level then (two 4K planes underflowed when it dropped); with one display, or a 4K one beside a smaller
+  one, memory scales and its deep sleep works (`rdna4-uclk=<MHz>` holds a minimum always).
 - The Navi 44 cards (RX 9060 XT, RX 9060) under macOS: matched and given their firmware, measured under Linux and in the
   emulator, not yet run on one (see *Supported cards*).
 

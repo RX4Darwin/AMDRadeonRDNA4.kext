@@ -224,6 +224,7 @@ public:
 	static uint32_t snapRead(void *ctx, uint8_t seg, uint32_t dword);
 	static void snapDiff(void *ctx, const RegSnap::Reg &was, uint32_t now);
 	volatile bool uhdClocks { false };   // set by smuStarted, on the compute thread
+	bool uclkHeld { false }, uclkKnown { false };   // memoryClockFollowDisplays: what UCLK's hard minimum is now
 	bool pipe2DpAllowed { false };
 	bool readSecondEdid(uint8_t hpd);
 	// Display sleep and wake of the pipe lightSecondPipe lit, as amdgpu does
@@ -448,6 +449,7 @@ private:
 	const SmuMailbox *smuFind();
 	bool smuHardMinMet(uint32_t clk);
 	bool smuSetHardMin(uint32_t clk, const char *name, uint32_t mhz);
+	void memoryClockFollowDisplays();   // UCLK held at its top level while an extra display runs a 4K-class mode (clk.cpp)
 	bool raiseDisplayClocks();
 	uint32_t topDpmLevel(uint32_t clk);
 	void logDisplayClocks();
