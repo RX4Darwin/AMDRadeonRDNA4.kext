@@ -2598,15 +2598,17 @@ void RDNA4Compute::fanDescribe(char *out, size_t size) {
 		         c[RDNA4_SMU_OD_FAN_ZERO_RPM], c[RDNA4_SMU_OD_FAN_ZERO_RPM_STOP]);
 }
 
-// One change on top of what is applied, as amdgpu's od_edit_dpm_table and its commit: each value checked against the board's limits,
-// the feature bits amdgpu sets for it (a curve: FAN_CURVE, manual mode; the minimum speed: FAN_LEGACY, which excludes the curve; the
-// target and acoustic values: FAN_CURVE in auto mode; zero RPM: ZERO_FAN), then uploaded; nothing changes when the SMU refuses it.
+// Changes on top of what is applied, as amdgpu's od_edit_dpm_table and its commit: one command, or several separated by ';' (or new
+// lines), all staged and then uploaded once (RDNA4Gadget's Apply: reset, the curve and zero RPM together, so the card never runs the
+// steps between). Each value checked against the board's limits, the feature bits amdgpu sets for it (a curve: FAN_CURVE, manual mode;
+// the minimum speed: FAN_LEGACY, which excludes the curve; the target and acoustic values: FAN_CURVE in auto mode; zero RPM: ZERO_FAN);
+// any invalid command refuses them all, and nothing changes when the SMU refuses the table.
 int RDNA4Compute::fanCommand(const char *cmd) {
 	if (!odKnown)
 		return ENODEV;
 	auto word = [&cmd](const char *w) {
 		const size_t n = strlen(w);
-		if (strncmp(cmd, w, n) || (cmd[n] && cmd[n] != ' '))
+		if (strncmp(cmd, w, n) || (cmd[n] && cmd[n] != ' ' && cmd[n] != ';' && cmd[n] != '\n'))
 			return false;
 		cmd += n;
 		return true;
@@ -2628,52 +2630,65 @@ int RDNA4Compute::fanCommand(const char *cmd) {
 	                   kZero = 1u << RDNA4_SMU_OD_FEATURE_ZERO_FAN;
 	uint8_t next[sizeof(odCur)];
 	memcpy(next, odCur, sizeof(next));
-	uint32_t mask = odMask, a = 0, b = 0;
-	if (word("reset")) {
-		memcpy(next, odBoot, sizeof(next));
-		mask = 0;
-	} else if (word("curve")) {   // five points T:P, temperatures rising, speeds not falling, each within the limits
-		for (uint32_t i = 0, lastT = 0, lastP = 0; i < 5; i++, lastT = a, lastP = b) {
-			if (!number(a) || !number(b) || a < odMin[RDNA4_SMU_ODL_FAN_TEMP] || a > odMax[RDNA4_SMU_ODL_FAN_TEMP] ||
-			    b < odMin[RDNA4_SMU_ODL_FAN_PWM] || b > odMax[RDNA4_SMU_ODL_FAN_PWM] || (i && (a <= lastT || b < lastP)))
+	uint32_t mask = odMask, a = 0, b = 0, commands = 0;
+	for (;;) {
+		while (*cmd == ' ' || *cmd == ';' || *cmd == '\n')
+			cmd++;
+		if (!*cmd)
+			break;
+		commands++;
+		if (word("reset")) {
+			memcpy(next, odBoot, sizeof(next));
+			mask = 0;
+		} else if (word("curve")) {   // five points T:P, temperatures rising, speeds not falling, each within the limits
+			for (uint32_t i = 0, lastT = 0, lastP = 0; i < 5; i++, lastT = a, lastP = b) {
+				if (!number(a) || !number(b) || a < odMin[RDNA4_SMU_ODL_FAN_TEMP] || a > odMax[RDNA4_SMU_ODL_FAN_TEMP] ||
+				    b < odMin[RDNA4_SMU_ODL_FAN_PWM] || b > odMax[RDNA4_SMU_ODL_FAN_PWM] || (i && (a <= lastT || b < lastP)))
+					return EINVAL;
+				next[RDNA4_SMU_OD_FAN_TEMP + i] = static_cast<uint8_t>(a);
+				next[RDNA4_SMU_OD_FAN_PWM + i] = static_cast<uint8_t>(b);
+			}
+			next[RDNA4_SMU_OD_FAN_MODE] = 1;
+			mask = (mask | kCurve) & ~kLegacy;
+		} else if (word("zero")) {
+			if (!number(a) || a < odMin[RDNA4_SMU_ODL_FAN_ZERO_RPM] || a > odMax[RDNA4_SMU_ODL_FAN_ZERO_RPM])
 				return EINVAL;
-			next[RDNA4_SMU_OD_FAN_TEMP + i] = static_cast<uint8_t>(a);
-			next[RDNA4_SMU_OD_FAN_PWM + i] = static_cast<uint8_t>(b);
+			next[RDNA4_SMU_OD_FAN_ZERO_RPM] = static_cast<uint8_t>(a);
+			mask |= kZero;
+		} else if (word("stop")) {
+			if (!number(a) || a < odStopMin || a > odStopMax)
+				return EINVAL;
+			next[RDNA4_SMU_OD_FAN_ZERO_RPM_STOP] = static_cast<uint8_t>(a);
+			mask |= kZero;
+		} else if (word("target")) {
+			if (!number(a) || !lim16(RDNA4_SMU_ODL_FAN_TARGET_TEMP, a))
+				return EINVAL;
+			put16(next, RDNA4_SMU_OD_FAN_TARGET_TEMP, a);
+			next[RDNA4_SMU_OD_FAN_MODE] = 0;
+			mask = (mask | kCurve) & ~kLegacy;
+		} else if (word("minpwm")) {
+			if (!number(a) || !lim16(RDNA4_SMU_ODL_FAN_MIN_PWM, a))
+				return EINVAL;
+			put16(next, RDNA4_SMU_OD_FAN_MIN_PWM, a);
+			next[RDNA4_SMU_OD_FAN_MODE] = 0;
+			mask = (mask | kLegacy) & ~kCurve;
+		} else if (word("acoustic")) {
+			if (!number(a) || !number(b) || !lim16(RDNA4_SMU_ODL_ACOUSTIC_TARGET, a) || !lim16(RDNA4_SMU_ODL_ACOUSTIC_LIMIT, b) || a > b)
+				return EINVAL;
+			put16(next, RDNA4_SMU_OD_ACOUSTIC_TARGET, a);
+			put16(next, RDNA4_SMU_OD_ACOUSTIC_LIMIT, b);
+			next[RDNA4_SMU_OD_FAN_MODE] = 0;
+			mask = (mask | kCurve) & ~kLegacy;
+		} else {
+			return EINVAL;
 		}
-		next[RDNA4_SMU_OD_FAN_MODE] = 1;
-		mask = (mask | kCurve) & ~kLegacy;
-	} else if (word("zero")) {
-		if (!number(a) || a < odMin[RDNA4_SMU_ODL_FAN_ZERO_RPM] || a > odMax[RDNA4_SMU_ODL_FAN_ZERO_RPM])
+		while (*cmd == ' ')
+			cmd++;
+		if (*cmd && *cmd != ';' && *cmd != '\n')   // (something after a command's values)
 			return EINVAL;
-		next[RDNA4_SMU_OD_FAN_ZERO_RPM] = static_cast<uint8_t>(a);
-		mask |= kZero;
-	} else if (word("stop")) {
-		if (!number(a) || a < odStopMin || a > odStopMax)
-			return EINVAL;
-		next[RDNA4_SMU_OD_FAN_ZERO_RPM_STOP] = static_cast<uint8_t>(a);
-		mask |= kZero;
-	} else if (word("target")) {
-		if (!number(a) || !lim16(RDNA4_SMU_ODL_FAN_TARGET_TEMP, a))
-			return EINVAL;
-		put16(next, RDNA4_SMU_OD_FAN_TARGET_TEMP, a);
-		next[RDNA4_SMU_OD_FAN_MODE] = 0;
-		mask = (mask | kCurve) & ~kLegacy;
-	} else if (word("minpwm")) {
-		if (!number(a) || !lim16(RDNA4_SMU_ODL_FAN_MIN_PWM, a))
-			return EINVAL;
-		put16(next, RDNA4_SMU_OD_FAN_MIN_PWM, a);
-		next[RDNA4_SMU_OD_FAN_MODE] = 0;
-		mask = (mask | kLegacy) & ~kCurve;
-	} else if (word("acoustic")) {
-		if (!number(a) || !number(b) || !lim16(RDNA4_SMU_ODL_ACOUSTIC_TARGET, a) || !lim16(RDNA4_SMU_ODL_ACOUSTIC_LIMIT, b) || a > b)
-			return EINVAL;
-		put16(next, RDNA4_SMU_OD_ACOUSTIC_TARGET, a);
-		put16(next, RDNA4_SMU_OD_ACOUSTIC_LIMIT, b);
-		next[RDNA4_SMU_OD_FAN_MODE] = 0;
-		mask = (mask | kCurve) & ~kLegacy;
-	} else {
-		return EINVAL;
 	}
+	if (!commands)
+		return EINVAL;
 	uint8_t was[sizeof(odCur)];
 	const uint32_t wasMask = odMask;
 	memcpy(was, odCur, sizeof(was));
@@ -2688,7 +2703,7 @@ int RDNA4Compute::fanCommand(const char *cmd) {
 
 namespace {
 int fanSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
-	char value[160] = "";
+	char value[256] = "";
 	if (gFanCompute)
 		gFanCompute->fanDescribe(value, sizeof(value));
 	const int err = sysctl_handle_string(oidp, value, sizeof(value), req);

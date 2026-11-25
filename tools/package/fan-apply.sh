@@ -11,8 +11,13 @@ until /usr/sbin/sysctl -n debug.rdna4_fan > /dev/null 2>&1; do
 	[ $i -lt 120 ] || { echo "rdna4-fan-apply: no debug.rdna4_fan (the driver's kext not running)" >&2; exit 1; }
 	sleep 1
 done
-head -n 16 "$conf" | while IFS= read -r line; do
-	case "$line" in '' | '#'*) continue ;; esac
-	/usr/sbin/sysctl "debug.rdna4_fan=$line" > /dev/null || echo "rdna4-fan-apply: refused: $line" >&2
-done
+# the whole file as one change (the kext stages the commands and uploads the table once: the card never runs the steps between);
+# a kext that takes one command at a time (before 0.5.0's) gets them line by line
+all=$(head -n 16 "$conf" | grep -v -e '^#' -e '^$' | tr '\n' ';')
+if ! /usr/sbin/sysctl "debug.rdna4_fan=$all" > /dev/null 2>&1; then
+	head -n 16 "$conf" | while IFS= read -r line; do
+		case "$line" in '' | '#'*) continue ;; esac
+		/usr/sbin/sysctl "debug.rdna4_fan=$line" > /dev/null || echo "rdna4-fan-apply: refused: $line" >&2
+	done
+fi
 echo "rdna4-fan-apply: $(/usr/sbin/sysctl -n debug.rdna4_fan)"
