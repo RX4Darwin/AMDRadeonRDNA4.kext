@@ -1,6 +1,6 @@
 # The power features held back under lit displays, plan
 
-Status, 2026-11-25: step 1 done and on by default (memory free unless an extra display runs a 4K-class mode); GFXOFF open. Asked for by Sunneva after the OpenMW speed work: display DPM,
+Status, 2026-11-25: step 1 done and on by default (memory free unless an extra display runs a 4K-class mode); GFXOFF measured (~3 W), not built. Asked for by Sunneva after the OpenMW speed work: display DPM,
 memory and fabric deep sleep, GFXOFF.
 
 ## What holds them back today (rig: RX 9070 XT, two displays lit, desktop idle)
@@ -40,6 +40,29 @@ itself ran (a build that held it for any second display: 2505 MHz, 46 W), its 4K
 3. **Then the deep sleeps follow on their own** (DS_UCLK/DS_FCLK need the memory clock free to drop); check FCLK and the socket power.
 4. **GFXOFF last:** save and restore the gfx ring's and the runtime's HQD state across a power-down, then allow GFXOFF after 100 ms idle as
    amdgpu does; card tests: the self-test, the desktop, sleep/wake, the 24-hour run.
+
+## GFXOFF: what it needs, and measuring the gain first (started 2026-11-25)
+
+What exists (docs/gfx-pm-audit.md sections 9-10): `rdna4-gfxoff=1` sends AllowGfxOff once at the end of bring-up; every GC register or
+doorbell access goes through a guard that wakes GFX first (DisallowGfxOff) and stays awake for the rest of the boot; after the wake the
+boot compute HQD and the clock-gating registers are restored. It is refused while the gfx ring (rdna4-gfx) or any runtime client is up,
+because those are programmed by MMIO and lost at the power-down (no MES and no MQD-based mapping here). On the default desktop (our
+accelerator, WindowServer a client, the gfx ring always up) it therefore never happens.
+
+What real GFXOFF needs: (a) re-arming: allow again after ~100 ms with no GC work, as amdgpu does (amdgpu_gfx.c gfx_off_delay_work);
+(b) the gfx ring (CP_RB0 base/size/rptr/wptr, its doorbell, the goldens) and every client's HQD, SH_MEM_BASES/CONFIG and VMID state
+restored after each wake, before the first packet; (c) every path that touches GC still through the guard (user-space doorbells would
+bypass it: check none exist). The payoff is unknown: at idle GFX already sits at ~40 MHz in deep sleep with clock gating on.
+
+Step 0, measure: a boot with `rdna4-gfxoff=1 rdna4-gfx=0 rdna4-accel=0` (nothing reaches GC after bring-up, so the existing Allow holds)
+against the same boot without `rdna4-gfxoff=1`: idle socket power from the SMU metrics (sensors read the SMU only, no GC access). The
+difference is what (a)-(c) can win at a still desktop. Worth the work only if it is several watts.
+
+Step 0 result (2026-11-25, rig, accelerator and gfx ring off so nothing reaches GC after bring-up; one `rdna4-run sensors` reading
+after 150 s idle, since that call opens a runtime client and wakes GFX): GFXOFF allowed: GFX 0 MHz, **14 W**; the same boot without it:
+GFX 40 MHz (deep sleep), **17 W**. So GFXOFF is worth ~3 W at a still desktop (the default accelerated desktop idles at 19-21 W now).
+Also seen: after the wake that `rdna4-run` caused, GFX ran at 3.3 GHz and 67 W with no load until the next boot: the existing wake path
+leaves the block busy or unmanaged (GRBM 0x0800382c after the wake); to fix before any GFXOFF goes further.
 
 ## Risks
 
