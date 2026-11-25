@@ -48,6 +48,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 
 #include "amdfw.hpp"
 #include "codeobj.hpp"
@@ -331,6 +332,8 @@ public:   // (debug.rdna4_fan's handler)
 	int fanCommand(const char *cmd);             // debug.rdna4_fan: reset | curve T:P,T:P,T:P,T:P,T:P | zero 0|1 | stop C | target C |
 	                                             // minpwm P | acoustic TARGET LIMIT; 0 or an errno
 	void fanDescribe(char *out, size_t size);    // what is applied, for reading debug.rdna4_fan
+	void pmSurveyNow() { gfxPmSurvey("on request (debug.rdna4_pmsurvey)", false); }   // GC power state into the log
+	void gfxOffDescribe(char *out, size_t size) const;   // debug.rdna4_gfxoff
 	void fanLimits(char *out, size_t size);      // the board's limits, for reading debug.rdna4_fan_limits
 private:
 	bool uploadOverdrive();                      // odCur with odMask to the SMU (TransferTableDram2Smu)
@@ -579,7 +582,7 @@ private:
 	static constexpr uint32_t kPmProbeMHz = 1000;
 	static uint32_t requestedGfxPm();
 	static bool requestedGfxCap(uint32_t &mhz);      // rdna4-gfxcap: false when absent
-	void gfxPmSurvey(const char *tag);
+	void gfxPmSurvey(const char *tag, bool trailed = true);
 	void gfxCapApply(uint32_t mhz);
 	// W27: rdna4-gfxoff (GFXOFF allowed at the very end of bring-up, guarded on every
 	// GC access) and rdna4-gfxcg (clock gating), see the comments in compute.cpp.
@@ -596,12 +599,36 @@ private:
 	mutable volatile SInt32 gcState { 0 };      // kGcOn until the end-of-bring-up Allow
 	mutable volatile SInt32 gcBusy { 0 };       // GC accessors inside an access
 	mutable thread_t gcOwner { nullptr };       // the thread that is restoring GC state after a GFXOFF wake
+	mutable volatile uint64_t gcLastUse { 0 };  // mach_absolute_time of the last GC access's end (the re-arm timer's idle measure)
+	// Re-armed GFXOFF (rdna4-gfxoff=1, 2026-11-25): allowed again after 100 ms without a GC access, the gfx ring and every
+	// compute queue rebuilt after each wake (gfxOffTick, gfxOffAllow, gfxOffAfterWake)
+	thread_call_t gfxOffTimer { nullptr };
+	bool gfxOffRearm { false };
+	bool gfxOffFlagOn { false };                // the persistent flag is set (written once a boot)
+	bool trailQuiet { false };                  // trail() writes nothing (the GFXOFF wake's ring rebuild)
+	mutable volatile uint32_t gfxOffWakes { 0 };   // wakes this boot (routine log lines only for the first ones)
+	uint32_t gfxOffAllows { 0 }, gfxOffRefusals { 0 };
+	mutable uint32_t gfxOffBy[7] {};             // wakes by: compute job, gfx job, copy, Vulkan, doorbell, register access, other
+	const char *gfxOffLastWhy { "" };
+	mutable uint64_t gfxOffSince { 0 }, gfxOffNs { 0 };   // when the last Allow went out; the time GFXOFF was allowed in all
+	static void gfxOffTick(thread_call_param_t self, thread_call_param_t);
+	void gfxOffArm();
+	bool gfxOffIdle(const char **why);
+	bool gfxRingRestoreAfterWake();             // gfxring.cpp: goldens, CSB, SRM, ring 0, a ring test
 	bool bootQueueLive { false };               // stage 5's plain HQD is up ...
 	uint32_t bringupGen { 0 };                  // ... in THIS bring-up: bumped at every runStages start
 	uint32_t bootQueueGen { 0 };
 	static constexpr uint32_t kGcSnapMax = 16;
 	uint32_t gcSnapVal[kGcSnapMax] {};          // GC registers we program by MMIO, read just before AllowGfxOff
 	bool gcSnapValid { false };
+	// Every active compute queue's HQD registers, and each VMID's SH_MEM state, read just before AllowGfxOff
+	// and written back after the wake (gfxOffSnapshotQueues, gfxOffRestoreQueues): GFXOFF's power-down loses
+	// MMIO-programmed queues (no MQD-based mapping, no MES here).
+	static constexpr uint32_t kHqdSnapRegs = 21;
+	struct HqdSnap { bool active; uint32_t v[kHqdSnapRegs]; };
+	HqdSnap hqdSnap[2][4] {};
+	uint32_t shMemSnap[16][2] {}, schedSnap { 0 };
+	bool queueSnapValid { false };
 	IOLock *gcLock { nullptr };
 	IOLock *smuLock { nullptr };                // serializes the SMU mailbox
 	IOLock *smuTableLock { nullptr };           // the SMU driver table: one transfer and the reads of it at a time
@@ -610,6 +637,8 @@ private:
 	bool gcEnsureAwake(uint32_t what);          // wake GFX before a submitter emits into pm4Queue; false = still held
 	void gfxOffSnapshot();
 	uint32_t gfxOffRestoreRegs();
+	void gfxOffSnapshotQueues();
+	uint32_t gfxOffRestoreQueues();
 	bool gfxOffAllowedNow(const char **why);
 	// Persistent "GFXOFF may be allowed" flag in NVRAM (set before AllowGfxOff, cleared
 	// after a successful DisallowGfxOff), read at the next start.

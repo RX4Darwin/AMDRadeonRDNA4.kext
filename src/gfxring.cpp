@@ -56,7 +56,8 @@
 #include <libkern/c++/OSNumber.h>
 #include <pexpert/pexpert.h>
 
-#define GLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: gfx: " fmt "\n", ## __VA_ARGS__)
+static bool gGfxQuiet;   // (gfxRingRestoreAfterWake: the bring-up's steps again, without their log lines each wake)
+#define GLOG(fmt, ...)  do { if (!gGfxQuiet) rdna4Log("AMDRadeonRDNA4: gfx: " fmt "\n", ## __VA_ARGS__); } while (0)
 
 using namespace GfxReg;
 
@@ -180,6 +181,35 @@ bool RDNA4Compute::gfxRingResume() {
 	     "doorbell", rdGc(CpMeCntl), stat,
 	     stat ? " (did not idle: amdgpu reports and goes on)" : "");
 	return true;
+}
+
+// After a GFXOFF wake (gfxOffAfterWake, gcOwner): the ring's registers are gone. The ring was idle at the Allow (gfxOffIdle) and
+// every writer wakes GFX before writing (gcEnsureAwake), so it is set up anew as at bring-up, from dword 0, and proven with
+// a register write. No trail: a write to NVRAM each wake would wear it.
+bool RDNA4Compute::gfxRingRestoreAfterWake() {
+	gGfxQuiet = gfxOffWakes > 3;
+	trailQuiet = true;
+	gfxGoldenInit();
+	bool ok = gfxCsbInit();
+	gfxSrmEnable();
+	ok = ok && gfxRingResume();
+	trailQuiet = false;
+	uint32_t pkt[8], scratch = 0;
+	if (ok) {
+		wr(IpDiscovery::HwGc, ScratchReg0, 0xCAFEDEAD);
+		gfxRing.emit(pkt, Pm4::setUconfigReg(pkt, shAbs(ScratchReg0), 0x6F0FF0FFu));
+		gfxKick(gfxRing.wptr());
+		for (uint32_t us = 0; us < 100000 && scratch != 0x6F0FF0FFu; us += 10) {
+			scratch = rdGc(ScratchReg0);
+			if (scratch != 0x6F0FF0FFu)
+				IODelay(10);
+		}
+		ok = scratch == 0x6F0FF0FFu;
+	}
+	gGfxQuiet = false;
+	if (!ok || gfxOffWakes <= 3)
+		GLOG("ring 0 after a GFXOFF wake: %s (SCRATCH_REG0 0x%08x)", ok ? "set up again, ring test ok" : "FAILED", scratch);
+	return ok;
 }
 
 void RDNA4Compute::gfxKick(uint64_t wptrDwords) {

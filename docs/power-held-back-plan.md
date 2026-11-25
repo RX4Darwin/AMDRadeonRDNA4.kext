@@ -1,6 +1,6 @@
 # The power features held back under lit displays, plan
 
-Status, 2026-11-25: step 1 done and on by default (memory free unless an extra display runs a 4K-class mode); GFXOFF measured (~3 W), not built. Asked for by Sunneva after the OpenMW speed work: display DPM,
+Status, 2026-11-25: step 1 done and on by default (memory free unless an extra display runs a 4K-class mode); GFXOFF built, opt-in (rdna4-gfxoff=1). Asked for by Sunneva after the OpenMW speed work: display DPM,
 memory and fabric deep sleep, GFXOFF.
 
 ## What holds them back today (rig: RX 9070 XT, two displays lit, desktop idle)
@@ -63,6 +63,26 @@ after 150 s idle, since that call opens a runtime client and wakes GFX): GFXOFF 
 GFX 40 MHz (deep sleep), **17 W**. So GFXOFF is worth ~3 W at a still desktop (the default accelerated desktop idles at 19-21 W now).
 Also seen: after the wake that `rdna4-run` caused, GFX ran at 3.3 GHz and 67 W with no load until the next boot: the existing wake path
 leaves the block busy or unmanaged (GRBM 0x0800382c after the wake); to fix before any GFXOFF goes further.
+
+## GFXOFF built (2026-11-25, opt-in `rdna4-gfxoff=1`)
+
+- **Why GFX ran at 3.3 GHz after a wake:** CP_ME_CNTL lost its PFP/ME halt bits at the power-up (0x1500a000 -> 0x0000a000 with
+  the gfx ring off; the fetcher then stuck on POST_WPTR_GFX_BUSY, 100 % busy). CP_ME_CNTL is now in the saved registers.
+- **Queues:** every active compute HQD (ME1, 2 pipes x 4 queues), SH_MEM_CONFIG/BASES of 16 VMIDs and RLC_CP_SCHEDULERS are
+  saved inside the Allow (idle, no accessor) and written back after the wake in hqdInitFor's order; all 3 came back each time,
+  the self-test passes after a wake. The gfx ring is set up anew (goldens, CSB, SRM, ring 0, a scratch-register ring test).
+- **Re-arming:** a 100 ms thread_call; the Allow needs rtLock (every submission holds it), no GC accessor, GFX idle (GRBM GUI_ACTIVE,
+  CP_STAT, CPC), the gfx ring read up to what was written and no client gfx work outstanding. Every packet writer
+  (submitIbLocked, gfxClientEmit, the Vulkan submit, sdmaRun, launch) wakes GFX before it writes. The NVRAM flag is written once a
+  boot and the trail not at all during a wake (flash wear).
+- **The early Disallow:** the SMU answers DisallowGfxOff neither at attach nor at the bring-up start (warm restart); holding GC then
+  skipped the driver for the whole boot. Now it goes on; stage 3 sends DisallowGfxOff on every boot. At attach the flag write also
+  hung (NVRAM not published): left alone there.
+- **Card (rig, accelerated desktop):** ~1 cycle a second with the desktop up (WindowServer's gfx jobs and the kext's copies;
+  allowed ~45 % of the time, power unchanged at 19-22 W); with the displays asleep 8 wakes in 40 s, allowed 90 %, GFX 0 MHz,
+  15 W (18 W without). OpenMW's 12 cell loads, Quake II, vkcube (MoltenVK), the self-test: no hang, no failed restore. Not run:
+  system sleep, a long run, a RADV Vulkan app, the paravirtual mode. `debug.rdna4_gfxoff` (counters by wake source) and
+  `debug.rdna4_pmsurvey` (the GC power survey into the log) are read-only sysctls.
 
 ## Risks
 

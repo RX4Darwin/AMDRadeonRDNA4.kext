@@ -262,6 +262,7 @@ struct N48nBackend {
 	static uint32_t submit(void *context, const N48N::Ib *ibs, uint32_t count, uint32_t sequence) {
 		RDNA4Compute &c = of(context);
 		RDNA4Compute::N48nState &s = me(context);
+		(void)c.gcEnsureAwake(0xfffffff4u);   // GFXOFF: the wake rebuilds the gfx ring, so before this writes to it
 		const IOReturn ready = c.gfxClientReady();
 		if (ready != kIOReturnSuccess)   // no graphics ring this boot (rdna4-gfx=2), not up yet, or halted after lost work
 			return ready == kIOReturnNotResponding ? N48N::kAborted : static_cast<uint32_t>(ready);

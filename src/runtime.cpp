@@ -3353,6 +3353,7 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 /* Put one command buffer of `c`'s on its queue (its own, or the shared one it is pinned to) with the client's fence after it. The caller holds
  * rtLock and has checked that the buffer is the client's to run. Also what the shared mode's boot test submits with (vmshared.cpp). */
 IOReturn RDNA4Compute::submitIbLocked(RtClient &c, uint64_t ibVa, uint64_t dwords, uint64_t &fence) {
+	(void)gcEnsureAwake(0xfffffff1u);   // GFXOFF: awake before the packets are written, not at the doorbell (gfxOffAfterWake)
 	retireIbFences(c);
 	/* A shared queue's ring (4 KiB) carries the jobs of up to four clients: 8 outstanding jobs of 20 dwords each keep it far from full. */
 	if (c.ibOutstanding >= (c.shared ? 8u : kMaxIbOutstanding))
@@ -3760,6 +3761,7 @@ void RDNA4Compute::gfxClientWedge(const char *why) {
 /* Append IB + fence for `c`: the caller has checked the state (gfxClientReady, or the bring-up self-test) and the IB's ownership/range.
  * Packets: CONTEXT_CONTROL (amdgpu #10), INDIRECT_BUFFER in the client's VMID (#11), RELEASE_MEM to the client's fence dword (#12/#13). */
 IOReturn RDNA4Compute::gfxClientEmit(RtClient &c, uint64_t ibVa, uint32_t dwords, uint32_t &fence) {
+	(void)gcEnsureAwake(0xfffffff2u);   // GFXOFF: the wake rebuilds the gfx ring, so before anything is written to it
 	if (!c.gfxFenceCpu || !c.gfxFenceMc)
 		return kIOReturnNoResources;
 	for (RtClient &o : clients)
@@ -4720,6 +4722,7 @@ void RDNA4Compute::waitAwake() {
 
 // One packet on SDMA0 queue 0 with a FENCE after it; waits for the fence.
 bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeoutMs) {
+	(void)gcEnsureAwake(0xfffffff3u);   // GFXOFF: awake before the copy is queued
 	uint32_t fence[Sdma::kFenceDwords];
 	uint32_t trap[Sdma::kTrapDwords];
 	const uint32_t value = ++sdmaFence;
