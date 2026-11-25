@@ -65,8 +65,11 @@ Windows DLLs, and the macOS port that exists extracts its model from that DLL (s
    2.8 -> 0.15, prepare inputs 1.0 -> 0.48, prepare reactivity 1.1 -> 0.63). HDR (`r_hdr 1`, RGBA16Float): correct, 2.3-2.6 ms.
    MetalQuake: both presets (spatial and temporal, 2880x1620 -> 3840x2160 RGBA16Float) draw correctly during its attract demo.
    RDNA4Gadget's Tweaks tab: "MetalFX upscaling: AMD FSR" (`MetalFXFSR`, on unless set off); off gives Apple's own (card-run).
-   Left: the reconstructed depth and SPD counter live in buffers (host memory: prepare inputs and reactivity could gain), jitter sign
-   untested with a game whose convention differs, a window resize, display sleep.
+   Jitter sign settled (card, Quake II, still view, the game window captured twice 1 s apart): as given, frame-to-frame difference 0.13;
+   flipped (`RDNA4_FSR3_JITTER=-1,-1`) 0.98, a visible shimmer; zero 0.14. MetalFX's convention is FSR's: the default stays.
+   Left: a window resize and display sleep (need the rig free: the key tool types into the frontmost app), and the reconstructed depth
+   and SPD counter, still buffers in host memory (prepare inputs 0.48 ms, prepare reactivity 0.63 ms: putting buffers in VRAM is a
+   device-wide change, not worth it for this alone).
 4. **Hooks:** the two descriptor methods replaced once a process (as Super Resolution's CAMetalLayer methods), only for our device; any
    other device gets Apple's. A switch in RDNA4Gadget's Tweaks tab ("MetalFX: AMD FSR"), on by default once it works (without it, MetalFX
    does nothing on our device today).
