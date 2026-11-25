@@ -1,6 +1,6 @@
 # MetalFX on our device, backed by AMD FSR, plan
 
-Status: plan, 2026-11-24. Nothing built. Asked for by Sunneva after the FSR 1 work (docs/fsr1-upscaling-plan.md).
+Status: step 2 (the spatial scaler) built and card-run 2026-11-25; the temporal scaler (FSR 3.1) is next. Asked for by Sunneva after the FSR 1 work (docs/fsr1-upscaling-plan.md).
 
 ## Why
 
@@ -39,6 +39,10 @@ Windows DLLs, and the macOS port that exists extracts its model from that DLL (s
    `MTLFXSpatialScaler` (colorTexture, outputTexture, inputContentWidth/Height, colorProcessingMode, encodeToCommandBuffer:), backed by the
    FSR 1 kernels already in the bundle (`upscale:into:`, extended to RGBA16Float for HDR colour). Small, and testable with Quake II's and
    MetalQuake's spatial modes. Replaces the nil of today, so those modes work at all.
+   **Done 2026-11-25:** `RDNA4FXSpatialScaler` (end of `tools/metal/native/RDNA4MTLDevice.mm`) answers
+   `newSpatialScalerWithDevice:` on our device (MetalFX found by name, not linked). The FSR kernels gained RGBA16Float and, in HDR
+   mode, AMD's reversible tonemap. Quake II (`r_metalfx 1`, `r_metalfx_scale 0.5`) draws its 3D view at 1600x900, upscaled to
+   3200x1800 on the card, in BGRA8 and in RGBA16Float HDR (`r_hdr 1`). MetalQuake's MetalFX preset not yet run.
 3. **Temporal:** `newTemporalScalerWithDevice:` answered by an object conforming to `MTLFXTemporalScaler`: its inputs map one to one on
    FSR 3.1's dispatch description (color, depth, motion with motionVectorScaleX/Y, jitterOffsetX/Y, exposure or auto exposure, preExposure,
    reactiveMask on macOS 14+, reset, depthReversed, inputContentWidth/Height); `encodeToCommandBuffer:` records the passes as compute

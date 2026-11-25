@@ -3,10 +3,12 @@
 // driver's upscaling (docs/fsr1-upscaling-plan.md). Compiled by clang for gfx1201 with -nogpulib (tools/gen/build-shaders.sh),
 // and as C on the Mac by test/fsr1-test.c, which checks the same pixel functions.
 //
-// Buffers, not textures: EASU's four gathers are twelve loads, edges clamped. Pixels are 32 bits as scale.cl's: four 8-bit
-// channels, or with `tenBit` three 10-bit ones and a 2-bit alpha. The constants FsrEasuCon and FsrRcasCon make are computed
-// here from the integer sizes and an integer sharpness, so the caller does no floating point. EASU into a buffer of the output
-// size, then RCAS from it into the scanout; alpha is the nearest source pixel's (EASU) and passed through (RCAS).
+// Buffers, not textures: EASU's four gathers are twelve loads, edges clamped. `fmt` says what a pixel is: 0 four 8-bit channels
+// (as scale.cl's), 1 three 10-bit ones and a 2-bit alpha, 2 four half floats (RGBA16Float, 64 bits); plus 4 for HDR colour, run
+// through AMD's reversible tonemap (FsrSrtm / FsrSrtmInv) so EASU and RCAS see 0-1 values. The constants FsrEasuCon and FsrRcasCon
+// make are computed here from the integer sizes and an integer sharpness, so the caller does no floating point. EASU into a buffer
+// of the output size, then RCAS from it into the target; alpha is the nearest source pixel's (EASU) and passed through (RCAS).
+// Pitches are in pixels.
 //
 // Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation
@@ -44,13 +46,49 @@ FSR_FN float fsrRcpLo(float a) { return fsrAsFloat(0x7ef07ebbu - fsrAsUint(a)); 
 FSR_FN float fsrRcpMed(float a) { const float b = fsrAsFloat(0x7ef19fffu - fsrAsUint(a)); return b * (-b * a + 2.0f); }
 FSR_FN float fsrRsqLo(float a) { return fsrAsFloat(0x5f347d74u - (fsrAsUint(a) >> 1)); }
 
-FSR_FN FsrPixel fsrLoad(const FSR_GLOBAL uint *src, uint pitch, uint w, uint h, int x, int y, uint tenBit)
+// IEEE half <-> float by their bits (no half type: the host check runs the same code)
+FSR_FN float fsrHalf(uint h)
+{
+	const uint sign = (h & 0x8000u) << 16, e = h >> 10 & 0x1fu, m = h & 0x3ffu;
+	if (!e)
+		return fsrAsFloat(sign) + (sign ? -1.0f : 1.0f) * (float)m * (1.0f / 16777216.0f);   // zero or denormal: m * 2^-24
+	return fsrAsFloat(sign | (e == 31 ? 0x7f800000u : (e + 112) << 23) | m << 13);
+}
+
+FSR_FN uint fsrToHalf(float f)
+{
+	const uint x = fsrAsUint(f), sign = x >> 16 & 0x8000u, m = x & 0x7fffffu;
+	const int e = (int)(x >> 23 & 0xff) - 112;
+	if ((x & 0x7fffffffu) > 0x7f800000u)
+		return sign | 0x7e00u;   // NaN
+	if (e >= 31)
+		return sign | 0x7c00u;   // too large: infinity
+	if (e <= 0) {                // a denormal half, or zero
+		if (e < -10)
+			return sign;
+		const uint full = m | 0x800000u, shift = (uint)(14 - e);
+		return sign | ((full >> shift) + (full >> (shift - 1) & 1u));
+	}
+	return (sign | (uint)e << 10 | m >> 13) + (m >> 12 & 1u);   // rounded half up (a carry moves into the exponent, as it should)
+}
+
+FSR_FN FsrPixel fsrLoad(const FSR_GLOBAL uint *src, uint pitch, uint w, uint h, int x, int y, uint fmt)
 {
 	x = x < 0 ? 0 : x >= (int)w ? (int)w - 1 : x;
 	y = y < 0 ? 0 : y >= (int)h ? (int)h - 1 : y;
-	const uint v = src[(ulong)y * pitch + (uint)x];
+	const ulong at = (ulong)y * pitch + (uint)x;
 	FsrPixel p;
-	if (tenBit) {
+	if ((fmt & 3) == 2) {
+		const uint lo = src[2 * at], hi = src[2 * at + 1];
+		p.x = fsrHalf(lo & 0xffffu), p.y = fsrHalf(lo >> 16), p.z = fsrHalf(hi & 0xffffu), p.w = fsrHalf(hi >> 16);
+		if (fmt & 4) {   // FsrSrtm: c / (1 + max(c)), 0-1 for any c >= 0
+			const float r = 1.0f / (1.0f + fsrMax(fsrMax(p.x, p.y), fsrMax(p.z, 0.0f)));
+			p.x *= r, p.y *= r, p.z *= r;
+		}
+		return p;
+	}
+	const uint v = src[at];
+	if (fmt & 1) {
 		p.x = (v & 0x3ffu) * (1.0f / 1023.0f), p.y = (v >> 10 & 0x3ffu) * (1.0f / 1023.0f), p.z = (v >> 20 & 0x3ffu) * (1.0f / 1023.0f);
 		p.w = (v >> 30) * (1.0f / 3.0f);
 	} else {
@@ -60,13 +98,23 @@ FSR_FN FsrPixel fsrLoad(const FSR_GLOBAL uint *src, uint pitch, uint w, uint h, 
 	return p;
 }
 
-FSR_FN uint fsrPack(FsrPixel p, uint tenBit)
+// Pixel (x, y) of dst written as `fmt` says
+FSR_FN void fsrStore(FSR_GLOBAL uint *dst, uint pitch, uint x, uint y, FsrPixel p, uint fmt)
 {
-	const float s = tenBit ? 1023.0f : 255.0f;
-	const uint x = (uint)(fsrSat(p.x) * s + 0.5f), y = (uint)(fsrSat(p.y) * s + 0.5f), z = (uint)(fsrSat(p.z) * s + 0.5f);
-	if (tenBit)
-		return x | y << 10 | z << 20 | (uint)(fsrSat(p.w) * 3.0f + 0.5f) << 30;
-	return x | y << 8 | z << 16 | (uint)(fsrSat(p.w) * 255.0f + 0.5f) << 24;
+	const ulong at = (ulong)y * pitch + x;
+	if ((fmt & 3) == 2) {
+		if (fmt & 4) {   // FsrSrtmInv: c / (1 - max(c))
+			const float r = 1.0f / fsrMax(1.0f - fsrMax(fsrMax(p.x, p.y), fsrMax(p.z, 0.0f)), 1.0f / 65504.0f);
+			p.x *= r, p.y *= r, p.z *= r;
+		}
+		dst[2 * at] = fsrToHalf(p.x) | fsrToHalf(p.y) << 16;
+		dst[2 * at + 1] = fsrToHalf(p.z) | fsrToHalf(p.w) << 16;
+		return;
+	}
+	const float s = fmt & 1 ? 1023.0f : 255.0f;
+	const uint r = (uint)(fsrSat(p.x) * s + 0.5f), g = (uint)(fsrSat(p.y) * s + 0.5f), b = (uint)(fsrSat(p.z) * s + 0.5f);
+	dst[at] = fmt & 1 ? r | g << 10 | b << 20 | (uint)(fsrSat(p.w) * 3.0f + 0.5f) << 30
+	                  : r | g << 8 | b << 16 | (uint)(fsrSat(p.w) * 255.0f + 0.5f) << 24;
 }
 
 FSR_FN float fsrLuma(FsrPixel p) { return p.z * 0.5f + (p.x * 0.5f + p.y); }   // luma times 2
@@ -109,7 +157,7 @@ FSR_FN float fsrDering(float v, float a, float b, float c, float d)
 }
 
 // FsrEasuF: output pixel (x, y) of a source srcW x srcH scaled to dstW x dstH
-FSR_FN uint fsrEasuPixel(const FSR_GLOBAL uint *src, uint pitch, uint srcW, uint srcH, uint dstW, uint dstH, uint x, uint y, uint tenBit)
+FSR_FN FsrPixel fsrEasuPixel(const FSR_GLOBAL uint *src, uint pitch, uint srcW, uint srcH, uint dstW, uint dstH, uint x, uint y, uint fmt)
 {
 	// its position in the source (FsrEasuCon's con0: (ip + 0.5) * in / out - 0.5), and the source pixel 'f' up and left of it
 	float ppX = ((float)x + 0.5f) * (float)srcW / (float)dstW - 0.5f, ppY = ((float)y + 0.5f) * (float)srcH / (float)dstH - 0.5f;
@@ -120,7 +168,7 @@ FSR_FN uint fsrEasuPixel(const FSR_GLOBAL uint *src, uint pitch, uint srcW, uint
 	//  e f g h
 	//  i j k l
 	//    n o
-#define FSR_TAP(dx, dy) fsrLoad(src, pitch, srcW, srcH, ix + (dx), iy + (dy), tenBit)
+#define FSR_TAP(dx, dy) fsrLoad(src, pitch, srcW, srcH, ix + (dx), iy + (dy), fmt)
 	const FsrPixel b = FSR_TAP(0, -1), c = FSR_TAP(1, -1), e = FSR_TAP(-1, 0), f = FSR_TAP(0, 0), g = FSR_TAP(1, 0), h = FSR_TAP(2, 0);
 	const FsrPixel i = FSR_TAP(-1, 1), j = FSR_TAP(0, 1), k = FSR_TAP(1, 1), l = FSR_TAP(2, 1), n = FSR_TAP(0, 2), o = FSR_TAP(1, 2);
 #undef FSR_TAP
@@ -162,7 +210,7 @@ FSR_FN uint fsrEasuPixel(const FSR_GLOBAL uint *src, uint pitch, uint srcW, uint
 	out.y = fsrDering(sum.y * r, f.y, g.y, j.y, k.y);
 	out.z = fsrDering(sum.z * r, f.z, g.z, j.z, k.z);
 	out.w = (ppX < 0.5f ? (ppY < 0.5f ? f : j) : (ppY < 0.5f ? g : k)).w;   // the nearest pixel's alpha
-	return fsrPack(out, tenBit);
+	return out;
 }
 
 // FsrRcasF: pixel (x, y) of a w x h image sharpened; `sharpness` in thousandths of a stop (0 sharpest; AMD's samples use 200).
@@ -175,14 +223,14 @@ FSR_FN float fsrRcasLobe(float b, float d, float e, float f, float h)
 	return fsrMax(-hitMin, hitMax);
 }
 
-FSR_FN uint fsrRcasPixel(const FSR_GLOBAL uint *src, uint pitch, uint w, uint h, uint x, uint y, uint sharpness, uint tenBit)
+FSR_FN FsrPixel fsrRcasPixel(const FSR_GLOBAL uint *src, uint pitch, uint w, uint h, uint x, uint y, uint sharpness, uint fmt)
 {
 	//    b
 	//  d e f
 	//    h
-	const FsrPixel b = fsrLoad(src, pitch, w, h, (int)x, (int)y - 1, tenBit), d = fsrLoad(src, pitch, w, h, (int)x - 1, (int)y, tenBit);
-	const FsrPixel e = fsrLoad(src, pitch, w, h, (int)x, (int)y, tenBit), f = fsrLoad(src, pitch, w, h, (int)x + 1, (int)y, tenBit);
-	const FsrPixel hh = fsrLoad(src, pitch, w, h, (int)x, (int)y + 1, tenBit);
+	const FsrPixel b = fsrLoad(src, pitch, w, h, (int)x, (int)y - 1, fmt), d = fsrLoad(src, pitch, w, h, (int)x - 1, (int)y, fmt);
+	const FsrPixel e = fsrLoad(src, pitch, w, h, (int)x, (int)y, fmt), f = fsrLoad(src, pitch, w, h, (int)x + 1, (int)y, fmt);
+	const FsrPixel hh = fsrLoad(src, pitch, w, h, (int)x, (int)y + 1, fmt);
 	const float limit = 0.25f - 1.0f / 16.0f;   // FSR_RCAS_LIMIT
 	const float lobe = fsrMax(-limit, fsrMin(fsrMax(fsrMax(fsrRcasLobe(b.x, d.x, e.x, f.x, hh.x), fsrRcasLobe(b.y, d.y, e.y, f.y, hh.y)),
 	                                                fsrRcasLobe(b.z, d.z, e.z, f.z, hh.z)),
@@ -194,25 +242,25 @@ FSR_FN uint fsrRcasPixel(const FSR_GLOBAL uint *src, uint pitch, uint w, uint h,
 	out.y = (lobe * (b.y + d.y + hh.y + f.y) + e.y) * r;
 	out.z = (lobe * (b.z + d.z + hh.z + f.z) + e.z) * r;
 	out.w = e.w;
-	return fsrPack(out, tenBit);
+	return out;
 }
 
 #ifdef __OPENCL_C_VERSION__
 // One work-item per output pixel, a group of 64 along a row, a row per group in y (as scale.cl).
 __kernel __attribute__((reqd_work_group_size(64, 1, 1)))
 void easu(__global const uint *src, __global uint *dst, uint srcPitch, uint dstPitch, uint srcW, uint srcH, uint dstW, uint dstH,
-          uint tenBit)
+          uint fmt)
 {
 	const uint x = __builtin_amdgcn_workgroup_id_x() * 64u + __builtin_amdgcn_workitem_id_x(), y = __builtin_amdgcn_workgroup_id_y();
 	if (x < dstW && y < dstH)
-		dst[(ulong)y * dstPitch + x] = fsrEasuPixel(src, srcPitch, srcW, srcH, dstW, dstH, x, y, tenBit);
+		fsrStore(dst, dstPitch, x, y, fsrEasuPixel(src, srcPitch, srcW, srcH, dstW, dstH, x, y, fmt), fmt);
 }
 
 __kernel __attribute__((reqd_work_group_size(64, 1, 1)))
-void rcas(__global const uint *src, __global uint *dst, uint srcPitch, uint dstPitch, uint w, uint h, uint sharpness, uint tenBit)
+void rcas(__global const uint *src, __global uint *dst, uint srcPitch, uint dstPitch, uint w, uint h, uint sharpness, uint fmt)
 {
 	const uint x = __builtin_amdgcn_workgroup_id_x() * 64u + __builtin_amdgcn_workitem_id_x(), y = __builtin_amdgcn_workgroup_id_y();
 	if (x < w && y < h)
-		dst[(ulong)y * dstPitch + x] = fsrRcasPixel(src, srcPitch, w, h, x, y, sharpness, tenBit);
+		fsrStore(dst, dstPitch, x, y, fsrRcasPixel(src, srcPitch, w, h, x, y, sharpness, fmt), fmt);
 }
 #endif

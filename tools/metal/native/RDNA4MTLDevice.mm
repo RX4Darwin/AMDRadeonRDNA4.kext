@@ -55,6 +55,7 @@
 #import <IOKit/IOKitLib.h>
 #import <IOSurface/IOSurface.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <MetalFX/MetalFX.h>   // (its types; the classes are found by name, MetalFX is not linked)
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -2405,7 +2406,9 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 @property (readonly) dispatch_queue_t finishing;   // where a GL app's command buffers end, in order (nil until the first)
 - (dispatch_queue_t)work;
 - (const rdna4_program_t *)resolveKernel:(BOOL)srgb;   // rdna4_resolve or rdna4_resolve_srgb, loaded on first use (NULL: not loaded)
-- (NSError *)upscale:(RDNA4MTLTexture *)src into:(RDNA4MTLTexture *)dst;   // (work queue) FSR 1: EASU then RCAS (src/shaders/fsr1.cl)
+// (work queue) FSR 1 (src/shaders/fsr1.cl): EASU of src's top left sw x sh into an image of dst's size, then RCAS into dst; colour in
+// HDR (linear, above white) through AMD's reversible tonemap
+- (NSError *)upscale:(RDNA4MTLTexture *)src width:(uint32_t)sw height:(uint32_t)sh into:(RDNA4MTLTexture *)dst hdr:(BOOL)hdr;
 - (uint64_t)spareBuffer;             // what an unbound buffer slot points at: the zeroed spare buffer
 - (BOOL)drawnInFlight:(RDNA4MTLTexture *)t;   // a draw not yet waited for draws into it, a view of it or the texture it views
 - (void)drewDepth:(RDNA4MTLTexture *)t;      // (work queue) a draw wrote its depth: in flight as a draw's target is
@@ -4396,24 +4399,29 @@ static void eventWait(id event, uint64_t value)
 - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time { [self keepDrawable:drawable]; }
 - (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration { [self keepDrawable:drawable]; }
 
+// A step after the work before it: FSR 1 from src's top left w x h into dst (Super Resolution's drawables, MetalFX's spatial scaler)
+- (void)recordUpscale:(RDNA4MTLTexture *)src width:(uint32_t)w height:(uint32_t)h into:(RDNA4MTLTexture *)dst hdr:(BOOL)hdr
+{
+	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
+	[self writesTo:dst];
+	[self record:^NSError * {
+		NSError *why = [device upscale:src width:w height:h into:dst hdr:hdr];
+		if (!why) {
+			[dst wroteAll];
+			[dst heldRows:0 to:(uint32_t)dst.height width:(uint32_t)dst.width];
+			[self drewInto:dst];
+		}
+		return why;
+	}];
+}
+
 // Presented once the work has run; an upscaled layer's drawable (RDNA4UpscaledDrawable) upscaled into its real one first, a step after the
 // app's draws, and the real one presented
 - (void)keepDrawable:(id<MTLDrawable>)drawable
 {
 	if ([(id)drawable isKindOfClass:[RDNA4UpscaledDrawable class]]) {
 		RDNA4UpscaledDrawable *u = (RDNA4UpscaledDrawable *)drawable;
-		RDNA4MTLTexture *src = u.small, *dst = (RDNA4MTLTexture *)u.real.texture;
-		RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
-		[self writesTo:dst];
-		[self record:^NSError * {
-			NSError *why = [device upscale:src into:dst];
-			if (!why) {
-				[dst wroteAll];
-				[dst heldRows:0 to:(uint32_t)dst.height width:(uint32_t)dst.width];
-				[self drewInto:dst];
-			}
-			return why;
-		}];
+		[self recordUpscale:u.small width:(uint32_t)u.small.width height:(uint32_t)u.small.height into:(RDNA4MTLTexture *)u.real.texture hdr:NO];
 		drawable = u.real;
 	}
 	[_drawables addObject:drawable];
@@ -5017,6 +5025,7 @@ static bool rebindImport(const struct mach_header_64 *image, const char *name, v
 
 // SkyLight's surface calls to ours, once, in a GL process (never WindowServer)
 static void superResolutionInstall(void);   // (at the end of the file)
+static void metalFXInstall(void);           // (at the end of the file)
 
 static void glSurfacesInstall(void)
 {
@@ -6772,26 +6781,40 @@ static uint32_t fsrRenderScale(void)
 	return (env || set) && v >= 25 && v < 100 ? (uint32_t)v : 100;
 }
 
-static BOOL fsrFormat(MTLPixelFormat f)
+// The FSR kernels' pixel format (fsr1.cl's fmt): 0 8-bit channels, 1 10-bit, 2 RGBA16Float; -1 none they take
+static int fsrPixelFormat(MTLPixelFormat f)
 {
-	return f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB || f == MTLPixelFormatRGBA8Unorm ||
-	       f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatRGB10A2Unorm || f == MTLPixelFormatBGR10A2Unorm;
+	switch (f) {
+	case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
+		return 0;
+	case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatBGR10A2Unorm:
+		return 1;
+	case MTLPixelFormatRGBA16Float:
+		return 2;
+	default:
+		return -1;
+	}
 }
+
+// What Super Resolution takes from a layer: 8-bit and 10-bit drawables (EDR's RGBA16Float is left to Core Animation)
+static BOOL fsrFormat(MTLPixelFormat f) { const int k = fsrPixelFormat(f); return k == 0 || k == 1; }
 
 @implementation RDNA4MTLDevice (SuperResolution)
 
-- (NSError *)upscale:(RDNA4MTLTexture *)src into:(RDNA4MTLTexture *)dst
+- (NSError *)upscale:(RDNA4MTLTexture *)src width:(uint32_t)sw height:(uint32_t)sh into:(RDNA4MTLTexture *)dst hdr:(BOOL)hdr
 {
 	const MTLPixelFormat f = dst.pixelFormat;
-	if (!fsrFormat(f) || src.pixelFormat != f || src.samples > 1 || !src.gpuBase || !dst.gpuBase)
+	const int kind = fsrPixelFormat(f);
+	if (kind < 0 || src.pixelFormat != f || src.samples > 1 || dst.samples > 1 || !src.gpuBase || !dst.gpuBase || !sw || !sh ||
+	    sw > src.width || sh > src.height)
 		return rdna4Error([NSString stringWithFormat:@"an upscale of a format %lu texture into a format %lu one", (unsigned long)src.pixelFormat,
 		                                             (unsigned long)f], 0);
-	const uint32_t sw = (uint32_t)src.width, sh = (uint32_t)src.height, dw = (uint32_t)dst.width, dh = (uint32_t)dst.height;
+	const uint32_t dw = (uint32_t)dst.width, dh = (uint32_t)dst.height, bpp = dst.bpp;
 	@synchronized(self) {
 		if (!_fsr[1].handle && (rdna4_load(&_gpu, kFsr1CodeObject, sizeof kFsr1CodeObject, "easu", &_fsr[0]) ||
 		                        rdna4_load(&_gpu, kFsr1CodeObject, sizeof kFsr1CodeObject, "rcas", &_fsr[1])))
 			return rdna4Error(@"the FSR kernels", 0);
-		const uint64_t bytes = (uint64_t)dw * dh * 4;
+		const uint64_t bytes = (uint64_t)dw * dh * bpp;
 		if (_fsrMid.bytes < bytes) {
 			if (_fsrMid.handle)
 				rdna4_free(&_gpu, &_fsrMid);
@@ -6804,12 +6827,12 @@ static BOOL fsrFormat(MTLPixelFormat f)
 		why = [self drainGfx];   // (the held copy's fill went to the gfx ring, the dispatches to a compute queue)
 	if (why)
 		return why;
-	const uint32_t tenBit = f == MTLPixelFormatRGB10A2Unorm || f == MTLPixelFormatBGR10A2Unorm;
-	// the kernels' arguments (fsr1.cl's easu and rcas): pixel pitches, sizes
-	struct __attribute__((packed)) { uint64_t src, dst; uint32_t srcPitch, dstPitch, srcW, srcH, dstW, dstH, tenBit; } easu = {
-		src.gpuBase, _fsrMid.gpu, (uint32_t)(src.rowBytes / 4), dw, sw, sh, dw, dh, tenBit };
-	struct __attribute__((packed)) { uint64_t src, dst; uint32_t srcPitch, dstPitch, w, h, sharpness, tenBit; } rcas = {
-		_fsrMid.gpu, dst.gpuBase, dw, (uint32_t)(dst.rowBytes / 4), dw, dh, fsrSharpness(), tenBit };
+	const uint32_t fmt = (uint32_t)kind | (hdr && kind == 2 ? 4u : 0u);
+	// the kernels' arguments (fsr1.cl's easu and rcas): pitches in pixels, sizes
+	struct __attribute__((packed)) { uint64_t src, dst; uint32_t srcPitch, dstPitch, srcW, srcH, dstW, dstH, fmt; } easu = {
+		src.gpuBase, _fsrMid.gpu, (uint32_t)(src.rowBytes / bpp), dw, sw, sh, dw, dh, fmt };
+	struct __attribute__((packed)) { uint64_t src, dst; uint32_t srcPitch, dstPitch, w, h, sharpness, fmt; } rcas = {
+		_fsrMid.gpu, dst.gpuBase, dw, (uint32_t)(dst.rowBytes / bpp), dw, dh, fsrSharpness(), fmt };
 	const uint32_t groups[3] = { (dw + 63) / 64, dh, 1 }, size[3] = { 64, 1, 1 };
 	kern_return_t kr = rdna4_dispatch(&_gpu, &_fsr[0], groups, size, &easu, sizeof easu, 1000, NULL);
 	if (!kr)
@@ -6935,6 +6958,8 @@ static void superResolutionInstall(void)
 		                                                                          (IMP)fsrSetDrawableSize);
 		gRealDrawableSize = (CGSize (*)(id, SEL))method_setImplementation(class_getInstanceMethod(c, @selector(drawableSize)), (IMP)fsrDrawableSize);
 		gRealNextDrawable = (id (*)(id, SEL))method_setImplementation(class_getInstanceMethod(c, @selector(nextDrawable)), (IMP)fsrNextDrawable);
+		// MetalFX's spatial scaler, once MetalFX is loaded (each image added, the ones already there first): answered on our device
+		_dyld_register_func_for_add_image([](const struct mach_header *, intptr_t) { metalFXInstall(); });
 	});
 }
 
@@ -6970,4 +6995,86 @@ static void antiLagPace(id<MTLCommandBuffer> presenting)
 	[wait waitUntilCompleted];
 	if (wait && !said.exchange(true))
 		RLOG(@"RDNA4MTL: Anti-Lag: frames paced (the first waited %llu us for the frame before)", nowUs() - t0);
+}
+
+// ---- MetalFX's spatial scaler on our device: AMD FSR 1 (docs/fsr3-metalfx-plan.md, step 2)
+//
+// MetalFX says it supports our device, but its own spatial scaler comes back nil on it (its passes are Apple-GPU code), so a game asking
+// for one (Quake II's Metal port, MetalQuake) gets none. Asked for with our device, -[MTLFXSpatialScalerDescriptor newSpatialScalerWithDevice:]
+// gives an RDNA4FXSpatialScaler instead: FSR 1's EASU and RCAS on the card (upscale:width:height:into:hdr:), recorded as a step of the
+// app's command buffer. MetalFX is found by name, not linked: it is loaded only in the processes that use it.
+
+@interface RDNA4FXSpatialScaler : NSObject <MTLFXSpatialScaler>
+- (instancetype)initWithDescriptor:(MTLFXSpatialScalerDescriptor *)d device:(RDNA4MTLDevice *)device;
+@end
+
+@implementation RDNA4FXSpatialScaler {
+	RDNA4MTLDevice *_device;
+}
+@synthesize inputContentWidth = _inputContentWidth, inputContentHeight = _inputContentHeight, colorTexture = _colorTexture,
+            outputTexture = _outputTexture, colorTextureFormat = _colorTextureFormat, outputTextureFormat = _outputTextureFormat,
+            inputWidth = _inputWidth, inputHeight = _inputHeight, outputWidth = _outputWidth, outputHeight = _outputHeight,
+            colorProcessingMode = _colorProcessingMode, fence = _fence;
+
+- (instancetype)initWithDescriptor:(MTLFXSpatialScalerDescriptor *)d device:(RDNA4MTLDevice *)device
+{
+	if ((self = [super init])) {
+		_device = device;
+		_colorTextureFormat = d.colorTextureFormat, _outputTextureFormat = d.outputTextureFormat;
+		_inputWidth = _inputContentWidth = d.inputWidth, _inputHeight = _inputContentHeight = d.inputHeight;
+		_outputWidth = d.outputWidth, _outputHeight = d.outputHeight;
+		_colorProcessingMode = d.colorProcessingMode;
+	}
+	return self;
+}
+
+- (MTLTextureUsage)colorTextureUsage { return MTLTextureUsageShaderRead; }
+- (MTLTextureUsage)outputTextureUsage { return MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget; }
+
+- (void)encodeToCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
+{
+	RDNA4MTLTexture *src = (RDNA4MTLTexture *)_colorTexture, *dst = (RDNA4MTLTexture *)_outputTexture;
+	if (![(id)commandBuffer isKindOfClass:[RDNA4MTLCommandBuffer class]] || ![(id)src isKindOfClass:[RDNA4MTLTexture class]] ||
+	    ![(id)dst isKindOfClass:[RDNA4MTLTexture class]]) {
+		RTRACE(4, @"MetalFX spatial scaler: textures or a command buffer not of this device: not encoded");
+		return;
+	}
+	const uint32_t w = (uint32_t)MIN(_inputContentWidth ?: src.width, src.width), h = (uint32_t)MIN(_inputContentHeight ?: src.height, src.height);
+	[(RDNA4MTLCommandBuffer *)commandBuffer recordUpscale:src width:w height:h into:dst
+	                                                  hdr:_colorProcessingMode == MTLFXSpatialScalerColorProcessingModeHDR];
+}
+
+@end
+
+// (a new... method: it returns a retained object, the caller releases it; plain functions would hand back an autoreleased one, which
+// Quake II's ref_metal then released once too often and crashed on)
+typedef id (*NewScalerFn)(id, SEL, id) __attribute__((ns_returns_retained));
+static NewScalerFn gRealNewSpatialScaler;
+
+__attribute__((ns_returns_retained)) static id fxNewSpatialScaler(MTLFXSpatialScalerDescriptor *d, SEL sel, id<MTLDevice> device)
+{
+	if (![(id)device isKindOfClass:[RDNA4MTLDevice class]])
+		return gRealNewSpatialScaler(d, sel, device);
+	if (fsrPixelFormat(d.colorTextureFormat) < 0 || d.colorTextureFormat != d.outputTextureFormat || !d.inputWidth || !d.inputHeight ||
+	    !d.outputWidth || !d.outputHeight) {
+		RLOG(@"RDNA4MTL: MetalFX spatial scaler of format %lu into %lu: not one FSR takes", (unsigned long)d.colorTextureFormat,
+		     (unsigned long)d.outputTextureFormat);
+		return nil;
+	}
+	RLOG(@"RDNA4MTL: MetalFX spatial scaler: AMD FSR 1, %lux%lu to %lux%lu, format %lu%s", (unsigned long)d.inputWidth,
+	     (unsigned long)d.inputHeight, (unsigned long)d.outputWidth, (unsigned long)d.outputHeight, (unsigned long)d.colorTextureFormat,
+	     d.colorProcessingMode == MTLFXSpatialScalerColorProcessingModeHDR ? " (HDR)" : "");
+	return [[RDNA4FXSpatialScaler alloc] initWithDescriptor:d device:(RDNA4MTLDevice *)device];
+}
+
+static void metalFXInstall(void)
+{
+	static std::atomic<bool> done;
+	if (done.load(std::memory_order_relaxed))
+		return;
+	Class c = NSClassFromString(@"MTLFXSpatialScalerDescriptor");
+	Method m = c ? class_getInstanceMethod(c, @selector(newSpatialScalerWithDevice:)) : nullptr;
+	if (!m || done.exchange(true))
+		return;
+	gRealNewSpatialScaler = (NewScalerFn)method_setImplementation(m, (IMP)fxNewSpatialScaler);
 }
