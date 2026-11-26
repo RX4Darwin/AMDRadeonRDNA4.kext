@@ -169,7 +169,7 @@ public:
 	// Physical image size from the EDID. 0 = unknown.
 	uint32_t    imageWidthMm { 0 }, imageHeightMm { 0 };
 	bool dpPlaneReady();
-	void prepareDpSurface(uint64_t extraSlotsBytes, bool clocksExpected);
+	void prepareDpSurface(uint64_t extraSlotsBytes, uint64_t displayLimit, bool clocksExpected);
 	uint64_t displayReserve {};
 	IODeviceMemory *dpVram {}, *dpAperture {};
 	Ndrv::Surface dpSurface {};

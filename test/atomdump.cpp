@@ -3311,6 +3311,24 @@ static int testNdrv() {
 	                  Ndrv::spareSurface(kBar, k1080, kBar, 16 * kMiB, 1280, 720, spare) &&
 	                  spare.physBase == kBar + 9 * kMiB,
 	                  "ndrv: spare surface in a 16 MiB range");
+	// Alienware, 1080p GOP and a separate 3840-pitch primary plane: the third offline head
+	// starts at +110 MiB. A 1080p placeholder fits, but a future 4K mapping would cross compute.
+	{
+		const uint64_t limit = 128 * kMiB, primary = 148116 * 1024ull - 104 * kMiB;
+		const uint64_t floor = primary + 2 * 34 * kMiB;
+		failures += check(Ndrv::displayReservation(primary, 104 * kMiB, limit) == limit &&
+		                  Ndrv::displayReservation(primary, 104 * kMiB, 256 * kMiB) == primary + 104 * kMiB &&
+		                  !Ndrv::displayReservation(limit + 1, 104 * kMiB, limit),
+		                  "ndrv: a large primary plane preserves the compute base and rejects an oversized plane");
+		const bool fits = Ndrv::spareSurface(kBar, floor, kBar, limit, 1920, 1080, spare);
+		const uint64_t start = spare.physBase - kBar;
+		failures += check(fits && start == 110 * kMiB &&
+		                  Ndrv::headMappingLength(start, limit, k1080, k4k) == limit - start &&
+		                  !Ndrv::headMappingLength(start, limit, k4k, k4k) &&
+		                  !Ndrv::headMappingLength(limit + 1, limit, k1080, k4k) &&
+		                  !Ndrv::spareSurface(kBar, floor, kBar, limit, 3840, 2160, spare),
+		                  "ndrv: offline head and its hot-plug modes stay below the 128 MiB compute window");
+	}
 	// The last byte counts (the surface plus the 128 bytes getApertureRange adds).
 	failures += check(Ndrv::spareSurface(kBar, k1080, kBar, 9 * kMiB + k720 + 128, 1280, 720, spare) &&
 	                  !Ndrv::spareSurface(kBar, k1080, kBar, 9 * kMiB + k720 + 127, 1280, 720, spare),

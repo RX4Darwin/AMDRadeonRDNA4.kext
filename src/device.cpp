@@ -3624,7 +3624,7 @@ bool RDNA4Device::bootEdidMatches() {
 	return edidAllLen != 0;
 }
 
-void RDNA4Device::prepareDpSurface(uint64_t extraSlotsBytes, bool clocksExpected) {
+void RDNA4Device::prepareDpSurface(uint64_t extraSlotsBytes, uint64_t displayLimit, bool clocksExpected) {
 	ExtraHold hold(*this);
 	if (!modesetRequested || !extraLock || !modeCount || !liveTimingValid || !bootTimingValid || fbDepth != 32 ||
 	    !pipe.valid() || pipe.signal != Pipe::Signal::DpSst || pipe.otg || pipe.opp || pipe.dig || pipe.link ||
@@ -3657,7 +3657,12 @@ void RDNA4Device::prepareDpSurface(uint64_t extraSlotsBytes, bool clocksExpected
 		return;
 	const uint64_t offset = dpSurface.physBase - fbPhysBase;
 	const uint64_t length = round_page_64(uint64_t(dpSurface.rowBytes) * dpSurface.height + 128);
-	const uint64_t span = offset + length, reserved = span + extraSlotsBytes;
+	const uint64_t span = offset + length;
+	// Keep the primary plane in full. Offline heads may use the remaining space up to the
+	// compute window; their published mappings and future hot-plug modes obey the same limit.
+	const uint64_t reserved = Ndrv::displayReservation(span, extraSlotsBytes, displayLimit);
+	if (!reserved)
+		return;
 	dpPlaneMc = dpConsoleMc + offset;
 	const uint32_t hi = regReadDmu(2, kDmcubRegion4OffsetHigh), lo = regReadDmu(2, kDmcubRegion4Offset);
 	const uint64_t mailbox = (uint64_t(hi) << 32) | lo;

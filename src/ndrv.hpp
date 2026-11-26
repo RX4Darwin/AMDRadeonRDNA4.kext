@@ -371,6 +371,21 @@ private:
 // unsupported (IOBootNDRV::doControl / doStatus).
 int32_t bootReply(bool isStatus, uint16_t code);
 
+// The primary plane must fit in full. Secondary slots may grow up to the start of compute.
+constexpr uint64_t displayReservation(uint64_t primary, uint64_t slots, uint64_t limit) {
+	if (primary > limit)
+		return 0;
+	return slots > limit - primary ? limit : primary + slots;
+}
+
+// Allow room for a future mode switch without exposing the compute window past the display range.
+constexpr uint64_t headMappingLength(uint64_t offset, uint64_t limit, uint64_t bytes, uint64_t preferred) {
+	if (offset >= limit || !bytes || bytes > limit - offset)
+		return 0;
+	const uint64_t requested = bytes > preferred ? bytes : preferred;
+	return requested < limit - offset ? requested : limit - offset;
+}
+
 // Place a width x height, 32 bpp surface for a second head in the memory
 // range [rangeBase, rangeBase + rangeLen) that holds the console framebuffer
 // [fbBase, fbBase + fbLen): 1 MiB aligned and at least 1 MiB past the

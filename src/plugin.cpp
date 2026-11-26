@@ -623,9 +623,14 @@ const Modes::Mode *head2BuildTable(Head2 *h, RDNA4Device &dev, size_t &n) {
 	                 h->table, Modes::MaxModes);
 	if (head2Level >= 2) {
 		size_t kept = 0;
-		for (size_t i = 0; i < n; i++)
-			if (dev.secondPipeModeOk(h->table[i].t))
+		for (size_t i = 0; i < n; i++) {
+			const auto &t = h->table[i].t;
+			Ndrv::Surface available {};
+			if (dev.secondPipeModeOk(t) &&
+			    Ndrv::spareSurface(dev.fbPhysBase, surfaceFloor(h, dev) - dev.fbPhysBase, h->rangeBase, h->rangeLen,
+			                       max(t.hActive, lit.hActive), max(t.vActive, lit.vActive), available))
 				h->table[kept++] = h->table[i];
+		}
 		n = kept;
 		// A sink whose own timing of that size and rate won (a monitor's
 		// CVT-RB 4K60 over CEA VIC 97) gets the plan's, which it lists too.
@@ -657,8 +662,9 @@ void head2MapSurface(Head2 *h) {
 	const uint64_t bytes = static_cast<uint64_t>(h->surface.rowBytes) * h->surface.height;
 	IODeviceMemory *old = h->vram;
 
-	h->vram = IODeviceMemory::withSubRange(h->range, h->surface.physBase - h->rangeBase,
-	                                       bytes > kHeadSurfaceMaxBytes ? bytes : kHeadSurfaceMaxBytes);
+	const uint64_t offset = h->surface.physBase - h->rangeBase;
+	const uint64_t length = Ndrv::headMappingLength(offset, h->rangeLen, bytes, kHeadSurfaceMaxBytes);
+	h->vram = length ? IODeviceMemory::withSubRange(h->range, offset, length) : nullptr;
 	OSSafeReleaseNULL(old);
 	if (!h->vram)
 		HLOG(h, "no VRAM range for the surface: WindowServer will not map it");
@@ -724,10 +730,8 @@ void fillHead(Head2 *h, RDNA4Device &dev) {
 			h->range = mem;
 			h->rangeBase = base;
 			h->rangeLen = mem->getLength();
-			// With the compute bring-up the surface has to end below the compute pool, which never starts
-			// under kPoolFloor or the enlarged display reservation.
 			if (computeStage)
-				h->rangeLen = min(h->rangeLen, max(RDNA4Compute::kPoolFloor, dev.displayReserve));
+				h->rangeLen = min(h->rangeLen, RDNA4Compute::kPoolFloor);
 			break;
 		}
 	}
@@ -1489,7 +1493,8 @@ void attach(FbEntry &e) {
 	if (orgGetVRAMRange && gApertureRouted && !pvGpu && !(Trial::option("rdna4-pvgpu", guest) && guest) &&
 	    !(Trial::option("rdna4-vrambench", bench) && bench) && !(Trial::option("rdna4-coldboot", cold) && cold) &&
 	    !(Trial::option("rdna4-dscboot", dsc) && dsc))
-		dev.prepareDpSurface(RDNA4Device::kMaxExtra * kHeadSlotBytes + (2ull << 20), computeStage >= RDNA4Compute::StageGfx);
+		dev.prepareDpSurface(RDNA4Device::extraHeads() * kHeadSlotBytes + (2ull << 20),
+		                     computeStage ? RDNA4Compute::kPoolFloor : ~0ull, computeStage >= RDNA4Compute::StageGfx);
 	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidAll, dev.edidAllLen, be);
 	st->ndrv.adaptiveSync = vrr;
 #ifdef AMDRadeonRDNA4_PVGPU

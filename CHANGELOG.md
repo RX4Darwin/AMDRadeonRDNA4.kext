@@ -7,7 +7,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 - The primary DisplayPort framebuffer can offer EDID modes larger than the firmware console using a separate scanout
   surface and the boot pipe’s Linux DML table. Host tests cover QHD and UHD plane programming and restoration of a
-  stretched 1080p console. Hardware validation of this implementation is pending.
+  stretched 1080p console. On Tahoe with an RX 9070 XT and a single Alienware AW2724DM, OpenCore supplied a 1920×1080
+  console and Displays switched the desktop to 2560×1440 at 60 Hz (59.950 Hz measured). Bounding offline head mappings
+  kept the 128 MiB compute pool at VRAM+128 MiB. SDMA passed its write and fill tests, and WindowServer used Metal.
 
 - The boot framebuffer serves up to four EDID blocks over DisplayPort. On the maintainer's Samsung 4K display, macOS
   received the third block (DisplayID) and 2560×1440 ran at 143.98 Hz with the display series from PR #28.
