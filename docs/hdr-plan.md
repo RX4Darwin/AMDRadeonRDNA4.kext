@@ -52,8 +52,10 @@ in the upper-left two thirds, black right and bottom, while the monitor reports 
 is full size. Every other mode tried fills the screen with HDR on: real 1920x1080, the HiDPI sizes on the 3840x2160
 mode, 3840x2160 itself; and 2560x1440 fills with HDR off. The driver does the same for all of them (the same metadata
 and VSC SDP; a build that logged frames larger than the head saw none), so this looks like the monitor's handling of a
-2560x1440 HDR signal, but it is not proven: trying 2560x1440 with HDR under Windows or Linux on the same monitor would
-settle it. (A first reading blamed the BT.2020 VSC SDP and removed it, 4a43e45; switching HDR on and off had changed both
+2560x1440 HDR signal, but it is not proven. Windows (AMD 32.0.32015.7029) does not settle it: at "2560x1440" with HDR it
+fills the screen, but it sends the monitor 3840x2160@144 and scales the 2560x1440 desktop on the card (QueryDisplayConfig:
+target signal 3840x2160, source 2560x1440), so the monitor never sees a 2560x1440 HDR signal there. Doing the same would
+avoid the question: an HDR twin of a size below the native one keeps the native timing and scales the plane up. (A first reading blamed the BT.2020 VSC SDP and removed it, 4a43e45; switching HDR on and off had changed both
 packets. Reverted.)
 
 ## Next
