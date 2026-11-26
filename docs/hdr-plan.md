@@ -45,14 +45,16 @@ DP_MSA_MISC 0x40, no HPD drop or retrain afterwards; macOS kept HDR on across a 
 first switch. Not judged by eye yet (colours should look the same as with PQ alone on a monitor that assumed BT.2020).
 It is not what shrinks the picture in 2560x1440 (next section).
 
-## Non-native modes on the Samsung (2026-11-26)
+## 2560x1440 on the Samsung (2026-11-26)
 
-With HDR on in a real 2560x1440 mode the Samsung (3840x2160 panel) shows the picture pixel for pixel: the desktop fills
-the upper-left two thirds, black right and bottom, while the monitor reports a 2560x1440 input and macOS's screenshot is
-full size. With HDR off the same signal fills the screen, and with HDR on in a HiDPI size on the 3840x2160 mode ("looks
-like 1920x1080") it does too. So the card's output is right; the monitor does not scale up an HDR signal below its
-native size. (A first reading blamed the BT.2020 VSC SDP and removed it, 4a43e45; switching HDR on and off had changed
-both. Reverted.)
+With HDR on in the real 2560x1440 mode ("low resolution" in Displays) the Samsung (3840x2160 panel) shows the desktop
+in the upper-left two thirds, black right and bottom, while the monitor reports a 2560x1440 input and macOS's screenshot
+is full size. Every other mode tried fills the screen with HDR on: real 1920x1080, the HiDPI sizes on the 3840x2160
+mode, 3840x2160 itself; and 2560x1440 fills with HDR off. The driver does the same for all of them (the same metadata
+and VSC SDP; a build that logged frames larger than the head saw none), so this looks like the monitor's handling of a
+2560x1440 HDR signal, but it is not proven: trying 2560x1440 with HDR under Windows or Linux on the same monitor would
+settle it. (A first reading blamed the BT.2020 VSC SDP and removed it, 4a43e45; switching HDR on and off had changed both
+packets. Reverted.)
 
 ## Next
 
