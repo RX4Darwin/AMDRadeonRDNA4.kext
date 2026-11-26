@@ -42,3 +42,32 @@ kernel void rdna4_resolve_srgb(texture2d_ms<float, access::read> src [[texture(0
 	sum /= float(n);
 	dst.write(float4(linearToSrgb(sum.rgb), sum.a), p);
 }
+
+// Generate one linear mip level. Match the native Metal driver's existing CPU filter:
+// nearest for R16, and rounded 2x2 averages of the four stored bytes for RG16.
+kernel void rdna4_mip_planes(device const uint *src [[buffer(0)]], device uint *dst [[buffer(1)]],
+                             constant uint *layout [[buffer(2)]], uint2 p [[thread_position_in_grid]])
+{
+    const uint w = layout[0], h = layout[1], sourceHeight = layout[2], sourceWidth = layout[3];
+    const uint srcPitch = layout[4], dstPitch = layout[5];
+    if (p.y >= h || p.x >= w)
+        return;
+    const uint top = p.y * 2 * srcPitch;
+    if (layout[6] == 2) {
+        const uint x = p.x * 2;
+        if (x >= w)
+            return;
+        uint packed = src[top + x] & 0xffffu;
+        if (x + 1 < w)
+            packed |= src[top + x + 1] << 16;
+        dst[p.y * dstPitch + p.x] = packed;
+        return;
+    }
+    const uint bottom = min(p.y * 2 + 1, sourceHeight - 1) * srcPitch;
+    const uint left = p.x * 2, right = min(left + 1, sourceWidth - 1);
+    const uint a = src[top + left], b = src[top + right], c = src[bottom + left], d = src[bottom + right];
+    const uint mask = 0x00ff00ffu;
+    const uint even = ((a & mask) + (b & mask) + (c & mask) + (d & mask) + 0x00020002u) >> 2;
+    const uint odd = (((a >> 8) & mask) + ((b >> 8) & mask) + ((c >> 8) & mask) + ((d >> 8) & mask) + 0x00020002u) >> 2;
+    dst[p.y * dstPitch + p.x] = (even & mask) | ((odd & mask) << 8);
+}
