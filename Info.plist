@@ -40,6 +40,28 @@
 			<key>IOResourceMatch</key>
 			<string>IOKit</string>
 		</dict>
+		<!-- Navi 48's HDMI/DP audio function for Apple's AMD HDA controller driver (docs/audio-plan.md). Only a device the
+		     driver marks with rdna4-hda (`sudo sysctl debug.rdna4_hda=1`) matches: step 0, to see what it does. -->
+		<key>AMDRadeonRDNA4HDA</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.apple.driver.AppleGFXHDA</string>
+			<key>IOClass</key>
+			<string>AppleGFXHDAEGController</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOPCIMatch</key>
+			<string>0xAB401002 0xAB281002</string>
+			<key>IOPropertyMatch</key>
+			<dict>
+				<key>rdna4-hda</key>
+				<true/>
+			</dict>
+			<key>IOPCITunnelCompatible</key>
+			<true/>
+			<key>IOPCIUseDeviceMapper</key>
+			<true/>
+		</dict>
 	</dict>
 	<key>OSBundleLibraries</key>
 	<dict>

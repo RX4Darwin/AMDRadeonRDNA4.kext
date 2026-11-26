@@ -38,6 +38,7 @@
 #include <pexpert/pexpert.h>
 #include <kern/thread_call.h>
 #include <mach/kmod.h>
+#include <sys/sysctl.h>
 
 #include "accelcensus.hpp"
 #include "rdna4accel.hpp"
@@ -184,6 +185,13 @@ KernelPatcher::KextInfo kextIOSurface {
 	KernelPatcher::KextInfo::Unloaded,
 };
 #endif
+
+// IOPCIFamily (boot kernel collection, loaded before Lilu): debug.rdna4_hda routes IOPCIDevice::extendedConfigRead16 in it.
+const char *kPathIOPCIFamily = "/System/Library/Extensions/IOPCIFamily.kext/Contents/MacOS/IOPCIFamily";
+KernelPatcher::KextInfo kextIOPCIFamily {
+	"com.apple.iokit.IOPCIFamily", &kPathIOPCIFamily, 1, {true}, {},
+	KernelPatcher::KextInfo::Unloaded,
+};
 
 mach_vm_address_t orgDoDriverIO { 0 };
 mach_vm_address_t orgVslNew { 0 };
@@ -1506,6 +1514,65 @@ bool wrapStart(void *fb, IOService *provider) {
 	return FunctionCast(wrapStart, orgStart)(fb, provider);
 }
 
+// Step 0 of docs/audio-plan.md: hand the card's HDMI/DP audio function (function 1 beside the GPU) to Apple's
+// AppleGFXHDAEGController. The AMDRadeonRDNA4HDA personality in Info.plist matches it once it is marked rdna4-hda, and
+// the controller's probe takes only the AMD functions in its table (AB28, Navi 21's, among them, not Navi 48's AB40), so
+// IOPCIDevice::extendedConfigRead16 (what it reads them with) is routed to read AB28 as its device ID, and the codec's
+// function group is chosen by the device-id property, which is set to AB28 too. At run time only
+// (`sudo sysctl debug.rdna4_hda=1`), so a boot never repeats what it did.
+IOPCIDevice *gHdaGpu, *gHdaDevice;
+mach_vm_address_t orgExtConfigRead16 { 0 };
+constexpr uint16_t kHdaSpoofId = 0xab28;
+
+UInt16 wrapExtConfigRead16(IOPCIDevice *that, IOByteCount offset) {
+	const UInt16 value = FunctionCast(wrapExtConfigRead16, orgExtConfigRead16)(that, offset);
+	return that == gHdaDevice && offset == kIOPCIConfigDeviceID ? kHdaSpoofId : value;
+}
+
+void offerHdaToApple(IOPCIDevice *gpu) {
+	IORegistryEntry *bus = gpu ? gpu->getParentEntry(gIOServicePlane) : nullptr;
+	OSIterator *it = bus ? bus->getChildIterator(gIOServicePlane) : nullptr;
+	if (!it)
+		return;
+	while (OSObject *o = it->getNextObject()) {
+		auto *d = OSDynamicCast(IOPCIDevice, o);
+		if (!d || d == gpu || d->getFunctionNumber() != 1 || d->configRead16(kIOPCIConfigVendorID) != 0x1002)
+			continue;
+		const uint16_t id = d->configRead16(kIOPCIConfigDeviceID);
+		if (!orgExtConfigRead16 && gPatcher) {
+			KernelPatcher::RouteRequest read {"__ZN11IOPCIDevice20extendedConfigRead16Ey", wrapExtConfigRead16, orgExtConfigRead16};
+			if (!gPatcher->routeMultiple(kextIOPCIFamily.loadIndex, &read, 1))
+				orgExtConfigRead16 = 0;
+			gPatcher->clearError();
+		}
+		if (!orgExtConfigRead16) {
+			FBLOG("audio: IOPCIDevice::extendedConfigRead16 not routed: HDA function %04x left alone", id);
+			break;
+		}
+		gHdaDevice = d;
+		uint8_t spoofed[4] = { kHdaSpoofId & 0xff, kHdaSpoofId >> 8, 0, 0 };
+		d->setProperty("device-id", spoofed, sizeof(spoofed));
+		d->setProperty("rdna4-hda", kOSBooleanTrue);
+		d->registerService();
+		FBLOG("audio: HDA function %04x at function 1 offered to AppleGFXHDAEGController as %04x", id, kHdaSpoofId);
+		break;
+	}
+	it->release();
+}
+
+int hdaSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = 0;
+	const int err = sysctl_handle_int(oidp, &value, 0, req);
+	if (err || !req->newptr)
+		return err;
+	if (value != 1 || !gHdaGpu)
+		return EINVAL;
+	offerHdaToApple(gHdaGpu);
+	return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_hda, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, hdaSysctl, "I",
+	    "AMDRadeonRDNA4: write 1 to hand the card's HDMI/DP audio function to AppleGFXHDA (docs/audio-plan.md)");
+
 // Create the state for one of our framebuffers, once. Runs after the
 // original handled Open (or, if the route arrived later, before the first
 // Control/Status), so IOBootNDRV already owns the console framebuffer.
@@ -1526,6 +1593,10 @@ void attach(FbEntry &e) {
 	}
 	// A test boot's stage (rdna4-trial) is only known once NVRAM is.
 	computeStage = RDNA4Compute::requestedStage();
+	if (!gHdaGpu) {
+		gHdaGpu = pci;
+		sysctl_register_oid(&sysctl__debug_rdna4_hda);
+	}
 	Ndrv::Backend be { &dev, deviceSurfaceFor, deviceSwitchTo, deviceSetPower,
 	                   deviceSupportsHardwareCursor, deviceSetHardwareCursor,
 	                   deviceDrawHardwareCursor, deviceGetHardwareCursorDrawState };
@@ -2298,6 +2369,7 @@ void pluginStart() {
 	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "", pvGpu ? ", FAKE PARAVIRT GPU (VM only)" : "");
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
 	lilu.onKextLoadForce(&kextIOGraphics, 1, processGraphics, nullptr);
+	lilu.onKextLoadForce(&kextIOPCIFamily, 1, [](void *, KernelPatcher &, size_t, mach_vm_address_t, size_t) {}, nullptr);   // (its index, for debug.rdna4_hda)
 	RDNA4Accel::start();   // our own accelerator: nothing published unless debug.rdna4_accel=1 (rdna4accel.cpp)
 #ifdef AMDRadeonRDNA4_PVGPU
 	// whether this boot has the fake GPU is only known once NVRAM is (rdna4-trial): the functions are resolved in any case
