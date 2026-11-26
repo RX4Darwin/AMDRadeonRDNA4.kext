@@ -1011,7 +1011,9 @@ void hotplugPoll(OSObject *owner, IOTimerEventSource *timer) {
 	if (present != h->hpdSeen) {
 		if (present)
 			h->hpdPin = hpd;
-		h->hpdBack = present && h->connected && h->hpdSame >= 1;
+		// Any drop, even one shorter than a poll: a monitor switched off and on drops its pin for under 0.5 s and may
+		// come back without the link or the DPCD settings it had (card, 2026-11-26).
+		h->hpdBack = present && h->connected;
 		HLOG(h, "hotplug: HPD%u went %s", h->hpdPin, present ? "high" : "low");
 		h->hpdSeen = present;
 		h->hpdSame = 0;
