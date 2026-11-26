@@ -59,6 +59,8 @@ constexpr uint32_t kDpgColourBCb     = 0x1859;
 constexpr uint32_t kDpgOffsetSegment = 0x185a;
 constexpr uint32_t kDpgStatus        = 0x185b;   // DOUBLE_BUFFER_PENDING [0]
 // HUBP / DPP
+constexpr uint32_t kPrimaryAddress     = 0x060a;
+constexpr uint32_t kPrimaryAddressHigh = 0x060b;
 constexpr uint32_t kHubpViewportStart = 0x05e9;
 constexpr uint32_t kHubpViewportDim   = 0x05eb;  // WIDTH [13:0], HEIGHT [29:16]
 constexpr uint32_t kHubpSurfacePitch  = 0x0607;  // HUBPREQ DCSURF_SURFACE_PITCH: PITCH [15:0], pixels - 1
@@ -213,6 +215,11 @@ bool build(const Target &t, Plan &out, const char **why) {
 
 	if (t.otg >= 4 || t.dig >= 4 || t.link >= 6 || t.opp >= 4 || t.hubp >= 4) {
 		err = "pipe instance out of range";
+		return false;
+	}
+	if (t.surface && (!t.dp || (t.surface & 255) || (t.surface >> 48) ||
+	                  t.pitchPx < t.to.hActive || t.pitchPx > 65536)) {
+		err = "invalid scanout address or pitch";
 		return false;
 	}
 	OtgTiming::Regs rg {};
@@ -441,10 +448,11 @@ bool build(const Target &t, Plan &out, const char **why) {
 	// --- dcn401_program_pipe under the OTG update lock ---
 	b.update(kOtgGlobalCtrl2 + otg, 0x7u << 25, static_cast<uint32_t>(t.otg) << 25, "update lock sel");
 	b.update(kOtgUpdateLock + otg, 0x1, 0x1, "update lock");
-	b.waitSet(kOtgUpdateLock + otg, 1u << 8, 10 * kMs, "update lock held", true);
+	b.waitSet(kOtgUpdateLock + otg, 1u << 8, 10 * kMs, "update lock held", !t.surface);
+	out.planeBegin = out.count;
 	b.write(kHubpViewportStart + hubp, 0, "viewport start");
 	b.write(kHubpViewportDim + hubp, sizeWH(w, h), "viewport size");
-	if (t.pitchPx)
+	if (t.pitchPx && !t.surface)
 		b.update(kHubpSurfacePitch + hubp, 0xffff, t.pitchPx - 1, "surface pitch");
 	b.write(kHubpreqBlankOffset0 + hubp, dlgBlankEnd(t.to), "plane: where the blank ends");
 	// A console the firmware stretches (Target::scalerOff) would go on being
@@ -464,6 +472,12 @@ bool build(const Target &t, Plan &out, const char **why) {
 		b.add(t.extra[i].op, t.extra[i].dword, t.extra[i].mask, t.extra[i].value, t.extra[i].arg, t.extra[i].what);
 	}
 	b.seg = 2;
+	if (t.surface) {
+		b.update(kHubpSurfacePitch + hubp, 0xffff, t.pitchPx - 1, "surface pitch");
+		b.update(kPrimaryAddressHigh + hubp, 0xffff, static_cast<uint32_t>(t.surface >> 32), "surface address high");
+		b.update(kPrimaryAddress + hubp, 0xffffff00, static_cast<uint32_t>(t.surface), "surface address low");
+	}
+	out.planeEnd = out.count;
 	b.update(kOtgUpdateLock + otg, 0x1, 0, "update unlock");
 
 	// --- blank_pixel_data(false): DPG video mode; set_avmute(false) ---
@@ -475,6 +489,21 @@ bool build(const Target &t, Plan &out, const char **why) {
 	if (b.full) {
 		err = "plan too long";
 		return false;
+	}
+	return true;
+}
+
+bool capturePlane(Plan &rollback, uint32_t (*read)(void *, uint8_t, uint32_t), void *ctx) {
+	if (!read || rollback.planeBegin >= rollback.planeEnd || rollback.planeEnd > rollback.count)
+		return false;
+	for (size_t i = rollback.planeBegin; i < rollback.planeEnd; ++i) {
+		auto &step = rollback.steps[i];
+		if (step.op != Op::Write && step.op != Op::Update)
+			return false;
+		const uint32_t old = read(ctx, step.seg, step.dword);
+		if (old == ~0u)
+			return false;
+		step.value = step.op == Op::Write ? old : old & step.mask;
 	}
 	return true;
 }

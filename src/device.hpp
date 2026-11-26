@@ -159,9 +159,7 @@ public:
 
 	// Display mode table (modes.hpp). By default it holds only the boot mode;
 	// with boot-arg "rdna4-modeset=1" it also carries the sink's EDID modes.
-	// Modes never exceed the GOP framebuffer, and every mode keeps the boot
-	// surface's pitch and memory, so a mode change only moves the timing
-	// and viewport — the scanout surface itself never moves. modeCount 0 =
+	// Larger DP modes have a separate, permanently reserved aperture. modeCount 0 =
 	// the live timing is unknown and the display is left to the boot NDRV.
 	Modes::Mode modeTable[Modes::MaxModes] {};
 	size_t      modeCount { 0 };
@@ -170,6 +168,17 @@ public:
 	bool        modesetRequested { false };
 	// Physical image size from the EDID. 0 = unknown.
 	uint32_t    imageWidthMm { 0 }, imageHeightMm { 0 };
+	bool dpPlaneReady();
+	void prepareDpSurface(uint64_t extraSlotsBytes, uint64_t displayLimit, bool clocksExpected, bool (*ensureRanges)());
+	uint64_t displayReserve {};
+	IODeviceMemory *dpVram {}, *dpAperture {};
+	Ndrv::Surface dpSurface {};
+	bool largerThanConsole(const Edid::DetailedTiming &t) const { return t.hActive > fbWidth || t.vActive > fbHeight; }
+	const Modes::Mode *activeDpMode() const {
+		const uint32_t id = __atomic_load_n(&dpActiveId, __ATOMIC_ACQUIRE);
+		return id ? findMode(id) : nullptr;
+	}
+	uint64_t displaySpan() const { return dpVram ? dpVram->getLength() : fbLength; }
 	const Modes::Mode *findMode(uint32_t id) const;
 	// Program mode `m` on the lit HDMI pipe (modeset.hpp). On failure the
 	// previous timing is programmed back and an error returned.
@@ -272,7 +281,7 @@ public:
 	// the kext's own training on that link: stream off, transmitter off,
 	// DpTrain::bringUp, stream encoder tied to the link, video restarted.
 	void noteBootDpLink();
-	bool readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link);
+	bool readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link, bool *aligned = nullptr);
 	// What a DisplayPort boot display's mode may clock at: what its trained link carries at 8 bpc, and the DISPCLK
 	// the kext holds (dispclkTargetKHz); the boot pixel clock if either is not known. The link is not retrained.
 	uint32_t bootDpMaxKHz();
@@ -324,7 +333,7 @@ public:
 	void logBootLink(const char *when);
 	const char *auxWhy { "" };   // why the last AUX transaction gave no reply, and the status it ended with
 	uint32_t    auxSts { 0 };
-	bool bootSinkPresent();              // the boot display's HPD pin
+	bool bootSinkPresent(uint32_t *sample = nullptr);              // the boot display's HPD pin
 	DpTrain::Sink bootDpSink {};
 	DpTrain::Link bootDpLink {};
 	bool bootDpLinkKnown { false };
@@ -527,7 +536,17 @@ private:
 	// The mode whose request timing (HUBP DLG/TTU) the boot plane has: the GOP's, until a switch with Linux's values.
 	Edid::DetailedTiming reqTiming {};
 	bool reqTimingValid { false };
-	ModeSet::Plan modePlan {};
+	ModeSet::Plan modePlan {}, surfaceReturn {};
+	uint64_t dpPlaneMc {}, dpConsoleMc {};
+	uint32_t dpActiveId {};
+	bool surfaceRecovery {};
+	uint32_t dpSurfaceClockLimit();
+	bool singleDpPipe() const;
+	bool bootEdidMatches();
+	bool surfaceLatched(uint64_t mc, uint32_t pitch, uint32_t width, uint32_t height);
+	bool restoreDpPlane();
+	uint64_t returnMc {};
+	uint32_t returnPitch {}, returnWidth {}, returnHeight {};
 	bool pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out, uint8_t *ddcLine = nullptr);
 	// The lit pipe and its connector's wiring as a mode-set target (timings not filled in).
 	bool bootPipeTarget(ModeSet::Target &t);

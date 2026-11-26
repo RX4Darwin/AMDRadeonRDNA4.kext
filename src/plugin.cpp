@@ -300,18 +300,23 @@ Modes::Mode gBootScaled[Modes::MaxScaled] {};   // the boot display's scaled mod
 size_t gBootScaledCount { 0 };
 ScaledMemory gBootScaledMemory;
 bool gScaledOffered { false };                  // our accelerator serves WindowServer: it can present their frames
-bool gApertureRouted { false };                 // wrapGetApertureRange is in: without it a scaled mode's aperture would be cut from BAR0
+bool gApertureRouted { false };                 // the PVGPU aperture route is available for scaled modes
 
-// Ndrv::Backend over RDNA4Device. Every mode reuses the boot surface: modes
-// never exceed the GOP framebuffer and keep its pitch (see device.hpp).
+// NDRV reports the same aperture and pitch the pipe uses for this mode.
 bool deviceSurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) {
 	auto *dev = static_cast<RDNA4Device *>(ctx);
+	if (dev->dpAperture && !dev->dpPlaneReady())
+		return false;
 	if (m.source == Modes::SourceScaled) {
 		out = { dev->fbPhysBase, m.t.hActive * 4u, m.t.hActive, m.t.vActive };   // (the base is only reported: wrapGetApertureRange)
 		return true;
 	}
-	if (m.t.hActive > dev->fbWidth || m.t.vActive > dev->fbHeight)
-		return false;
+	if (dev->largerThanConsole(m.t)) {
+		if (!dev->dpAperture)
+			return false;
+		out = {dev->dpSurface.physBase, dev->dpSurface.rowBytes, m.t.hActive, m.t.vActive};
+		return true;
+	}
 	out = { dev->fbPhysBase, dev->fbRowBytes, m.t.hActive, m.t.vActive };
 	return true;
 }
@@ -597,7 +602,7 @@ void createHeads(IOPCIDevice *pci) {
 constexpr uint64_t kHeadSlotBytes = 34ull << 20;
 
 uint64_t surfaceFloor(const Head2 *h, const RDNA4Device &dev) {
-	return dev.fbPhysBase + dev.fbLength + h->slot * kHeadSlotBytes;
+	return dev.fbPhysBase + dev.displaySpan() + h->slot * kHeadSlotBytes;
 }
 
 // rdna4-vrr=1: offer variable refresh (docs/freesync-plan.md).
@@ -618,9 +623,14 @@ const Modes::Mode *head2BuildTable(Head2 *h, RDNA4Device &dev, size_t &n) {
 	                 h->table, Modes::MaxModes);
 	if (head2Level >= 2) {
 		size_t kept = 0;
-		for (size_t i = 0; i < n; i++)
-			if (dev.secondPipeModeOk(h->table[i].t))
+		for (size_t i = 0; i < n; i++) {
+			const auto &t = h->table[i].t;
+			Ndrv::Surface available {};
+			if (dev.secondPipeModeOk(t) &&
+			    Ndrv::spareSurface(dev.fbPhysBase, surfaceFloor(h, dev) - dev.fbPhysBase, h->rangeBase, h->rangeLen,
+			                       max(t.hActive, lit.hActive), max(t.vActive, lit.vActive), available))
 				h->table[kept++] = h->table[i];
+		}
 		n = kept;
 		// A sink whose own timing of that size and rate won (a monitor's
 		// CVT-RB 4K60 over CEA VIC 97) gets the plan's, which it lists too.
@@ -652,8 +662,9 @@ void head2MapSurface(Head2 *h) {
 	const uint64_t bytes = static_cast<uint64_t>(h->surface.rowBytes) * h->surface.height;
 	IODeviceMemory *old = h->vram;
 
-	h->vram = IODeviceMemory::withSubRange(h->range, h->surface.physBase - h->rangeBase,
-	                                       bytes > kHeadSurfaceMaxBytes ? bytes : kHeadSurfaceMaxBytes);
+	const uint64_t offset = h->surface.physBase - h->rangeBase;
+	const uint64_t length = Ndrv::headMappingLength(offset, h->rangeLen, bytes, kHeadSurfaceMaxBytes);
+	h->vram = length ? IODeviceMemory::withSubRange(h->range, offset, length) : nullptr;
 	OSSafeReleaseNULL(old);
 	if (!h->vram)
 		HLOG(h, "no VRAM range for the surface: WindowServer will not map it");
@@ -719,10 +730,8 @@ void fillHead(Head2 *h, RDNA4Device &dev) {
 			h->range = mem;
 			h->rangeBase = base;
 			h->rangeLen = mem->getLength();
-			// With the compute bring-up the surface has to end below the compute pool, which never starts
-			// under RDNA4Compute::kPoolFloor.
-			if (computeStage && h->rangeLen > RDNA4Compute::kPoolFloor)
-				h->rangeLen = RDNA4Compute::kPoolFloor;
+			if (computeStage)
+				h->rangeLen = min(h->rangeLen, RDNA4Compute::kPoolFloor);
 			break;
 		}
 	}
@@ -1393,6 +1402,11 @@ IOReturn head2DriverIO(Head2 *h, void *contents, UInt32 commandCode, uint16_t &c
 // nothing for head 2: hand out its surface instead (retained, as the original
 // does).
 IODeviceMemory *wrapGetVRAMRange(void *fb) {
+	for (const auto &entry : fbTable)
+		if (entry.fb == fb && entry.state && entry.state->dev.dpVram) {
+			entry.state->dev.dpVram->retain();
+			return entry.state->dev.dpVram;
+		}
 	Head2 *h = headFor(fb);
 	if (h && h->vram) {
 		h->vram->retain();
@@ -1405,6 +1419,11 @@ IODeviceMemory *wrapGetVRAMRange(void *fb) {
 // the other heads and the compute pool. Retained, as the original's is; a descriptor passed as IODeviceMemory, as the original does.
 IODeviceMemory *wrapGetApertureRange(void *fb, IOPixelAperture aperture) {
 	if (aperture == kIOFBSystemAperture) {
+		for (const auto &entry : fbTable)
+			if (entry.fb == fb && entry.state && entry.state->dev.activeDpMode()) {
+				entry.state->dev.dpAperture->retain();
+				return entry.state->dev.dpAperture;
+			}
 		uint32_t width, height;
 		ScaledMemory *memory = nullptr;
 		if (Head2 *h = headFor(fb)) {
@@ -1421,6 +1440,43 @@ IODeviceMemory *wrapGetApertureRange(void *fb, IOPixelAperture aperture) {
 		}
 	}
 	return FunctionCast(wrapGetApertureRange, orgGetApertureRange)(fb, aperture);
+}
+
+// Resolve at IONDRVSupport load. Extra heads need the VRAM route and PVGPU needs the
+// aperture route for scaled frames. A plain build can defer the other routes until a
+// larger surface has actually been mapped, before its modes are published to NDRV.
+KernelPatcher *gPatcher = nullptr;
+struct RangeRoute {
+	mach_vm_address_t target {};
+	bool installed {};
+} vramRange, apertureRange;
+IOLock *rangeRouteLock {};
+bool installRangeRoute(KernelPatcher::RouteRequest request, RangeRoute &route, const char *name) {
+	if (route.installed)
+		return true;
+	request.from = route.target;
+	route.installed = route.target && gPatcher->routeMultiple(kextIONDRVSupport.loadIndex, &request, 1);
+	FBLOG("modes: IONDRVFramebuffer::%s %s", name, route.installed ? "routed" : "route unavailable");
+	gPatcher->clearError();
+	return route.installed;
+}
+
+bool installVramRange() {
+	return installRangeRoute({nullptr, wrapGetVRAMRange, orgGetVRAMRange}, vramRange, "getVRAMRange");
+}
+
+bool installApertureRange() {
+	return installRangeRoute({nullptr, wrapGetApertureRange, orgGetApertureRange}, apertureRange, "getApertureRange");
+}
+
+bool ensureDpSurfaceRanges() {
+	// Only deferred routing needs a lock; both existing routes may already be in.
+	if (!rangeRouteLock)
+		return vramRange.installed && apertureRange.installed;
+	IOLockLock(rangeRouteLock);
+	const bool ready = installVramRange() && installApertureRange();
+	IOLockUnlock(rangeRouteLock);
+	return ready;
 }
 
 bool wrapStart(void *fb, IOService *provider) {
@@ -1470,6 +1526,16 @@ void attach(FbEntry &e) {
 	const bool vrr = vrrWanted();
 	if (vrr && be.switchTo == deviceSwitchTo)
 		be.setRefresh = deviceSetRefresh;
+	uint32_t guest = 0, bench = 0, cold = 0, dsc = 0;
+	if (!pvGpu && !(Trial::option("rdna4-pvgpu", guest) && guest) &&
+	    !(Trial::option("rdna4-vrambench", bench) && bench) && !(Trial::option("rdna4-coldboot", cold) && cold) &&
+	    !(Trial::option("rdna4-dscboot", dsc) && dsc))
+		dev.prepareDpSurface(RDNA4Device::extraHeads() * kHeadSlotBytes + (2ull << 20),
+		                     computeStage ? RDNA4Compute::kPoolFloor : ~0ull, computeStage >= RDNA4Compute::StageGfx,
+		                     ensureDpSurfaceRanges);
+	else
+		FBLOG("modes: no larger DP surface: pvgpu %u, vrambench %u, coldboot %u, dscboot %u",
+		      pvGpu ? pvGpu : guest, bench, cold, dsc);
 	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidAll, dev.edidAllLen, be);
 	st->ndrv.adaptiveSync = vrr;
 #ifdef AMDRadeonRDNA4_PVGPU
@@ -1510,7 +1576,7 @@ void attach(FbEntry &e) {
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidAllLen));
 	fillHeads(dev);
 	// Behind the extra heads' slots, below the compute pool (128 MiB).
-	VramBench::run(dev.fbPhysBase, ((dev.fbLength + (1ull << 20) - 1) & ~((1ull << 20) - 1)) +
+	VramBench::run(dev.fbPhysBase, ((dev.displaySpan() + (1ull << 20) - 1) & ~((1ull << 20) - 1)) +
 	                               RDNA4Device::kMaxExtra * kHeadSlotBytes + (2ull << 20));
 
 	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
@@ -1532,7 +1598,7 @@ void attach(FbEntry &e) {
 	// when asked for: it must never be the reason the desktop is missing.
 	if (computeStage && dev.isAmd) {
 		RDNA4Compute::Env env { pci, svc, dev.mmioBase(), dev.mmioSize(), dev.discovery(),
-		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
+		                        dev.fbPhysBase, dev.displayReserve ? dev.displayReserve : dev.fbLength, dev.liveFramePeriodNs(),
 		                        createVblankService, deviceCursorProbe, &dev };
 		env.smuReady = deviceSmuReady;
 		dev.compute = &st->compute;   // its sleep and wake from the device's notifiers (rdna4-syssleep without rdna4-pm)
@@ -1991,15 +2057,6 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	}
 	if (index != kextIONDRVSupport.loadIndex || __atomic_exchange_n(&ndrvRouted, true, __ATOMIC_SEQ_CST))
 		return;
-	KernelPatcher::RouteRequest request {
-		"__ZN17IONDRVFramebuffer10doDriverIOEjPvjj", wrapDoDriverIO, orgDoDriverIO,
-	};
-	if (patcher.routeMultiple(index, &request, 1, address, size))
-		FBLOG("ndrv: routed IONDRVFramebuffer::doDriverIO");
-	else
-		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d)",
-		      patcher.getError());
-	patcher.clearError();
 	// The second display and its hot-plug are on unless turned off: lit at
 	// boot, mode switching, display sleep and hot-plug ran on the card for an
 	// HDMI monitor on either connector (2026-10-04..06). Not in VM test
@@ -2010,6 +2067,29 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	uint32_t second = 4;
 #endif
 	PE_parse_boot_argn("rdna4-head2", &second, sizeof(second));
+	vramRange.target = patcher.solveSymbol(index, "__ZN17IONDRVFramebuffer12getVRAMRangeEv", address, size);
+	patcher.clearError();
+	apertureRange.target = patcher.solveSymbol(index, "__ZN17IONDRVFramebuffer16getApertureRangeEi", address, size);
+	patcher.clearError();
+	if (second)
+		installVramRange();
+#ifdef AMDRadeonRDNA4_PVGPU
+	gApertureRouted = installApertureRange();
+#endif
+	if (!vramRange.installed || !apertureRange.installed) {
+		rangeRouteLock = IOLockAlloc();
+		if (!rangeRouteLock)
+			FBLOG("modes: cannot allocate the lock for deferred framebuffer range routes");
+	}
+	KernelPatcher::RouteRequest request {
+		"__ZN17IONDRVFramebuffer10doDriverIOEjPvjj", wrapDoDriverIO, orgDoDriverIO,
+	};
+	if (patcher.routeMultiple(index, &request, 1, address, size))
+		FBLOG("ndrv: routed IONDRVFramebuffer::doDriverIO");
+	else
+		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d)",
+		      patcher.getError());
+	patcher.clearError();
 	if (second) {
 		head2Level = second;
 		KernelPatcher::RouteRequest start {
@@ -2021,25 +2101,8 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 			FBLOG("head2: not available: no IONDRVFramebuffer::start route (error %d)",
 			      patcher.getError());
 		patcher.clearError();
-		KernelPatcher::RouteRequest vram {
-			"__ZN17IONDRVFramebuffer12getVRAMRangeEv", wrapGetVRAMRange, orgGetVRAMRange,
-		};
-		if (patcher.routeMultiple(index, &vram, 1, address, size))
-			FBLOG("head2: routed IONDRVFramebuffer::getVRAMRange");
-		else
-			FBLOG("head2: no IONDRVFramebuffer::getVRAMRange route (error %d): WindowServer "
-			      "will not map the second head", patcher.getError());
-		patcher.clearError();
 	}
 #ifdef AMDRadeonRDNA4_PVGPU
-	{
-		KernelPatcher::RouteRequest aperture {
-			"__ZN17IONDRVFramebuffer16getApertureRangeEi", wrapGetApertureRange, orgGetApertureRange,
-		};
-		gApertureRouted = patcher.routeMultiple(index, &aperture, 1, address, size);
-		FBLOG("modes: IONDRVFramebuffer::getApertureRange %s", gApertureRouted ? "routed" : "NOT routed: no scaled modes");
-		patcher.clearError();
-	}
 	{   // (pass-through unless our accelerator serves WindowServer)
 		uint32_t accel = 0;
 		gAccelCursor = Trial::bootArg("rdna4-accel", accel) && accel == 4;
@@ -2128,7 +2191,6 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 // Boots where IONDRVSupport is loaded where Lilu does not see it in time: SimpleHDA loads it itself the moment the system kext collection is
 // ready (2026-10-22: at 18 s, the framebuffer published 0.4 s later; Lilu's first load notice of the boot at 21 s). Then IONDRVFramebuffer
 // starts without our routes and is gone, and the card is never brought up (only the firmware's picture): lateNdrvCheck below.
-KernelPatcher *gPatcher = nullptr;
 thread_call_t gLateNdrv = nullptr;
 // IONDRVSupport routed from the kernel's kext list when Lilu has not told us of its load: polled every 20 ms from 1 s on (every 2 s from 60
 // s, until 120 s), so the routes are in before its framebuffers match. SimpleHDA loads IONDRVSupport itself inside the catalog hook and
@@ -2450,12 +2512,13 @@ bool bootModes(const Modes::Mode *&table, size_t &n, uint32_t &width, uint32_t &
 
 	const RDNA4Device &dev = bootState->dev;
 	uint32_t liveW, liveH;
+	const auto *large = dev.activeDpMode();
 	const bool live = dev.liveSize(liveW, liveH) && liveW && liveW <= dev.fbWidth && liveH && liveH <= dev.fbHeight;
 
 	table = dev.modeTable;
 	n = dev.modeCount;
-	width = live ? liveW : dev.fbWidth;
-	height = live ? liveH : dev.fbHeight;
+	width = large ? large->t.hActive : live ? liveW : dev.fbWidth;
+	height = large ? large->t.vActive : live ? liveH : dev.fbHeight;
 	return true;
 }
 
@@ -2798,6 +2861,10 @@ bool PvScanout::cursorMove(uint32_t port, int32_t x, int32_t y, bool visible)
 	});
 }
 
+bool PvScanout::fixedFrontBuffer(uint32_t port) {
+	return port == 0 && !pvBootHead && bootState && bootState->dev.dpVram;
+}
+
 bool PvScanout::head(uint32_t port, Head &out)
 {
 	if (port == 0 && pvBootHead) {
@@ -2815,8 +2882,12 @@ bool PvScanout::head(uint32_t port, Head &out)
 		if (!bootState)
 			return false;
 
-		// the mode it runs in now (bootModes), from the console's start at its pitch (deviceSurfaceFor); else the console's size
+		// Use the committed scanout geometry for native presents, including the first frame after a switch.
 		const RDNA4Device &dev = bootState->dev;
+		if (const auto *large = dev.activeDpMode()) {
+			out = {dev.dpSurface.physBase, dev.dpSurface.rowBytes, large->t.hActive, large->t.vActive};
+			return true;
+		}
 		const Modes::Mode *table;
 		size_t n;
 		uint32_t width = dev.fbWidth, height = dev.fbHeight;

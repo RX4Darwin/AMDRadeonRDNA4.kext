@@ -102,6 +102,7 @@ bool setMode(uint32_t port, uint32_t width, uint32_t height);
 bool wantsMode(uint32_t port, uint32_t width, uint32_t height);
 
 /* The scanout of head `port` (plugin.cpp); false while it is not lit. */
+bool fixedFrontBuffer(uint32_t port);
 bool head(uint32_t port, Head &out);
 
 /*
