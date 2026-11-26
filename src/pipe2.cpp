@@ -398,6 +398,8 @@ bool use(uint8_t hpd, bool tmds, uint8_t pipe, bool uhd, bool y420) {
 // 3840x2160 at 729 MHz (82 Hz) uncompressed on HBR3: the DIG two pixels a cycle without DSC (rdna4-dscboot=3).
 constexpr Table kHiTable = { P0Hpd1Hi::kConfig, P0Hpd1Hi::kGen, sizeof(P0Hpd1Hi::kGen) / sizeof(Gen), nullptr, 0,
                              P0Hpd1Hi::kModeTimings, 1, nullptr, P0Hpd1Hi::kAux, countOf(P0Hpd1Hi::kAux), nullptr, 0 };
+const Edid::DetailedTiming &dscTiming() { return kDsc10Table.config.timing; }
+
 void useDsc(int variant) {
 	switch (variant) {
 	case 2: cur = &kDsc60Table; break;

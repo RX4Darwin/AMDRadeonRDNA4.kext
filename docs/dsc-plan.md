@@ -115,7 +115,18 @@ Later the same day:
 - Still to do: the DISPCLK target following DML for the mode (`rdna4-dispclk=1400` by hand), and mode switches with
   DSC on (refused while the test stream runs).
 
-Card tests: `rdna4-dscboot=1` (8 bpc) or `=4` (10 bpc) with `rdna4-dispclk=1400`; mode switches are refused while lit.
+Mode switches (card, 2026-11-26): with `rdna4-dispclk=1400` and a 3840x2160 console the boot display offers
+3840x2160@144 beside its other modes. Picking it lights pipe 0 again (RDNA4Device::relightBootPipe):
+- Linux's sleep part of the table it runs;
+- the OTG stopped and MPCC0 out of OPP0's tree, as the cold start's dcn401_init_hw leaves them (the lighting
+  requires both);
+- the memory clock held;
+- the 10 bpc DSC table lit with its link trained at HBR3 (143.988 Hz).
+
+Leaving it lights the 3840x2160 table the same way, then retimes as usual (2560x1440@144 after it: 143.965 Hz). If the
+DSC table does not light, the 3840x2160 one is lit again.
+
+Card tests: `rdna4-dscboot=1` (8 bpc) or `=4` (10 bpc) with `rdna4-dispclk=1400` boots into the DSC stream.
 
 ## Notes
 

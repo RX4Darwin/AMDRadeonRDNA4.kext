@@ -2856,6 +2856,18 @@ static int testPipe2() {
 			if (dsc.steps[i].dword == 0x209b && (dsc.steps[i].mask & 0x300))
 				ppc = dsc.steps[i].value & 0x300;
 		failures += check(built && ppc == 0x100, "pipe2: the DSC 4K144 plan's DIG FIFO pixels a cycle 0x%x (%s)", ppc, why);
+		// The way out of the stream (relightBootPipe): the 10 bpc table's sleep part builds at its own timing and
+		// turns the DSC engine off (DSC_TOP0_DSC_TOP_CONTROL), so the 3840x2160 table can light the pipe after it.
+		Pipe2::useDsc(4);
+		t.part = Pipe2::Part::Sleep;
+		t.now = Pipe2::dscTiming();
+		bool off = false;
+		const bool down = Pipe2::build(t, dsc, &why);
+		for (size_t i = 0; down && i < dsc.count; i++)
+			off = off || (dsc.steps[i].seg == 2 && dsc.steps[i].dword == 0x3000 && (dsc.steps[i].mask & 1) &&
+			              !(dsc.steps[i].value & 1));
+		failures += check(down && off && Edid::sameTiming(Pipe2::config().timing, Pipe2::dscTiming()),
+		                  "pipe2: the DSC table's sleep part turns DSC off (%s)", why);
 	}
 	Pipe2::use(first);
 	return failures;

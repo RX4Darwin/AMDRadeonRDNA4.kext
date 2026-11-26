@@ -2797,9 +2797,10 @@ void RDNA4Device::buildModeTable() {
 
 	// DisplayPort has no TMDS limit, but its link is not retrained: what the link carries, and DISPCLK.
 	if (pipe.valid() && pipe.signal == Pipe::Signal::DpSst && bootTimingValid && bootTiming.pixelClockKHz) {
-		DpTrain::Sink sink = bootDpSink;
-		DpTrain::Link link = bootDpLink;
-		const bool known = bootDpLinkKnown || readBootDpLink(sink, link);
+		if (!bootDpLinkKnown)   // (also for the DSC mode below; captureGopState reads it next anyway)
+			noteBootDpLink();
+		const DpTrain::Link link = bootDpLink;
+		const bool known = bootDpLinkKnown;
 		bootDpLinkKHz = known ? DpTrain::bandwidthKbps(link) / 24 : 0;
 		lim.maxPixelClockKHz = bootDpMaxKHz();
 		FBLOG("modes: DisplayPort modes up to %u kHz (link %u lane(s) at 0x%02x: %u kHz at 8 bpc; DISPCLK %u kHz; boot "
@@ -2866,6 +2867,17 @@ void RDNA4Device::buildModeTable() {
 	currentModeId = defaultModeId = modeTable[bootIdx].id;
 	liveTiming = stretched ? bootTiming : modeTable[bootIdx].t;
 	liveTimingValid = bootTimingValid;
+	// 3840x2160@144 over DSC, past what the link carries uncompressed: offered when the sink lists it and the boot
+	// display can run it (dscModeFits); switched to by lighting pipe 0 again from Linux's table (applyMode).
+	if (modesetRequested && dscModeFits(Pipe2::dscTiming())) {
+		Modes::Mode listed[Modes::MaxModes];
+		const Edid::DetailedTiming &dsc = Pipe2::dscTiming();
+		const size_t n = Modes::build(edidAll, edidAllLen, Modes::Limits { 0, 0, dsc.pixelClockKHz }, listed, Modes::MaxModes);
+		if (Modes::match(listed, n, dsc) >= 0) {
+			Modes::ensure(modeTable, modeCount, Modes::MaxModes, dsc, Modes::SourceBoot);
+			FBLOG("modes: 3840x2160@144 offered over DSC (DISPCLK %u kHz)", dispclkTargetKHz());
+		}
+	}
 	for (size_t i = 0; i < modeCount; i++) {
 		const Modes::Mode &m = modeTable[i];
 		FBLOG("modes: id %u %ux%u@%u.%03u %u kHz%s%s", m.id, m.t.hActive, m.t.vActive,
@@ -3551,6 +3563,7 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 			      fecCap, fecCfg, fec[0], fec[2], fec[1]);
 		}
 		dscLit = true;
+		dscVariant = static_cast<uint8_t>(dscBoot);
 		liveTiming = reqTiming = Pipe2::config().timing;
 		liveTimingValid = reqTimingValid = true;
 	}
@@ -3570,6 +3583,110 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 		FBLOG("dcninit: the mode before the power loss (%ux%u at %u kHz) set again: %s (0x%x)", wanted.hActive, wanted.vActive,
 		      wanted.pixelClockKHz, back == kIOReturnSuccess ? "done" : "FAILED, the table's timing kept", back);
 	}
+	return ok;
+}
+
+// 3840x2160@144 needs DSC on four HBR3 lanes, DISPCLK at DML's 1384.6 MHz (rdna4-dispclk=1400) and a console of that
+// size for the plane Linux's table shows, on the boot pipe the table is for (docs/dsc-plan.md).
+bool RDNA4Device::dscModeFits(const Edid::DetailedTiming &t) {
+	constexpr uint32_t kDscDispclkKHz = 1384600;
+	return pipe.valid() && pipe.signal == Pipe::Signal::DpSst && !pipe.otg && !pipe.hubp && !pipe.dig && !pipe.link &&
+	       pipe.hpd == 1 && bootDpLinkKnown && bootDpSink.hasDsc && bootDpSink.maxRate >= DpTrain::kHbr3 &&
+	       bootDpSink.maxLanes >= 4 && dispclkTargetKHz() >= kDscDispclkKHz && fbDepth == 32 &&
+	       fbWidth == t.hActive && fbHeight == t.vActive && fbRowBytes == t.hActive * 4u;
+}
+
+// Pipe 0 taken down from the table it runs (the DSC one, or the 3840x2160 one at the mode it was switched to) and lit
+// again from the other, its link trained for it: the switch into and out of 3840x2160@144 over DSC. Each is Linux's
+// own sequence (tools/gen/pipegen). The memory clock is held before the DSC stream starts (memoryClockFollowDisplays).
+// False if a part was not built or did not run; the pipe may be dark then.
+// ponytail: not across a hot-plug of the boot display (its link comes back trained for the GOP's stream).
+bool RDNA4Device::relightBootPipe(bool dsc) {
+	constexpr uint8_t kVariant = 4;   // 10 bpc, as Linux runs it
+	// The plane keeps what it shows now: the console, or the native desktop's frame it was last flipped to.
+	AtomBios::DisplayPath path {};
+	const uint64_t surface = bootScanout();
+	if (!pipe.valid() || pipe.otg || pipe.hubp || pipe.dig || pipe.link || pipe.hpd != 1 || !bootDpLinkKnown ||
+	    !pathForHpd(pipe.hpd, path) || !surface) {
+		FBLOG("dsc: pipe 0 not lit again: not the DisplayPort boot pipe the tables are for, or no scanout address "
+		      "(0x%llx)", surface);
+		return false;
+	}
+	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
+	if (!plan)
+		return false;
+	ExtraHold hold(*this);
+	const uint8_t connector = static_cast<uint8_t>(path.connectorObjId & 0xff);
+	ExtraPipe boot {};
+	boot.pipe = 0;
+	boot.hpd = pipe.hpd;
+	boot.aux = sinkAuxInst;
+	boot.sink = bootDpSink;
+	boot.link = dsc ? DpTrain::Link { 4, DpTrain::kHbr3, true } : bootDpLink;   // (set again for each light() below)
+	boot.target.connectorObjId = connector;
+	xpOverride = &boot;
+	Pipe2::Target t {};
+	t.litHubp = 0;
+	t.alone = true;
+	t.encoderObjId = path.encoderObjId;
+	t.connectorObjId = connector;
+	t.surface = surface;
+	t.depth = Pipe2::Depth::Plane;
+	const char *why = "";
+	if (dscLit)
+		Pipe2::useDsc(dscVariant);
+	else
+		(void)Pipe2::use(1, false, 0, true);
+	t.part = Pipe2::Part::Sleep;
+	t.now = liveTiming;
+	// Blender MPCC0 out of OPP0's tree, as mpc1_remove_mpcc leaves it and the cold start's dcn401_init_hw does: the
+	// lighting requires it (and sets it up itself after).
+	static constexpr ModeSet::Step kMpccOff[] = {
+		{ ModeSet::Op::Write, 3, false, 0x0000, 0, 0xf, 0, "MPCC0_MPCC_TOP_SEL: none" },
+		{ ModeSet::Op::Write, 3, false, 0x0001, 0, 0xf, 0, "MPCC0_MPCC_BOT_SEL: none" },
+		{ ModeSet::Op::Write, 3, false, 0x0002, 0, 0xf, 0, "MPCC0_MPCC_OPP_ID: none" },
+		{ ModeSet::Op::Update, 3, false, 0x02f2, 0xf, 0xf, 0, "MPC_OUT0_MUX: no blender" },
+	};
+	// Down, then the timing generator stopped (the sleep part leaves it running; the lighting requires it stopped),
+	// as the cold start does.
+	static ModeSet::Step otgStop[16];
+	size_t notg = 0;
+	const bool down = Pipe2::build(t, *plan, &why) &&
+	                  runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dsc: down", otgOff(), plan->aux) &&
+	                  DcnInit::steps(otgStop, 16, notg, DcnInit::Table::OtgOff) &&
+	                  runSteps(otgStop, notg, nullptr, 0, "dsc: otg off", otgOff()) &&
+	                  runSteps(kMpccOff, sizeof(kMpccOff) / sizeof(kMpccOff[0]), nullptr, 0, "dsc: blender off", 0);
+	dscLit = false;
+	auto light = [&](bool withDsc) {
+		if (withDsc)
+			Pipe2::useDsc(kVariant);
+		else
+			(void)Pipe2::use(1, false, 0, true);
+		boot.link = withDsc ? DpTrain::Link { 4, DpTrain::kHbr3, true } : bootDpLink;
+		liveTiming = reqTiming = Pipe2::config().timing;
+		liveTimingValid = reqTimingValid = true;
+		memoryClockFollowDisplays();
+		t.part = Pipe2::Part::Light;
+		t.now = {};
+		t.linkRate = boot.link.rate;
+		return Pipe2::build(t, *plan, &why) &&
+		       runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dsc: light", otgOff(), plan->aux);
+	};
+	bool ok = down && light(dsc);
+	// The DSC stream not lit: the 3840x2160 one again, so the display is not left dark.
+	const bool fellBack = down && !ok && dsc && light(false);
+	if (fellBack)
+		FBLOG("dsc: the DSC stream did not light (%s): pipe 0 lit from the 3840x2160 table again", why);
+	dscLit = ok && dsc;
+	dscVariant = dscLit ? kVariant : 0;
+	xpOverride = nullptr;
+	IOFree(plan, sizeof(Pipe2::Plan));
+	useSlotTable();
+	const uint64_t periodNs = ok ? measureFramePeriodNs(otgOff()) : 0;
+	const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
+	FBLOG("dsc: pipe 0 %s %s%s%s; OTG0 measured %u.%03u Hz", ok ? "lit again from" : "FAILED to light from",
+	      dsc ? "the DSC table (3840x2160@144, 10 bpc, four HBR3 lanes)" : "the 3840x2160 table", *why ? ": " : "", why,
+	      mHz / 1000, mHz % 1000);
 	return ok;
 }
 
@@ -3596,9 +3713,21 @@ bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {
 }
 
 IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
-	if (dscLit) {
-		FBLOG("modes: switch to id %u refused: the boot display runs the DSC test stream (rdna4-dscboot)", m.id);
-		return kIOReturnUnsupported;
+	// Into or out of the DSC stream: pipe 0 lit again from the other table; a mode other than the 3840x2160 table's is
+	// then switched to from there as usual.
+	const bool toDsc = Edid::sameTiming(m.t, Pipe2::dscTiming());
+	if (toDsc || dscLit) {
+		if (toDsc && dscLit)
+			return kIOReturnSuccess;
+		const char *refused = toDsc && !dscModeFits(m.t) ? ": the boot display cannot run it now" :
+		                      bootReleased ? ": the boot pipe is released" : nullptr;
+		if (refused || !relightBootPipe(toDsc)) {
+			FBLOG("modes: switch to id %u %s the DSC stream FAILED%s", m.id, toDsc ? "into" : "out of",
+			      refused ? refused : "");
+			return kIOReturnIOError;
+		}
+		if (toDsc || Edid::sameTiming(m.t, liveTiming))
+			return kIOReturnSuccess;
 	}
 	if (bootReleased) {
 		FBLOG("modes: switch to id %u refused: the boot pipe is released, its connector is a head's", m.id);

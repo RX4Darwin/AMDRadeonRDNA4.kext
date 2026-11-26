@@ -460,6 +460,9 @@ private:
 	const SmuMailbox *smuFind();
 	bool smuHardMinMet(uint32_t clk);
 	bool smuSetHardMin(uint32_t clk, const char *name, uint32_t mhz);
+	uint8_t dscVariant { 0 };   // the useDsc table pipe 0 was lit from while dscLit
+	bool dscModeFits(const Edid::DetailedTiming &t);   // the boot display can run t (the DSC table's) over DSC
+	bool relightBootPipe(bool dsc);   // pipe 0 lit again from Linux's DSC table or its 3840x2160 one (applyMode)
 	bool dscLit { false };   // rdna4-dscboot: pipe 0 runs Linux's DSC test stream (coldStart); mode switches refused
 	bool readReceiverCaps(uint8_t aux, uint8_t (&caps)[16]);   // DPCD 0x000, or the extended block at 0x2200 (Linux's rule)
 	void readDscCaps(uint8_t aux, DpTrain::Sink &sink, const char *who);   // DPCD 1.4: the sink's DSC decoder, logged

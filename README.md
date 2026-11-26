@@ -142,7 +142,9 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 - A display plugged in after boot gets no accelerated display for it (they are counted at boot).
 - In the paravirtual mode (`rdna4-pvgpu=1`): no ray tracing, Metal heaps, argument buffers or indirect command buffers,
   and at most 16 textures a stage (so Chrome's WebGL via Dawn does not run). The native driver (the default) has these.
-- Display Stream Compression (DSC): 3840x2160 at 120 and 144 Hz.
+- Display Stream Compression (DSC) on its own: 3840x2160 at 144 Hz is offered on the DisplayPort boot display only
+  with `rdna4-dispclk=1400` and a 3840x2160 OpenCore console. Not on a second display, not in other DSC modes
+  (4K120), and not after the monitor is unplugged while it runs.
 - Variable refresh (FreeSync) by default: with `rdna4-vrr=1` it works on DisplayPort monitors, the boot display included
   (48-144 Hz on the rig's two), at the timings at the monitor's top rate (on a 4K144 monitor not yet at 4K: that needs
   DSC).
