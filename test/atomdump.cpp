@@ -1057,6 +1057,12 @@ struct PlanRegs {
 				return r.v;
 		return 0;
 	}
+	bool has(uint8_t seg, uint32_t dw) const {
+		for (const R &r : regs)
+			if (r.seg == seg && r.dw == dw)
+				return true;
+		return false;
+	}
 	void set(uint8_t seg, uint32_t dw, uint32_t v) {
 		for (R &r : regs)
 			if (r.seg == seg && r.dw == dw) {
@@ -1258,6 +1264,21 @@ static int testModeSet() {
 		hdmi2.to = t720;
 		failures += check(ModeSet::build(hdmi2, plan2, &why) && (sc = scdcStep(plan2, &at)) && sc->value == 0,
 		                  "modeset: back to 720p on an SCDC sink does not clear TMDS_CONFIG");
+	}
+
+	// The surface's pitch, written with the plane's size when the target has one (the boot pipe: the console's).
+	{
+		PlanRegs before;
+		before.run(plan);
+		ModeSet::Target pitched = t;
+		pitched.pitchPx = 1920;
+		static ModeSet::Plan plan3;
+		PlanRegs rp;
+		const bool built = ModeSet::build(pitched, plan3, &why);
+		rp.run(plan3);
+		failures += check(built && (rp.get(2, 0x0607) & 0xffff) == 1919 && !before.has(2, 0x0607),
+		                  "modeset: surface pitch 0x%x with a 1920-pixel target, written without one %d",
+		                  rp.get(2, 0x0607), before.has(2, 0x0607));
 	}
 
 	// Refusals: interlaced targets, more than 340 MHz without SCDC, more than
