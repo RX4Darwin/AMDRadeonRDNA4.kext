@@ -3361,7 +3361,15 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	// The one boot pipe there is a table for: the GOP's DisplayPort display on pipe 0 at its 4K timing. After a power
 	// loss it may have been switched to another mode since (2560x1440 on the native desktop, 2026-11-22: the cold start
 	// refused, neither display came back from sleep): lit at the table's timing, then switched back to that mode below.
-	const Edid::DetailedTiming wanted = liveTiming;
+	// A console smaller than the raster (the firmware's scaler stretches it: OpenCore's console resolution): the relit plane
+	// shows the table's full size at its pitch, so the console-sized mode macOS runs (Modes::stretchedConsole) is set after
+	// it instead (2026-11-26: rows of shrunken desktops behind a 1920x1080 console on the 4K Samsung).
+	const bool stretched = liveTiming.hActive > fbWidth || liveTiming.vActive > fbHeight;
+	const Modes::Mode *console = nullptr;
+	for (size_t i = 0; stretched && i < modeCount; i++)
+		if (modeTable[i].id == currentModeId && modeTable[i].t.hActive == fbWidth && modeTable[i].t.vActive == fbHeight)
+			console = &modeTable[i];
+	const Edid::DetailedTiming wanted = console ? console->t : liveTiming;
 	if (!pipe.valid() || pipe.otg != 0 || pipe.hubp != 0 || pipe.dig != 0 || pipe.link != 0 || pipe.hpd != 1 ||
 	    !bootDpLinkKnown || !pathForHpd(pipe.hpd, path) || !Pipe2::use(1, false, 0, true) ||
 	    (!coldBoot && !nearTiming(liveTiming, Pipe2::config().timing))) {
@@ -3579,6 +3587,7 @@ bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {
 	// DSCL_AUTOCAL.AUTOCAL_MODE: the firmware stretching a smaller console.
 	const uint32_t autocal = regReadDmu(2, 0x0d19 + dppOff());
 	t.scalerOff = autocal != 0xFFFFFFFF && (autocal & 0x3) != 0;
+	t.pitchPx = fbRowBytes / 4;   // the console's, the surface macOS draws the boot display into
 	return true;
 }
 
@@ -3785,7 +3794,7 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		                              !bootEdidMatches() || m.t.pixelClockKHz > dpSurfaceClockLimit())))
 			return kIOReturnUnsupported;
 		t.surface = larger ? dpPlaneMc : dpConsoleMc;
-		t.pitch = (larger ? dpSurface.rowBytes : fbRowBytes) / 4;
+		t.pitchPx = (larger ? dpSurface.rowBytes : fbRowBytes) / 4;
 	}
 	if (!reqTimingValid) {
 		reqTiming = bootTiming;
@@ -3844,7 +3853,7 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		const uint32_t viewport = regReadDmu(2, Pipe::Reg::kHubpViewportDim);
 		returnWidth = viewport & 0x3fff;
 		returnHeight = (viewport >> 16) & 0x3fff;
-		undo.pitch = max(returnPitch, static_cast<uint32_t>(liveTiming.hActive));
+		undo.pitchPx = max(returnPitch, static_cast<uint32_t>(liveTiming.hActive));
 		undo.dpMaxKHz = max(undo.dpMaxKHz, liveTiming.pixelClockKHz);
 		if ((regReadDmu(2, kMasterUpdateLock) & 1) || !surfaceLatched(returnMc, returnPitch, returnWidth, returnHeight) ||
 		    !ModeSet::build(undo, surfaceReturn, &why))
@@ -3858,7 +3867,7 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	bool applied = runPlan(modePlan);
 	uint64_t periodNs = 0;
 	if (applied && movePlane) {
-		applied = surfaceLatched(t.surface, t.pitch, m.t.hActive, m.t.vActive);
+		applied = surfaceLatched(t.surface, t.pitchPx, m.t.hActive, m.t.vActive);
 		periodNs = applied ? measureFramePeriodNs() : 0;
 		const uint64_t measured = periodNs ? 1000000000000ull / periodNs : 0;
 		const uint64_t expected = m.t.refreshMilliHz();

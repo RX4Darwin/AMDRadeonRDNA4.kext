@@ -1057,6 +1057,12 @@ struct PlanRegs {
 				return r.v;
 		return 0;
 	}
+	bool has(uint8_t seg, uint32_t dw) const {
+		for (const R &r : regs)
+			if (r.seg == seg && r.dw == dw)
+				return true;
+		return false;
+	}
 	void set(uint8_t seg, uint32_t dw, uint32_t v) {
 		for (R &r : regs)
 			if (r.seg == seg && r.dw == dw) {
@@ -1116,7 +1122,7 @@ static int testLargerDpSurface() {
 		t.vidM = ModeSet::dpVidM(mode.pixelClockKHz, 540000);
 		t.scalerOff = true;
 		t.surface = 0x12345000000ull;
-		t.pitch = uhd.hActive;
+		t.pitchPx = uhd.hActive;
 		ModeSet::Step dml[Pipe2::kMaxModeSteps];
 		t.extra = dml;
 		t.nextra = Pipe2::modeSteps(mode, dml, Pipe2::kMaxModeSteps);
@@ -1137,7 +1143,7 @@ static int testLargerDpSurface() {
 		const PlanRegs home = regs;
 		failures += check(ModeSet::capturePlane(rollback, PlanRegs::read, &regs), "surface: capture boot plane");
 		regs.run(forward);
-		failures += check(regs.get(2, 0x0607) == t.pitch - 1 && regs.get(2, 0x060a) == uint32_t(t.surface) &&
+		failures += check(regs.get(2, 0x0607) == t.pitchPx - 1 && regs.get(2, 0x060a) == uint32_t(t.surface) &&
 		                  regs.get(2, 0x060b) == t.surface >> 32 && regs.get(2, 0x05eb) ==
 		                  (uint32_t(mode.hActive) | (uint32_t(mode.vActive) << 16)), "surface: pitch, address and viewport");
 		regs.run(rollback);
@@ -1149,9 +1155,9 @@ static int testLargerDpSurface() {
 		}
 		regs.set(2, 0x0607, ~0u);
 		failures += check(!ModeSet::capturePlane(rollback, PlanRegs::read, &regs), "surface: unreadable pitch");
-		t.pitch = mode.hActive - 1;
+		t.pitchPx = mode.hActive - 1;
 		failures += check(!ModeSet::build(t, forward, nullptr), "surface: reject undersized pitch");
-		t.pitch = uhd.hActive;
+		t.pitchPx = uhd.hActive;
 		t.surface++;
 		failures += check(!ModeSet::build(t, forward, nullptr), "surface: reject misaligned address");
 	}
@@ -1320,6 +1326,21 @@ static int testModeSet() {
 		hdmi2.to = t720;
 		failures += check(ModeSet::build(hdmi2, plan2, &why) && (sc = scdcStep(plan2, &at)) && sc->value == 0,
 		                  "modeset: back to 720p on an SCDC sink does not clear TMDS_CONFIG");
+	}
+
+	// The surface's pitch, written with the plane's size when the target has one (the boot pipe: the console's).
+	{
+		PlanRegs before;
+		before.run(plan);
+		ModeSet::Target pitched = t;
+		pitched.pitchPx = 1920;
+		static ModeSet::Plan plan3;
+		PlanRegs rp;
+		const bool built = ModeSet::build(pitched, plan3, &why);
+		rp.run(plan3);
+		failures += check(built && (rp.get(2, 0x0607) & 0xffff) == 1919 && !before.has(2, 0x0607),
+		                  "modeset: surface pitch 0x%x with a 1920-pixel target, written without one %d",
+		                  rp.get(2, 0x0607), before.has(2, 0x0607));
 	}
 
 	// Refusals: interlaced targets, more than 340 MHz without SCDC, more than

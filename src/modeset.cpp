@@ -61,9 +61,9 @@ constexpr uint32_t kDpgStatus        = 0x185b;   // DOUBLE_BUFFER_PENDING [0]
 // HUBP / DPP
 constexpr uint32_t kPrimaryAddress     = 0x060a;
 constexpr uint32_t kPrimaryAddressHigh = 0x060b;
-constexpr uint32_t kSurfacePitch       = 0x0607;
 constexpr uint32_t kHubpViewportStart = 0x05e9;
 constexpr uint32_t kHubpViewportDim   = 0x05eb;  // WIDTH [13:0], HEIGHT [29:16]
+constexpr uint32_t kHubpSurfacePitch  = 0x0607;  // HUBPREQ DCSURF_SURFACE_PITCH: PITCH [15:0], pixels - 1
 constexpr uint32_t kHubpreqBlankOffset0 = 0x063b; // REFCYC_H_BLANK_END [12:0], DLG_V_BLANK_END [30:16]
 constexpr uint32_t kDsclSclMode       = 0x0d08;  // DSCL_MODE [2:0], 0 = bypass
 constexpr uint32_t kDsclControl       = 0x0d0a;  // SCL_BOUNDARY_MODE [0]
@@ -218,7 +218,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 		return false;
 	}
 	if (t.surface && (!t.dp || (t.surface & 255) || (t.surface >> 48) ||
-	                  t.pitch < t.to.hActive || t.pitch > 65536)) {
+	                  t.pitchPx < t.to.hActive || t.pitchPx > 65536)) {
 		err = "invalid scanout address or pitch";
 		return false;
 	}
@@ -452,6 +452,8 @@ bool build(const Target &t, Plan &out, const char **why) {
 	out.planeBegin = out.count;
 	b.write(kHubpViewportStart + hubp, 0, "viewport start");
 	b.write(kHubpViewportDim + hubp, sizeWH(w, h), "viewport size");
+	if (t.pitchPx && !t.surface)
+		b.update(kHubpSurfacePitch + hubp, 0xffff, t.pitchPx - 1, "surface pitch");
 	b.write(kHubpreqBlankOffset0 + hubp, dlgBlankEnd(t.to), "plane: where the blank ends");
 	// A console the firmware stretches (Target::scalerOff) would go on being
 	// scaled from the old ratio's settings: the scaler off, as
@@ -471,7 +473,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 	}
 	b.seg = 2;
 	if (t.surface) {
-		b.update(kSurfacePitch + hubp, 0xffff, t.pitch - 1, "surface pitch");
+		b.update(kHubpSurfacePitch + hubp, 0xffff, t.pitchPx - 1, "surface pitch");
 		b.update(kPrimaryAddressHigh + hubp, 0xffff, static_cast<uint32_t>(t.surface >> 32), "surface address high");
 		b.update(kPrimaryAddress + hubp, 0xffffff00, static_cast<uint32_t>(t.surface), "surface address low");
 	}

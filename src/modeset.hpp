@@ -127,9 +127,10 @@ struct Target {
 	// otherwise: at the monitor's native size the firmware runs the scaler
 	// 1:1 (DSCL_MODE 1), and its request timing goes with that.
 	bool        scalerOff;
-	// A zero address keeps the current plane. pitch is in 32-bit pixels.
+	// Optional surface pitch in pixels, including for a stretched boot console after relight.
+	uint32_t    pitchPx;
+	// A zero address keeps the current plane base.
 	uint64_t    surface;
-	uint32_t    pitch;
 };
 
 // The first DP_VID_M (against a DP_VID_N of 0x8000) of a stream on a link with
