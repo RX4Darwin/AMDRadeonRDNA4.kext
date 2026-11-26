@@ -77,7 +77,18 @@ with 0 errors.
 Next for 144 Hz: a reference from a working driver. The rig has no Linux any more (Windows and macOS only), and reading DCN
 registers under Windows needs a kernel tool (RW-Everything's driver is on Microsoft's blocklist). The plan: one boot of a Linux
 live USB (kernel 6.13 or later) with the Samsung at 3840x2160@144, `sudo bash tools/linux/linux-capture.sh --snap-only`, and the
-dump diffed against pipe2_linux_p0_dp1_dsc144.inc. Sunneva, 2026-11-26: not now.
+dump diffed against pipe2_linux_p0_dp1_dsc144.inc.
+
+Done 2026-11-26, on a Fedora install on the rig (kernel 7.3.4): Linux shows a clean picture at 3840x2160@144, the same
+raster and link as ours (1332.75 MHz, four HBR3 lanes, 960x108 slices, 16 bpp, one pipe, no ODM). The full capture script
+froze the machine twice; tools/linux/dsc-snap.py read the table's 248 registers (test/ref/dsc_linux_4k144_snapshot.txt) and
+tools/linux/dsc-diff.py compared them: 193 the same, 52 differ. Not causes: DSC_VERSION_MAJOR (Linux never writes it, the
+hardware reads 1), audio and DRR (on under Linux), the tiled 10-bit desktop surface. Candidates:
+- the plane's memory side: Linux has 18 DET segments to our 14 and other TTU/prefetch/VSTARTUP values; at 4K144 the plane
+  reads about 4.8 GB/s, from a linear surface on macOS. An underflow corrupts whole compressed slices (noise). The DSC test
+  now logs the planes' and OPTC0's underflow flags.
+- 10 bpc under Linux (FMT, DP_PIXEL_FORMAT, the encoder and its RC parameters), 8 in our table; 8 works at 4K60.
+- DSCL line buffer partitions (Linux 5, ours 0) and the DPP clock DTO (Linux 247/255).
 
 ## Notes
 
