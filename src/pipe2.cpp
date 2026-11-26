@@ -114,6 +114,16 @@ namespace P0Hpd1Uhd {
 #include "pipe2_linux_p0_dp1_uhd.inc"
 }
 
+namespace P0Hpd1Dsc144 {
+#include "pipe2_linux_p0_dp1_dsc144.inc"
+}
+namespace P0Hpd1Dsc60 {
+#include "pipe2_linux_p0_dp1_dsc60.inc"
+}
+namespace P0Hpd1Hi {
+#include "pipe2_linux_p0_dp1_hi.inc"
+}
+
 namespace P1Hpd3Uhd {
 #include "pipe2_linux_p1_hpd3_uhd.inc"
 }
@@ -288,6 +298,14 @@ constexpr Table kTables[] = {
 };
 constexpr size_t kTableCount = sizeof(kTables) / sizeof(kTables[0]);
 
+// Not in kTables: one mode and no mode registers, and use() must never pick it (useDsc()).
+constexpr Table kDscTable = { P0Hpd1Dsc144::kConfig, P0Hpd1Dsc144::kGen, sizeof(P0Hpd1Dsc144::kGen) / sizeof(Gen), nullptr, 0,
+                              P0Hpd1Dsc144::kModeTimings, 1, nullptr, P0Hpd1Dsc144::kAux, countOf(P0Hpd1Dsc144::kAux), nullptr, 0 };
+// The same at the GOP's 3840x2160@60 (533.25 MHz, one pixel a cycle), DSC forced on: a card test that tells the DSC set-up
+// from the 144 Hz rate.
+constexpr Table kDsc60Table = { P0Hpd1Dsc60::kConfig, P0Hpd1Dsc60::kGen, sizeof(P0Hpd1Dsc60::kGen) / sizeof(Gen), nullptr, 0,
+                                P0Hpd1Dsc60::kModeTimings, 1, nullptr, P0Hpd1Dsc60::kAux, countOf(P0Hpd1Dsc60::kAux), nullptr, 0 };
+
 const Table *cur = &kTables[0];   // the table in use (use())
 
 // DIGn_HDMI_CONTROL: DATA_SCRAMBLE_EN and CLOCK_CHANNEL_RATE are the mode
@@ -369,6 +387,11 @@ bool use(uint8_t hpd, bool tmds, uint8_t pipe, bool uhd, bool y420) {
 	cur = fallback;
 	return true;
 }
+
+// 3840x2160 at 729 MHz (82 Hz) uncompressed on HBR3: the DIG two pixels a cycle without DSC (rdna4-dscboot=3).
+constexpr Table kHiTable = { P0Hpd1Hi::kConfig, P0Hpd1Hi::kGen, sizeof(P0Hpd1Hi::kGen) / sizeof(Gen), nullptr, 0,
+                             P0Hpd1Hi::kModeTimings, 1, nullptr, P0Hpd1Hi::kAux, countOf(P0Hpd1Hi::kAux), nullptr, 0 };
+void useDsc(int variant) { cur = variant == 2 ? &kDsc60Table : variant == 3 ? &kHiTable : &kDscTable; }
 
 bool isUhd(const Config &c) { return c.timing.hActive >= kUhdWidth; }
 

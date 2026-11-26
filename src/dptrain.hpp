@@ -40,6 +40,7 @@ constexpr uint8_t kRbr = 0x06, kHbr = 0x0a, kHbr2 = 0x14, kHbr3 = 0x1e;
 struct Link {
 	uint8_t lanes;   // 1, 2 or 4
 	uint8_t rate;    // kRbr .. kHbr3
+	bool    fec;     // forward error correction (a DSC stream needs it): made ready on both ends before training
 };
 
 // The symbol clock of a rate (what the transmitter is enabled with), and what
@@ -109,6 +110,7 @@ struct Io {
 	bool (*pattern)(void *ctx, Pattern p);          // what the transmitter sends
 	bool (*drive)(void *ctx, uint8_t lane, uint8_t swing, uint8_t preEmphasis);   // one lane, levels 0..3
 	void (*delayUs)(void *ctx, uint32_t us);
+	bool (*fecReady)(void *ctx, bool ready);        // the link encoder's FEC ready (Link::fec only)
 };
 
 enum class Result : uint8_t {

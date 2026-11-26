@@ -42,6 +42,8 @@ size_t configureSteps(uint8_t link, uint8_t lanes, ModeSet::Step *out);
 size_t patternSteps(uint8_t link, DpTrain::Pattern p, ModeSet::Step *out);
 // After the transmitter is disabled.
 size_t offSteps(uint8_t link, ModeSet::Step *out);
+// FEC ready on the link encoder (enc2_fec_set_ready), during training, after the sink's FEC_READY.
+size_t fecReadySteps(uint8_t link, bool ready, ModeSet::Step *out);
 
 // Once the link is trained and before the stream is unblanked: the link
 // encoder's back end in DisplayPort mode and on, stream encoder `dig` clocked

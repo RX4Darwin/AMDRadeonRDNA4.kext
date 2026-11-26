@@ -3100,6 +3100,11 @@ DpTrain::Result RDNA4Device::trainLink(uint8_t aux, uint8_t link, uint8_t hpd, u
 		DpPhy::buildDrive(cmd, x->link, x->hpd, x->conn, x->settings, swing, preEmphasis);
 		return x->dmub(cmd);
 	};
+	io.fecReady = [](void *c, bool ready) {
+		auto *x = static_cast<Ctx *>(c);
+		ModeSet::Step s[DpPhy::kMaxSteps];
+		return x->steps(s, DpPhy::fecReadySteps(x->link, ready, s));
+	};
 	io.delayUs = [](void *, uint32_t us) {
 		if (us >= 10000)
 			IOSleep(us / 1000);
@@ -3288,9 +3293,12 @@ void RDNA4Device::extraAuxPadsAfterPowerLoss() {
 }
 
 bool RDNA4Device::coldStart(uint32_t &relight) {
-	uint32_t on = 0;
+	uint32_t on = 0, dscBoot = 0;
 	relight = 0;
-	if ((!Trial::option("rdna4-dcninit", on) || !on) && !coldBoot)
+	// rdna4-dscboot=1: the card test of DSC (docs/dsc-plan.md): the cold start lights pipe 0 again from Linux's DSC
+	// table at 3840x2160@144 on four HBR3 lanes (DISPCLK and DPPCLK raised with rdna4-dispclk=1400 first).
+	(void)Trial::option("rdna4-dscboot", dscBoot);
+	if ((!Trial::option("rdna4-dcninit", on) || !on) && !coldBoot && !dscBoot)
 		return false;
 	ExtraHold hold(*this);
 	if (!uhdClocks) {   // a cold start's order: the 4K boot display lit on the kext's clocks, not the GOP's
@@ -3372,6 +3380,18 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	boot.aux = sinkAuxInst;
 	boot.sink = bootDpSink;
 	boot.link = bootDpLink;
+	if (dscBoot) {
+		if ((dscBoot != 3 && !bootDpSink.hasDsc) || bootDpSink.maxRate < DpTrain::kHbr3 || bootDpSink.maxLanes < 4) {
+			FBLOG("dscboot: not run: the boot display has no DSC decoder or no four HBR3 lanes (DSC %d, rate 0x%02x x%u)",
+			      bootDpSink.hasDsc, bootDpSink.maxRate, bootDpSink.maxLanes);
+			useSlotTable();
+			return false;
+		}
+		boot.link = DpTrain::Link { 4, DpTrain::kHbr3, dscBoot != 3 };
+		FBLOG("dscboot: pipe 0 to be lit again (test %u: %s) on four HBR3 lanes (DISPCLK target %u kHz)", dscBoot,
+		      dscBoot == 2 ? "3840x2160@60, DSC forced" : dscBoot == 3 ? "3840x2160 at 729 MHz, no DSC" : "3840x2160@144, DSC",
+		      dispclkTargetKHz());
+	}
 	boot.target.connectorObjId = connector;
 	xpOverride = &boot;
 
@@ -3382,7 +3402,7 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	t.connectorObjId = connector;
 	t.surface = surface;
 	t.depth = Pipe2::Depth::Plane;
-	t.linkRate = bootDpLink.rate;
+	t.linkRate = boot.link.rate;
 	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
 	static ModeSet::Step init[256], otgStop[16];
 	size_t ninit = 0, notg = 0;
@@ -3428,8 +3448,48 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	if (ok)
 		breadcrumb("cold start: boot pipe light");
 	t.part = Pipe2::Part::Light;
+	if (dscBoot)
+		Pipe2::useDsc(static_cast<int>(dscBoot));
 	ok = ok && Pipe2::build(t, *plan, &why) &&
 	     runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dcninit: light", otgOff(), plan->aux);
+	if (ok && dscBoot) {
+		uint8_t status[2] {}, enabled = 0;
+		const bool read = dpcdRead(sinkAuxInst, 0x20f, status, sizeof(status)) && dpcdRead(sinkAuxInst, 0x160, &enabled, 1);
+		FBLOG("dscboot: lit: sink DSC_ENABLE 0x%02x, DSC_STATUS 0x%02x (bit 0: RC buffer under-run, 1: overflow, 2: chunk "
+		      "length error)%s", enabled, status[0], read ? "" : " (not read)");
+		// The status bits are sticky: what the sink saw while DSC was turned on before its PPS came. Cleared (written
+		// back as ones, in case the sink clears them that way, and read, in case reading does), then read 1 s and 3 s on.
+		const uint8_t clear = 0x07;
+		uint8_t later[2] {};
+		(void)dpcdWrite(sinkAuxInst, 0x20f, &clear, 1);
+		for (int i = 0; i < 2; i++) {
+			IOSleep(i ? 2000 : 1000);
+			const bool r = dpcdRead(sinkAuxInst, 0x20f, &later[i], 1);
+			FBLOG("dscboot: DSC_STATUS %u s after clearing: 0x%02x%s", i ? 3u : 1u, later[i], r ? "" : " (not read)");
+			// What each block of the chain says (card diagnosis, rdna4-dscboot only).
+			static const struct { uint8_t seg; uint16_t dword; const char *name; } kRegs[] = {
+				{ 2, 0x008a, "DOMAIN16_PG_STATUS" }, { 1, 0x006c, "DSCCLK0_DTO_PARAM" }, { 1, 0x00a7, "DSCCLK_DTO_CTRL" },
+				{ 2, 0x3000, "DSC_TOP0_DSC_TOP_CONTROL" }, { 2, 0x3005, "DSCCIF0_DSCCIF_CONFIG0" },
+				{ 2, 0x300a, "DSCC0_DSCC_CONFIG0" }, { 2, 0x300d, "DSCC0_DSCC_STATUS" },
+				{ 2, 0x3010, "DSCC0_DSCC_INTERRUPT_STATUS0" }, { 2, 0x3013, "DSCC0_DSCC_PPS_CONFIG1" },
+				{ 2, 0x1a64, "DSCRM0_DSCRM_DSC_FORWARD_CONFIG" }, { 2, 0x1acc, "ODM0_OPTC_DATA_FORMAT_CONTROL" },
+				{ 2, 0x1acd, "ODM0_OPTC_BYTES_PER_PIXEL" }, { 2, 0x1ace, "ODM0_OPTC_WIDTH_CONTROL" },
+				{ 2, 0x211f, "DP0_DP_PIXEL_FORMAT" }, { 2, 0x2122, "DP0_DP_VID_STREAM_CNTL" },
+				{ 2, 0x212d, "DP0_DP_DPHY_CNTL" }, { 2, 0x2141, "DP0_DP_SEC_CNTL" }, { 2, 0x209b, "DIG0_DIG_FIFO_CTRL0" },
+			};
+			for (const auto &g : kRegs)
+				FBLOG("dscboot:   %-32s 0x%08x", g.name, regReadDmu(g.seg, g.dword));
+			uint8_t fec[3] {}, fecCfg = 0, fecCap = 0;
+			(void)dpcdRead(sinkAuxInst, 0x280, fec, sizeof(fec));
+			(void)dpcdRead(sinkAuxInst, 0x120, &fecCfg, 1);
+			(void)dpcdRead(sinkAuxInst, 0x090, &fecCap, 1);
+			FBLOG("dscboot:   sink FEC_CAPABILITY 0x%02x FEC_CONFIGURATION 0x%02x FEC_STATUS 0x%02x, error count 0x%02x%02x",
+			      fecCap, fecCfg, fec[0], fec[2], fec[1]);
+		}
+		dscLit = true;
+		liveTiming = reqTiming = Pipe2::config().timing;
+		liveTimingValid = reqTimingValid = true;
+	}
 	xpOverride = nullptr;
 	if (plan)
 		IOFree(plan, sizeof(Pipe2::Plan));
@@ -3439,7 +3499,7 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	FBLOG("dcninit: %s%s%s; OTG0 measured %u.%03u Hz, HUBP0_DCHUBP_CNTL 0x%08x", ok ? "boot pipe lit again" : "FAILED",
 	      *why ? ": " : "", why, mHz / 1000, mHz % 1000, regReadDmu(2, 0x05f4));
 	// Lit at the table's timing, with the table's request timing: the mode it ran before the power loss set again.
-	if (ok && !nearTiming(wanted, table)) {
+	if (ok && !dscLit && !nearTiming(wanted, table)) {
 		liveTiming = reqTiming = table;
 		liveTimingValid = reqTimingValid = true;
 		const IOReturn back = applyMode(Modes::Mode { currentModeId, wanted, wanted.refreshMilliHz(), false, Modes::SourceBoot });
@@ -3471,6 +3531,10 @@ bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {
 }
 
 IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
+	if (dscLit) {
+		FBLOG("modes: switch to id %u refused: the boot display runs the DSC test stream (rdna4-dscboot)", m.id);
+		return kIOReturnUnsupported;
+	}
 	if (bootReleased) {
 		FBLOG("modes: switch to id %u refused: the boot pipe is released, its connector is a head's", m.id);
 		return kIOReturnUnsupported;
@@ -4003,6 +4067,10 @@ void RDNA4Device::readDscCaps(uint8_t aux, DpTrain::Sink &sink, const char *who)
 	      "colour formats 0x%02x depths 0x%02x, %u/%u MPixels/s, bpp step 1/%u", who, aux, c.version & 0xf, c.version >> 4,
 	      c.rcBufferBytes, c.sliceCaps1, c.sliceCaps2, c.maxSliceWidth, c.lineBufferBits, c.blockPrediction ? ", block prediction" : "",
 	      c.colorFormats, c.colorDepths, c.throughputMode0, c.throughputMode1, c.bppIncrementDiv);
+	char hex[33];
+	for (int i = 0; i < 16; i++)
+		snprintf(hex + 2 * i, 3, "%02x", dsc[i]);
+	FBLOG("%s: DSC caps (DPCD 0x060..0x06F) %s", who, hex);
 }
 
 // The smallest link of the sink's that carries a mode at 8 bpc: what the next

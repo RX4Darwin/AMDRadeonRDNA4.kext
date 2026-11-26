@@ -1,6 +1,6 @@
 # Display Stream Compression (DSC), plan
 
-Status, 2026-11-26: steps 1 and 2 done, step 3's reference and register values done (host-tested); host-only by Sunneva's choice. The rig's Samsung reports DPCD 1.2 / HBR2 (17.3 Gbit/s) over
+Status, 2026-11-26: steps 1-3 done on the host; on the card DSC WORKS at 3840x2160@60 (forced on), 3840x2160@144 shows noise (below). The rig's Samsung reports DPCD 1.2 / HBR2 (17.3 Gbit/s) over
 DisplayPort and has no DP 1.4 setting, though its EDID lists 3840x2160@120 (1188 MHz): it cannot take DSC, so nothing here
 can run on the card until someone with a DP 1.4 DSC monitor tries it.
 
@@ -46,6 +46,37 @@ compresses the stream (to 8-12 bits per pixel) so both fit. The README lists it 
    (`dp-modes-above-boot`) counts the compressed rate; `modes.cpp` offers 4K 120/144 only when the sink has DSC and the link fits.
 5. **On a card, later:** needs a DP 1.4 DSC monitor: the mode, a still and a moving picture, display sleep/wake, mode switches
    back to 60 Hz; underflow checks (`logUnderflow`).
+
+## Card tests (2026-11-26, rig: the Samsung on DP0)
+
+The Samsung is DSC-capable after all: its DPCD 0x000 says 1.2 / HBR2 for old sources, the extended block at 0x2200 says 1.4 /
+HBR3 (the kext reads it since fb3348c, as Linux does), and DPCD 0x060 has a DSC 1.2 decoder (`012100762b010100000f0e0108000000`:
+slices 1/2/4/8 up to 2560 wide, 10-bit line buffer, block prediction, 340 MP/s a slice). `rdna4-dscboot=<n>` (with
+`rdna4-dispclk=1400`, which also raises DPPCLK; the card's DISPCLK/DPPCLK go to 2 GHz) lets the cold start light pipe 0 again from
+one of three Linux tables (tools/gen/pipegen/run.sh, the sink's caps from `PIPEGEN_DSC_CAPS`) on four HBR3 lanes:
+
+| test | stream | the Samsung (Sunneva's eyes) | sink DSC_STATUS after clearing |
+|---|---|---|---|
+| 1 | 3840x2160@144 (1332.75 MHz), DSC 4 slices, 16 bpp | **noise** (5 boots, with each fix below) | 0x07 (chunk-length error stays) |
+| 2 | 3840x2160@60 (533.25 MHz), DSC forced, 2 slices | **normal picture** | 0x03 |
+| 2 | the same with 4 slices (the 2-slice caps bit hidden) | **normal picture** | 0x03 |
+| 3 | 3840x2160 at 729 MHz (82 Hz), no DSC | black (the monitor may just refuse 82 Hz) | - |
+
+So the DSC set-up is right: engine, PPS packets, FEC, DSC_ENABLE, our HBR3 training, 2 and 4 slices. Bits 0-1 of DSC_STATUS stay
+set on this sink with a good picture; bit 2 (chunk-length error) is the one that tells a broken stream. What fails is the
+high-pixel-rate path: above DPREFCLK (720 MHz) Linux runs the DIG at two pixels a cycle (`dcn401_build_pipe_pix_clk_params`), the
+DP DTO gets an integer part, DP_VID_TIMING its N interval. Test 3 meant to tell that path from DSC; its black screen does not.
+
+Fixes found on the way (all in the generator, kept): `dcn401_init_hw` power-gates the DSC engines and only the full commit
+(`dcn32_update_dsc_pg`) ungates them: the "dsc" scenario now does; FEC ready is set inside training at Linux's point (after the
+sink is in D0), by `DpTrain` for a `Link::fec`; pipegen took one pixel a cycle for every DP stream, Linux's rule is now used
+(no existing table changes: they are all below 720 MHz). Register dump of a 144 Hz boot: DSC powered, clocked, forwarding to OPP0,
+no overflow; OPTC DSC mode, 2.0 bytes per pixel, 960-pixel slices; encoder told "compressed"; FEC active, the sink decodes FEC
+with 0 errors.
+
+Next for 144 Hz: a test of the two-pixel path the monitor surely accepts (4K120 at 1188 MHz with DSC is the same path; an
+uncompressed mode above 720 MHz from the EDID needs more than HBR3 has), and reading what the GOP or Windows program for this
+monitor at 144 Hz (the rig boots Windows) to compare with Linux's sequence.
 
 ## Notes
 

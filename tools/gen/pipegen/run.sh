@@ -100,6 +100,7 @@ table() {
 	out=$1; shift
 	pre=""
 	if [ "$1" = dplink ]; then pre="$1 $2 $3 $4"; shift 4; fi
+	if [ "$1" = dsc ]; then pre="$pre $1"; shift; fi
 	if [ "$1" = dpdual ]; then pre="$1"; shift; fi
 	if [ "$1" = y420 ]; then pre="$pre $1"; shift; fi
 	# shellcheck disable=SC2086
@@ -122,7 +123,7 @@ table() {
 			grep -q 'DML: mode not supported' "$B/mode.err" || { cat "$B/mode.err" >&2; exit 1; }
 			echo "modes.txt: DML does not support${line##*#}: it stays on the 25 % rule"
 		fi
-	done < <(cat "$here/modes.txt" ${MODES_MORE:+"$here/$MODES_MORE"})
+	done < <([ -n "${MODES_NONE:-}" ] || cat "$here/modes.txt" ${MODES_MORE:+"$here/$MODES_MORE"})
 
 	# A 4:2:0 table also gets what changes with the encoding: the same pipe and timing lit in RGB.
 	rgb=""
@@ -176,6 +177,15 @@ if [ $# -eq 0 ]; then
 	# lights it again after the display hardware was started from nothing (src/dcninit.cpp, rdna4-dcninit).
 	# Its own monitor's modes besides modes.txt (MODES_MORE): the boot display's mode switches use this table's.
 	MODES_MORE=modes-boot-dp.txt table pipe2_linux_p0_dp1_uhd.inc   dplink a 0 0  0 0 0 1  3840 48 32 80  2160 3 5 54  533250 1 0 0
+	# The card tests of DSC (rdna4-dscboot, docs/dsc-plan.md): pipe 0 lit again by the cold start for the rig's Samsung (its
+	# DPCD 0x060 DSC caps) on four HBR3 lanes, one mode each: 1 = 3840x2160@144 with DSC; 2 = 3840x2160@60 with DSC forced
+	# on and four slices (the 2-slice caps bit hidden); 3 = 3840x2160 at 729 MHz without DSC (two pixels a cycle).
+	PIPEGEN_DSC_CAPS=012100762b010100000f0e0108000000 MODES_NONE=1 \
+		table pipe2_linux_p0_dp1_dsc144.inc  dplink d 0 0 dsc  0 0 0 1  3840 48 32 80  2160 3 5 146  1332750 1 0 0
+	PIPEGEN_DSC_CAPS=0121007629010100000f0e0108000000 PIPEGEN_DSC_FORCE=1 MODES_NONE=1 \
+		table pipe2_linux_p0_dp1_dsc60.inc   dplink d 0 0 dsc  0 0 0 1  3840 48 32 80  2160 3 5 54  533250 1 0 0
+	PIPEGEN_DP_LINK="4 30" MODES_NONE=1 \
+		table pipe2_linux_p0_dp1_hi.inc      dplink a 0 0  0 0 0 1  3840 48 32 80  2160 3 5 54  729000 1 0 0
 else
 	table pipe2_linux.inc "$@"
 fi

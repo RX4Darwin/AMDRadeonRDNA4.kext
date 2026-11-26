@@ -235,8 +235,12 @@ static void sink_reset(const struct cfg *c)
 	if (c->sink_kind == 'd') {     /* kind a with a DSC 1.2 decoder and FEC (dscgen.c's first sink) */
 		static const uint8_t dsc[16] = { 0x01, 0x21, 0x00, 0x05, 0x2b, 0x00, 0x01, 0x00,
 						 0x00, 0x07, 0x06, 0x11, 0x08, 0x00, 0x00, 0x00 };
+		const char *caps = getenv("PIPEGEN_DSC_CAPS");   /* a real sink's DPCD 0x060-0x06F, 32 hex digits */
+
 		g_dpcd[0x000] = 0x14; g_dpcd[0x003] = 0x81;
 		memcpy(&g_dpcd[0x060], dsc, sizeof(dsc));
+		for (int i = 0; caps && i < 16 && sscanf(caps + 2 * i, "%2hhx", &g_dpcd[0x060 + i]) == 1; i++)
+			;
 		g_dpcd[0x090] = 0x01;                                 /* FEC_CAPABLE */
 	}
 	g_sink_swing = c->sink_swing; g_sink_pre = c->sink_pre;
@@ -445,7 +449,14 @@ static void make_state(const struct cfg *c)
 	pipe->stream_res.pix_clk_params.color_depth = COLOR_DEPTH_888;
 	pipe->stream_res.pix_clk_params.pixel_encoding = c->t.pixel_encoding;
 	/* dcn401_build_pipe_pix_clk_params: a 4:2:0 TMDS stream enters the DIG two pixels a cycle */
-	pipe->stream_res.pix_clk_params.dio_se_pix_per_cycle = c->y420 ? 2 : 1;
+	/* dcn401_build_pipe_pix_clk_params: a DisplayPort stream enters the DIG 2, 4 or 8 pixels a cycle above 1, 2 or 4
+	 * times DPREFCLK (720 MHz, g_clk_mgr) */
+	{
+		const unsigned khz = c->t.pix_clk_100hz / 10, ref = 720000;
+
+		pipe->stream_res.pix_clk_params.dio_se_pix_per_cycle = c->y420 ? 2 : !c->dp ? 1 :
+			khz > 4 * ref ? 8 : khz > 2 * ref ? 4 : khz > ref ? 2 : 1;
+	}
 	pipe->pll_settings.actual_pix_clk_100hz = pipe->stream_res.pix_clk_params.requested_pix_clk_100hz;
 	pipe->pll_settings.adjusted_pix_clk_100hz = pipe->stream_res.pix_clk_params.requested_pix_clk_100hz;
 	pipe->pll_settings.calculated_pix_clk_100hz = pipe->stream_res.pix_clk_params.requested_pix_clk_100hz;
@@ -527,6 +538,21 @@ static void sequence(const struct cfg *c)
 	 * the firmware's own start-up skipped the ones it did not light. The link encoder's hw_init is left out:
 	 * it programs the AUX channel, which a TMDS link does not use and whose instance is board wiring. */
 	rec_mark("begin:init", 0);
+	if (pipe->stream_res.dsc) {
+		/* dcn32_update_dsc_pg, as the commit runs it before the stream: the engine taken out of the power gating
+		 * dcn401_init_hw leaves every DSC domain in (DOMAIN16 + engine; DOMAIN_PGFSM_PWR_STATUS 2 = gated), through the
+		 * IP request window, open as the GOP leaves it (the plan requires that further down) */
+		const uint32_t status[4] = { hwseq_reg.DOMAIN16_PG_STATUS, hwseq_reg.DOMAIN17_PG_STATUS,
+					     hwseq_reg.DOMAIN18_PG_STATUS, hwseq_reg.DOMAIN19_PG_STATUS };
+		const int inst = pipe->stream_res.dsc->inst;
+
+		rec_poke_field(status[inst], DOMAIN16_PG_STATUS__DOMAIN_PGFSM_PWR_STATUS_MASK, 2u << 30);
+		rec_poke_field(hwseq_reg.DC_IP_REQUEST_CNTL, DC_IP_REQUEST_CNTL__IP_REQUEST_EN_MASK,
+			       DC_IP_REQUEST_CNTL__IP_REQUEST_EN_MASK);
+		rec_poll("dcn32_dsc_pg_control", status[inst], DOMAIN16_PG_STATUS__DOMAIN_PGFSM_PWR_STATUS_MASK, 0, 1000);
+		g_new->res_ctx.is_dsc_acquired[inst] = true;
+		dcn32_update_dsc_pg(dc, g_new, false);
+	}
 	g_pool.mpc->funcs->mpc_init_single_inst(g_pool.mpc, c->pipe);
 	pipe->stream_res.tg->funcs->tg_init(pipe->stream_res.tg);
 
@@ -819,8 +845,9 @@ static void dsc_choose(struct cfg *c)
 	g_clk_mgr.funcs = &funcs;
 	g_dc.caps.max_odm_combine_factor = 4;
 	dc_dsc_get_default_config_option(&g_dc, &opt);
+	opt.force_dsc_when_not_needed = getenv("PIPEGEN_DSC_FORCE") != NULL;   /* a test: DSC on a stream that fits without */
 	if (!dc_dsc_parse_dsc_dpcd(&g_dc, &g_dpcd[0x060], no_branch, &caps) ||
-	    dc_bandwidth_in_kbps_from_timing(&c->t, DC_LINK_ENCODING_DP_8b_10b) <= kbps ||
+	    (!opt.force_dsc_when_not_needed && dc_bandwidth_in_kbps_from_timing(&c->t, DC_LINK_ENCODING_DP_8b_10b) <= kbps) ||
 	    !dc_dsc_compute_config(g_pool.dscs[c->pipe], &caps, &opt, kbps, &c->t, DC_LINK_ENCODING_DP_8b_10b, &c->dsc_cfg)) {
 		fprintf(stderr, "DSC: not used on this link (the stream fits uncompressed, or no configuration fits)\n");
 		exit(1);

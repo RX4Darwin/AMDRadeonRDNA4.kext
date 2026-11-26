@@ -17,7 +17,7 @@ constexpr uint32_t kLinkCntl           = 0x211e;   // DP_LINK_TRAINING_COMPLETE 
 constexpr uint32_t kConfig             = 0x2121;   // DP_UDI_LANES [1:0] = lanes - 1
 constexpr uint32_t kDphyInternalCtrl   = 0x2125;   // the alternative scrambler reset of an eDP panel: none
 constexpr uint32_t kLinkFramingCntl    = 0x2129;   // IDLE_BS_INTERVAL [17:0], VBID_DISABLE [24], ENHANCED_FRAME_MODE [28]
-constexpr uint32_t kDphyCntl           = 0x212d;   // DPHY_BYPASS [16]
+constexpr uint32_t kDphyCntl           = 0x212d;   // DPHY_FEC_READY_SHADOW [5], DPHY_FEC_EN [4], DPHY_BYPASS [16]
 constexpr uint32_t kDphyTrainingPattern = 0x212e;  // 0..3 = TPS1..TPS4
 constexpr uint32_t kDphyPrbsCntl       = 0x2133;   // DPHY_PRBS_EN [0]
 constexpr uint32_t kDphyScramCntl      = 0x2134;   // SCRAMBLER_ADVANCE [4], SCRAMBLER_BS_COUNT [17:8]
@@ -83,6 +83,12 @@ size_t offSteps(uint8_t link, ModeSet::Step *out) {
 	s.write(kDphyTrainingPattern, 0, "dp training pattern");
 	s.update(kLinkCntl, 1u << 4, 0, "dp link training complete");
 	s.write(kDphyInternalCtrl, 0, "dp panel mode");
+	return s.n;
+}
+
+size_t fecReadySteps(uint8_t link, bool ready, ModeSet::Step *out) {
+	Steps s { out, link * kStride };
+	s.update(kDphyCntl, 1u << 5, ready ? 1u << 5 : 0, "dp fec ready");
 	return s.n;
 }
 

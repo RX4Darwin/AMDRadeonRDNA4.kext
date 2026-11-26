@@ -22,6 +22,7 @@ constexpr uint32_t kChannelCodingSet      = 0x108;
 constexpr uint32_t kSinkCount             = 0x200;
 constexpr uint32_t kLane01Status          = 0x202;   // .. 0x207: status, alignment, sink status, adjust requests
 constexpr uint32_t kSetPower              = 0x600;
+constexpr uint32_t kFecConfiguration      = 0x120;   // [0] FEC_READY
 
 constexpr uint8_t kMaxLevel = 3;
 // A lane's pre-emphasis is limited by its voltage swing (voltage_swing_to_pre_emphasis).
@@ -115,8 +116,13 @@ struct Trainer {
 				crUs = (interval & 0x7f) ? (interval & 0x7f) * 4000u : 400;
 		}
 
-		// dpcd_exit_training_mode, dpcd_configure_channel_coding, dpcd_set_link_settings
-		if (!write1(kTrainingPatternSet, 0) || !write1(kChannelCodingSet, 0x01) ||   // 8b/10b
+		// dpcd_exit_training_mode; dp_set_fec_ready (the sink's FEC_READY, then the link encoder's), as Linux does before
+		// the link settings; dpcd_configure_channel_coding, dpcd_set_link_settings
+		if (!write1(kTrainingPatternSet, 0))
+			return Result::Io;
+		if (link.fec && (!write1(kFecConfiguration, 0x01) || !io.fecReady || !io.fecReady(io.ctx, true)))
+			return Result::Io;
+		if (!write1(kChannelCodingSet, 0x01) ||                                       // 8b/10b
 		    !write1(kDownspreadCtrl, 0x10) ||                                       // 0.5 % down-spread
 		    !write1(kLaneCountSet, static_cast<uint8_t>(link.lanes | 0x80)) ||      // enhanced framing
 		    !write1(kLinkBwSet, link.rate))

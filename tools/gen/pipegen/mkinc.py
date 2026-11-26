@@ -57,6 +57,13 @@ if dp:
     SHARED['DTBCLK_P_CNTL'] = 0x7 << (3 * pipe)                # DTBCLK_Pn_SRC_SEL, _EN
     SHARED['DCCG_GATE_DISABLE_CNTL5'] = 1 << pipe              # DTBCLK_Pn_GATE_DISABLE
     SHARED['DCCG_GATE_DISABLE_CNTL3'] = 0x3 << (8 + 2 * pipe) | 0x3 << (20 + 2 * pipe)   # SYMCLK32_SEn, _LEn gates
+# A compressed stream (pipegen's "dsc" scenario, told by its requirement): the pipe's own DSC engine (Linux gives pipe n
+# engine n) and its DSCCLK DTO, and its enable bit in the DTO control.
+dsc = any(p[0] == 'MARK' and p[1] == 'require:dsc_off' for p in lines)
+if dsc:
+    OWN += [f'DSC_TOP{pipe}_', f'DSCCIF{pipe}_', f'DSCC{pipe}_', f'DSCRM{pipe}_', f'DSCCLK{pipe}_DTO_PARAM',
+            f'DOMAIN{16 + pipe}_PG_']
+    SHARED['DSCCLK_DTO_CTRL'] = 1 << pipe                      # DSCCLKn_EN
 SOURCE_OUI = bytes([0x00, 0x00, 0x1a])
 # Two things in a DisplayPort trace are not the same on every link or in every mode, and the plan works them
 # out when it runs (src/pipe2.cpp): the first DP_VID_M, 0x8000 x pixel clock / the link's symbol clock, before
@@ -69,7 +76,8 @@ MSA = [f'DP{dig}_DP_MSA_TIMING_PARAM{i}' for i in range(1, 5)]
 # Link training: from the lane count going to the encoder to the look at the link status afterwards. The plan
 # has one entry for it; src/dptrain.cpp does it when the plan runs. These are the functions Linux writes
 # registers in on the way (src/dpphy.cpp has them).
-TRAINING = ('enc1_configure_encoder', 'dcn10_link_encoder_set_dp_phy_pattern_training_pattern',
+# (enc2_fec_set_ready: FEC ready, done by src/dptrain.cpp for a Link::fec)
+TRAINING = ('enc1_configure_encoder', 'enc2_fec_set_ready', 'dcn10_link_encoder_set_dp_phy_pattern_training_pattern',
             'set_link_training_complete', 'enable_phy_bypass_mode', 'disable_prbs_mode', 'setup_panel_mode',
             'set_dp_phy_pattern_passthrough_mode', 'dp_wait_for_training_aux_rd_interval',
             'dp_transition_to_video_idle')
@@ -112,6 +120,9 @@ for p in lines[1:]:
         what, arg = p[1], int(p[2], 0)
         if what == 'require:mpcc_opp_id_none':
             emit('R', (arg >> 24) - 1, arg & 0xffffff, 0xf, 0xf, 0, f'{names[((arg >> 24) - 1, arg & 0xffffff)][0]}: the blender feeds no OPP')
+        elif what == 'require:dsc_off':
+            seg, dword = (arg >> 24) - 1, arg & 0xffffff
+            emit('R', seg, dword, 0x1, 0, 0, f'{names[(seg, dword)][0]}: the DSC engine forwards to no OPP')
         elif what == 'require:ip_request_open':
             seg, dword = (arg >> 24) - 1, arg & 0xffffff
             assert names[(seg, dword)] == ['DC_IP_REQUEST_CNTL']
@@ -179,9 +190,10 @@ for p in lines[1:]:
         if k == 'WAIT':             # Linux sends it twice while enabling a stream: the last one is repeated
             avi_from = len(out)
         if name == f'VPG{dig}_VPG_GENERIC_PACKET_ACCESS_CTRL':
-            assert k == 'U' and value == 0, 'generic packet 0 expected'
-            avi_word = 0
-        elif name == f'VPG{dig}_VPG_GENERIC_PACKET_DATA':
+            # packet 0 is the AVI infoframe; a DSC stream's PPS goes in packets 11 to 14 (plain steps)
+            assert k == 'U' and (value == 0 or dsc), 'generic packet 0 expected'
+            avi_word = 0 if value == 0 else None
+        elif name == f'VPG{dig}_VPG_GENERIC_PACKET_DATA' and avi_word is not None:
             assert k == 'W'
             if 1 <= avi_word <= 4:
                 emit('A', seg, dword, mask, value, avi_word, what)
@@ -299,7 +311,17 @@ keys = [k for k in modes[0][1] if any(m[1][k] != modes[0][1][k] for m in modes)]
 if dp:      # the first Mvid follows the link as well as the mode: not in the table, and the rule holds in every mode
     vid_m = addr(f'DP{dig}_DP_VID_M')
     assert all(m[1][vid_m][1] == first_vid_m(int(m[0][12])) for m in modes), 'DP_VID_M is not the first Mvid in a mode'
-    keys.remove(vid_m)
+    if vid_m in keys:
+        keys.remove(vid_m)
+if not keys:    # one mode (a "dsc" table): its timing alone
+    print('\nstatic const Edid::DetailedTiming kModeTimings[] = {')
+    for c, _ in modes:
+        mha, mhfp, mhsw, mhbp, mva, mvfp, mvsw, mvbp, mkhz, mhpos, mvpos = map(int, c[4:15])
+        print(f"\t{{ {mkhz}, {mha}, {mhfp + mhsw + mhbp}, {mhfp}, {mhsw}, {mva}, {mvfp + mvsw + mvbp}, {mvfp}, {mvsw}, "
+              f"{'true' if mhpos else 'false'}, {'true' if mvpos else 'false'}, false }},")
+    print('};')
+    sys.stderr.write(f'mkinc: {len(modes)} modes, 0 registers change with the mode\n')
+    sys.exit(0)
 print(f'''
 // What Linux leaves different from mode to mode in this pipe's registers, the plane showing the top-left of the
 // {ha}x{va} surface (tools/gen/pipegen/modes.txt): one row of values per mode, in the order of kModeRegs. Row 0 is
