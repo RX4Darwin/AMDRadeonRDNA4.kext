@@ -18,6 +18,7 @@
 //  BAR into the pool's heap, as before.
 //
 
+#include "drr.hpp"
 #include "compute.hpp"
 #include "flip.hpp"
 #include "klog.hpp"
@@ -2887,7 +2888,14 @@ uint64_t RDNA4Compute::rtBufferMc(const void *owner, uint64_t handle) {
 bool RDNA4Compute::rtScanoutFlip(uint8_t hubp, uint64_t mc) {
 	Locked g(rtLock);
 
-	return Flip::request(*this, hubp, mc);
+	if (!Flip::request(*this, hubp, mc))
+		return false;
+	// Variable refresh: the flip ends the stretched blank, as Linux's manual trigger after a flip (dc.c). HUBP n feeds
+	// OTG n on every pipe this driver lights.
+	ModeSet::Step trigger;
+	if (Drr::active(hubp) && Drr::build(hubp, Drr::Phase::Trigger, 0, 0, &trigger, 1) == 1)
+		wr(IpDiscovery::HwDmu, GfxReg::Reg { trigger.seg, trigger.dword }, trigger.value);
+	return true;
 }
 
 bool RDNA4Compute::rtScanoutShown(uint8_t hubp, uint64_t &requested, uint64_t &inUse) {

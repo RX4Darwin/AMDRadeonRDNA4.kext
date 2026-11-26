@@ -1,8 +1,9 @@
 # Variable refresh (FreeSync / DisplayPort Adaptive-Sync), plan
 
-Status, 2026-11-26: with `rdna4-vrr=1` macOS offers "Variable" refresh on the Lenovo (card-verified); choosing it still runs
-the fixed timing (no DRR programmed yet). The Samsung gets no variable mode yet (its 144 Hz timings are outside the EDID
-blocks macOS reads).
+Status, 2026-11-26: with `rdna4-vrr=1` the Lenovo (second pipe, DisplayPort) runs variable refresh, card-verified: macOS
+offers "Variable", and with it the monitor reads 48 Hz on an idle desktop and 70-144 Hz while a window is dragged. The
+Samsung (boot display) gets no variable mode yet (its 144 Hz timings are outside the EDID blocks macOS reads), and the boot
+pipe has no refresh switch yet.
 
 ## What the monitors and macOS have
 
@@ -53,6 +54,9 @@ probably unrelated).
 1. (Done, see above.) Find what makes macOS offer Variable: look for 'vrr?', verticalBlankingExtension and Adaptive-Sync strings in IOGraphics
    (IOFramebuffer), SkyLight/CoreDisplay (the shared cache) and an AMD framebuffer kext of Tahoe's, and what each reads.
 2. Present that for a DP sink with Adaptive-Sync (EDID range, DPCD 0x007 bit 6).
-3. Hardware, from Linux (pipegen, as the rest): OTG DRR (V_TOTAL_MIN/MAX, the flip as the event that ends the extended blank),
-   MSA_TIMING_PAR_IGNORE_EN in DPCD 0x107, for the timing macOS picks.
+3. (Done for the second pipe.) Hardware, from Linux: pipegen's "drr" scenario runs dcn10_set_drr (on, off) and the
+   manual trigger for each pipe into src/drr_linux.inc (src/drr.cpp). Switching to a variable timing turns it on with the
+   mode's V total as the minimum and the extension added as the maximum, and sets DPCD 0x107 bit 7 (ignore MSA) when the
+   sink has 0x007 bit 6; each flip (rtScanoutFlip) then writes OTG_TRIGA_MANUAL_TRIG, as Linux after a flip. Only flips end
+   the blank (Linux's default): a cursor moving over a still desktop is shown at the slow rate.
 4. Card: a game or a moving window at a rate under the maximum, the monitor's own refresh read-out; display sleep/wake.

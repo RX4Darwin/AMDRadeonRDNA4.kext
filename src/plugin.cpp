@@ -515,6 +515,13 @@ int32_t head2SwitchTo(void *ctx, const Modes::Mode &m, bool) {
 	return h->dev->applySecondPipeMode(*run);
 }
 
+int32_t head2SetRefresh(void *ctx, const Modes::Mode &m, uint32_t extLines) {
+	auto *h = static_cast<Head2 *>(ctx);
+	RDNA4Device::ExtraHold hold(*h->dev);
+	h->dev->selectExtra(h->slot);
+	return h->dev->setSecondPipeRefresh(m, extLines);
+}
+
 void head2SetPower(void *ctx, bool on) {
 	auto *h = static_cast<Head2 *>(ctx);
 
@@ -671,8 +678,10 @@ void head2Init(Head2 *h, RDNA4Device &dev, const Modes::Mode *mode, size_t n) {
 		be.setPower = head2SetPower;
 	// Like the boot display, the other modes are offered with rdna4-modeset=1.
 	const bool switching = dev.xp().lit && dev.modesetRequested;
-	if (switching)
+	if (switching) {
 		be.switchTo = head2SwitchTo;
+		be.setRefresh = head2SetRefresh;
+	}
 	h->ndrv.init(switching ? h->table : mode, switching ? n : 1, mode->id, h->edid, h->edidLen, be);
 	h->ndrv.adaptiveSync = vrrWanted();
 	if (gScaledOffered)

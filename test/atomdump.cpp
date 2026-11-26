@@ -25,6 +25,7 @@
 #include "../src/dmub.hpp"
 #include "../src/pipe.hpp"
 #include "../src/ndrv.hpp"
+#include "../src/drr.hpp"
 #include "../src/modeset.hpp"
 #include "../src/pipe2.hpp"
 #include "../src/dptrain.hpp"
@@ -2813,6 +2814,8 @@ struct FakeBackend {
 	int32_t  switchRet = Ndrv::kSuccess;
 	int      powerCalls = 0;
 	bool     powerOn = true;
+	int      refreshCalls = 0;
+	uint32_t refreshExt = 0;
 
 	static bool surfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) {
 		auto *b = static_cast<FakeBackend *>(ctx);
@@ -2831,8 +2834,16 @@ struct FakeBackend {
 		b->powerCalls++;
 		b->powerOn = on;
 	}
+	static int32_t setRefresh(void *ctx, const Modes::Mode &, uint32_t ext) {
+		auto *b = static_cast<FakeBackend *>(ctx);
+		b->refreshCalls++;
+		b->refreshExt = ext;
+		return Ndrv::kSuccess;
+	}
 	Ndrv::Backend backend() {
-		return { this, surfaceFor, switchTo, setPower };
+		Ndrv::Backend be { this, surfaceFor, switchTo, setPower };
+		be.setRefresh = setRefresh;
+		return be;
 	}
 };
 
@@ -3225,10 +3236,13 @@ static int testNdrv() {
 		psw.csData = static_cast<int32_t>(kAlias);
 		psw.csMode = Ndrv::kDepthMode1;
 		failures += check(pt.control(Ndrv::cscSwitchMode, &psw, ret) && ret == Ndrv::kSuccess && pb.switches == 1 &&
-		                  pt.currentModeId() == static_cast<int32_t>(kAlias), "ndrv: switch to the installed timing");
+		                  pt.currentModeId() == static_cast<int32_t>(kAlias) && pb.refreshCalls == 1 && pb.refreshExt == 1000,
+		                  "ndrv: switch to the installed timing (variable refresh %d calls, %u lines)", pb.refreshCalls, pb.refreshExt);
 		psw.csData = pt.idFor(*other);
-		failures += check(pt.control(Ndrv::cscSwitchMode, &psw, ret) && ret == Ndrv::kSuccess && pb.switches == 1,
-		                  "ndrv: the same mode by its table ID switched again");
+		failures += check(pt.control(Ndrv::cscSwitchMode, &psw, ret) && ret == Ndrv::kSuccess && pb.switches == 1 &&
+		                  pb.refreshCalls == 2 && pb.refreshExt == 0, "ndrv: the same mode by its table ID switched again or stayed variable");
+		failures += check(pt.control(Ndrv::cscSwitchMode, &psw, ret) && ret == Ndrv::kSuccess && pb.refreshCalls == 2,
+		                  "ndrv: a fixed mode asked for fixed refresh again");
 		Ndrv::VDDetailedTimingRec odd = set;
 		odd.csVerticalBlanking += 7;
 		odd.csDisplayModeID = first + 1;
@@ -3242,6 +3256,20 @@ static int testNdrv() {
 		                  pt.control(Ndrv::cscSwitchMode, &psw, ret) && ret == Ndrv::kBadArgument,
 		                  "ndrv: a freed slot still switches");
 		failures += check(!tr.control(Ndrv::cscSetDetailedTiming, &set, ret), "ndrv: slots without rdna4-vrr");
+	}
+
+	// Variable refresh as Linux programs it (src/drr_linux.inc), pipe 1 between 1125 and 3374 lines.
+	{
+		ModeSet::Step st[8];
+		const size_t on = Drr::build(1, Drr::Phase::On, 1125, 3374, st, 8);
+		failures += check(on == 4 && st[0].dword == 0x1bb1 && st[0].value == 3373 && st[0].op == ModeSet::Op::Write &&
+		                  st[1].dword == 0x1bb0 && st[1].value == 1124 && st[2].dword == 0x1bb3 && st[2].op == ModeSet::Op::Update &&
+		                  st[2].value == 0x00020003, "drr: pipe 1 on (%zu steps)", on);
+		failures += check(Drr::build(1, Drr::Phase::Off, 0, 0, st, 8) == 3 && st[0].value == 0, "drr: pipe 1 off");
+		failures += check(Drr::build(1, Drr::Phase::Trigger, 0, 0, st, 8) == 1 && st[0].dword == 0x1bbc && st[0].value == 1,
+		                  "drr: pipe 1 trigger");
+		failures += check(!Drr::build(4, Drr::Phase::On, 1125, 3374, st, 8) && !Drr::build(1, Drr::Phase::On, 1125, 3374, st, 2) &&
+		                  !Drr::build(1, Drr::Phase::On, 0, 3374, st, 8), "drr: a bad pipe, room or range built");
 	}
 
 	printf("\nndrv: %zu modes (boot = 100 = %ux%u, other e.g. %d = %ux%u), EDID/DPMS %s\n", n,

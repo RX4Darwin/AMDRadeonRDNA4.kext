@@ -74,6 +74,7 @@ struct cfg {
 	bool dual;     /* the "dpdual" scenario: an HDMI stream on a DisplayPort connector, through a passive DP++ adapter */
 	bool y420;     /* "y420": the HDMI stream in YCbCr 4:2:0, half the TMDS clock (amdgpu's force_yuv420_output) */
 	bool dsc;      /* "dsc" (after dplink, sink kind d): the stream compressed, as dc_dsc_compute_config chooses */
+	bool drr;      /* the "drr" scenario: variable refresh on a lit DisplayPort stream (sequence_drr) */
 	struct dc_dsc_config dsc_cfg;
 	int sink_swing, sink_pre;     /* the drive the simulated sink asks for before it reports lock */
 	char sink_kind;               /* its capabilities: sink_reset() */
@@ -623,6 +624,28 @@ static void sequence_dp(const struct cfg *c)
 	rec_mark("end", 0);
 }
 
+/* ---- the "drr" scenario: variable refresh (FreeSync, DisplayPort Adaptive-Sync) on a lit stream ----
+ *
+ * What amdgpu does when a stream's refresh becomes variable (dc_stream_adjust_vmin_vmax -> hwss.set_drr), when it
+ * becomes fixed again, and after each flip while it is variable (the manual trigger in dc.c's commit_planes_for_stream,
+ * which ends the stretched blank). V totals 0x2001 (minimum) and 0x3001 (maximum) mark the values the driver puts in for
+ * the mode's own (src/drr.cpp). */
+static void sequence_drr(void)
+{
+	struct dc *dc = &g_dc;
+	struct pipe_ctx *pipe = g_pipe;
+	struct timing_generator *tg = pipe->stream_res.tg;
+	struct dc_crtc_timing_adjust on = { .v_total_min = 0x2001, .v_total_max = 0x3001 }, off = { 0 };
+
+	rec_mark("begin:on", 0);
+	dc->hwss.set_drr(&pipe, 1, on);
+	rec_mark("begin:off", 0);
+	dc->hwss.set_drr(&pipe, 1, off);
+	rec_mark("begin:trigger", 0);
+	tg->funcs->program_manual_trigger(tg);
+	rec_mark("end", 0);
+}
+
 /* Two runs, unknown registers reading all-zeros then all-ones: a full write whose value differs between the runs
  * carries bits read back from the register, so it becomes an update that leaves those bits alone. A different
  * sequence of events means a read steered the code; that has to be settled with rec_poke(), not guessed. */
@@ -874,7 +897,8 @@ int main(int argc, char **argv)
 		emit();
 		return 0;
 	}
-	if (argc > 1 && !strcmp(argv[1], "dp")) { c.dp = true; argv++; argc--; }
+	if (argc > 1 && !strcmp(argv[1], "drr")) { c.dp = c.drr = true; argv++; argc--; }
+	else if (argc > 1 && !strcmp(argv[1], "dp")) { c.dp = true; argv++; argc--; }
 	else if (argc > 1 && !strcmp(argv[1], "dpdual")) { c.dual = true; argv++; argc--; }
 	if (argc > 1 && !strcmp(argv[1], "y420")) { c.y420 = true; argv++; argc--; }
 	if (argc > 4 && !strcmp(argv[1], "dplink")) {
@@ -889,9 +913,10 @@ int main(int argc, char **argv)
 	}
 	verbose = argc > 17;
 	if (argc < 17) {
-		fprintf(stderr, "usage: pipegen [dp | dpdual | dplink K S P] [on W H] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync "
+		fprintf(stderr, "usage: pipegen [dp | drr | dpdual | dplink K S P] [on W H] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync "
 				"vback  khz hpositive vpositive vic [verbose]\n  hpd counts from 1, as the VBIOS path records do\n"
 				"  dp: the reference for retiming a lit DisplayPort stream instead of the second-pipe plan\n"
+				"  drr: variable refresh on, off, and the trigger after a flip, on a lit DisplayPort stream\n"
 				"  dpdual: an HDMI stream on a DisplayPort connector (a passive DP++ adapter)\n"
 				"  y420: (after dpdual, or alone for HDMI) the HDMI stream in YCbCr 4:2:0\n"
 				"  dplink K S P [dsc]: light a DisplayPort stream, training its link against a simulated sink of kind\n"
@@ -925,7 +950,7 @@ int main(int argc, char **argv)
 		rec_log_reads = verbose && run == 0;
 		setup();
 		make_state(&c);
-		if (c.dp && !c.train) sequence_dp(&c); else sequence(&c);
+		if (c.drr) sequence_drr(); else if (c.dp && !c.train) sequence_dp(&c); else sequence(&c);
 		if (run == 0) { memcpy(run0, evs, sizeof(struct ev) * nev); n0 = nev; }
 	}
 	printf("CONFIG %d %d %d %d  %u %u %u %u  %u %u %u %u  %u %d %d  %d %u  %d\n", c.pipe, c.dig, c.link, c.hpd + 1,

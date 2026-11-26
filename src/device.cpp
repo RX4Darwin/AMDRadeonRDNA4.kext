@@ -10,6 +10,7 @@
 #include "device.hpp"
 #include "klog.hpp"
 #include "dpphy.hpp"
+#include "drr.hpp"
 #include "edid.hpp"
 #include "dmub.hpp"
 #include "sku.hpp"
@@ -4762,6 +4763,35 @@ bool RDNA4Device::relinkSecondPipe(uint32_t pixelClockKHz) {
 		xp().on = runSecondPipePart(Pipe2::Part::Wake);
 	}
 	return ok;
+}
+
+IOReturn RDNA4Device::setSecondPipeRefresh(const Modes::Mode &m, uint32_t extLines) {
+	const Pipe2::Config &c = Pipe2::config();
+	if (!xp().lit || !c.dp)
+		return kIOReturnUnsupported;
+	const bool on = extLines != 0;
+	uint8_t caps = 0, spread = 0;
+	if (on && (!dpcdRead(xp().aux, Drr::kDpcdPortCount, &caps, 1) || !(caps & Drr::kMsaIgnoreCapable))) {
+		FBLOG("drr: pipe %u stays fixed: the sink cannot ignore the MSA timing (DPCD 0x007 = 0x%02x)", c.pipe, caps);
+		return kIOReturnUnsupported;
+	}
+	const uint32_t vTotal = m.t.vActive + m.t.vBlank;
+	ModeSet::Step steps[8];
+	const size_t n = Drr::build(c.pipe, on ? Drr::Phase::On : Drr::Phase::Off, vTotal, vTotal + extLines, steps, 8);
+	if (!n || !dpcdRead(xp().aux, Drr::kDpcdDownspread, &spread, 1))
+		return kIOReturnUnsupported;
+	// As Linux's enable_stream_features: the sink told to ignore the MSA timing while the refresh is variable. It is set
+	// before the V total starts to move and cleared after it stops.
+	const uint8_t want = static_cast<uint8_t>(on ? spread | Drr::kMsaIgnore : spread & ~Drr::kMsaIgnore);
+	if (on && want != spread && !dpcdWrite(xp().aux, Drr::kDpcdDownspread, &want, 1))
+		return kIOReturnIOError;
+	if (!runSteps(steps, n, nullptr, 0, "drr", c.pipe * Pipe::Reg::kOtgStride))
+		return kIOReturnIOError;
+	Drr::setActive(c.pipe, on);
+	if (!on && want != spread && !dpcdWrite(xp().aux, Drr::kDpcdDownspread, &want, 1))
+		return kIOReturnIOError;
+	FBLOG("drr: pipe %u %s (V total %u..%u lines)", c.pipe, on ? "variable" : "fixed", vTotal, vTotal + extLines);
+	return kIOReturnSuccess;
 }
 
 IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {

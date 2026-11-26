@@ -125,6 +125,7 @@ void Translator::init(const Modes::Mode *table, size_t n, uint32_t bootId,
 	syncState = kDPMSSyncOn;
 	for (Slot &sl : slots)
 		sl = Slot {};
+	variable = false;
 	// Without the boot entry the IDs could not be tied to what IOBootNDRV
 	// already reported, so the mode requests stay with it.
 	bool haveBoot = false;
@@ -564,6 +565,11 @@ int32_t Translator::switchMode(VDSwitchInfoRec &r) {
 	// The backend may place the new mode's surface elsewhere.
 	if (!same && !surface(*m, s))
 		return kBadArgument;
+	// An installed timing with a blanking extension is the mode with variable refresh; anything else runs it fixed.
+	const Slot *sl = slotFor(r.csData);
+	const uint32_t ext = sl && sl->mode ? sl->timing.csReserved2 : 0;
+	if (be.setRefresh && (ext || variable) && be.setRefresh(be.ctx, *m, ext) == kSuccess)
+		variable = ext != 0;
 	r.csBaseAddr = static_cast<uintptr_t>(1 | s.physBase);
 	return kSuccess;
 }

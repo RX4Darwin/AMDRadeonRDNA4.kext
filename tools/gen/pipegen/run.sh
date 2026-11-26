@@ -94,6 +94,21 @@ if [ "${1:-}" = init ]; then
 	exit 0
 fi
 
+# "drr": variable refresh on, off and its per-flip trigger (pipegen.c sequence_drr) for each pipe, into
+# src/drr_linux.inc (mkdrr.py). Also part of the full run.
+drr_table() {
+	for p in 0 1 2 3; do
+		"$B/pipegen" drr $p $p $p $((p + 1))  1920 48 32 80  1080 3 5 37  333070 1 0 0 > "$B/drr$p.txt"
+	done
+	python3 "$here/mkdrr.py" "$(git -C "$L" rev-parse HEAD)" "$B"/drr[0-3].txt > "$B/drr_linux.inc"
+	cp -f "$B/drr_linux.inc" "$repo/src/drr_linux.inc"
+	echo "wrote src/drr_linux.inc"
+}
+if [ "${1:-}" = drr ]; then
+	drr_table
+	exit 0
+fi
+
 # table <file under src> [dplink <sink>] <configuration>: one table. With "dplink a 0 0" it is for a DisplayPort
 # stream, the link trained against the simulated sink that needs no lane adjustment.
 table() {
@@ -189,6 +204,8 @@ if [ $# -eq 0 ]; then
 else
 	table pipe2_linux.inc "$@"
 fi
+
+drr_table
 
 # The reference for the host test of the DisplayPort mode switch (src/modeset.cpp): the same Linux code
 # retiming a lit DP stream on pipe 0 to 2560x1440@60 (CVT reduced blanking).

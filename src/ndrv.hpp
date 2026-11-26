@@ -282,6 +282,8 @@ struct Backend {
 	int32_t (*setHardwareCursor)(void *ctx, void *cursorRef);
 	int32_t (*drawHardwareCursor)(void *ctx, int32_t x, int32_t y, uint32_t visible);
 	int32_t (*getHardwareCursorDrawState)(void *ctx, VDHardwareCursorDrawStateRec &state);
+	// `m` (the mode on) with variable refresh down to `extLines` lines more than its V total, or fixed (0).
+	int32_t (*setRefresh)(void *ctx, const Modes::Mode &m, uint32_t extLines);
 };
 
 class Translator {
@@ -337,6 +339,7 @@ private:
 	static constexpr int32_t kSlotIdBase = 0x40000000;   // the slots' own IDs, apart from the table's
 	Slot     slots[kSlots] {};
 	uint32_t slotSeed { 0 };
+	bool     variable { false };   // the backend runs the mode on with variable refresh
 	static bool isSlotId(int32_t id);
 	Slot *slotFor(int32_t id);
 	const Slot *slotFor(int32_t id) const { return const_cast<Translator *>(this)->slotFor(id); }
