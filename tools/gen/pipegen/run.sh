@@ -197,6 +197,9 @@ if [ $# -eq 0 ]; then
 	# on and four slices (the 2-slice caps bit hidden); 3 = 3840x2160 at 729 MHz without DSC (two pixels a cycle).
 	PIPEGEN_DSC_CAPS=012100762b010100000f0e0108000000 MODES_NONE=1 \
 		table pipe2_linux_p0_dp1_dsc144.inc  dplink d 0 0 dsc  0 0 0 1  3840 48 32 80  2160 3 5 146  1332750 1 0 0
+	# 4 = the 144 Hz one at 10 bits a component, as Linux runs it (test/ref/dsc_linux_4k144_snapshot.txt).
+	PIPEGEN_DSC_CAPS=012100762b010100000f0e0108000000 PIPEGEN_BPC=10 MODES_NONE=1 \
+		table pipe2_linux_p0_dp1_dsc144_10.inc  dplink d 0 0 dsc  0 0 0 1  3840 48 32 80  2160 3 5 146  1332750 1 0 0
 	PIPEGEN_DSC_CAPS=0121007629010100000f0e0108000000 PIPEGEN_DSC_FORCE=1 MODES_NONE=1 \
 		table pipe2_linux_p0_dp1_dsc60.inc   dplink d 0 0 dsc  0 0 0 1  3840 48 32 80  2160 3 5 54  533250 1 0 0
 	PIPEGEN_DP_LINK="4 30" MODES_NONE=1 \

@@ -96,6 +96,27 @@ Card, the same day (rdna4-dscboot=1, kext b7d58c36): at 4K144 the plane underflo
 up: the next step is the memory side, Linux's DET segments and watermarks and the clocks it runs at 4K144 (DCFCLK, FCLK,
 UCLK, DISPCLK).
 
+Later the same day:
+- DML asks for DISPCLK 1384.6 MHz and DPPCLK 1341 MHz for this stream (one pipe, one pixel a DPP clock). The kext held
+  650 MHz. With `rdna4-dispclk=1400` the plane stops underflowing.
+- The DIG FIFO then ran one pixel a cycle with its error bit set: pipe2.cpp forced one for every non-4:2:0 table. Fixed
+  in d70d692, so it holds Linux's 0x0000011d. The picture is mostly right from then on.
+- The rest: a noisy strip (the right quarter at 8 bpc, the top at 10 bpc, `rdna4-dscboot=4`). The sink reports RC
+  buffer under-run and overflow, and OPTC0's underflow flag comes back after clearing.
+- A live register dump against Linux's snapshot: every DSC, OPTC-DSC and DIG register the table writes is the same.
+  The rest differs because of Linux's surface (DET, watermarks, tiling), its DRR, audio and VSC packets, other pipes'
+  clocks, and VSTARTUP-derived OTG values. OPTC_SEGMENT_WIDTH (Linux 1920) made no difference.
+- Clocks under Fedora at 4K144 (pp_dpm_*): UCLK held at its top level (1258 MHz), FCLK 2016, SOCCLK 1280,
+  DCEFCLK 514. Ours left UCLK free (97 MHz): the firmware's memory clock switches do not fit this stream's blank.
+  With `rdna4-uclk=1258` the strip and OPTC0's underflow are gone. The kext now holds UCLK at its top level (1187 MHz
+  as our firmware reports it) whenever the boot display runs above 600 MHz, set before the DSC stream lights: clean
+  from the first frame, 144.011 Hz (card, 2026-11-26). The sink still reports DSC_STATUS 0x03 after clearing; the
+  picture is clean.
+- Still to do: the DISPCLK target following DML for the mode (`rdna4-dispclk=1400` by hand), and mode switches with
+  DSC on (refused while the test stream runs).
+
+Card tests: `rdna4-dscboot=1` (8 bpc) or `=4` (10 bpc) with `rdna4-dispclk=1400`; mode switches are refused while lit.
+
 ## Notes
 
 - Regenerating today's tables from lib/linux (6addb4f38557) reproduces them exactly, except the six YCbCr 4:2:0 ones (one

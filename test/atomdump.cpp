@@ -2898,6 +2898,27 @@ static int testPipe2() {
 	}
 	failures += testPipe2Move(3, 4);
 	failures += testPipe2Move(4, 3);
+
+	// An RGB table above 720 MHz (the DSC 4K144 one) keeps Linux's two pixels a cycle in the DIG FIFO: only a 4:2:0
+	// table's pipe is set to the encoding it runs (card, 2026-11-26: forced to one, the FIFO overflowed).
+	{
+		Pipe2::useDsc(1);
+		Pipe2::Target t {};
+		t.alone = true;
+		t.encoderObjId = encoderObjOf(Pipe2::config());
+		t.surface = 0x8002100000ull;
+		t.depth = Pipe2::Depth::Plane;
+		t.linkRate = DpTrain::kHbr3;
+		t.part = Pipe2::Part::Light;
+		static Pipe2::Plan dsc;
+		const char *why = "";
+		uint32_t ppc = ~0u;
+		const bool built = Pipe2::build(t, dsc, &why);
+		for (size_t i = 0; built && i < dsc.count; i++)
+			if (dsc.steps[i].dword == 0x209b && (dsc.steps[i].mask & 0x300))
+				ppc = dsc.steps[i].value & 0x300;
+		failures += check(built && ppc == 0x100, "pipe2: the DSC 4K144 plan's DIG FIFO pixels a cycle 0x%x (%s)", ppc, why);
+	}
 	Pipe2::use(first);
 	return failures;
 }

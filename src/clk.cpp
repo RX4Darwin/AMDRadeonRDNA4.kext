@@ -90,10 +90,10 @@ constexpr Clock kClocks[] = {
  * The hard minimums the display asks the firmware for once it runs. DISPCLK,
  * DPPCLK and DCFCLK: above what Linux's DML asks for one 3840x2160@60 pipe
  * (621, 598 and 228 MHz); they are required for 4K. UCLK: held at its top
- * level only while an extra display runs a 4K-class mode beside the boot one
- * (memoryClockFollowDisplays): the firmware idles memory at 97 MHz, and two 4K
- * planes underflowed there (card, 2026-11-04); the display does not take part
- * in memory clock switches. A 4K boot display with a 1080p one beside it ran
+ * level only while an extra display runs a 4K-class mode beside the boot one,
+ * or the boot display a mode above 4K60's clock (memoryClockFollowDisplays):
+ * the firmware idles memory at 97 MHz, and two 4K planes underflowed there
+ * (card, 2026-11-04); the display does not take part in memory clock switches. A 4K boot display with a 1080p one beside it ran
  * clean with memory free (58-2500 MHz, idle 47 -> 21 W, watched through load
  * changes and display sleep, 2026-11-25). FCLK is the firmware's. Each has an
  * option to set it instead (0 for DISPCLK: leave the clocks alone, and no 4K;
@@ -423,11 +423,13 @@ void RDNA4Device::smuStarted()
 /*
  * UCLK's hard minimum: the top DPM level while an extra display is lit (asleep
  * or not) in a 4K-class mode (its 3840x2160 table, or 500 MHz of pixel clock
- * and more), the lowest otherwise, so the firmware scales memory. Not with
- * rdna4-uclk set: raiseDisplayClocks asked for that.
+ * and more) or the boot display runs above 600 MHz, the lowest otherwise, so
+ * the firmware scales memory. Not with rdna4-uclk set: raiseDisplayClocks asked for that.
  * ponytail: lit only (not on/off), and no lock against a pipe lit while
  * smuStarted reads the flags; the next lighting or take-down asks again.
  */
+constexpr uint32_t kBootUclkFreeKHz = 600000;   // the boot pipe's fastest pixel clock with memory free
+
 void RDNA4Device::memoryClockFollowDisplays()
 {
 	uint32_t asked = 0;
@@ -439,6 +441,10 @@ void RDNA4Device::memoryClockFollowDisplays()
 
 	for (const ExtraPipe &p : extra)
 		hold = hold || (p.lit && (p.uhd || p.target.now.pixelClockKHz >= 500000));
+	// The boot display alone above 4K60's 533 MHz: at 4K144 (DSC, 1333 MHz) the plane underflowed with memory free
+	// and ran clean held, as Linux holds it (card, 2026-11-26).
+	// ponytail: a pixel clock line, not DML's p-state check; refine with that if modes between 600 and 1333 MHz underflow.
+	hold = hold || (liveTimingValid && liveTiming.pixelClockKHz > kBootUclkFreeKHz);
 
 	if (uclkHeld == hold && uclkKnown)
 		return;
@@ -450,6 +456,6 @@ void RDNA4Device::memoryClockFollowDisplays()
 
 	const uint32_t mhz = hold ? topDpmLevel(kPpclkUclk) : lowest & 0xffff;
 
-	if (mhz && smuSetHardMin(kPpclkUclk, hold ? "UCLK (a 4K display beside the boot one)" : "UCLK (free)", mhz))
+	if (mhz && smuSetHardMin(kPpclkUclk, hold ? "UCLK (held for the displays)" : "UCLK (free)", mhz))
 		uclkHeld = hold, uclkKnown = true;
 }
