@@ -54,6 +54,11 @@ recorder models the Azalia index/data pair (rec_indirect) so its read-modify-wri
 - 2026-11-26 on the rig: 93 of 93 steps written, DP0_DP_SEC_CNTL 0x00901111 (audio packets on beside HDR's), both
   displays unaffected, AppleGFXHDA started as before, still no audio engine or Sound output. The three assertions are
   in setRequireMaxBusStall, setCodecProperties and readVendorRevisionInfo (missing properties, not the blocker).
+- Same day: AppleGFXHDA's AppleDisplay match handler (`gfxMatchedHandler`) reads `hda-gfx`, `connector-type` (it
+  compares 0x400 DisplayPort / 0x800 HDMI), `built-in`, `port-number`, `AAPL,DisplayPipe` and the display's
+  `IODisplayEDID` (`edidIsValidForAudio`). With `hda-gfx` = "onboard-1" on the function and on all six framebuffers and
+  `connector-type` DisplayPort on the framebuffers (a named stash, "experiment: audio hda-gfx + connector-type"), nothing
+  changed: no `IOFBEvent` on the controller, no engine. So the handler is either not reached or refuses for another reason.
 - Next: why AppleGFXHDADriver makes no engine: its graphics association (AppleDisplay matching, the framebuffer's
   connector type, registerFramebufferNotification) and whether the codec's pin reports presence and ELD (HDA verbs
   through the controller, or AppleGFXHDA's own logging).
