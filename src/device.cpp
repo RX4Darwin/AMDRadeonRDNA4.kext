@@ -3666,6 +3666,21 @@ bool RDNA4Device::relightBootPipe(bool dsc) {
 		liveTiming = reqTiming = Pipe2::config().timing;
 		liveTimingValid = reqTimingValid = true;
 		memoryClockFollowDisplays();
+		// The table gives pipe 0 DET segments for it alone (14 for the DSC stream): next to a lit second pipe it gets
+		// what is left, as a second pipe's lighting does (2026-11-26: both displays lost their picture without).
+		const Pipe2::Config &c = Pipe2::config();
+		freeIdleDet(c);
+		uint32_t others = 0;
+		for (uint32_t i = 0; i < 4; i++)
+			if (i != c.pipe)
+				others += regReadDmu(c.detSeg, c.detCtrl[i]) & 0x1f;
+		others += shrinkCompbuf(c, others);
+		t.detSegments = static_cast<uint8_t>(detShare(c.detSegments, others));
+		FBLOG("dsc: DET segments: %u for pipe 0 (the table's %u), %u held by the others", t.detSegments, c.detSegments, others);
+		if (!t.detSegments) {
+			why = "no DET segments left for pipe 0";
+			return false;
+		}
 		t.part = Pipe2::Part::Light;
 		t.now = {};
 		t.linkRate = boot.link.rate;

@@ -126,6 +126,10 @@ Mode switches (card, 2026-11-26): with `rdna4-dispclk=1400` and a 3840x2160 cons
 Leaving it lights the 3840x2160 table the same way, then retimes as usual (2560x1440@144 after it: 143.965 Hz). If the
 DSC table does not light, the 3840x2160 one is lit again.
 
+Beside the Lenovo (HDMI, second pipe) the table's 14 DET segments overlapped the second pipe's: noise on the Samsung,
+the Lenovo dark. The relight now gives pipe 0 what is left, as a second pipe's lighting does: 13 segments, 144.000 Hz,
+both displays clean (card, 2026-11-26).
+
 Card tests: `rdna4-dscboot=1` (8 bpc) or `=4` (10 bpc) with `rdna4-dispclk=1400` boots into the DSC stream.
 
 ## Notes
