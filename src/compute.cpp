@@ -1027,23 +1027,48 @@ void RDNA4Compute::pspFlush(void *ctx) {
 	static_cast<RDNA4Compute *>(ctx)->flushHdp();
 }
 
+// The SMU's answer register, polled for up to `ms` milliseconds: 0 while it has not answered.
+uint32_t RDNA4Compute::smuPoll(uint32_t ms) {
+	for (uint32_t waited = 0;; waited++) {
+		const uint32_t resp = rd(IpDiscovery::HwMp1, SmuResp);
+		if (resp != 0 && resp != kBad)
+			return resp;
+		if (waited >= ms)
+			return 0;
+		IOSleep(1);
+	}
+}
+
 uint32_t RDNA4Compute::smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint32_t timeoutMs) {
 	if (smuLock)
 		IOLockLock(smuLock);           // one message in the mailbox at a time (W27 gcWake can run on any thread)
+	// A message given up on earlier may still be in the SMU's hands: writing the next one over it loses one of
+	// the two (seen: AllowGfxOff timed out during a display mode switch, the DisallowGfxOff after it never
+	// answered and the GFXOFF wake failed). amdgpu waits for the previous answer first, for up to 2 s.
+	if (smuPendingMsg) {
+		const uint32_t late = smuPoll(kSmuBusyMs);
+		uint64_t ns = 0;
+		absolutetime_to_nanoseconds(mach_absolute_time() - smuPendingAt, &ns);
+		if (!late) {
+			CLOG("smu: message 0x%x still unanswered after %llu ms: 0x%x not sent", smuPendingMsg, ns / 1000000, msg);
+			if (smuLock)
+				IOLockUnlock(smuLock);
+			ret = 0;
+			return 0;
+		}
+		CLOG("smu: message 0x%x answered 0x%02x after %llu ms", smuPendingMsg, late, ns / 1000000);
+		smuPendingMsg = 0;
+	}
 	wr(IpDiscovery::HwMp1, SmuResp, 0);
 	wr(IpDiscovery::HwMp1, SmuArg, param);
 	wr(IpDiscovery::HwMp1, SmuMsg, msg);
-	uint32_t resp = 0;
-	for (uint32_t ms = 0; ms <= timeoutMs; ms++) {
-		resp = rd(IpDiscovery::HwMp1, SmuResp);
-		if (resp != 0 && resp != kBad)
-			break;
-		IOSleep(1);
-	}
+	const uint32_t resp = smuPoll(timeoutMs);
+	if (!resp)
+		smuPendingMsg = msg, smuPendingAt = mach_absolute_time();
 	ret = rd(IpDiscovery::HwMp1, SmuArg);
 	if (smuLock)
 		IOLockUnlock(smuLock);
-	return resp == kBad ? 0 : resp;
+	return resp;
 }
 
 namespace {
@@ -1377,7 +1402,7 @@ void RDNA4Compute::gcWake(uint32_t what) const {
 	if (gcState == kGcOff || gcState == kGcAllowing) {
 		uint32_t ret = 0, resp = 0;
 		for (int attempt = 0; attempt < 2 && resp != kSmuRespOk; attempt++)
-			resp = self->smuSend(kSmuMsgDisallowGfxOff, 0, ret, 100);
+			resp = self->smuSend(kSmuMsgDisallowGfxOff, 0, ret, kSmuBusyMs);   // amdgpu's 2 s: a busy SMU is no failure
 		const char *who = what == 0xffffffffu ? "the start of a bring-up" : what == 0xfffffffeu ? "the shutdown quiesce" : what == 0xfffffff0u ? "a dispatch/queue test (before it emitted)" :
 		                  (what >> 24) == 0xdb ? "a doorbell write, dword" : "a GC register access, seg<<16|dword";
 		if (resp == kSmuRespOk) {

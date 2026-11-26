@@ -92,9 +92,15 @@ hung WindowServer within seconds, and watchdogd panicked the machine about two m
 register access, 0xfffff3 (DisallowGfxOff -> 0x00)` (the SDMA path), after which every GC access is dropped, SDMA fences
 never land and WindowServer waits for ever. The same switch without `rdna4-gfxoff=1` is fine. So the SMU stops answering
 the GFXOFF messages around a boot-display mode switch: suspect SMU mailbox use from two threads at once (the re-arm
-tick's AllowGfxOff against a display path's message) or a message the PMFW refuses while the display clocks change; not
-yet looked into. `rdna4-gfxoff=1` was taken off the rig's config.plist; GFXOFF stays opt-in and is not to be made the
-default before this is understood and fixed.
+tick's AllowGfxOff against a display path's message) or a message the PMFW refuses while the display clocks change.
+
+**Cause and fix (same day):** the SMU is slow, not dead: it took 2.3 s to answer an AllowGfxOff and up to 11.5 s for a
+DisallowGfxOff early in the boot. `RDNA4Compute::smuSend` gave up after 100 ms and wrote the next message over the
+unanswered one (the wake's DisallowGfxOff, twice), which the SMU then never answered, and the wake declared GC lost
+for the boot. It now does what amdgpu's smu_cmn does: an unanswered message is remembered and waited for (up to 2 s)
+before the next is written, and the wake gives DisallowGfxOff 2 s. Card (rig, `rdna4-gfxoff=1`, the Samsung at
+1440p144 from login): AllowGfxOff timed out again at 165 s, the next message waited 2.3 s for its answer and went on;
+no hang, 299 GFXOFF cycles in 4 minutes. `rdna4-gfxoff=1` is back on the rig.
 
 ## Risks
 

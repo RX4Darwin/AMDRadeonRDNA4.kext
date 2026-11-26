@@ -631,6 +631,8 @@ private:
 	bool queueSnapValid { false };
 	IOLock *gcLock { nullptr };
 	IOLock *smuLock { nullptr };                // serializes the SMU mailbox
+	uint32_t smuPendingMsg { 0 };               // a message the SMU had not answered when smuSend gave up on it (0: none)
+	uint64_t smuPendingAt { 0 };                // when it was sent (mach_absolute_time)
 	IOLock *smuTableLock { nullptr };           // the SMU driver table: one transfer and the reads of it at a time
 	void gcWake(uint32_t what) const;
 	void gfxOffAfterWake(uint32_t what);
@@ -1266,8 +1268,12 @@ private:
 		return GpuVm::mcToPhysical(mc, sv.fbMcBase, sv.gcFbOffset, physical);
 	}
 	// SMU mailbox (MP1): send one message, return the response code
-	// (1 = OK, 0 = no answer) and the argument register after it.
+	// (1 = OK, 0 = no answer) and the argument register after it. As amdgpu's smu_cmn_send_smc_msg_with_param,
+	// a message the SMU has not answered yet is waited for (kSmuBusyMs) before the next one is written; while
+	// it stays unanswered nothing is sent and 0 is returned.
 	uint32_t smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint32_t timeoutMs);
+	uint32_t smuPoll(uint32_t ms);
+	static constexpr uint32_t kSmuBusyMs = 2000;   // smu_cmn's timeout (adev->usec_timeout x 20)
 
 	static uint32_t pspRead(void *ctx, uint32_t dword);
 	static void     pspWrite(void *ctx, uint32_t dword, uint32_t value);
