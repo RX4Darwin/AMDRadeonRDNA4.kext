@@ -395,6 +395,7 @@ void RDNA4Device::dmubCursorTest() {
 // NDRV hardware cursor (W14, W21)
 // ---------------------------------------------------------------------------
 
+#include "drr.hpp"
 #include "device.hpp"
 #include "klog.hpp"
 #include "ndrv.hpp"
@@ -1646,6 +1647,11 @@ IOReturn RDNA4Device::drawHardwareCursor(int32_t x, int32_t y, uint32_t visible)
 		changed = true;
 	}
 	cursorMpcLock(false);   // program_cursor_position: unlock; the update latches at the next VUPDATE
+	// Variable refresh: the move ends the stretched blank, so the pointer is not held to the slowest rate on a still
+	// desktop (dc_stream_set_cursor_position with DRR_TRIGGER_ON_FLIP_AND_CURSOR).
+	ModeSet::Step trigger;
+	if (Drr::trigger(static_cast<uint8_t>(cursorIndex()), trigger))
+		regWriteDmu(trigger.seg, trigger.dword, trigger.value);
 	cursorDrawCalls++;
 	if (changed && cursorVisChanges < 6) {
 		cursorVisChanges++;

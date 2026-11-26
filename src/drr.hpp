@@ -40,6 +40,10 @@ size_t build(uint8_t pipe, Phase phase, uint32_t vTotalMin, uint32_t vTotalMax, 
 void setActive(uint8_t pipe, bool on);
 bool active(uint8_t pipe);
 
+// The write that ends pipe `pipe`'s stretched blank, when its refresh is variable: after a flip, and after a cursor move
+// (DC's DRR_TRIGGER_ON_FLIP_AND_CURSOR). False when there is nothing to write.
+bool trigger(uint8_t pipe, ModeSet::Step &out);
+
 // DPCD: the sink can ignore the MSA timing (DOWN_STREAM_PORT_COUNT, 0x007 bit 6), and is told to (DOWNSPREAD_CTRL,
 // 0x107 bit 7), as Linux's enable_stream_features does for a stream with variable refresh.
 constexpr uint32_t kDpcdPortCount = 0x007, kDpcdDownspread = 0x107;

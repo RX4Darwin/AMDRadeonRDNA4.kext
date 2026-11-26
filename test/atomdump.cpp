@@ -3268,6 +3268,10 @@ static int testNdrv() {
 		failures += check(Drr::build(1, Drr::Phase::Off, 0, 0, st, 8) == 3 && st[0].value == 0, "drr: pipe 1 off");
 		failures += check(Drr::build(1, Drr::Phase::Trigger, 0, 0, st, 8) == 1 && st[0].dword == 0x1bbc && st[0].value == 1,
 		                  "drr: pipe 1 trigger");
+		failures += check(!Drr::trigger(1, st[0]), "drr: a fixed pipe triggered");
+		Drr::setActive(1, true);
+		failures += check(Drr::trigger(1, st[0]) && st[0].dword == 0x1bbc && !Drr::trigger(0, st[0]), "drr: the variable pipe's trigger");
+		Drr::setActive(1, false);
 		failures += check(!Drr::build(4, Drr::Phase::On, 1125, 3374, st, 8) && !Drr::build(1, Drr::Phase::On, 1125, 3374, st, 2) &&
 		                  !Drr::build(1, Drr::Phase::On, 0, 3374, st, 8), "drr: a bad pipe, room or range built");
 	}

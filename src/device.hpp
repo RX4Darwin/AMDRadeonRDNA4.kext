@@ -244,6 +244,7 @@ public:
 	// Variable refresh on the second pipe's DisplayPort stream in mode `m`: down to `extLines` lines more than its V
 	// total, or fixed (0). src/drr.hpp.
 	IOReturn setSecondPipeRefresh(const Modes::Mode &m, uint32_t extLines);
+	void secondPipeKeepMsaIgnore();
 	Modes::Limits secondPipeModeLimits() const;
 	// Whether the pipe can be switched to `t` (Pipe2::modeSteps): Linux's
 	// values for it are in the table or it is near the lit mode's pixel

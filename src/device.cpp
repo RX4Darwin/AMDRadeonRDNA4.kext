@@ -4372,6 +4372,7 @@ void RDNA4Device::secondLinkBack() {
 		runSecondPipePart(Pipe2::Part::Sleep);
 		xp().on = pickSecondLink(xp().target.now.pixelClockKHz) && runSecondPipePart(Pipe2::Part::Wake);
 	}
+	secondPipeKeepMsaIgnore();
 }
 
 uint8_t RDNA4Device::secondSinkHpd(bool orAnother) {
@@ -4585,7 +4586,22 @@ void RDNA4Device::setSecondPipePower(bool on) {
 	if (xp().on) {
 		scdcRefresh();
 		diffAfterWake();
+		secondPipeKeepMsaIgnore();
 	}
+}
+
+// While the pipe runs variable, a sink whose DPCD 0x107 lost the ignore-MSA bit (it was switched off and on, or its link
+// was trained again, which writes 0x107 afresh) is told again; without it the monitor shows nothing (seen on the card
+// 2026-11-26: the Lenovo switched off and on stayed black).
+void RDNA4Device::secondPipeKeepMsaIgnore() {
+	const Pipe2::Config &c = Pipe2::config();
+	uint8_t spread = 0;
+	if (!xp().on || !c.dp || !Drr::active(c.pipe) || !dpcdRead(xp().aux, Drr::kDpcdDownspread, &spread, 1) ||
+	    (spread & Drr::kMsaIgnore))
+		return;
+	spread = static_cast<uint8_t>(spread | Drr::kMsaIgnore);
+	FBLOG("drr: pipe %u: the sink lost DPCD 0x107's ignore-MSA bit, set again: %s", c.pipe,
+	      dpcdWrite(xp().aux, Drr::kDpcdDownspread, &spread, 1) ? "ok" : "FAILED");
 }
 
 void RDNA4Device::snapAfterLight(const Pipe2::Plan &plan)

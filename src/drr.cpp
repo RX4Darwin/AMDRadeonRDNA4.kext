@@ -51,4 +51,8 @@ bool active(uint8_t pipe) {
 	return pipe < kPipes && __atomic_load_n(&gActive[pipe], __ATOMIC_ACQUIRE);
 }
 
+bool trigger(uint8_t pipe, ModeSet::Step &out) {
+	return active(pipe) && build(pipe, Phase::Trigger, 0, 0, &out, 1) == 1;
+}
+
 } // namespace Drr

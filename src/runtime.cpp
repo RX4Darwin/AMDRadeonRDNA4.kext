@@ -2893,7 +2893,7 @@ bool RDNA4Compute::rtScanoutFlip(uint8_t hubp, uint64_t mc) {
 	// Variable refresh: the flip ends the stretched blank, as Linux's manual trigger after a flip (dc.c). HUBP n feeds
 	// OTG n on every pipe this driver lights.
 	ModeSet::Step trigger;
-	if (Drr::active(hubp) && Drr::build(hubp, Drr::Phase::Trigger, 0, 0, &trigger, 1) == 1)
+	if (Drr::trigger(hubp, trigger))
 		wr(IpDiscovery::HwDmu, GfxReg::Reg { trigger.seg, trigger.dword }, trigger.value);
 	return true;
 }
