@@ -3178,9 +3178,6 @@ static int testNdrv() {
 		Hdr::staticMetadataSdp(sdp);
 		failures += check(sdp[0] == 0x4c1d8700 && sdp[1] == 0x00021a01 && !sdp[2] && !sdp[8],
 		                  "hdr: static metadata SDP 0x%08x 0x%08x", sdp[0], sdp[1]);
-		Hdr::vscBt2020Sdp(sdp);   // Linux's rev 5 header; DB16 0x06 (RGB, BT.2020 RGB), DB17 0x01 (8 bpc, full range)
-		failures += check(sdp[0] == 0x13050700 && sdp[5] == 0x00000106 && !sdp[1] && !sdp[4] && !sdp[6],
-		                  "hdr: VSC SDP 0x%08x 0x%08x", sdp[0], sdp[5]);
 		// Edid::takesPq: a CTA block with an HDR Static Metadata block whose EOTFs include PQ (the Samsung's bytes).
 		uint8_t pq[256] {};
 		memcpy(pq, lenovo, 128);

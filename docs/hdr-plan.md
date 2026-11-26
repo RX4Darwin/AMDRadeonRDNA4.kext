@@ -2,8 +2,9 @@
 
 Status, 2026-11-26: with `rdna4-hdr=1` (and `rdna4-vrr=1`, which serves the timing range) macOS offers HDR on the rig's
 Samsung, and switching it on sends the HDR static metadata (PQ): the Samsung's "HDR Tone Mapping" goes active with HDR
-on and greyed out with it off, and the picture looked normal. BT.2020 is signalled in a VSC SDP (link stable; not yet
-judged by eye). The link stays 8 bits a component. Off by default.
+on and greyed out with it off, and the picture looked normal. BT.2020 is not signalled: a VSC SDP for it made the
+Samsung show the desktop shrunk into its upper-left corner (step 3, removed). The link stays 8 bits a component. Off by
+default.
 
 ## What the monitors and macOS have
 
@@ -35,14 +36,18 @@ and the secondary stream's master enable, as Linux (vpg3_update_generic_info_pac
 enc3_stream_encoder_update_dp_info_packets); off clears GSP3. The mastering primaries, luminance, MaxCLL and MaxFALL are
 0 ("unknown"). Card: DP0_DP_SEC_CNTL 0x00800001 with HDR on, the Samsung's tone mapping follows.
 
-## Step 3 (done, 2026-11-26): BT.2020
+## Step 3 (tried and removed, 2026-11-26): BT.2020
 
 If the sink takes colorimetry from a VSC SDP (DPCD 0x2210 bit 3; the Samsung reads 0x08), HDR on also sends a VSC SDP
 revision 5 (mod_build_vsc_infopacket: DB16 = RGB | BT.2020 RGB, DB17 = 8 bpc full range) in VPG packet 0 with
 DP_SEC_GSP0_ENABLE, and sets MSA MISC1 bit 6 so the sink takes colorimetry from it (dcn401 set_stream_attribute).
 HDR off clears GSP0 and the bit, which leaves the MSA's own colorimetry as before. Card: DP_SEC_CNTL 0x00900001,
 DP_MSA_MISC 0x40, no HPD drop or retrain afterwards; macOS kept HDR on across a reboot and the packets went out at its
-first switch. Not judged by eye yet (colours should look the same as with PQ alone on a monitor that assumed BT.2020).
+first switch. By eye (Sunneva, later that night): with it the Samsung showed the whole desktop shrunk into its upper-left
+corner, though macOS's own screenshot was full size; switching HDR off (only the packets change, the mode stays) made
+it normal, and on again shrank it again. Removed: HDR sends the PQ metadata only, as in step 2, which looked normal.
+Why the VSC SDP does that to this monitor is not known (its DB16 0x06 = RGB, BT.2020 RGB, DB17 0x01 = 8 bpc full
+range follow Linux's set_vsc_packet_colorimetry_data); Linux sends one whenever the sink takes it.
 
 ## Next
 
