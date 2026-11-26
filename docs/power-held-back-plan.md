@@ -1,6 +1,6 @@
 # The power features held back under lit displays, plan
 
-Status, 2026-11-25: step 1 done and on by default (memory free unless an extra display runs a 4K-class mode); GFXOFF built, opt-in (rdna4-gfxoff=1). Asked for by Sunneva after the OpenMW speed work: display DPM,
+Status, 2026-11-25: step 1 done and on by default (memory free unless an extra display runs a 4K-class mode); GFXOFF built, opt-in (rdna4-gfxoff=1), with a known hang on a mode switch (below). Asked for by Sunneva after the OpenMW speed work: display DPM,
 memory and fabric deep sleep, GFXOFF.
 
 ## What holds them back today (rig: RX 9070 XT, two displays lit, desktop idle)
@@ -83,6 +83,18 @@ leaves the block busy or unmanaged (GRBM 0x0800382c after the wake); to fix befo
   15 W (18 W without). OpenMW's 12 cell loads, Quake II, vkcube (MoltenVK), the self-test: no hang, no failed restore. Not run:
   system sleep, a long run, a RADV Vulkan app, the paravirtual mode. `debug.rdna4_gfxoff` (counters by wake source) and
   `debug.rdna4_pmsurvey` (the GC power survey into the log) are read-only sysctls.
+
+## GFXOFF hang on a mode switch (2026-11-26, rig)
+
+With `rdna4-gfxoff=1`, switching the Samsung (its EDID now offers 2560x1440@144, 604 MHz) to that mode from the desktop
+hung WindowServer within seconds, and watchdogd panicked the machine about two minutes later. Reproduced three times, on
+`next` without PR 28 too. The kext log: shortly after the switch `AllowGfxOff timed out`, then `WAKE FAILED for a GC
+register access, 0xfffff3 (DisallowGfxOff -> 0x00)` (the SDMA path), after which every GC access is dropped, SDMA fences
+never land and WindowServer waits for ever. The same switch without `rdna4-gfxoff=1` is fine. So the SMU stops answering
+the GFXOFF messages around a boot-display mode switch: suspect SMU mailbox use from two threads at once (the re-arm
+tick's AllowGfxOff against a display path's message) or a message the PMFW refuses while the display clocks change; not
+yet looked into. `rdna4-gfxoff=1` was taken off the rig's config.plist; GFXOFF stays opt-in and is not to be made the
+default before this is understood and fixed.
 
 ## Risks
 
