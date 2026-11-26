@@ -15,8 +15,8 @@ kext)
 	put LICENSE "$d/LICENSE"
 	put lib/Lilu/LICENSE.txt "$d/LICENSE.Lilu"                 # plugin_start.cpp is compiled in
 	put lib/MacKernelSDK/LICENSE.txt "$d/LICENSE.MacKernelSDK"  # libkmod and libkmodc++ are linked in (APSL 2.0)
-	sed -n '/Copyright/,/OTHER DEALINGS/p' src/amdgpu/clearstate_defs.h | sed -e 's/^ \* \{0,1\}//' > "$d/LICENSE.amdgpu-code"
-	[ -s "$d/LICENSE.amdgpu-code" ] || die "no MIT notice in src/amdgpu/clearstate_defs.h"
+	sed -n '/Copyright/,/OTHER DEALINGS/p' lib/linux/drivers/gpu/drm/amd/amdgpu/clearstate_defs.h | sed -e 's/^ \* \{0,1\}//' > "$d/LICENSE.amdgpu-code"
+	[ -s "$d/LICENSE.amdgpu-code" ] || die "no MIT notice in lib/linux/drivers/gpu/drm/amd/amdgpu/clearstate_defs.h"
 	;;
 bundle)
 	b=${2:?the driver bundle}

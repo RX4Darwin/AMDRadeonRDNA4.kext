@@ -16,20 +16,8 @@
 # through DIG0 on link 0 (HPD1) and DIG1 on link 1 (HPD2) into
 # src/pipe2_linux_dp1.inc and _dp2.inc. With one it writes only the first.
 #
-# The Linux tree only needs the display driver and its headers: lib/linux, a
-# submodule at the commit the checked-in tables were made from (sparse, and
-# "update = none" so that a recursive clone does not fetch all of Linux; set it
-# up with the commands below inside lib/linux, then git checkout <commit>).
-# A sparse checkout is enough (the commit is in each table's first line):
-#
-#   git clone --depth 1 --filter=blob:none --no-checkout https://github.com/torvalds/linux.git
-#   cd linux && git sparse-checkout init --no-cone && git sparse-checkout set \
-#       /drivers/gpu/drm/amd/display/ '/drivers/gpu/drm/amd/include/*.h' \
-#       '/drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_4_1_0_*' \
-#       '/drivers/gpu/drm/amd/include/asic_reg/dce/dce_11_0_*' \
-#       '/drivers/gpu/drm/amd/include/asic_reg/nbif/nbif_6_3_1_*' \
-#       /include/drm/display/drm_dp.h /include/drm/display/drm_dsc.h /include/drm/display/drm_dsc_helper.h \
-#       /drivers/gpu/drm/display/drm_dsc_helper.c /include/linux/hdmi.h && git checkout
+# The Linux tree is lib/linux, a submodule at the commit the checked-in tables were made from (sparse, one commit deep,
+# "update = none" so that a recursive clone does not fetch all of Linux): tools/build/fetch-linux.sh sets it up.
 #
 # How it works: pipegen.c includes dcn401_resource.c for Linux's own register
 # tables and block constructors, builds one fake pipe (stream, plane, link),

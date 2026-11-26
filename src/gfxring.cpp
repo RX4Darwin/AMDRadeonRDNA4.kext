@@ -46,8 +46,9 @@
 #include "psred_kernel.h"
 #include "psstore_kernel.h"
 
-#include "amdgpu/clearstate_defs.h"
-#include "amdgpu/clearstate_gfx12.h"
+// amdgpu's GFX 12 clear-state tables, from lib/linux (tools/build/fetch-linux.sh)
+#include "clearstate_defs.h"
+#include "clearstate_gfx12.h"
 
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>

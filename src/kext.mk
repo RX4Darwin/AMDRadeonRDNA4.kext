@@ -47,6 +47,7 @@ COMMON_FLAGS = \
 	-isysroot $(SDK) \
 	-I$(ROOT)/lib/MacKernelSDK/Headers \
 	-I$(ROOT)/include \
+	-I$(ROOT)/lib/linux/drivers/gpu/drm/amd/amdgpu \
 	-I$(LILU_SHIM) \
 	-I$(LILU) \
 	-I. \

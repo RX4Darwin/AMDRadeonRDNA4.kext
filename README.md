@@ -398,6 +398,7 @@ pointers are refused at load, with the reason in the kernel log.
 Clone with the submodules (`git clone --recursive`, or `git submodule update --init`; they are in `lib/`).
 
 ```sh
+tools/build/fetch-linux.sh      # once: the parts of Linux the kext builds from (lib/linux, sparse)
 tools/build/fetch-firmware.sh   # once: AMD's firmware for the compute bring-up (both chips' sets), into lib/linux-firmware/amdgpu/
 make                            # the kext and the programs (x86_64, macOS 11 and later)
 make PVGPU=1                    # the Metal path: the driver's own Metal driver by default (OpenGL, Vulkan via MoltenVK), paravirtual with rdna4-pvgpu=1

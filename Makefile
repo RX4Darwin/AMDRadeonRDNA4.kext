@@ -125,6 +125,8 @@ all: check-config kext tools
 check-config:
 	@case "$(CONFIG)/$(VMTEST)/$(PVGPU)" in DEBUG/[01]/[01]|RELEASE/[01]/[01]) ;; \
 	*) echo "CONFIG is DEBUG or RELEASE, VMTEST and PVGPU are 0 or 1 (got CONFIG=$(CONFIG) VMTEST=$(VMTEST) PVGPU=$(PVGPU))" >&2; exit 1 ;; esac
+	@[ -f lib/linux/drivers/gpu/drm/amd/amdgpu/clearstate_gfx12.h ] || { echo "lib/linux is not set up (the kext \
+	builds amdgpu's clear-state tables from it): run tools/build/fetch-linux.sh" >&2; exit 1; }
 
 product-dir:
 	@echo $(PRODUCT_DIR)

@@ -64,7 +64,7 @@ are in the [README](../README.md).
 | `src/regsnap.{hpp,cpp}` | Register snapshots of what a plan wrote, compared after display sleep and wake (`rdna4-wakediff`). |
 | `src/vrambench.{hpp,cpp}` | CPU write and read speed of VRAM through BAR0, per cache mode (`rdna4-vrambench`). |
 | `src/cursor_linux_ref.inc` | The cursor registers as Linux leaves them on this card, for the cursor's comparison log. |
-| `src/gfxring.cpp`, `src/amdgpu/clearstate_*.h` | The graphics ring (PFP/ME) brought up as amdgpu's gfx_v12_0 does, with Linux's clear-state data. |
+| `src/gfxring.cpp` | The graphics ring (PFP/ME) brought up as amdgpu's gfx_v12_0 does, with Linux's clear-state data (`clearstate_gfx12.h`, compiled from `lib/linux`). |
 | `src/gpuvm.{hpp,cpp}`, `src/gpuvmtable.{hpp,cpp}`, `src/ptpages.{hpp,cpp}`, `src/vmid.{hpp,cpp}` | The GPU's page tables for the runtime's clients: entry encoders, the table writer, demand-allocated table pages, the VMID pool. Freestanding and host-tested. |
 | `src/vmshared.cpp`, `src/vmtest.cpp` | Clients' jobs on kernel-owned compute queues (`rdna4-vmshared`), and the address-space self-test (`rdna4-vmid-test`). |
 | `src/pmidle.cpp` | Idle accounting and the GFX power items of `docs/power-gfx.md`. |
