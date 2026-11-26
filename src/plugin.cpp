@@ -1136,6 +1136,19 @@ IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSOb
 // descriptor byte for byte; at 64x64 WindowServer drew the pointer itself), cropped onto the 64x64 plane. IOFramebuffer's first call
 // is its test (convertCursorImage records the descriptor in IOFBCursorInfo and returns false). Otherwise IONDRV's own.
 mach_vm_address_t orgSetCursorImage { 0 }, orgSetCursorState { 0 }, orgFbGetAttribute { 0 };
+mach_vm_address_t orgFbSetAttribute { 0 }, orgFbTimingInfo { 0 }, orgFbGetConnAttribute { 0 };
+
+// rdna4-vrrprobe=1 (docs/freesync-plan.md step 0): the boot display says it can refresh variably ('vrr?', and its modes' timing
+// carries the vertical blanking extension down to the EDID's lowest rate), and what WindowServer then asks and sets is logged.
+// Nothing in the display hardware changes.
+bool gVrrProbe;
+bool vrrProbeFb(void *fb) { return gVrrProbe && PvScanout::portOf(static_cast<IOService *>(fb)) == 0; }
+void vrrLog(const char *what, IOSelect a, uintptr_t v) {
+	static uint32_t lines;
+	if (lines++ < 200)
+		FBLOG("vrrprobe: %s '%c%c%c%c' (0x%08x) = 0x%lx", what, (a >> 24) & 0xff, (a >> 16) & 0xff, (a >> 8) & 0xff, a & 0xff, a,
+		      static_cast<unsigned long>(v));
+}
 constexpr uint32_t kCursorAnnounced = 128;
 uint32_t gCursorHot[8][2];   // each head's image's hot spot: IOFramebuffer moves the image's corner, cursorMove takes the hot spot
 bool gAccelCursor;           // rdna4-accel=4, read where the routes are made
@@ -1194,7 +1207,53 @@ IOReturn wrapFbGetAttribute(void *fb, IOSelect attribute, uintptr_t *value)
 		*value = 1;
 		return kIOReturnSuccess;
 	}
-	return FunctionCast(wrapFbGetAttribute, orgFbGetAttribute)(fb, attribute, value);
+	if (vrrProbeFb(fb) && attribute == kIOFBVariableRefreshRate && value) {
+		*value = 1;
+		vrrLog("getAttribute", attribute, 1);
+		return kIOReturnSuccess;
+	}
+	const IOReturn r = FunctionCast(wrapFbGetAttribute, orgFbGetAttribute)(fb, attribute, value);
+	if (vrrProbeFb(fb))
+		vrrLog(r == kIOReturnSuccess ? "getAttribute" : "getAttribute (failed)", attribute, value ? *value : 0);
+	return r;
+}
+
+IOReturn wrapFbSetAttribute(void *fb, IOSelect attribute, uintptr_t value)
+{
+	if (vrrProbeFb(fb))
+		vrrLog("setAttribute", attribute, value);
+	if (vrrProbeFb(fb) && attribute == kIOFBVariableRefreshRate)
+		return kIOReturnSuccess;
+	return FunctionCast(wrapFbSetAttribute, orgFbSetAttribute)(fb, attribute, value);
+}
+
+IOReturn wrapFbGetConnAttribute(void *fb, IOIndex connect, IOSelect attribute, uintptr_t *value)
+{
+	const IOReturn r = FunctionCast(wrapFbGetConnAttribute, orgFbGetConnAttribute)(fb, connect, attribute, value);
+	if (vrrProbeFb(fb))
+		vrrLog(r == kIOReturnSuccess ? "getAttributeForConnection" : "getAttributeForConnection (failed)", attribute,
+		       value ? *value : 0);
+	return r;
+}
+
+// The mode's timing with the vertical blanking that takes it down to the display's lowest rate (EDID range limits, 48 Hz when
+// not known): Adaptive-Sync for IOGraphics (IODetailedTimingInformationV2::verticalBlankingExtension, 0 = none).
+IOReturn wrapFbTimingInfo(void *fb, IODisplayModeID mode, IOTimingInformation *info)
+{
+	const IOReturn r = FunctionCast(wrapFbTimingInfo, orgFbTimingInfo)(fb, mode, info);
+	if (r != kIOReturnSuccess || !info || !vrrProbeFb(fb) || !(info->flags & kIODetailedTimingValid))
+		return r;
+	IODetailedTimingInformationV2 &t = info->detailedInfo.v2;
+	const uint64_t total = static_cast<uint64_t>(t.horizontalActive + t.horizontalBlanking) * (t.verticalActive + t.verticalBlanking);
+	const uint32_t hz = total ? static_cast<uint32_t>(t.pixelClock / total) : 0, minHz = 48;
+	if (hz > minHz) {
+		t.verticalBlankingExtension = (t.verticalActive + t.verticalBlanking) * hz / minHz - (t.verticalActive + t.verticalBlanking);
+		static uint32_t lines;
+		if (lines++ < 40)
+			FBLOG("vrrprobe: mode 0x%x %ux%u at %u Hz: vertical blanking extension %u lines (down to %u Hz)", mode,
+			      t.horizontalActive, t.verticalActive, hz, t.verticalBlankingExtension, minHz);
+	}
+	return r;
 }
 
 IOReturn wrapSetCursorState(void *fb, SInt32 x, SInt32 y, bool visible)
@@ -1930,6 +1989,17 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 		if (!patcher.routeMultiple(index, cursor, 3, address, size))
 			FBLOG("cursor: no IONDRVFramebuffer::setCursorImage/setCursorState/getAttribute routes (error %d)", patcher.getError());
 		patcher.clearError();
+		uint32_t vrr = 0;
+		if (Trial::bootArg("rdna4-vrrprobe", vrr) && vrr) {
+			KernelPatcher::RouteRequest probe[] {
+				{ "__ZN17IONDRVFramebuffer12setAttributeEjm", wrapFbSetAttribute, orgFbSetAttribute },
+				{ "__ZN17IONDRVFramebuffer25getAttributeForConnectionEijPm", wrapFbGetConnAttribute, orgFbGetConnAttribute },
+				{ "__ZN17IONDRVFramebuffer27getTimingInfoForDisplayModeEiP19IOTimingInformation", wrapFbTimingInfo, orgFbTimingInfo },
+			};
+			gVrrProbe = patcher.routeMultiple(index, probe, 3, address, size);
+			FBLOG("vrrprobe: IONDRVFramebuffer routes %s (error %d)", gVrrProbe ? "in" : "NOT in", patcher.getError());
+			patcher.clearError();
+		}
 	}
 #endif
 	// Both kinds of hot-plug start their HPD poll when IOFramebuffer opens.
