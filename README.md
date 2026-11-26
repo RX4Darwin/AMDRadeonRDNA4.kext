@@ -143,8 +143,9 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 - In the paravirtual mode (`rdna4-pvgpu=1`): no ray tracing, Metal heaps, argument buffers or indirect command buffers,
   and at most 16 textures a stage (so Chrome's WebGL via Dawn does not run). The native driver (the default) has these.
 - Display Stream Compression (DSC): 3840x2160 at 120 and 144 Hz.
-- Variable refresh (FreeSync) by default: with `rdna4-vrr=1` it works on a second DisplayPort monitor (48-144 Hz on the
-  rig's Lenovo); not yet on the boot display, nor where the high-rate timings are only in DisplayID blocks.
+- Variable refresh (FreeSync) by default: with `rdna4-vrr=1` it works on DisplayPort monitors, the boot display included
+  (48-144 Hz on the rig's two), at the timings at the monitor's top rate (on a 4K144 monitor not yet at 4K: that needs
+  DSC).
 - DisplayPort MST, HDR output to the monitor.
 - Audio over HDMI and DisplayPort.
 - Hardware video decode and encode (VCN).

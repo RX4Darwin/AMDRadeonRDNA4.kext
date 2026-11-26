@@ -1332,6 +1332,18 @@ uint64_t RDNA4Device::liveFramePeriodNs() const {
 // only way to learn the exact rate the GOP chose. Edges are detected by
 // polling every 10 us, so 10 frames give ~0.01 % precision. Returns 0 if the
 // counter does not move (OTG stopped / unreadable).
+uint32_t RDNA4Device::otgFramesInASecond(uint8_t otg) {
+	const uint32_t reg = Pipe::Reg::kOtgFrameCount + otg * Pipe::Reg::kOtgStride;
+	const uint32_t c0 = regReadDmu(2, reg);
+	IOSleep(1000);
+	const uint32_t c1 = regReadDmu(2, reg);
+	if (c0 == 0xFFFFFFFF || c1 == 0xFFFFFFFF)
+		return 0;
+	const uint32_t frames = (c1 - c0) & 0xffffff;
+	FBLOG("drr: OTG%u made %u frames in 1 s%s", otg, frames, Drr::active(otg) ? " (variable refresh)" : "");
+	return frames;
+}
+
 uint64_t RDNA4Device::measureFramePeriodNs(uint32_t otgOffset) {
 	if (!pipe.valid())
 		return 0;
@@ -2220,6 +2232,23 @@ int head2SleepSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *re
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_head2sleep, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, head2SleepSysctl, "I",
 	    "AMDRadeonRDNA4: 1 puts the second display's pipe to sleep, 2 wakes it, each register step a breadcrumb");
 
+// debug.rdna4_otghz: write a pipe number, read back how many frames its OTG made in the next second (variable refresh
+// leaves no fixed rate to read; docs/freesync-plan.md). Registered with debug.rdna4_head2sleep, on its device.
+int gOtgHz;
+
+int otgHzSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = gOtgHz;
+	const int err = sysctl_handle_int(oidp, &value, 0, req);
+	if (err || !req->newptr)
+		return err;
+	if (value < 0 || value >= static_cast<int>(Pipe::kMaxOtg) || !gSleepTestDev)
+		return EINVAL;
+	gOtgHz = static_cast<int>(gSleepTestDev->otgFramesInASecond(static_cast<uint8_t>(value)));
+	return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_otghz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, otgHzSysctl, "I",
+	    "AMDRadeonRDNA4: write a pipe number, read the frames its OTG made in the following second");
+
 RDNA4Device *gColdDev;   // the device debug.rdna4_coldreset acts on (rdna4-coldprobe=1)
 
 int coldResetSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
@@ -2659,6 +2688,7 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	if (!gSleepTestDev && rmmio) {
 		gSleepTestDev = this;
 		sysctl_register_oid(&sysctl__debug_rdna4_head2sleep);
+		sysctl_register_oid(&sysctl__debug_rdna4_otghz);
 	}
 	if (systemSleepWanted() && !sleepWakeNotifier) {
 		if (rmmio && pipe.valid() && !coldBoot)   // what a cold start after the wake compares against
@@ -2779,12 +2809,11 @@ void RDNA4Device::buildModeTable() {
 	}
 
 	// The EDID with its blocks past the first extension (DisplayID timings), for the table alone.
-	static uint8_t full[512];
-	memcpy(full, edidData, sizeof(edidData));
-	memcpy(full + sizeof(edidData), edidMore, sizeof(edidMore));
-	const size_t fullLen = edidLen == sizeof(edidData) ? edidLen + edidMoreLen : edidLen;
+	memcpy(edidAll, edidData, sizeof(edidData));
+	memcpy(edidAll + sizeof(edidData), edidMore, sizeof(edidMore));
+	edidAllLen = edidLen == sizeof(edidData) ? edidLen + edidMoreLen : edidLen;
 	if (modesetRequested && edidLen)
-		modeCount = Modes::build(full, fullLen, lim, modeTable, Modes::MaxModes);
+		modeCount = Modes::build(edidAll, edidAllLen, lim, modeTable, Modes::MaxModes);
 
 	Edid::BaseInfo base {};
 	if (edidLen && Edid::parseBaseBlock(edidData, edidLen, base)) {
@@ -4590,18 +4619,9 @@ void RDNA4Device::setSecondPipePower(bool on) {
 	}
 }
 
-// While the pipe runs variable, a sink whose DPCD 0x107 lost the ignore-MSA bit (it was switched off and on, or its link
-// was trained again, which writes 0x107 afresh) is told again; without it the monitor shows nothing (seen on the card
-// 2026-11-26: the Lenovo switched off and on stayed black).
 void RDNA4Device::secondPipeKeepMsaIgnore() {
-	const Pipe2::Config &c = Pipe2::config();
-	uint8_t spread = 0;
-	if (!xp().on || !c.dp || !Drr::active(c.pipe) || !dpcdRead(xp().aux, Drr::kDpcdDownspread, &spread, 1) ||
-	    (spread & Drr::kMsaIgnore))
-		return;
-	spread = static_cast<uint8_t>(spread | Drr::kMsaIgnore);
-	FBLOG("drr: pipe %u: the sink lost DPCD 0x107's ignore-MSA bit, set again: %s", c.pipe,
-	      dpcdWrite(xp().aux, Drr::kDpcdDownspread, &spread, 1) ? "ok" : "FAILED");
+	if (xp().on && Pipe2::config().dp)
+		keepMsaIgnore(Pipe2::config().pipe, xp().aux);
 }
 
 void RDNA4Device::snapAfterLight(const Pipe2::Plan &plan)
@@ -4781,33 +4801,59 @@ bool RDNA4Device::relinkSecondPipe(uint32_t pixelClockKHz) {
 	return ok;
 }
 
-IOReturn RDNA4Device::setSecondPipeRefresh(const Modes::Mode &m, uint32_t extLines) {
-	const Pipe2::Config &c = Pipe2::config();
-	if (!xp().lit || !c.dp)
-		return kIOReturnUnsupported;
+// Variable refresh on DisplayPort pipe `otg` (its sink on AUX `aux`) in timing `t`: down to `extLines` lines more than its
+// V total, or fixed (0).
+IOReturn RDNA4Device::setPipeRefresh(uint8_t otg, uint8_t aux, const Edid::DetailedTiming &t, uint32_t extLines) {
 	const bool on = extLines != 0;
 	uint8_t caps = 0, spread = 0;
-	if (on && (!dpcdRead(xp().aux, Drr::kDpcdPortCount, &caps, 1) || !(caps & Drr::kMsaIgnoreCapable))) {
-		FBLOG("drr: pipe %u stays fixed: the sink cannot ignore the MSA timing (DPCD 0x007 = 0x%02x)", c.pipe, caps);
+	if (on && (!dpcdRead(aux, Drr::kDpcdPortCount, &caps, 1) || !(caps & Drr::kMsaIgnoreCapable))) {
+		FBLOG("drr: pipe %u stays fixed: the sink cannot ignore the MSA timing (DPCD 0x007 = 0x%02x)", otg, caps);
 		return kIOReturnUnsupported;
 	}
-	const uint32_t vTotal = m.t.vActive + m.t.vBlank;
+	const uint32_t vTotal = t.vActive + t.vBlank;
 	ModeSet::Step steps[8];
-	const size_t n = Drr::build(c.pipe, on ? Drr::Phase::On : Drr::Phase::Off, vTotal, vTotal + extLines, steps, 8);
-	if (!n || !dpcdRead(xp().aux, Drr::kDpcdDownspread, &spread, 1))
+	const size_t n = Drr::build(otg, on ? Drr::Phase::On : Drr::Phase::Off, vTotal, vTotal + extLines, steps, 8);
+	if (!n || !dpcdRead(aux, Drr::kDpcdDownspread, &spread, 1))
 		return kIOReturnUnsupported;
 	// As Linux's enable_stream_features: the sink told to ignore the MSA timing while the refresh is variable. It is set
 	// before the V total starts to move and cleared after it stops.
 	const uint8_t want = static_cast<uint8_t>(on ? spread | Drr::kMsaIgnore : spread & ~Drr::kMsaIgnore);
-	if (on && want != spread && !dpcdWrite(xp().aux, Drr::kDpcdDownspread, &want, 1))
+	if (on && want != spread && !dpcdWrite(aux, Drr::kDpcdDownspread, &want, 1))
 		return kIOReturnIOError;
-	if (!runSteps(steps, n, nullptr, 0, "drr", c.pipe * Pipe::Reg::kOtgStride))
+	if (!runSteps(steps, n, nullptr, 0, "drr", otg * Pipe::Reg::kOtgStride))
 		return kIOReturnIOError;
-	Drr::setActive(c.pipe, on);
-	if (!on && want != spread && !dpcdWrite(xp().aux, Drr::kDpcdDownspread, &want, 1))
+	Drr::setActive(otg, on);
+	if (!on && want != spread && !dpcdWrite(aux, Drr::kDpcdDownspread, &want, 1))
 		return kIOReturnIOError;
-	FBLOG("drr: pipe %u %s (V total %u..%u lines)", c.pipe, on ? "variable" : "fixed", vTotal, vTotal + extLines);
+	FBLOG("drr: pipe %u %s (V total %u..%u lines)", otg, on ? "variable" : "fixed", vTotal, vTotal + extLines);
 	return kIOReturnSuccess;
+}
+
+// While pipe `otg` runs variable, a sink whose DPCD 0x107 lost the ignore-MSA bit (it was switched off and on, or its
+// link was trained again, which writes 0x107 afresh) is told again; without it the monitor shows nothing (seen on the
+// card 2026-11-26: the Lenovo switched off and on stayed black).
+void RDNA4Device::keepMsaIgnore(uint8_t otg, uint8_t aux) {
+	uint8_t spread = 0;
+	if (!Drr::active(otg) || !dpcdRead(aux, Drr::kDpcdDownspread, &spread, 1) || (spread & Drr::kMsaIgnore))
+		return;
+	spread = static_cast<uint8_t>(spread | Drr::kMsaIgnore);
+	FBLOG("drr: pipe %u: the sink lost DPCD 0x107's ignore-MSA bit, set again: %s", otg,
+	      dpcdWrite(aux, Drr::kDpcdDownspread, &spread, 1) ? "ok" : "FAILED");
+}
+
+IOReturn RDNA4Device::setSecondPipeRefresh(const Modes::Mode &m, uint32_t extLines) {
+	const Pipe2::Config &c = Pipe2::config();
+	return xp().lit && c.dp ? setPipeRefresh(c.pipe, xp().aux, m.t, extLines) : kIOReturnUnsupported;
+}
+
+// The boot display: its pipe and the sink the firmware lit it on.
+IOReturn RDNA4Device::setBootRefresh(const Modes::Mode &m, uint32_t extLines) {
+	return pipe.valid() && !pipe.isTmds() ? setPipeRefresh(pipe.otg, sinkAuxInst, m.t, extLines) : kIOReturnUnsupported;
+}
+
+void RDNA4Device::bootKeepMsaIgnore() {
+	if (pipe.valid() && !pipe.isTmds())
+		keepMsaIgnore(pipe.otg, sinkAuxInst);
 }
 
 IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {

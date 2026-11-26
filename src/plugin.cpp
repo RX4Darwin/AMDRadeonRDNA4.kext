@@ -316,6 +316,10 @@ bool deviceSurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out)
 	return true;
 }
 
+int32_t deviceSetRefresh(void *ctx, const Modes::Mode &m, uint32_t extLines) {
+	return static_cast<RDNA4Device *>(ctx)->setBootRefresh(m, extLines);
+}
+
 int32_t deviceSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 	auto *dev = static_cast<RDNA4Device *>(ctx);
 	if (m.source != Modes::SourceScaled)
@@ -1062,6 +1066,7 @@ struct BootDp {
 	IOTimerEventSource *timer { nullptr };
 	bool                seen { false };   // the pin at the last poll
 	bool                gone { false };   // it was low for a second since the link was last good
+	bool                returned { false };   // it came back less than 7 s ago (variable refresh's DPCD check)
 	uint32_t            same { 0 };       // polls it has read that way
 	uint32_t            polls { 0 };
 } bootDp;
@@ -1071,6 +1076,7 @@ void bootDpPoll(OSObject *, IOTimerEventSource *timer) {
 	const bool present = dev.bootSinkPresent();
 	if (present != bootDp.seen) {
 		FBLOG("dptrain: the boot display's HPD pin went %s", present ? "high" : "low");
+		bootDp.returned = present;
 		bootDp.seen = present;
 		bootDp.same = 0;
 	} else {
@@ -1082,6 +1088,12 @@ void bootDpPoll(OSObject *, IOTimerEventSource *timer) {
 		bootDp.gone = false;
 		dev.logBootLink("the display is back");
 	}
+	// Variable refresh: the firmware trains the link again after the pin returns, which rewrites DPCD 0x107 (within 2 s
+	// on the card); its ignore-MSA bit is looked at 1, 3 and 7 s after any return, however short the drop.
+	if (present && (bootDp.same == 2 || bootDp.same == 6 || bootDp.same == 14) && bootDp.returned)
+		dev.bootKeepMsaIgnore();
+	if (bootDp.same == 14)
+		bootDp.returned = false;
 	// rdna4-dptrain=2: once, 15 s after the framebuffer opened, with the
 	// cable left alone, to try the training by itself.
 	if (dev.dpTrainLevel >= 2 && ++bootDp.polls == 15000 / kHpdPollMs)
@@ -1454,8 +1466,14 @@ void attach(FbEntry &e) {
 		}
 	}
 #endif
-	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidData, dev.edidLen, be);
-	st->ndrv.adaptiveSync = vrrWanted();
+	// rdna4-vrr=1: macOS gets every EDID block the sink has, not only the first extension: the Samsung's 144 Hz timings
+	// are in a DisplayID block past it, and CoreDisplay gives only those (at the EDID's top rate) a variable copy.
+	const bool vrr = vrrWanted();
+	if (vrr && be.switchTo == deviceSwitchTo)
+		be.setRefresh = deviceSetRefresh;
+	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, vrr ? dev.edidAll : dev.edidData,
+	              vrr ? dev.edidAllLen : dev.edidLen, be);
+	st->ndrv.adaptiveSync = vrr;
 #ifdef AMDRadeonRDNA4_PVGPU
 	// A test boot's level (rdna4-trial) is only known once NVRAM is; the heads' framebuffers are told before macOS asks.
 	uint32_t pvTrial = 0, pvDisp = 0;

@@ -1,9 +1,11 @@
 # Variable refresh (FreeSync / DisplayPort Adaptive-Sync), plan
 
-Status, 2026-11-26: with `rdna4-vrr=1` the Lenovo (second pipe, DisplayPort) runs variable refresh, card-verified: macOS
-offers "Variable", and with it the monitor reads 48 Hz on an idle desktop and 70-144 Hz while a window is dragged. The
-Samsung (boot display) gets no variable mode yet (its 144 Hz timings are outside the EDID blocks macOS reads), and the boot
-pipe has no refresh switch yet.
+Status, 2026-11-26: with `rdna4-vrr=1` variable refresh works on both rig monitors, card-verified. The Lenovo (second
+pipe) read 48 Hz idle and 70-144 Hz while dragging on its OSD. The Samsung (boot display, 2560x1440@144) counted 48-51
+frames a second idle and 86-144 while dragging (debug.rdna4_otghz). macOS gets every EDID block with the option on: the
+Samsung's 144 Hz timings are in a DisplayID block that our translator used to hide (it served two blocks). At 4K the
+Samsung has only 60 Hz until DSC 4K144 works, and CoreDisplay makes variable copies only near the EDID's top rate.
+Measuring: `sudo sysctl debug.rdna4_otghz=<pipe>; sysctl debug.rdna4_otghz` = that OTG's frames in the next second.
 
 ## What the monitors and macOS have
 

@@ -72,6 +72,8 @@ public:
 	// macOS is given the two above.
 	uint8_t edidMore[256] {};
 	size_t  edidMoreLen { 0 };
+	uint8_t edidAll[512] {};   // edidData and edidMore together: every block the sink has (up to four)
+	size_t  edidAllLen { 0 };
 	// A display beyond the boot one (rdna4-head2, plugin.cpp): the sink on
 	// another connector, the pipe it is lit on and what the kext lit for it.
 	// The second-pipe functions below act on the selected one (selectExtra).
@@ -245,6 +247,12 @@ public:
 	// total, or fixed (0). src/drr.hpp.
 	IOReturn setSecondPipeRefresh(const Modes::Mode &m, uint32_t extLines);
 	void secondPipeKeepMsaIgnore();
+	// The same for the boot display (the firmware keeps its link: the bit is looked at after its pin comes back).
+	IOReturn setBootRefresh(const Modes::Mode &m, uint32_t extLines);
+	void bootKeepMsaIgnore();
+	uint32_t otgFramesInASecond(uint8_t otg);   // debug.rdna4_otghz
+	IOReturn setPipeRefresh(uint8_t otg, uint8_t aux, const Edid::DetailedTiming &t, uint32_t extLines);
+	void keepMsaIgnore(uint8_t otg, uint8_t aux);
 	Modes::Limits secondPipeModeLimits() const;
 	// Whether the pipe can be switched to `t` (Pipe2::modeSteps): Linux's
 	// values for it are in the table or it is near the lit mode's pixel
