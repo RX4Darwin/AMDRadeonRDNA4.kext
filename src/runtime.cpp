@@ -43,6 +43,12 @@ using namespace GfxReg;
 
 namespace {
 
+bool reportHostRefusal(HostRefusals::Window &window, uint64_t &repeats) {
+	uint64_t nowNs;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+	return window.record(nowNs, repeats);
+}
+
 uint64_t hostFailureTimeUs() {
 	clock_sec_t seconds;
 	clock_usec_t micros;
@@ -2649,9 +2655,11 @@ IOReturn RDNA4Compute::hostChecks(const void *owner, uint64_t bytes, uint64_t fl
 	RtClient *c = vmClientFor(owner);
 	if (!c || !dmaReady || !busMasterSet)
 		return kIOReturnUnsupported;
+	uint64_t repeats;
 	if (bytes > kHostMaxBuffer) {
-		RLOG("host buffer size limit: unix_us=%llu vmid=%u request %llu bytes, max %llu",
-		     hostFailureTimeUs(), c->vmid, bytes, kHostMaxBuffer);
+		if (reportHostRefusal(c->hostRefusals.bufferSize, repeats))
+			RLOG("host buffer size limit: unix_us=%llu vmid=%u request %llu bytes, max %llu repeats=%llu",
+			     hostFailureTimeUs(), c->vmid, bytes, kHostMaxBuffer, repeats);
 		return kIOReturnNoResources;
 	}
 	if (!bytes || (flags & ~static_cast<uint64_t>(RDNA4_HOST_EXECUTABLE | RDNA4_HOST_READ_ONLY)))
@@ -2659,22 +2667,33 @@ IOReturn RDNA4Compute::hostChecks(const void *owner, uint64_t bytes, uint64_t fl
 	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
 	if (rounded < bytes || rounded > kHostMaxBuffer)
 		return kIOReturnNoResources;
-	if (counted && (rounded > kHostMaxClient - c->hostBytes || rounded > kHostMaxTotal - hostBytesTotal)) {
-		RLOG("host allocation quota: unix_us=%llu vmid=%u request %llu bytes, client %llu/%llu, total %llu/%llu",
-		     hostFailureTimeUs(), c->vmid, rounded, c->hostBytes, kHostMaxClient, hostBytesTotal, kHostMaxTotal);
+	const bool clientFull = counted && rounded > kHostMaxClient - c->hostBytes;
+	const bool totalFull = counted && rounded > kHostMaxTotal - hostBytesTotal;
+	if (clientFull || totalFull) {
+		auto reportQuota = [&](HostRefusals::Window &window, const char *resource) {
+			if (reportHostRefusal(window, repeats))
+				RLOG("host allocation quota: unix_us=%llu vmid=%u request %llu bytes, client %llu/%llu, total %llu/%llu resource=%s repeats=%llu",
+				     hostFailureTimeUs(), c->vmid, rounded, c->hostBytes, kHostMaxClient, hostBytesTotal, kHostMaxTotal, resource, repeats);
+		};
+		if (clientFull)
+			reportQuota(c->hostRefusals.clientBytes, "client-bytes");
+		if (totalFull)
+			reportQuota(c->hostRefusals.totalBytes, "total-bytes");
 		return kIOReturnNoResources;
 	}
 	uint32_t slot = 0;
 	while (slot < bufferCap() && buffers[slot].owner)
 		slot++;
 	if (slot == bufferCap()) {
-		RLOG("host buffer table full: unix_us=%llu vmid=%u %u slots, request %llu bytes",
-		     hostFailureTimeUs(), c->vmid, bufferCap(), rounded);
+		if (reportHostRefusal(c->hostRefusals.tableSlots, repeats))
+			RLOG("host buffer table full: unix_us=%llu vmid=%u %u slots, request %llu bytes repeats=%llu",
+			     hostFailureTimeUs(), c->vmid, bufferCap(), rounded, repeats);
 		return kIOReturnNoResources;
 	}
 	if (clientOverQuota(owner, false)) {
-		RLOG("host buffer client quota: unix_us=%llu vmid=%u %u slots, request %llu bytes",
-		     hostFailureTimeUs(), c->vmid, kClientBuffers, rounded);
+		if (reportHostRefusal(c->hostRefusals.clientSlots, repeats))
+			RLOG("host buffer client quota: unix_us=%llu vmid=%u %u slots, request %llu bytes repeats=%llu",
+			     hostFailureTimeUs(), c->vmid, kClientBuffers, rounded, repeats);
 		return kIOReturnNoResources;
 	}
 	return kIOReturnSuccess;
@@ -2734,8 +2753,10 @@ IOReturn RDNA4Compute::mapHostLocked(const void *owner, IOMemoryDescriptor *memo
 	if (segments)
 		IOFree(segments, segBytes);
 	if (!mapped) {
-		RLOG("host DMA mapping failed: unix_us=%llu vmid=%u %llu bytes, imported %u",
-		     hostFailureTimeUs(), c->vmid, rounded, static_cast<unsigned>(imported));
+		uint64_t repeats;
+		if (reportHostRefusal(c->hostRefusals.dmaMapping, repeats))
+			RLOG("host DMA mapping failed: unix_us=%llu vmid=%u %llu bytes, imported %u repeats=%llu",
+			     hostFailureTimeUs(), c->vmid, rounded, static_cast<unsigned>(imported), repeats);
 		(void)dma->clearMemoryDescriptor();
 		dma->release();
 		if (pageBuses)

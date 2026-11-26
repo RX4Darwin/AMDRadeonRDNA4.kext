@@ -41,6 +41,7 @@
 #include "../src/pm4.hpp"
 #include "../src/codeobj.hpp"
 #include "../src/gpuheap.hpp"
+#include "../src/hostrefusals.hpp"
 #include "../src/flip.hpp"
 #include "../src/gpuvm.hpp"
 #include "../src/vmid.hpp"
@@ -4142,6 +4143,25 @@ static int testCodeObject() {
 	return failures;
 }
 
+static int testHostRefusals() {
+	HostRefusals a {}, b {};
+	uint64_t repeats;
+	int failures = check(a.clientBytes.record(0, repeats) && !repeats, "host refusals: first is immediate");
+	for (unsigned i = 1; i < 240; ++i)
+		failures += check(!a.clientBytes.record(i * 1000000000ull / 240, repeats), "host refusals: suppressed retry %u", i);
+	failures += check(a.totalBytes.record(999999999, repeats) && !repeats, "host refusals: independent total quota");
+	failures += check(b.clientBytes.record(999999999, repeats) && !repeats, "host refusals: independent client");
+	failures += check(a.clientBytes.record(1000000000, repeats) && repeats == 240, "host refusals: all repeats at the boundary");
+	failures += check(!a.clientBytes.record(1000000000, repeats), "host refusals: no second line at the boundary");
+	failures += check(!a.totalBytes.record(1000000000, repeats), "host refusals: total quota retains its own deadline");
+	failures += check(a.clientBytes.record(4000000000ull, repeats) && repeats == 2, "host refusals: pending count survives idle time");
+	failures += check(a.totalBytes.record(4000000000ull, repeats) && repeats == 2, "host refusals: counts stay separate");
+	failures += check(b.clientBytes.record(4000000000ull, repeats) && repeats == 1, "host refusals: one repeat after idle");
+	a = HostRefusals {};
+	failures += check(a.clientBytes.record(4000000000ull, repeats) && !repeats, "host refusals: fresh client in a reused slot");
+	return failures;
+}
+
 static int testGpuHeap() {
 	int failures = 0;
 	GpuHeap::Heap h;
@@ -6019,6 +6039,7 @@ int main(int argc, char **argv) {
 	failures += testSmuMetricsOffsets();
 	failures += testPm4Packets();
 	failures += testCodeObject();
+	failures += testHostRefusals();
 	failures += testGpuHeap();
 	failures += testFlipArithmetic();
 	failures += testGcInfo();

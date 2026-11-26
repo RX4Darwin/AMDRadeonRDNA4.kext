@@ -55,6 +55,7 @@
 #include "flip.hpp"
 #include "gfxregs.hpp"
 #include "gpuheap.hpp"
+#include "hostrefusals.hpp"
 #include "gpuvmtable.hpp"
 #include "ih.hpp"
 #include "gpuvm.hpp"
@@ -961,6 +962,7 @@ private:
 		uint64_t queueVa { 0 }, mqdMc { 0 }, eopVa { 0 }, rptrVa { 0 }, wpollVa { 0 };
 		volatile uint32_t *queueCpu { nullptr };
 		uint64_t hostBytes { 0 };
+		HostRefusals hostRefusals {};
 		volatile uint32_t *kernargCpu { nullptr };
 		volatile uint32_t *fenceCpu { nullptr };
 		uint32_t fence { 0 }, doorbell { 0 };
