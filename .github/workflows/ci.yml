@@ -35,6 +35,9 @@ jobs:
           # Xcode 26 ships the Metal compiler as a separate component (the bundle's probe.metallib)
           xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
 
+      - name: Fetch Linux (the parts the kext and the generators build from; lib/linux is update = none)
+        run: tools/build/fetch-linux.sh
+
       - name: Kext, plain
         run: make all PVGPU=0
 
@@ -61,8 +64,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Fetch firmware
-        run: tools/build/fetch-firmware.sh
+      - name: Fetch firmware and Linux
+        run: tools/build/fetch-firmware.sh && tools/build/fetch-linux.sh
       - name: Host tests with firmware
         run: make test
       - name: Kext with firmware embedded
