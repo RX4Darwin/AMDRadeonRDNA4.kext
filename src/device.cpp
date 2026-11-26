@@ -19,6 +19,7 @@
 #include "dcninit.hpp"
 #include "compute.hpp"
 #include "hdr.hpp"
+#include "audio.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMessage.h>
@@ -5333,6 +5334,25 @@ IOReturn RDNA4Device::setBootHdr(bool on) {
 	      static_cast<unsigned>(o / Pipe::Reg::kDigStride), regReadDmu(2, kDpSecCntl + o), regReadDmu(2, kMsaMisc + o),
 	      regReadDmu(2, kVpgStatus + o));
 	return kIOReturnSuccess;
+}
+
+// Audio on the boot display (docs/audio-plan.md step 1): Linux's sequence for pipe 0 / DIG0 on DisplayPort
+// (src/audio_linux.inc, made for the rig's Samsung): the Azalia endpoint describes the sink to the HD Audio codec,
+// the audio clock runs and the stream encoder sends audio packets. Only for that pipe; once a boot.
+IOReturn RDNA4Device::enableBootAudio() {
+	if (!pipe.valid() || pipe.isTmds() || pipe.otg != 0 || pipe.dig != 0) {
+		FBLOG("audio: the boot display is not DisplayPort on pipe 0 / DIG0: no audio sequence for it");
+		return kIOReturnUnsupported;
+	}
+	constexpr size_t steps = sizeof(Audio::kBootDpAudio) / sizeof(Audio::kBootDpAudio[0]);
+	size_t written = 0;
+	for (const Audio::Step &s : Audio::kBootDpAudio) {
+		const uint32_t v = s.mask == 0xffffffff ? s.value : (regReadDmu(s.seg, s.reg) & ~s.mask) | s.value;
+		written += regWriteDmu(s.seg, s.reg, v);
+	}
+	FBLOG("audio: boot display: %zu of %zu steps written; DP0_DP_SEC_CNTL=0x%08x", written, steps,
+	      regReadDmu(2, Hdr::kDpSecCntl));
+	return written == steps ? kIOReturnSuccess : kIOReturnError;
 }
 
 void RDNA4Device::bootKeepMsaIgnore() {

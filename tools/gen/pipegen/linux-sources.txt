@@ -14,6 +14,7 @@ dc/dccg/dcn31/dcn31_dccg.c
 dc/dccg/dcn32/dcn32_dccg.c
 dc/dccg/dcn35/dcn35_dccg.c
 dc/dccg/dcn401/dcn401_dccg.c
+dc/dce/dce_audio.c
 dc/dce/dce_clock_source.c
 dc/dcn10/dcn10_cm_common.c
 dc/dcn30/dcn30_afmt.c
@@ -117,3 +118,4 @@ dc/dsc/rc_calc.c
 dc/dsc/rc_calc_dpi.c
 dc/dsc/dcn20/dcn20_dsc.c
 dc/dml/dsc/rc_calc_fpu.c
+dc/link/link_validation.c

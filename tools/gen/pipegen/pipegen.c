@@ -75,6 +75,7 @@ struct cfg {
 	bool y420;     /* "y420": the HDMI stream in YCbCr 4:2:0, half the TMDS clock (amdgpu's force_yuv420_output) */
 	bool dsc;      /* "dsc" (after dplink, sink kind d): the stream compressed, as dc_dsc_compute_config chooses */
 	bool drr;      /* the "drr" scenario: variable refresh on a lit DisplayPort stream (sequence_drr) */
+	bool audio;    /* the "audio" scenario: audio on a lit DisplayPort stream (sequence_audio) */
 	struct dc_dsc_config dsc_cfg;
 	int sink_swing, sink_pre;     /* the drive the simulated sink asks for before it reports lock */
 	char sink_kind;               /* its capabilities: sink_reset() */
@@ -312,8 +313,12 @@ void read_scdc_data(struct ddc_service *ddc) { rec_mark("scdc:read_status", 0); 
 static bool no_128b_132b(struct pipe_ctx *p) { return false; }
 static enum dp_link_encoding enc_8b_10b(const struct dc_link_settings *s) { return DP_8b_10b_ENCODING; }
 static void no_trace(struct dc_link *l, uint8_t s) { }
+static bool no_fec(const struct dc_link *l) { return false; }   /* (FEC only with DSC; the audio scenario has none) */
+uint32_t dp_link_bandwidth_kbps(const struct dc_link *link, const struct dc_link_settings *link_setting);
 static const struct link_service g_link_srv = {
 	.set_dpms_on = link_set_dpms_on,
+	.dp_link_bandwidth_kbps = dp_link_bandwidth_kbps,      /* the "audio" scenario's bandwidth check */
+	.dp_is_fec_supported = no_fec,
 	.dp_is_128b_132b_signal = no_128b_132b,
 	.dp_get_encoding_format = enc_8b_10b,
 	.dp_trace_source_sequence = no_trace,
@@ -646,6 +651,66 @@ static void sequence_drr(void)
 	rec_mark("end", 0);
 }
 
+/* ---- the "audio" scenario: audio on a lit DisplayPort stream (docs/audio-plan.md) ----
+ *
+ * What amdgpu does for a stream with audio, on a pipe whose stream already runs: the Azalia endpoint's one-time
+ * setup (dce_aud_hw_init), the endpoint's sink description from the EDID (dce110_apply_single_controller_ctx_to_hw:
+ * build_audio_output, the link's setup_audio_output = the stream encoder's dp_audio_setup, az_configure), the audio
+ * wall-clock DTO (dce110_setup_audio_dto's DP branch: DCN 4.01's DCCG has no set_audio_dtbclk_dto, so
+ * wall_dto_setup) and the enable (dce110_enable_audio_stream: az_enable, the link's enable_audio_packet). The sink's
+ * audio is PIPEGEN_AUDIO="<mfr id> <product id> <SAD, 3 bytes hex> <speaker allocation> <name>", as
+ * dm_helpers_parse_edid_caps and amdgpu_dm_fill_audio_info read them (ids little endian from EDID bytes 8-11);
+ * default: the rig's Samsung (Odyssey G70D: LPCM 2 channels, 32/44.1/48 kHz, 16/20/24 bit, front left/right). */
+static void sequence_audio(const struct cfg *c)
+{
+	struct dc *dc = &g_dc;
+	struct pipe_ctx *pipe = g_pipe;
+	struct dc_stream_state *stream = pipe->stream;
+	struct dcn10_stream_encoder *se = DCN10STRENC_FROM_STRENC(pipe->stream_res.stream_enc);
+	const char *spec = getenv("PIPEGEN_AUDIO");
+	unsigned mfr = 0x2d4c, product = 0xe06f, sad = 0x090707, speakers = 0x01;
+	char name[AUDIO_INFO_DISPLAY_NAME_SIZE_IN_CHARS] = "Odyssey G70D";
+
+	if (spec && sscanf(spec, "%x %x %x %x %19[^\n]", &mfr, &product, &sad, &speakers, name) != 5) {
+		fprintf(stderr, "bad PIPEGEN_AUDIO\n"); exit(2);
+	}
+	struct audio *audio = dcn401_create_audio(&g_ctx, 0);   /* the first free audio: endpoint 0 */
+	const struct dce_audio_registers *ar = ((struct dce_audio *)audio)->regs;   /* (DCE_AUD is dce_audio.c's) */
+	rec_indirect(ar->AZALIA_F0_CODEC_ENDPOINT_INDEX, ar->AZALIA_F0_CODEC_ENDPOINT_DATA);
+	g_pool.audios[0] = audio; g_pool.audio_count = 1;
+	pipe->stream_res.audio = audio;
+	stream->audio_info.manufacture_id = mfr;
+	stream->audio_info.product_id = product;
+	memcpy(stream->audio_info.display_name, name, sizeof(name));
+	stream->audio_info.mode_count = 1;
+	stream->audio_info.modes[0].format_code = (enum audio_format_code)((sad >> 19) & 0xf);
+	stream->audio_info.modes[0].channel_count = ((sad >> 16) & 7) + 1;
+	stream->audio_info.modes[0].sample_rates.all = (sad >> 8) & 0x7f;
+	stream->audio_info.modes[0].sample_size = sad & 0xff;
+	stream->audio_info.flags.all = speakers;
+
+	/* the stream is running (as sequence_dp) and no secondary packets are being sent yet */
+	rec_poke_field(se->regs->DP_VID_STREAM_CNTL, DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_ENABLE_MASK,
+		       DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_ENABLE_MASK);
+	rec_poke(se->regs->DP_SEC_CNTL, 0);
+
+	pipe->link_config.dp_link_settings = stream->link->cur_link_settings;   /* the link as it runs (make_state) */
+	const struct link_hwss *link_hwss = get_link_hwss(stream->link, &pipe->link_res);
+	struct audio_output out = { 0 };
+
+	rec_mark("begin:init", 0);
+	audio->funcs->hw_init(audio);
+	rec_mark("begin:configure", 0);
+	build_audio_output(g_new, pipe, &out);
+	link_hwss->setup_audio_output(pipe, &out, audio->inst);
+	audio->funcs->az_configure(audio, stream->signal, &out.crtc_info, &stream->audio_info, &out.dp_link_info);
+	rec_mark("begin:dto", 0);
+	audio->funcs->wall_dto_setup(audio, stream->signal, &out.crtc_info, &out.pll_info);
+	rec_mark("begin:enable", 0);
+	dc->hwss.enable_audio_stream(pipe);
+	rec_mark("end", 0);
+}
+
 /* Two runs, unknown registers reading all-zeros then all-ones: a full write whose value differs between the runs
  * carries bits read back from the register, so it becomes an update that leaves those bits alone. A different
  * sequence of events means a read steered the code; that has to be settled with rec_poke(), not guessed. */
@@ -706,6 +771,11 @@ static void init_watermarks_as_copies(struct hubbub *hubbub)
 }
 /* dc.c's: this card has no eDP panel. */
 void dc_get_edp_links(const struct dc *dc, struct dc_link **edp_links, unsigned int *edp_num) { *edp_num = 0; }
+/* dc_link_exports.c's (that file also has dc_get_edp_links): what build_audio_output asks of the link */
+uint32_t dc_link_bandwidth_kbps(const struct dc_link *link, const struct dc_link_settings *link_settings)
+{
+	return link->dc->link_srv->dp_link_bandwidth_kbps(link, link_settings);
+}
 /* dc.c's: on this card it only turns idle power features (MALL as a cache, through DMUB) off and on again,
  * nothing a display needs to light: a mark. */
 void dc_allow_idle_optimizations_internal(struct dc *dc, bool allow, char const *caller_name)
@@ -898,6 +968,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	if (argc > 1 && !strcmp(argv[1], "drr")) { c.dp = c.drr = true; argv++; argc--; }
+	else if (argc > 1 && !strcmp(argv[1], "audio")) { c.dp = c.audio = true; argv++; argc--; }
 	else if (argc > 1 && !strcmp(argv[1], "dp")) { c.dp = true; argv++; argc--; }
 	else if (argc > 1 && !strcmp(argv[1], "dpdual")) { c.dual = true; argv++; argc--; }
 	if (argc > 1 && !strcmp(argv[1], "y420")) { c.y420 = true; argv++; argc--; }
@@ -913,10 +984,11 @@ int main(int argc, char **argv)
 	}
 	verbose = argc > 17;
 	if (argc < 17) {
-		fprintf(stderr, "usage: pipegen [dp | drr | dpdual | dplink K S P] [on W H] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync "
+		fprintf(stderr, "usage: pipegen [dp | drr | audio | dpdual | dplink K S P] [on W H] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync "
 				"vback  khz hpositive vpositive vic [verbose]\n  hpd counts from 1, as the VBIOS path records do\n"
 				"  dp: the reference for retiming a lit DisplayPort stream instead of the second-pipe plan\n"
 				"  drr: variable refresh on, off, and the trigger after a flip, on a lit DisplayPort stream\n"
+				"  audio: audio on a lit DisplayPort stream (PIPEGEN_AUDIO: the sink's audio, see sequence_audio)\n"
 				"  dpdual: an HDMI stream on a DisplayPort connector (a passive DP++ adapter)\n"
 				"  y420: (after dpdual, or alone for HDMI) the HDMI stream in YCbCr 4:2:0\n"
 				"  dplink K S P [dsc]: light a DisplayPort stream, training its link against a simulated sink of kind\n"
@@ -951,7 +1023,7 @@ int main(int argc, char **argv)
 		rec_log_reads = verbose && run == 0;
 		setup();
 		make_state(&c);
-		if (c.drr) sequence_drr(); else if (c.dp && !c.train) sequence_dp(&c); else sequence(&c);
+		if (c.drr) sequence_drr(); else if (c.audio) sequence_audio(&c); else if (c.dp && !c.train) sequence_dp(&c); else sequence(&c);
 		if (run == 0) { memcpy(run0, evs, sizeof(struct ev) * nev); n0 = nev; }
 	}
 	printf("CONFIG %d %d %d %d  %u %u %u %u  %u %u %u %u  %u %d %d  %d %u  %d\n", c.pipe, c.dig, c.link, c.hpd + 1,

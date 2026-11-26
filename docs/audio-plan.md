@@ -42,10 +42,24 @@ reads 1002:AB28 (Navi 21's audio) as its device ID, and has it matched again. A 
   `AppleGFXHDADriver::start` ran and published an IOAudioDevice (transport `dprt`, `HDMIDPAudioCapabilities` yes), with
   no audio engine and nothing in Sound settings: no pin reports a display yet. The three earlier assertions remain.
 
+## Step 1: the display side for the boot display (written, card-run, no output yet)
+
+`tools/gen/pipegen/run.sh lib/linux audio` runs pipegen's "audio" scenario (sequence_audio): on the lit DP stream of
+pipe 0 / DIG0, Linux's dce_aud_hw_init, build_audio_output + the stream encoder's dp_audio_setup + dce_aud_az_configure
+(the sink from the EDID: the Samsung's IDs, name, LPCM 2 channels 32-48 kHz, front left/right), dce_aud_wall_dto_setup
+and dce110_enable_audio_stream (az_enable, ASP/AIP/ATP on). mkaudio.py writes it to src/audio_linux.inc (93 steps); the
+recorder models the Azalia index/data pair (rec_indirect) so its read-modify-writes stay updates. The kext replays it
+(`RDNA4Device::enableBootAudio`) when `debug.rdna4_hda=1` is written, before handing the function to AppleGFXHDA.
+
+- 2026-11-26 on the rig: 93 of 93 steps written, DP0_DP_SEC_CNTL 0x00901111 (audio packets on beside HDR's), both
+  displays unaffected, AppleGFXHDA started as before, still no audio engine or Sound output. The three assertions are
+  in setRequireMaxBusStall, setCodecProperties and readVendorRevisionInfo (missing properties, not the blocker).
+- Next: why AppleGFXHDADriver makes no engine: its graphics association (AppleDisplay matching, the framebuffer's
+  connector type, registerFramebufferNotification) and whether the codec's pin reports presence and ELD (HDA verbs
+  through the controller, or AppleGFXHDA's own logging).
+
 ## Later steps
 
-1. The Azalia endpoint and audio DTO for the boot display (Linux's sequence, likely through a pipegen scenario), so the
-   codec's pin reports the Samsung present with its ELD.
 2. Whatever IOFramebuffer attributes AppleGFXHDA asks of our framebuffer.
 3. DP audio packets on the stream encoder; then the second pipe and HDMI.
 4. A proper match without the run-time spoof (a personality that passes probe, or the spoof from boot once it is

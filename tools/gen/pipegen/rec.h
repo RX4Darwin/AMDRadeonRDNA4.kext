@@ -15,4 +15,7 @@ extern int rec_log_reads;
 /* While set, each write is recorded as a copy of the register last read (EV_COPY): for code that moves values
  * between registers (hubbub401_init_watermarks), which a recording of written values cannot express. */
 extern int rec_copy_mode;
+/* An index/data register pair (the Azalia endpoint's): the data register reads and keeps a value for each index, so a
+ * read-modify-write through it is recorded against that indexed register's own (unknown) value. */
+void rec_indirect(uint32_t index_addr, uint32_t data_addr);
 #endif

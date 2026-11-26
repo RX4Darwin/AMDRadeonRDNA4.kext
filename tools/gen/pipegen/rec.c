@@ -25,6 +25,11 @@ static uint32_t last_read;
 
 static struct { uint32_t addr, val; } mem[16384]; static int nmem;
 static uint32_t fill;
+static uint32_t ind_index, ind_data;
+void rec_indirect(uint32_t index_addr, uint32_t data_addr) { ind_index = index_addr; ind_data = data_addr; }
+uint32_t rec_peek(uint32_t a);
+/* The model's address for a register: the data register of the indirect pair stands for the indexed register. */
+static uint32_t cell(uint32_t a) { return ind_data && a == ind_data ? 0xff000000u | (rec_peek(ind_index) & 0xffffff) : a; }
 uint32_t rec_peek(uint32_t a) { for (int i = 0; i < nmem; i++) if (mem[i].addr == a) return mem[i].val; return fill; }
 void rec_reset(uint32_t f);
 void rec_poke(uint32_t a, uint32_t v)
@@ -61,7 +66,7 @@ uint32_t dm_read_reg_func(const struct dc_context *ctx, uint32_t address, const 
 			if (!polls[i].seen++) add(EV_WAIT, address, polls[i].mask, polls[i].settled, polls[i].timeout_us, func_name);
 			return rec_peek(address);
 		}
-	v = rec_peek(address);
+	v = rec_peek(cell(address));
 	last_read = address;
 	if (rec_log_reads) fprintf(stderr, "READ  %08x = %08x  in %s\n", address, v, func_name);
 	return v;
@@ -69,7 +74,7 @@ uint32_t dm_read_reg_func(const struct dc_context *ctx, uint32_t address, const 
 void dm_write_reg_func(const struct dc_context *ctx, uint32_t address, uint32_t value, const char *func_name)
 {
 	if (address == 0) { fprintf(stderr, "DROP  write to absent register in %s\n", func_name); return; }
-	rec_poke(address, value);
+	rec_poke(cell(address), value);
 	if (rec_copy_mode) {
 		add(EV_COPY, address, 0, 0, last_read, func_name);
 		return;
@@ -90,8 +95,8 @@ uint32_t generic_reg_update_ex(const struct dc_context *ctx, uint32_t addr, int 
 	uint32_t mask, value, v; va_list ap;
 	va_start(ap, field_value1); gather(&mask, &value, n, shift1, mask1, field_value1, ap); va_end(ap);
 	if (addr == 0) { fprintf(stderr, "DROP  update of absent register in %s\n", CALLER()); return 0; }
-	v = (rec_peek(addr) & ~mask) | value;
-	rec_poke(addr, v);
+	v = (rec_peek(cell(addr)) & ~mask) | value;
+	rec_poke(cell(addr), v);
 	add(EV_UPDATE, addr, mask, value, 0, CALLER());
 	return v;
 }
@@ -150,4 +155,4 @@ void generic_reg_wait(const struct dc_context *ctx, uint32_t addr, uint32_t shif
 void dcn41_shim_udelay(unsigned long us) { add(EV_DELAY, 0, 0, 0, (uint32_t)us, CALLER()); }
 void dcn41_shim_warn(const char *file, int line) { fprintf(stderr, "WARN  %s:%d\n", strrchr(file, '/') + 1, line); }
 
-void rec_reset(uint32_t f) { nmem = 0; nev = 0; fill = f; npolls = 0; }
+void rec_reset(uint32_t f) { nmem = 0; nev = 0; fill = f; npolls = 0; ind_index = ind_data = 0; }

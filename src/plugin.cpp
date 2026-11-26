@@ -1521,6 +1521,7 @@ bool wrapStart(void *fb, IOService *provider) {
 // function group is chosen by the device-id property, which is set to AB28 too. At run time only
 // (`sudo sysctl debug.rdna4_hda=1`), so a boot never repeats what it did.
 IOPCIDevice *gHdaGpu, *gHdaDevice;
+RDNA4Device *gHdaDev;   // the boot display's device: its audio goes on first (step 1)
 mach_vm_address_t orgExtConfigRead16 { 0 };
 constexpr uint16_t kHdaSpoofId = 0xab28;
 
@@ -1567,6 +1568,8 @@ int hdaSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		return err;
 	if (value != 1 || !gHdaGpu)
 		return EINVAL;
+	if (gHdaDev)
+		(void)gHdaDev->enableBootAudio();
 	offerHdaToApple(gHdaGpu);
 	return 0;
 }
@@ -1595,6 +1598,7 @@ void attach(FbEntry &e) {
 	computeStage = RDNA4Compute::requestedStage();
 	if (!gHdaGpu) {
 		gHdaGpu = pci;
+		gHdaDev = &dev;
 		sysctl_register_oid(&sysctl__debug_rdna4_hda);
 	}
 	Ndrv::Backend be { &dev, deviceSurfaceFor, deviceSwitchTo, deviceSetPower,

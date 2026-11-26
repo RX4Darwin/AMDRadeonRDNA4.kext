@@ -109,6 +109,16 @@ if [ "${1:-}" = drr ]; then
 	exit 0
 fi
 
+# "audio": audio on the lit DisplayPort boot display (pipegen.c sequence_audio: pipe 0, DIG0, link 0, HPD1, the
+# Samsung's 2560x1440@144), into src/audio_linux.inc (mkaudio.py; docs/audio-plan.md step 1).
+if [ "${1:-}" = audio ]; then
+	"$B/pipegen" audio 0 0 0 1  2560 48 32 80  1440 3 5 95  604250 1 0 0 > "$B/audio.txt"
+	python3 "$here/mkaudio.py" "$(git -C "$L" rev-parse HEAD)" "$B/audio.txt" > "$B/audio_linux.inc"
+	cp -f "$B/audio_linux.inc" "$repo/src/audio_linux.inc"
+	echo "wrote src/audio_linux.inc"
+	exit 0
+fi
+
 # table <file under src> [dplink <sink>] <configuration>: one table. With "dplink a 0 0" it is for a DisplayPort
 # stream, the link trained against the simulated sink that needs no lane adjustment.
 table() {
