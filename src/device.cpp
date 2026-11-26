@@ -663,8 +663,7 @@ bool RDNA4Device::readEDID(uint8_t inst, uint8_t *edid, size_t count,
 	return true;
 }
 
-// The extension blocks past the first (E-DDC segments) into edidMore, in order, logged with their DisplayID timings:
-// the mode table takes them, macOS's EDID stays the base block and the first extension.
+// Cache blocks 2 and 3 from E-DDC segment 1 in wire order.
 void RDNA4Device::readMoreEdidBlocks(uint8_t inst, uint8_t blocks) {
 	edidMoreLen = 0;
 	for (uint8_t b = 2; b <= blocks && b <= 3; b++) {
@@ -2808,7 +2807,7 @@ void RDNA4Device::buildModeTable() {
 		      bootTiming.pixelClockKHz);
 	}
 
-	// The EDID with its blocks past the first extension (DisplayID timings), for the table alone.
+	// The EDID with its blocks past the first extension (DisplayID timings), for the mode table and the boot framebuffer.
 	memcpy(edidAll, edidData, sizeof(edidData));
 	memcpy(edidAll + sizeof(edidData), edidMore, sizeof(edidMore));
 	edidAllLen = edidLen == sizeof(edidData) ? edidLen + edidMoreLen : edidLen;
@@ -2826,13 +2825,26 @@ void RDNA4Device::buildModeTable() {
 	// entry. Without a readable pipe (VM, unknown hardware), the EDID's
 	// preferred timing stands in when it matches the console geometry.
 	int bootIdx = -1;
+	const bool stretched = bootTimingValid && bootTiming.pixelClockKHz &&
+	                       (bootTiming.hActive > fbWidth || bootTiming.vActive > fbHeight);
 	if (bootTimingValid && bootTiming.pixelClockKHz) {
-		bootIdx = Modes::match(modeTable, modeCount, bootTiming);
-		if (bootIdx >= 0)
-			bootTiming.pixelClockKHz = modeTable[bootIdx].t.pixelClockKHz;
-		else
-			bootIdx = Modes::ensure(modeTable, modeCount, Modes::MaxModes, bootTiming,
-			                        Modes::SourceBoot);
+		const int wire = Modes::match(modeTable, modeCount, bootTiming);
+		if (wire >= 0)
+			bootTiming.pixelClockKHz = modeTable[wire].t.pixelClockKHz;
+		if (stretched) {
+			bootIdx = Modes::stretchedConsole(modeTable, modeCount, fbWidth, fbHeight, bootTiming);
+			if (bootIdx < 0) {
+				// No EDID mode describes the drawable console. Leave its geometry to IOBootNDRV.
+				modeCount = 0;
+				liveTiming = bootTiming;
+				liveTimingValid = true;
+				FBLOG("modes: no matching EDID mode for the stretched %ux%u console", fbWidth, fbHeight);
+				return;
+			}
+		} else {
+			bootIdx = wire >= 0 ? wire : Modes::ensure(modeTable, modeCount, Modes::MaxModes,
+			                                           bootTiming, Modes::SourceBoot);
+		}
 	} else if (edidLen) {
 		Edid::DetailedTiming pref {};
 		if (Edid::preferredTiming(edidData, edidLen, pref) &&
@@ -2852,7 +2864,7 @@ void RDNA4Device::buildModeTable() {
 	}
 
 	currentModeId = defaultModeId = modeTable[bootIdx].id;
-	liveTiming = modeTable[bootIdx].t;
+	liveTiming = stretched ? bootTiming : modeTable[bootIdx].t;
 	liveTimingValid = bootTimingValid;
 	for (size_t i = 0; i < modeCount; i++) {
 		const Modes::Mode &m = modeTable[i];

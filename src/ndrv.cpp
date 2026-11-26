@@ -120,6 +120,15 @@ void Translator::init(const Modes::Mode *table, size_t n, uint32_t bootId,
 	bootModeId = bootId;
 	edid = edidBytes;
 	edidLen = edidBytes ? (edidBytesLen / 128) * 128 : 0;
+	// Keep the original DDC reply for short EDIDs. Advertise additional blocks
+	// only up to the first bad checksum; block indices must stay contiguous.
+	if (edidLen > 256) {
+		size_t valid = 128;
+		while (valid < edidLen && valid / 128 <= edid[126] &&
+		       Edid::blockChecksumOk(edid + valid))
+			valid += 128;
+		edidLen = valid;
+	}
 	be = backend;
 	current = kBootModeId;
 	syncState = kDPMSSyncOn;

@@ -68,8 +68,7 @@ public:
 	// present. 0 length = no DDC sink found.
 	uint8_t edidData[256] {};
 	size_t  edidLen { 0 };
-	// Its blocks 2 and 3 (E-DDC segment 1; DisplayID on a 144 Hz DisplayPort monitor), for the mode table only:
-	// macOS is given the two above.
+	// Blocks 2 and 3 from E-DDC segment 1, assembled in edidAll for the boot framebuffer.
 	uint8_t edidMore[256] {};
 	size_t  edidMoreLen { 0 };
 	uint8_t edidAll[512] {};   // edidData and edidMore together: every block the sink has (up to four)

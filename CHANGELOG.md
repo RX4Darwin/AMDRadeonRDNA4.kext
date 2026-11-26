@@ -5,6 +5,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- The boot framebuffer serves up to four EDID blocks over DisplayPort. On the maintainer's Samsung 4K display, macOS
+  received the full 384-byte EDID, including the DisplayID extension.
+
 - **AMD's firmware comes from a submodule**: `lib/linux-firmware` (upstream linux-firmware, pinned at the commit the firmware
   shipped so far came from, sparse: only the amdgpu files the driver embeds and AMD's licence) replaces the download in
   `tools/build/fetch-firmware.sh`, which now sets the submodule up. The Navi 48 firmware is byte for byte what it was; builds now
