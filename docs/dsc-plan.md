@@ -90,6 +90,12 @@ hardware reads 1), audio and DRR (on under Linux), the tiled 10-bit desktop surf
 - 10 bpc under Linux (FMT, DP_PIXEL_FORMAT, the encoder and its RC parameters), 8 in our table; 8 works at 4K60.
 - DSCL line buffer partitions (Linux 5, ours 0) and the DPP clock DTO (Linux 247/255).
 
+Card, the same day (rdna4-dscboot=1, kext b7d58c36): at 4K144 the plane underflows for good (HUBP0_DCHUBP_CNTL underflow
+3, again 0.5 s after clearing; ODM0_OPTC_INPUT_GLOBAL_CONTROL 0x2400: underflow occurred and current), while FEC runs with
+0 errors and the sink reports RC buffer under-run and chunk errors (DSC_STATUS 0x07). The noise is the plane not keeping
+up: the next step is the memory side, Linux's DET segments and watermarks and the clocks it runs at 4K144 (DCFCLK, FCLK,
+UCLK, DISPCLK).
+
 ## Notes
 
 - Regenerating today's tables from lib/linux (6addb4f38557) reproduces them exactly, except the six YCbCr 4:2:0 ones (one

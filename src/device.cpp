@@ -3506,9 +3506,13 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 				{ 2, 0x1acd, "ODM0_OPTC_BYTES_PER_PIXEL" }, { 2, 0x1ace, "ODM0_OPTC_WIDTH_CONTROL" },
 				{ 2, 0x211f, "DP0_DP_PIXEL_FORMAT" }, { 2, 0x2122, "DP0_DP_VID_STREAM_CNTL" },
 				{ 2, 0x212d, "DP0_DP_DPHY_CNTL" }, { 2, 0x2141, "DP0_DP_SEC_CNTL" }, { 2, 0x209b, "DIG0_DIG_FIFO_CTRL0" },
+				{ 2, 0x1aca, "ODM0_OPTC_INPUT_GLOBAL_CONTROL" },   // OPTC_UNDERFLOW_OCCURRED_STATUS
 			};
 			for (const auto &g : kRegs)
 				FBLOG("dscboot:   %-32s 0x%08x", g.name, regReadDmu(g.seg, g.dword));
+			// A plane that cannot keep up corrupts whole compressed slices: noise rather than a few bad lines (4K144
+			// against Linux's registers, 2026-11-26: its plane has more DET and other watermarks).
+			logUnderflow("dscboot");
 			uint8_t fec[3] {}, fecCfg = 0, fecCap = 0;
 			(void)dpcdRead(sinkAuxInst, 0x280, fec, sizeof(fec));
 			(void)dpcdRead(sinkAuxInst, 0x120, &fecCfg, 1);
