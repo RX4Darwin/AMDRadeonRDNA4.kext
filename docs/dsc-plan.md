@@ -106,8 +106,14 @@ Later the same day:
 - A live register dump against Linux's snapshot: every DSC, OPTC-DSC and DIG register the table writes is the same.
   The rest differs because of Linux's surface (DET, watermarks, tiling), its DRR, audio and VSC packets, other pipes'
   clocks, and VSTARTUP-derived OTG values. OPTC_SEGMENT_WIDTH (Linux 1920) made no difference.
-- Next: compare clocks (DCFCLK, FCLK, UCLK, DISPCLK) with Linux at 4K144, under Fedora (pp_dpm_*), and the
-  plane's start-up timing per frame. Making the DISPCLK target follow DML for the mode is also still to do.
+- Clocks under Fedora at 4K144 (pp_dpm_*): UCLK held at its top level (1258 MHz), FCLK 2016, SOCCLK 1280,
+  DCEFCLK 514. Ours left UCLK free (97 MHz): the firmware's memory clock switches do not fit this stream's blank.
+  With `rdna4-uclk=1258` the strip and OPTC0's underflow are gone. The kext now holds UCLK at its top level (1187 MHz
+  as our firmware reports it) whenever the boot display runs above 600 MHz, set before the DSC stream lights: clean
+  from the first frame, 144.011 Hz (card, 2026-11-26). The sink still reports DSC_STATUS 0x03 after clearing; the
+  picture is clean.
+- Still to do: the DISPCLK target following DML for the mode (`rdna4-dispclk=1400` by hand), and mode switches with
+  DSC on (refused while the test stream runs).
 
 Card tests: `rdna4-dscboot=1` (8 bpc) or `=4` (10 bpc) with `rdna4-dispclk=1400`; mode switches are refused while lit.
 

@@ -3487,8 +3487,14 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	if (ok)
 		breadcrumb("cold start: boot pipe light");
 	t.part = Pipe2::Part::Light;
-	if (dscBoot)
+	if (dscBoot) {
 		Pipe2::useDsc(static_cast<int>(dscBoot));
+		// The memory clock held before the stream starts: free, the top of the picture was noise until it was
+		// (card, 2026-11-26).
+		liveTiming = Pipe2::config().timing;
+		liveTimingValid = true;
+		memoryClockFollowDisplays();
+	}
 	ok = ok && Pipe2::build(t, *plan, &why) &&
 	     runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dcninit: light", otgOff(), plan->aux);
 	if (ok && dscBoot) {
@@ -3683,6 +3689,7 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		      vidMNow, t.vidM);
 	if (runPlan(modePlan)) {
 		liveTiming = m.t;
+		memoryClockFollowDisplays();
 		if (t.nextra)
 			reqTiming = m.t;
 		// The firmware taking SET_PIXEL_CLOCK does not show the PLL runs at
