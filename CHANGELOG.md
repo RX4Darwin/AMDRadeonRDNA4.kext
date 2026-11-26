@@ -5,6 +5,12 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- Native Metal generates mip levels directly in VRAM for large Managed R16Unorm and RG16Unorm 2D textures,
+  keeping level 0 CPU-accessible. The host fallback walks rows directly. The reported working set includes
+  cached host buffers, and Metal can release them and retry a refused allocation. The per-client host limit
+  remains 1 GiB. The new bundle passed an on-card comparison against the CPU reference on an RX 9070 XT
+  under Tahoe, including an odd-sized RG16 texture, texture views, blits and the small-texture host fallback.
+
 - The primary DisplayPort framebuffer can offer EDID modes larger than the firmware console using a separate scanout
   surface and the boot pipe’s Linux DML table. This requires a single connected display. A second display at attach
   keeps the boot framebuffer on its console-sized surface. Host tests cover QHD and UHD plane programming and restoration of a

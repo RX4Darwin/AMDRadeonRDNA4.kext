@@ -92,6 +92,8 @@ enum RDNA4Stat { kStatBuffers, kStatDraws, kStatDrawUs, kStatDrainUs, kStatShado
 	             kStatDispatches, kStatDispatchUs, kStatSlotUs, kStatBuildUs, kStatWriteUs, kStatSubmitUs, kStatBarriers, kStatWaitUs, kStatRunUs, kStatEncodeUs, kStatRecordUs, kStatAllocs, kStatAllocUs, kStatFreeUs, kStatImports, kStatImportBytes, kStatAllocBytes, kStatSteps, kStatStepUs, kStatDrawnSurface, kStatDrawnOwn, kStatHeldIn, kStatHeldOut, kStatFramed, kStatVblMade, kStatVblCommitted, kStatVblDone, kStatMade0, kStatMade1, kStatMade2, kStatMade3, kStatMade4, kStatMade5, kStatIndexCpu, kStatIndexCpuUs, kStatIndexBusy, kStatCount };
 static std::atomic<uint64_t> gStats[kStatCount], gLatencyMaxUs, gEncodeMaxUs, gStepMaxUs;   // gLatencyMaxUs: the longest commit to done since the last report
 static std::atomic<int64_t> gHostLive, gHostCount, gOrderWaiting, gShadowLive, gShadowCount, gTexturesLive, gBuffersLive;   // gauges: host memory allocated (bytes, buffers), command buffers held back
+static std::atomic<uint64_t> gLargeMipBytes, gLargeMipCount;
+static std::atomic<uint64_t> gLargeMipHostPeak, gMipTailBytes, gMipTailCount;
 static uint64_t nowUs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000; }
 static void statAdd(RDNA4Stat s, uint64_t v) { gStats[s] += v; }
 static void statMax(std::atomic<uint64_t> &m, uint64_t v)
@@ -144,6 +146,9 @@ static void statReport(void)
 	RLOG(@"RDNA4MTL stats: host memory %.1f MB in %lld buffers (shadows %.1f MB in %lld), %lld command buffers held back for one enqueued before them; "
 	     @"%lld textures, %lld command buffers alive", gHostLive / 1e6, (long long)gHostCount, gShadowLive / 1e6, (long long)gShadowCount,
 	     (long long)gOrderWaiting, (long long)gTexturesLive, (long long)gBuffersLive);
+	if (gMipTailCount.load())
+		RLOG(@"RDNA4MTL stats: VRAM mip tails %llu bytes in %llu textures, large mip host peak %llu bytes",
+		     gMipTailBytes.load(), gMipTailCount.load(), gLargeMipHostPeak.load());
 }
 
 #include "pvdraw.hpp"
@@ -227,6 +232,7 @@ static void missingCall(id obj, NSInvocation *inv)
 - (instancetype)initWithAcceleratorPort:(io_service_t)service;         // nil unless RDNA4_NATIVE_MTL is set
 - (instancetype)initNativeWithAcceleratorPort:(io_service_t)service;   // whatever the environment (the router's choice)
 - (rdna4_t *)gpu;   // nil until the kext's runtime client is open
+- (const rdna4_program_t *)mipPlanesKernel;
 - (NSError *)drainGfx;   // waits for the draws submitted so far (the work queue)
 // A resource's gpuResourceID (argument buffers, MoltenVK's descriptor sets): the address of a 32-byte slot holding its T# or S#, which the
 // translated shader loads as it loads a bound one's (air2amdgpu.cpp). handle 0: a new slot (0 back: none left); `words` written into it.
@@ -464,6 +470,9 @@ static void deviceIdle(RDNA4MTLDevice *device);   // (below: the device's work q
 	const kern_return_t kr = allocHostBuffer(device.gpu, bytes, &_buf, &_cpu);
 	if (kr) {
 		rdna4Error([NSString stringWithFormat:@"a buffer of %lu bytes", (unsigned long)length], kr);
+		if (kr == kIOReturnNoResources)
+			RLOG(@"RDNA4MTL pressure: %llu bytes in %llu live large mipmapped textures, %llu host bytes including cache",
+			     gLargeMipBytes.load(), gLargeMipCount.load(), hostWorkingSetBytes());
 		return nil;
 	}
 	gHostLive += bytes, gHostCount += 1;
@@ -622,7 +631,10 @@ static void bcBlock(const uint8_t *b, uint32_t bytes, bool explicitAlpha, uint8_
 // menu titles strip on the 4K display (3752x60, 15040 bytes a row) read all zeros, its app menus never showed (2026-11-20).
 - (void)drewIntoShadow;
 - (void)writeBack;
-- (void)generateMipmaps;                    // levels 1 .. from level 0 (the CPU, 2x2 boxes)
+- (NSError *)generateMipmaps;
+- (BOOL)mipInVram:(NSUInteger)level;
+- (NSError *)transferMip:(MTLRegion)region level:(NSUInteger)level bytes:(void *)bytes
+                rowBytes:(NSUInteger)rowBytes upload:(BOOL)upload;
 @property (readonly) RDNA4MTLTexture *readCopy;   // a texture of its size and pitch, kept: what a draw reading its own target samples
 @property (readonly) uint64_t spanBytes;          // from its first row's start to its last row's end
 @property (readonly) uint64_t identity;           // where its first row is, as wrote() counts: in its IOSurface, else its GPU address
@@ -756,6 +768,8 @@ static BOOL vramTargets(void)
 	RDNA4MTLBuffer *_memory;
 	NSUInteger _width, _height;
 	MTLPixelFormat _format;
+	BOOL _managed;          // the descriptor's Metal storage mode, independent of its backing
+	uint64_t _largeMipBytes;
 	MTLTextureUsage _usage;
 	IOSurfaceRef _surface;
 	NSUInteger _plane, _offset;   // an IOSurface plane's, from the surface's base
@@ -766,6 +780,8 @@ static BOOL vramTargets(void)
 	// a mipmapped texture's levels, each an image of its own in _memory (an array's or cube's: its slices, _levelSlice apart, with the
 	// hardware's pitches for the level's size)
 	NSUInteger _levels, _levelOffset[16], _levelRow[16], _levelSlice[16];
+	rdna4_buffer_t _mipTail;   // owned by the root, with level 0 still in _memory
+	NSUInteger _mipTailStart; // root layout offset of level 1; copied into views
 	const uint8_t *_surfaceRows;   // shadowed: the IOSurface's own pixels, _surfaceRowBytes apart; _memory is the GPU's copy
 	NSUInteger _surfaceRowBytes;
 	uint32_t _shadowSeed;   // a planar surface's seed when last refreshed (_shadowSeeded)
@@ -837,7 +853,7 @@ static BOOL vramTargets(void)
 		return;
 	}
 	const uint32_t w = (uint32_t)MAX(_width >> level, (NSUInteger)1), h = (uint32_t)MAX(_height >> level, (NSUInteger)1);
-	linearImage(t, self.gpuBase + _levelOffset[level], _fm->gfx, viewSel(_fm->sel, _swizzle), w, h, (uint32_t)(_levelRow[level] / _fm->bpp));
+	linearImage(t, [self gpuAddressOfLevel:level], _fm->gfx, viewSel(_fm->sel, _swizzle), w, h, (uint32_t)(_levelRow[level] / _fm->bpp));
 }
 
 - (BOOL)shadowed { return _surfaceRows != NULL; }
@@ -853,7 +869,7 @@ static BOOL vramTargets(void)
 - (uint32_t)sampleOr
 {
 	uint32_t v = 0;
-	if (!_memory)
+	if (!_memory || [self mipInVram:0])
 		return 0;   // (the card's memory only)
 	for (NSUInteger y = 0; !_isDepth && y < _height; y += MAX(_height / 37, (NSUInteger)1))
 		for (NSUInteger x = 0; x < _width; x += MAX(_width / 41, (NSUInteger)1)) {
@@ -895,7 +911,14 @@ static char gCopyKey;
 }
 - (uint64_t)spanBytes { return _rowBytes * (_height - 1) + _width * self.bpp; }
 - (uint64_t)identity { return _surface && !_surfaceRows ? (1ull << 63 | (uint64_t)IOSurfaceGetID(_surface) << 32) + _offset : self.gpuBase; }
-- (void)wroteAll { wrote(self.identity - _offset, self.identity - _offset + (_memory ? _memory.length : _vram.bytes)); }
+- (void)wroteAll
+{
+	if (_mipTailStart) {
+		wrote(self.gpuBase, self.gpuBase + self.spanBytes);
+		return;
+	}
+	wrote(self.identity - _offset, self.identity - _offset + (_memory ? _memory.length : _vram.bytes));
+}
 - (void)written:(uint64_t)lo to:(uint64_t)hi
 {
 	const uint64_t base = self.identity, end = base + self.spanBytes;
@@ -1117,6 +1140,8 @@ static char gCopyKey;
 	}
 	_device = t->_device;
 	_memory = t->_memory;
+	_managed = t->_managed;
+	_mipTailStart = t->_mipTailStart;
 	_vramTarget = t->_vramTarget;
 	_vram = t->_vram;         // a multisampled texture's samples (its only memory) and how many: without them a view of one had address 0 and
 	_samples = t->_samples;   // one sample, and Chess's (SceneKit's) read of its 4x MSAA image through a view faulted and hung the draw (issue 23)
@@ -1358,8 +1383,32 @@ static char gCopyKey;
 		// A private render target in the card's memory: drawn over PCIe in host memory, MetalQuake's 4K RGBA16Float targets made a
 		// full-screen pass about 5 ms (2026-11-24). The CPU cannot reach it: its clears are fills or draws, its blits row copies on the card.
 		_vramTarget = YES;
-	} else if (!(_memory = [[RDNA4MTLBuffer alloc] initWithDevice:device length:bytes options:MTLResourceStorageModeShared]))
-		return nil;
+	} else {
+		const NSUInteger fullBytes = bytes;
+		_device = device;
+		if (twoD && _levels > 1 && fullBytes >= (8ull << 20) && d.storageMode == MTLStorageModeManaged &&
+		    (d.pixelFormat == MTLPixelFormatR16Unorm || d.pixelFormat == MTLPixelFormatRG16Unorm) && [device mipPlanesKernel] &&
+		    !rdna4_alloc(device.gpu, fullBytes - _levelOffset[1], &_mipTail)) {
+			_mipTailStart = _levelOffset[1];
+			bytes = _mipTailStart;
+			RTRACE(12, @"mip VRAM: format %lu %lux%lu, %lu host bytes + %llu VRAM bytes",
+			       (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bytes, _mipTail.bytes);
+		}
+		if (!(_memory = [[RDNA4MTLBuffer alloc] initWithDevice:device length:bytes options:MTLResourceStorageModeShared]))
+			return nil;
+	}
+	// Core Animation pools Managed textures by their reported storage mode.
+	_managed = d.storageMode == MTLStorageModeManaged;
+	if (_memory && _levels > 1 && (bytes >= (8ull << 20) || _mipTailStart)) {
+		_largeMipBytes = _memory.allocatedSize;
+		const uint64_t total = (gLargeMipBytes += _largeMipBytes);
+		statMax(gLargeMipHostPeak, total);
+		gLargeMipCount++;
+		if (_mipTail.handle) {
+			gMipTailBytes += (_mipTail.bytes + 4095) & ~4095ull;
+			gMipTailCount++;
+		}
+	}
 	_device = device;
 	_width = d.width;
 	_height = d.height;
@@ -1380,12 +1429,34 @@ static char gCopyKey;
 - (uint32_t)samples { return MAX(_samples, 1u); }
 - (NSUInteger)arrayLength { return _layers ?: 1; }
 - (MTLTextureUsage)usage { return _usage; }
-- (MTLStorageMode)storageMode { return _vramTarget ? MTLStorageModePrivate : MTLStorageModeShared; }
-- (NSUInteger)allocatedSize { return _memory ? _memory.allocatedSize : (NSUInteger)_vram.bytes; }
+- (MTLStorageMode)storageMode
+{
+	if (_managed)
+		return MTLStorageModeManaged;
+	return _vramTarget ? MTLStorageModePrivate : MTLStorageModeShared;
+}
+- (MTLResourceOptions)resourceOptions { return (MTLResourceOptions)self.storageMode << MTLResourceStorageModeShift; }
+- (NSUInteger)allocatedSize
+{
+	return _memory ? _memory.allocatedSize + self.root->_mipTail.bytes : (NSUInteger)_vram.bytes;
+}
 - (BOOL)isFramebufferOnly { return NO; }
-- (uint64_t)gpuBase { return _held ? _held.gpu + _offset : _vram.handle ? _vram.gpu + _offset : _memory.gpuAddress + _offset; }
+- (BOOL)mipInVram:(NSUInteger)level
+{
+	return _mipTailStart && _offset + _levelOffset[level] >= _mipTailStart;
+}
+- (uint64_t)gpuAddressOfLevel:(NSUInteger)level
+{
+	const NSUInteger offset = _offset + _levelOffset[level];
+	if ([self mipInVram:level])
+		return self.root->_mipTail.gpu + offset - _mipTailStart;
+	return (_held ? _held.gpu : _vram.handle ? _vram.gpu : _memory.gpuAddress) + offset;
+}
+- (uint64_t)gpuBase { return [self gpuAddressOfLevel:0]; }
 - (uint8_t *)bytes
 {
+	if ([self mipInVram:0])
+		return NULL;
 	[_held cpuTouched];
 	return (uint8_t *)_memory.contents + _offset;
 }
@@ -1404,9 +1475,20 @@ static char gCopyKey;
 - (void)dealloc
 {
 	gTexturesLive--;
+	if (_largeMipBytes) {
+		gLargeMipBytes -= _largeMipBytes;
+		gLargeMipCount--;
+	}
 	[_device freeHandle:_handle];
 	if (_vram.handle && !_parent)   // (a view's is its parent's)
 		rdna4_free(_device.gpu, &_vram);
+	if (_mipTail.handle) {
+		if (_largeMipBytes) {
+			gMipTailBytes -= (_mipTail.bytes + 4095) & ~4095ull;
+			gMipTailCount--;
+		}
+		rdna4_free(_device.gpu, &_mipTail);
+	}
 }
 
 - (BOOL)fits:(MTLRegion)r level:(NSUInteger)level
@@ -1433,8 +1515,51 @@ static char gCopyKey;
 	return YES;
 }
 
+// Explicit CPU access uses the tail only for the duration of the transfer.
+- (NSError *)transferMip:(MTLRegion)r level:(NSUInteger)level bytes:(void *)bytes
+                rowBytes:(NSUInteger)bpr upload:(BOOL)upload
+{
+	if (![self fits:r level:level])
+		return rdna4Error(@"a CPU copy past the end of a VRAM mip", 0);
+	if (!r.size.width || !r.size.height)
+		return nil;
+	const NSUInteger pitch = _levelRow[level], row = r.size.width * self.bpp;
+	const NSUInteger offset = _offset + _levelOffset[level] - _mipTailStart + r.origin.y * pitch + r.origin.x * self.bpp;
+	const NSUInteger length = (r.size.height - 1) * pitch + row;
+	const rdna4_buffer_t tail = self.root->_mipTail;
+	rdna4_t *gpu = _device.gpu;
+	kern_return_t kr;
+	if (r.size.height == 1 || (row == pitch && bpr == pitch)) {
+		kr = upload ? rdna4_write(gpu, &tail, offset, bytes, length) : rdna4_read(gpu, &tail, offset, bytes, length);
+	} else if (upload) {
+		// Update only this rectangle, including when another writer owns adjacent texels.
+		for (NSUInteger y = 0; y < r.size.height; y++) {
+			kr = rdna4_write(gpu, &tail, offset + y * pitch, (uint8_t *)bytes + y * bpr, row);
+			if (kr)
+				break;
+		}
+	} else {
+		NSMutableData *data = [NSMutableData dataWithLength:length];
+		if (!data)
+			return rdna4Error(@"staging a VRAM mip read", kIOReturnNoMemory);
+		kr = rdna4_read(gpu, &tail, offset, data.mutableBytes, length);
+		if (!kr)
+			for (NSUInteger y = 0; y < r.size.height; y++)
+				memcpy((uint8_t *)bytes + y * bpr, (const uint8_t *)data.bytes + y * pitch, row);
+	}
+	if (!kr && upload) {
+		const uint64_t address = tail.gpu + offset;
+		wrote(address, address + length);
+	}
+	return kr ? rdna4Error(@"CPU access to a VRAM mip", kr) : nil;
+}
+
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr
 {
+	if (level < _levels && [self mipInVram:level]) {
+		[self transferMip:r level:level bytes:(void *)bytes rowBytes:bpr upload:YES];
+		return;
+	}
 	if (self.vramOnly)
 		return;
 	[self refresh];   // (a shadowed surface's copy current: all of it goes back below)
@@ -1458,12 +1583,45 @@ static char gCopyKey;
 	[self shadowToSurface];
 }
 
-- (void)generateMipmaps
+- (NSError *)generateMipmapsInVram
 {
-	[self wroteAll];
-	if (_levels < 2)
-		return;
+	const rdna4_program_t *kernel = [_device mipPlanesKernel];
+	id<MTLBuffer> layout = [_device newBufferWithLength:7 * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+	if (!kernel || !layout)
+		return rdna4Error(@"preparing the VRAM mip dispatch", 0);
+	const uint32_t threads[3] = { 16, 8, 1 }, bpp = self.bpp;
+	for (NSUInteger l = 1; l < _levels; l++) {
+		const uint32_t w = (uint32_t)MAX(_width >> l, (NSUInteger)1);
+		const uint32_t h = (uint32_t)MAX(_height >> l, (NSUInteger)1);
+		const uint32_t parameters[7] = { w, h, (uint32_t)MAX(_height >> (l - 1), (NSUInteger)1),
+		                                (uint32_t)MAX(_width >> (l - 1), (NSUInteger)1),
+		                                (uint32_t)(_levelRow[l - 1] / 4), (uint32_t)(_levelRow[l] / 4), bpp };
+		memcpy(layout.contents, parameters, sizeof parameters);
+		const uint32_t gridWidth = bpp == 2 ? (w + 1) / 2 : w;
+		const uint32_t groups[3] = { (gridWidth + threads[0] - 1) / threads[0], (h + threads[1] - 1) / threads[1], 1 };
+		const struct {
+			uint64_t buffers[3];
+			uint32_t dims[6];
+			uint64_t textures;
+		} args = { { [self gpuAddressOfLevel:l - 1], [self gpuAddressOfLevel:l], layout.gpuAddress },
+		           { threads[0], threads[1], 1, gridWidth, h, 1 }, 0 };
+		const kern_return_t kr = rdna4_dispatch(_device.gpu, kernel, groups, threads, &args, sizeof args, 1000, NULL);
+		if (kr)
+			return rdna4Error(@"generating a VRAM mip", kr);
+		const uint64_t address = [self gpuAddressOfLevel:l];
+		wrote(address, address + _levelRow[l] * h);
+	}
+	return nil;
+}
 
+- (NSError *)generateMipmaps
+{
+	if (_levels < 2)
+		return nil;
+	if (_mipTailStart)
+		return [self generateMipmapsInVram];
+
+	[self wroteAll];
 	const uint32_t bpp = self.bpp;
 	uint8_t *const base = self.bytes;
 	const NSUInteger slices = MAX(_slices, (NSUInteger)1);
@@ -1498,6 +1656,7 @@ static char gCopyKey;
 			}
 		}
 	}
+	return nil;
 }
 
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes
@@ -1536,6 +1695,10 @@ static char gCopyKey;
 
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level
 {
+	if (level < _levels && [self mipInVram:level]) {
+		[self transferMip:r level:level bytes:bytes rowBytes:bpr upload:NO];
+		return;
+	}
 	if (self.vramOnly)
 		return;
 	// ponytail: a BC texture's CPU reads give nothing: it is kept as RGBA8, and the caller's rows are blocks (8 or 16 bytes for 4x4
@@ -1584,7 +1747,7 @@ static char gCopyKey;
 
 - (void)clearTo:(MTLClearColor)c
 {
-	if (!_memory) {   // ponytail: the card's memory only takes fills of one 32-bit pattern (fillFor)
+	if (!_memory || [self mipInVram:0]) {   // the card's memory takes fills of one 32-bit pattern (fillFor)
 		RLOG(@"RDNA4MTL: a clear of a format %lu texture in the card's memory to (%g %g %g %g): not done", (unsigned long)_format, c.red, c.green,
 		     c.blue, c.alpha);
 		return;
@@ -4290,10 +4453,14 @@ static RDNA4MTLTexture *cardOnly(id<MTLTexture> t)
 		NSError *why = colourOnly(to);
 		if (!why && offset + bpr * (size.height - 1) + ((RDNA4MTLTexture *)to).bpp * size.width > from.length)   // (Maps' glyphs: R8)
 			why = rdna4Error(@"a buffer-to-texture copy past the buffer's end", 0);
-		if (!why)
-			[to replaceRegion:MTLRegionMake2D(origin.x, origin.y, size.width, size.height) mipmapLevel:level slice:slice
-			        withBytes:(const uint8_t *)from.contents + offset bytesPerRow:bpr bytesPerImage:bpi];
-		return why;
+		if (why)
+			return why;
+		const MTLRegion region = MTLRegionMake2D(origin.x, origin.y, size.width, size.height);
+		if (!slice && level < to.mipmapLevelCount && [(RDNA4MTLTexture *)to mipInVram:level])
+			return [(RDNA4MTLTexture *)to transferMip:region level:level bytes:(uint8_t *)from.contents + offset rowBytes:bpr upload:YES];
+		[to replaceRegion:region mipmapLevel:level slice:slice withBytes:(const uint8_t *)from.contents + offset
+		       bytesPerRow:bpr bytesPerImage:bpi];
+		return nil;
 	}];
 }
 
@@ -4319,10 +4486,13 @@ static RDNA4MTLTexture *cardOnly(id<MTLTexture> t)
 		NSError *why = colourOnly(from);
 		if (!why && offset + bpr * (size.height - 1) + ((RDNA4MTLTexture *)from).bpp * size.width > to.length)
 			why = rdna4Error(@"a texture-to-buffer copy past the buffer's end", 0);
-		if (!why)
-			[from getBytes:(uint8_t *)to.contents + offset bytesPerRow:bpr bytesPerImage:bpi
-			    fromRegion:MTLRegionMake2D(origin.x, origin.y, size.width, size.height) mipmapLevel:level slice:slice];
-		return why;
+		if (why)
+			return why;
+		const MTLRegion region = MTLRegionMake2D(origin.x, origin.y, size.width, size.height);
+		if (!slice && level < from.mipmapLevelCount && [(RDNA4MTLTexture *)from mipInVram:level])
+			return [(RDNA4MTLTexture *)from transferMip:region level:level bytes:(uint8_t *)to.contents + offset rowBytes:bpr upload:NO];
+		[from getBytes:(uint8_t *)to.contents + offset bytesPerRow:bpr bytesPerImage:bpi fromRegion:region mipmapLevel:level slice:slice];
+		return nil;
 	}];
 }
 
@@ -4356,9 +4526,35 @@ static RDNA4MTLTexture *cardOnly(id<MTLTexture> t)
 		if (why)
 			return why;
 		RDNA4MTLTexture *f = [(RDNA4MTLTexture *)from level:fromLevel slice:fromSlice];
+		if (!f)
+			return rdna4Error(@"the source level of a texture copy", 0);
 		[f refresh];   // (a shadowed surface's copy current)
-		[to replaceRegion:MTLRegionMake2D(toOrigin.x, toOrigin.y, size.width, size.height) mipmapLevel:toLevel slice:toSlice
-		        withBytes:f.bytes + fromOrigin.y * f.rowBytes + f.bpp * fromOrigin.x bytesPerRow:f.rowBytes bytesPerImage:0];
+		const MTLRegion dstRegion = MTLRegionMake2D(toOrigin.x, toOrigin.y, size.width, size.height);
+		const BOOL fromVram = [f mipInVram:0];
+		const BOOL toVram = !toSlice && toLevel < to.mipmapLevelCount && [(RDNA4MTLTexture *)to mipInVram:toLevel];
+		const MTLRegion srcRegion = MTLRegionMake2D(fromOrigin.x, fromOrigin.y, size.width, size.height);
+		if ((fromVram || toVram) && ![f fits:srcRegion level:0])
+			return rdna4Error(@"a VRAM mip copy past the source texture", 0);
+		if ((fromVram || toVram) && f.bpp != ((RDNA4MTLTexture *)to).bpp)
+			return rdna4Error(@"a VRAM mip copy with different pixel sizes", 0);
+		__attribute__((objc_precise_lifetime)) NSMutableData *sourceData = nil;
+		const uint8_t *source;
+		NSUInteger pitch;
+		if (fromVram) {
+			pitch = size.width * f.bpp;
+			sourceData = [NSMutableData dataWithLength:pitch * size.height];
+			if (!sourceData)
+				return rdna4Error(@"staging a VRAM mip copy", kIOReturnNoMemory);
+			if (NSError *err = [f transferMip:srcRegion level:0 bytes:sourceData.mutableBytes rowBytes:pitch upload:NO])
+				return err;
+			source = (const uint8_t *)sourceData.bytes;
+		} else {
+			pitch = f.rowBytes;
+			source = f.bytes + fromOrigin.y * pitch + f.bpp * fromOrigin.x;
+		}
+		if (toVram)
+			return [(RDNA4MTLTexture *)to transferMip:dstRegion level:toLevel bytes:(void *)source rowBytes:pitch upload:YES];
+		[to replaceRegion:dstRegion mipmapLevel:toLevel slice:toSlice withBytes:source bytesPerRow:pitch bytesPerImage:0];
 		return nil;
 	}];
 }
@@ -4375,10 +4571,7 @@ static RDNA4MTLTexture *cardOnly(id<MTLTexture> t)
 {
 	[_commandBuffer writesTo:texture];
 	[_commandBuffer record:^NSError * {
-		NSError *why = colourOnly(texture);
-		if (!why)
-			[(RDNA4MTLTexture *)texture generateMipmaps];
-		return why;
+		return colourOnly(texture) ?: [(RDNA4MTLTexture *)texture generateMipmaps];
 	}];
 }
 
@@ -5209,7 +5402,7 @@ RDNA4_ANSWER_MISSING
 	uint64_t _slotVerts[kSlots]; // (RDNA4_DRAWTIME) its draw's vertices times instances
 	uint64_t _drawTimePrev;      // the GPU timestamp of the last timed draw seen ended
 	BOOL _drawTimeGap;           // a dispatch or barrier slot since it
-	rdna4_program_t _resolve[2];
+	rdna4_program_t _resolve[2], _mipPlanes;
 	rdna4_program_t _fsr[2];   // easu, rcas (upscale:into:)
 	rdna4_buffer_t _fsrMid;    // EASU's output, RCAS's input: the largest drawable upscaled so far
 }
@@ -5610,6 +5803,22 @@ static void padSlot(uint32_t *page, uint32_t n)
 	statAdd(kStatSelfReadBytes, total);
 	statAdd(kStatBarriers, 1);
 	return nil;
+}
+
+- (const rdna4_program_t *)mipPlanesKernel
+{
+	@synchronized(self) {
+		if (_mipPlanes.handle)
+			return &_mipPlanes;
+		rdna4_info_t info;
+		if (!_open || rdna4_info(&_gpu, &info) || !(info.flags & RDNA4_FLAG_DMA) || (info.flags & RDNA4_FLAG_WEDGED))
+			return NULL;
+		for (const MtlKernel &kernel : kMtlKernels) {
+			if (!strcmp(kernel.name, "rdna4_mip_planes") && !rdna4_load(&_gpu, kernel.elf, kernel.size, kernel.name, &_mipPlanes))
+				return &_mipPlanes;
+		}
+		return NULL;
+	}
 }
 
 // As the PV host's stageTextures: an image instruction on an all-zero T# can stall the texture unit (an unbound slot hung WindowServer's
