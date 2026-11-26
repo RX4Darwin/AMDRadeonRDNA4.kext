@@ -300,7 +300,7 @@ Modes::Mode gBootScaled[Modes::MaxScaled] {};   // the boot display's scaled mod
 size_t gBootScaledCount { 0 };
 ScaledMemory gBootScaledMemory;
 bool gScaledOffered { false };                  // our accelerator serves WindowServer: it can present their frames
-bool gApertureRouted { false };                 // wrapGetApertureRange is in: without it a scaled mode's aperture would be cut from BAR0
+bool gApertureRouted { false };                 // the PVGPU aperture route is available for scaled modes
 
 // NDRV reports the same aperture and pitch the pipe uses for this mode.
 bool deviceSurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) {
@@ -1442,6 +1442,43 @@ IODeviceMemory *wrapGetApertureRange(void *fb, IOPixelAperture aperture) {
 	return FunctionCast(wrapGetApertureRange, orgGetApertureRange)(fb, aperture);
 }
 
+// Resolve at IONDRVSupport load. Extra heads need the VRAM route and PVGPU needs the
+// aperture route for scaled frames. A plain build can defer the other routes until a
+// larger surface has actually been mapped, before its modes are published to NDRV.
+KernelPatcher *gPatcher = nullptr;
+struct RangeRoute {
+	mach_vm_address_t target {};
+	bool installed {};
+} vramRange, apertureRange;
+IOLock *rangeRouteLock {};
+bool installRangeRoute(KernelPatcher::RouteRequest request, RangeRoute &route, const char *name) {
+	if (route.installed)
+		return true;
+	request.from = route.target;
+	route.installed = route.target && gPatcher->routeMultiple(kextIONDRVSupport.loadIndex, &request, 1);
+	FBLOG("modes: IONDRVFramebuffer::%s %s", name, route.installed ? "routed" : "route unavailable");
+	gPatcher->clearError();
+	return route.installed;
+}
+
+bool installVramRange() {
+	return installRangeRoute({nullptr, wrapGetVRAMRange, orgGetVRAMRange}, vramRange, "getVRAMRange");
+}
+
+bool installApertureRange() {
+	return installRangeRoute({nullptr, wrapGetApertureRange, orgGetApertureRange}, apertureRange, "getApertureRange");
+}
+
+bool ensureDpSurfaceRanges() {
+	// Only deferred routing needs a lock; both existing routes may already be in.
+	if (!rangeRouteLock)
+		return vramRange.installed && apertureRange.installed;
+	IOLockLock(rangeRouteLock);
+	const bool ready = installVramRange() && installApertureRange();
+	IOLockUnlock(rangeRouteLock);
+	return ready;
+}
+
 bool wrapStart(void *fb, IOService *provider) {
 	auto *pci = OSDynamicCast(IOPCIDevice, provider);
 	if (!headCount && pci && isOurDevice(pci))
@@ -1490,11 +1527,15 @@ void attach(FbEntry &e) {
 	if (vrr && be.switchTo == deviceSwitchTo)
 		be.setRefresh = deviceSetRefresh;
 	uint32_t guest = 0, bench = 0, cold = 0, dsc = 0;
-	if (orgGetVRAMRange && gApertureRouted && !pvGpu && !(Trial::option("rdna4-pvgpu", guest) && guest) &&
+	if (!pvGpu && !(Trial::option("rdna4-pvgpu", guest) && guest) &&
 	    !(Trial::option("rdna4-vrambench", bench) && bench) && !(Trial::option("rdna4-coldboot", cold) && cold) &&
 	    !(Trial::option("rdna4-dscboot", dsc) && dsc))
 		dev.prepareDpSurface(RDNA4Device::extraHeads() * kHeadSlotBytes + (2ull << 20),
-		                     computeStage ? RDNA4Compute::kPoolFloor : ~0ull, computeStage >= RDNA4Compute::StageGfx);
+		                     computeStage ? RDNA4Compute::kPoolFloor : ~0ull, computeStage >= RDNA4Compute::StageGfx,
+		                     ensureDpSurfaceRanges);
+	else
+		FBLOG("modes: no larger DP surface: pvgpu %u, vrambench %u, coldboot %u, dscboot %u",
+		      pvGpu ? pvGpu : guest, bench, cold, dsc);
 	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidAll, dev.edidAllLen, be);
 	st->ndrv.adaptiveSync = vrr;
 #ifdef AMDRadeonRDNA4_PVGPU
@@ -2016,15 +2057,6 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	}
 	if (index != kextIONDRVSupport.loadIndex || __atomic_exchange_n(&ndrvRouted, true, __ATOMIC_SEQ_CST))
 		return;
-	KernelPatcher::RouteRequest request {
-		"__ZN17IONDRVFramebuffer10doDriverIOEjPvjj", wrapDoDriverIO, orgDoDriverIO,
-	};
-	if (patcher.routeMultiple(index, &request, 1, address, size))
-		FBLOG("ndrv: routed IONDRVFramebuffer::doDriverIO");
-	else
-		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d)",
-		      patcher.getError());
-	patcher.clearError();
 	// The second display and its hot-plug are on unless turned off: lit at
 	// boot, mode switching, display sleep and hot-plug ran on the card for an
 	// HDMI monitor on either connector (2026-10-04..06). Not in VM test
@@ -2035,6 +2067,29 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	uint32_t second = 4;
 #endif
 	PE_parse_boot_argn("rdna4-head2", &second, sizeof(second));
+	vramRange.target = patcher.solveSymbol(index, "__ZN17IONDRVFramebuffer12getVRAMRangeEv", address, size);
+	patcher.clearError();
+	apertureRange.target = patcher.solveSymbol(index, "__ZN17IONDRVFramebuffer16getApertureRangeEi", address, size);
+	patcher.clearError();
+	if (second)
+		installVramRange();
+#ifdef AMDRadeonRDNA4_PVGPU
+	gApertureRouted = installApertureRange();
+#endif
+	if (!vramRange.installed || !apertureRange.installed) {
+		rangeRouteLock = IOLockAlloc();
+		if (!rangeRouteLock)
+			FBLOG("modes: cannot allocate the lock for deferred framebuffer range routes");
+	}
+	KernelPatcher::RouteRequest request {
+		"__ZN17IONDRVFramebuffer10doDriverIOEjPvjj", wrapDoDriverIO, orgDoDriverIO,
+	};
+	if (patcher.routeMultiple(index, &request, 1, address, size))
+		FBLOG("ndrv: routed IONDRVFramebuffer::doDriverIO");
+	else
+		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d)",
+		      patcher.getError());
+	patcher.clearError();
 	if (second) {
 		head2Level = second;
 		KernelPatcher::RouteRequest start {
@@ -2045,25 +2100,6 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 		else
 			FBLOG("head2: not available: no IONDRVFramebuffer::start route (error %d)",
 			      patcher.getError());
-		patcher.clearError();
-	}
-	{
-		KernelPatcher::RouteRequest vram {
-			"__ZN17IONDRVFramebuffer12getVRAMRangeEv", wrapGetVRAMRange, orgGetVRAMRange,
-		};
-		if (patcher.routeMultiple(index, &vram, 1, address, size))
-			FBLOG("head2: routed IONDRVFramebuffer::getVRAMRange");
-		else
-			FBLOG("head2: no IONDRVFramebuffer::getVRAMRange route (error %d): WindowServer "
-			      "will not map the second head", patcher.getError());
-		patcher.clearError();
-	}
-	{
-		KernelPatcher::RouteRequest aperture {
-			"__ZN17IONDRVFramebuffer16getApertureRangeEi", wrapGetApertureRange, orgGetApertureRange,
-		};
-		gApertureRouted = patcher.routeMultiple(index, &aperture, 1, address, size);
-		FBLOG("modes: IONDRVFramebuffer::getApertureRange %s", gApertureRouted ? "routed" : "NOT routed: no scaled modes");
 		patcher.clearError();
 	}
 #ifdef AMDRadeonRDNA4_PVGPU
@@ -2155,7 +2191,6 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 // Boots where IONDRVSupport is loaded where Lilu does not see it in time: SimpleHDA loads it itself the moment the system kext collection is
 // ready (2026-10-22: at 18 s, the framebuffer published 0.4 s later; Lilu's first load notice of the boot at 21 s). Then IONDRVFramebuffer
 // starts without our routes and is gone, and the card is never brought up (only the firmware's picture): lateNdrvCheck below.
-KernelPatcher *gPatcher = nullptr;
 thread_call_t gLateNdrv = nullptr;
 // IONDRVSupport routed from the kernel's kext list when Lilu has not told us of its load: polled every 20 ms from 1 s on (every 2 s from 60
 // s, until 120 s), so the routes are in before its framebuffers match. SimpleHDA loads IONDRVSupport itself inside the catalog hook and

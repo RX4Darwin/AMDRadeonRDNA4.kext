@@ -127,7 +127,9 @@ struct Target {
 	// otherwise: at the monitor's native size the firmware runs the scaler
 	// 1:1 (DSCL_MODE 1), and its request timing goes with that.
 	bool        scalerOff;
-	// Optional surface pitch in pixels, including for a stretched boot console after relight.
+	// The pitch (pixels) of the surface the plane shows, written with its size as hubp401_program_size does; 0 leaves the
+	// register alone. The boot pipe's is the console's: after the cold start relit the pipe from a 3840x2160 table, a
+	// smaller console needs its own (2026-11-26).
 	uint32_t    pitchPx;
 	// A zero address keeps the current plane base.
 	uint64_t    surface;

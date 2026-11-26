@@ -3037,8 +3037,10 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 // DisplayPort link training on the boot display
 // ---------------------------------------------------------------------------
 
-bool RDNA4Device::bootSinkPresent() {
+bool RDNA4Device::bootSinkPresent(uint32_t *sample) {
 	const uint32_t hpdY = regReadDmu(2, 0x28f7);   // DC_GPIO_HPD_Y: one byte per pin, HPD1 lowest
+	if (sample)
+		*sample = hpdY;
 	return hpdY != 0xFFFFFFFF && pipe.hpd >= 1 && pipe.hpd <= 4 && ((hpdY >> (8 * (pipe.hpd - 1))) & 1);
 }
 
@@ -3056,7 +3058,7 @@ void RDNA4Device::noteBootDpLink() {
 
 // The boot display's sink capabilities and the link the firmware trained (DPCD reads): whether that is a link the
 // sink says it has.
-bool RDNA4Device::readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link) {
+bool RDNA4Device::readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link, bool *aligned) {
 	if (!pipe.valid() || pipe.signal != Pipe::Signal::DpSst || !sinkAuxValid) {
 		FBLOG("dptrain: the boot display is not on DisplayPort: nothing to retrain");
 		return false;
@@ -3081,6 +3083,8 @@ bool RDNA4Device::readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link) {
 	const bool lanes = link.lanes == 1 || link.lanes == 2 || link.lanes == 4;
 	const bool known = parsed && lanes && link.lanes <= sink.maxLanes && link.rate >= DpTrain::kRbr &&
 	                   link.rate <= sink.maxRate;
+	if (aligned)
+		*aligned = known && DpTrain::linkUp(status, link.lanes);
 	if (!known)
 		FBLOG("dptrain: that is not a link this sink says it has: it will not be retrained");
 	return known;
@@ -3614,17 +3618,34 @@ uint32_t RDNA4Device::dpSurfaceClockLimit() {
 	// Keep the running stream encoding. Bits per pixel affect bandwidth even for an ARGB8888 framebuffer.
 	const uint32_t format = regReadDmu(2, kDpPixelFormat), color = regReadDmu(2, kDpMsaColor);
 	const unsigned depth = (format >> 8) & 7;
-	if ((format & 0x10031) || (regReadDmu(2, kDpMsaMisc) & 0xc0) || (color & 0x06000000) ||
-	    (color >> 29) != depth || (depth != 1 && depth != 2))
+	const uint32_t misc = regReadDmu(2, kDpMsaMisc);
+	if ((format & 0x10031) || (misc & 0xc0) || (color & 0x06000000) ||
+	    (color >> 29) != depth || (depth != 1 && depth != 2)) {
+		FBLOG("modes: larger DP modes unavailable: unsupported stream format 0x%x, MSA color 0x%x misc 0x%x", format, color, misc);
 		return 0;
+	}
 	DpTrain::Link link {};
 	DpTrain::Sink sink {};
-	if (!readBootDpLink(sink, link))
+	bool aligned = false;
+	if (!readBootDpLink(sink, link, &aligned)) {
+		FBLOG("modes: larger DP modes unavailable: AUX%u did not yield a valid boot link (see aux/dptrain above)", sinkAuxInst);
 		return 0;
-	uint8_t compression = 0, lanes[3] {};
-	if (!dpcdRead(sinkAuxInst, 0x202, lanes, sizeof(lanes)) || !DpTrain::linkUp(lanes, link.lanes) ||
-	    (sink.rev >= 0x14 && (!dpcdRead(sinkAuxInst, 0x160, &compression, 1) || (compression & 1))))
+	}
+	if (!aligned) {
+		FBLOG("modes: larger DP modes unavailable: AUX%u DPCD 0x202 reports the trained lanes are not ready", sinkAuxInst);
 		return 0;
+	}
+	uint8_t compression = 0;
+	if (sink.rev >= 0x14) {
+		if (!dpcdRead(sinkAuxInst, 0x160, &compression, 1)) {
+			FBLOG("modes: larger DP modes unavailable: AUX%u could not read DSC_ENABLE (0x160)", sinkAuxInst);
+			return 0;
+		}
+		if (compression & 1) {
+			FBLOG("modes: larger DP modes unavailable: DSC is enabled on AUX%u", sinkAuxInst);
+			return 0;
+		}
+	}
 	return DpTrain::bandwidthKbps(link) / (depth == 1 ? 24u : 30u);
 }
 
@@ -3645,25 +3666,53 @@ bool RDNA4Device::bootEdidMatches() {
 	return edidAllLen != 0;
 }
 
-void RDNA4Device::prepareDpSurface(uint64_t extraSlotsBytes, uint64_t displayLimit, bool clocksExpected) {
+void RDNA4Device::prepareDpSurface(uint64_t extraSlotsBytes, uint64_t displayLimit, bool clocksExpected,
+                                  bool (*ensureRanges)()) {
 	ExtraHold hold(*this);
-	if (!modesetRequested || !extraLock || !modeCount || !liveTimingValid || !bootTimingValid || fbDepth != 32 ||
-	    !pipe.valid() || pipe.signal != Pipe::Signal::DpSst || pipe.otg || pipe.opp || pipe.dig || pipe.link ||
-	    pipe.hubp || pipe.hpd != 1 || coldBoot || bootReleased || dscLit || !bootSinkPresent() ||
-	    pipe.pitchPx * 4u != fbRowBytes || pipe.viewportW != fbWidth || pipe.viewportH != fbHeight ||
-	    fbLength < uint64_t(fbRowBytes) * fbHeight || !consoleMcAddress(dpConsoleMc) || bootScanout() != dpConsoleMc)
-		return;
+	if (!modesetRequested || !extraLock || !modeCount || !liveTimingValid || !bootTimingValid || fbDepth != 32)
+		return FBLOG("modes: no larger DP surface: modeset %u, lock %u, modes %zu, live timing %u, boot timing %u, depth %u",
+		             modesetRequested, extraLock != nullptr, modeCount, liveTimingValid, bootTimingValid, fbDepth);
 	for (const auto &head : extra)
 		if (head.edidLen)
-			return;
-	if (!singleDpPipe() || !Pipe2::use(1, false, 0, true))
-		return;
+			return FBLOG("modes: no larger DP surface: a second display is connected (HPD%u, %zu EDID bytes); single display only",
+			             head.hpd, head.edidLen);
+	if (!pipe.valid() || pipe.signal != Pipe::Signal::DpSst || pipe.otg || pipe.opp || pipe.dig || pipe.link ||
+	    pipe.hubp || pipe.hpd != 1)
+		return FBLOG("modes: no larger DP surface: unsupported boot pipe %s OTG%u OPP%u DIG%u link%u HUBP%u HPD%u",
+		             Pipe::signalName(pipe.signal), pipe.otg, pipe.opp, pipe.dig, pipe.link, pipe.hubp, pipe.hpd);
+	if (coldBoot || bootReleased || dscLit)
+		return FBLOG("modes: no larger DP surface: cold boot %u, boot pipe released %u, DSC lit %u", coldBoot, bootReleased, dscLit);
+	uint32_t hpd;
+	if (!bootSinkPresent(&hpd))
+		return FBLOG("modes: no larger DP surface: HPD%u not asserted or unreadable at attach (HPD_Y=0x%08x)", pipe.hpd, hpd);
+	if (!sinkAuxValid)
+		return FBLOG("modes: no larger DP surface: no boot AUX channel from the EDID probe at attach (HPD%u high)", pipe.hpd);
+	if (pipe.pitchPx * 4u != fbRowBytes || pipe.viewportW != fbWidth || pipe.viewportH != fbHeight ||
+	    fbLength < uint64_t(fbRowBytes) * fbHeight)
+		return FBLOG("modes: no larger DP surface: viewport %ux%u pitch %u px, console %ux%u stride %u length %llu",
+		             pipe.viewportW, pipe.viewportH, pipe.pitchPx, fbWidth, fbHeight, fbRowBytes, fbLength);
+	if (!consoleMcAddress(dpConsoleMc))
+		return FBLOG("modes: no larger DP surface: could not locate the console in VRAM");
+	const uint64_t scanout = bootScanout();
+	if (scanout != dpConsoleMc)
+		return FBLOG("modes: no larger DP surface: scanout 0x%llx differs from console 0x%llx", scanout, dpConsoleMc);
+	if (!singleDpPipe())
+		return FBLOG("modes: no larger DP surface: another timing generator is active or unreadable; single display only");
+	if (!Pipe2::use(1, false, 0, true))
+		return FBLOG("modes: no larger DP surface: the boot pipe DP table is unavailable");
 	struct Restore { RDNA4Device &dev; ~Restore() { dev.useSlotTable(); } } restore { *this };
 	const auto &model = Pipe2::config().timing;   // the generator's backing surface for this table
-	const uint32_t clock = clocksExpected ? max(dispclkTargetKHz(), bootTiming.pixelClockKHz) : bootTiming.pixelClockKHz;
-	const Modes::Limits limits {model.hActive, model.vActive, min(clock, dpSurfaceClockLimit())};
-	if (!limits.maxPixelClockKHz || (fbWidth >= limits.maxHActive && fbHeight >= limits.maxVActive))
-		return;
+	const uint32_t dispclk = clocksExpected ? dispclkTargetKHz() : 0;
+	const uint32_t clock = max(dispclk, bootTiming.pixelClockKHz);
+	if (fbWidth >= model.hActive && fbHeight >= model.vActive)
+		return FBLOG("modes: no larger DP surface: console %ux%u already covers the %ux%u table", fbWidth, fbHeight, model.hActive, model.vActive);
+	if (!clock)
+		return FBLOG("modes: no larger DP surface: no display clock budget at attach");
+	// IOLib's min is a macro: sample the sink once, even when the link is the limiting clock.
+	const uint32_t linkClock = dpSurfaceClockLimit();
+	if (!linkClock)
+		return;   // dpSurfaceClockLimit logged the failed stream or link check.
+	const Modes::Limits limits {model.hActive, model.vActive, min(clock, linkClock)};
 	Modes::Mode candidates[Modes::MaxModes];
 	const size_t count = Modes::build(edidAll, edidAllLen, limits, candidates, Modes::MaxModes);
 	size_t kept = 0;
@@ -3671,11 +3720,13 @@ void RDNA4Device::prepareDpSurface(uint64_t extraSlotsBytes, uint64_t displayLim
 		if (largerThanConsole(candidates[i].t) && Pipe2::modeKnown(candidates[i].t))
 			candidates[kept++] = candidates[i];
 	if (!kept)
-		return;
+		return FBLOG("modes: no larger DP surface: %zu EDID bytes, %zu candidates up to %ux%u at %u kHz, %zu free mode slots; no larger table timing fits",
+		             edidAllLen, count, limits.maxHActive, limits.maxVActive, limits.maxPixelClockKHz, Modes::MaxModes - modeCount);
 	auto *bar = pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
-	if (!bar || bar->getPhysicalAddress() != fbPhysBase ||
-	    !Ndrv::spareSurface(fbPhysBase, fbLength, fbPhysBase, bar->getLength(), model.hActive, model.vActive, dpSurface))
-		return;
+	if (!bar || bar->getPhysicalAddress() != fbPhysBase)
+		return FBLOG("modes: no larger DP surface: BAR0 does not map the console");
+	if (!Ndrv::spareSurface(fbPhysBase, fbLength, fbPhysBase, bar->getLength(), model.hActive, model.vActive, dpSurface))
+		return FBLOG("modes: no larger DP surface: BAR0 cannot fit the spare %ux%u plane", model.hActive, model.vActive);
 	const uint64_t offset = dpSurface.physBase - fbPhysBase;
 	const uint64_t length = round_page_64(uint64_t(dpSurface.rowBytes) * dpSurface.height + 128);
 	const uint64_t span = offset + length;
@@ -3683,16 +3734,21 @@ void RDNA4Device::prepareDpSurface(uint64_t extraSlotsBytes, uint64_t displayLim
 	// compute window; their published mappings and future hot-plug modes obey the same limit.
 	const uint64_t reserved = Ndrv::displayReservation(span, extraSlotsBytes, displayLimit);
 	if (!reserved)
-		return;
+		return FBLOG("modes: no larger DP surface: span %llu and head slots %llu exceed the display reservation (limit %llu)",
+		             span, extraSlotsBytes, displayLimit);
 	dpPlaneMc = dpConsoleMc + offset;
 	const uint32_t hi = regReadDmu(2, kDmcubRegion4OffsetHigh), lo = regReadDmu(2, kDmcubRegion4Offset);
 	const uint64_t mailbox = (uint64_t(hi) << 32) | lo;
-	if (reserved > bar->getLength() || mailbox >= (1ull << 48) || lo == ~0u || mailbox <= dpConsoleMc + reserved)
-		return;
+	if (reserved > bar->getLength())
+		return FBLOG("modes: no larger DP surface: reservation %llu exceeds BAR0 length %llu", reserved, bar->getLength());
+	if (mailbox >= (1ull << 48) || lo == ~0u || mailbox <= dpConsoleMc + reserved)
+		return FBLOG("modes: no larger DP surface: DMUB mailbox 0x%llx invalid or below reservation end 0x%llx", mailbox, dpConsoleMc + reserved);
 	dpVram = IODeviceMemory::withSubRange(bar, 0, span);
 	dpAperture = IODeviceMemory::withSubRange(bar, offset, length);
 	auto *map = dpAperture ? dpAperture->map(kIOMapWriteCombineCache) : nullptr;
-	if (!dpVram || !map || !map->getVirtualAddress()) {
+	if (!dpVram || !map || !map->getVirtualAddress() || !ensureRanges()) {
+		FBLOG("modes: no larger DP surface: VRAM range %u, aperture %u, CPU mapping %u (both framebuffer routes required)",
+		      dpVram != nullptr, dpAperture != nullptr, map && map->getVirtualAddress());
 		OSSafeReleaseNULL(map);
 		OSSafeReleaseNULL(dpVram);
 		OSSafeReleaseNULL(dpAperture);

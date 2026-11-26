@@ -169,7 +169,7 @@ public:
 	// Physical image size from the EDID. 0 = unknown.
 	uint32_t    imageWidthMm { 0 }, imageHeightMm { 0 };
 	bool dpPlaneReady();
-	void prepareDpSurface(uint64_t extraSlotsBytes, uint64_t displayLimit, bool clocksExpected);
+	void prepareDpSurface(uint64_t extraSlotsBytes, uint64_t displayLimit, bool clocksExpected, bool (*ensureRanges)());
 	uint64_t displayReserve {};
 	IODeviceMemory *dpVram {}, *dpAperture {};
 	Ndrv::Surface dpSurface {};
@@ -281,7 +281,7 @@ public:
 	// the kext's own training on that link: stream off, transmitter off,
 	// DpTrain::bringUp, stream encoder tied to the link, video restarted.
 	void noteBootDpLink();
-	bool readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link);
+	bool readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link, bool *aligned = nullptr);
 	// What a DisplayPort boot display's mode may clock at: what its trained link carries at 8 bpc, and the DISPCLK
 	// the kext holds (dispclkTargetKHz); the boot pixel clock if either is not known. The link is not retrained.
 	uint32_t bootDpMaxKHz();
@@ -328,7 +328,7 @@ public:
 	void logBootLink(const char *when);
 	const char *auxWhy { "" };   // why the last AUX transaction gave no reply, and the status it ended with
 	uint32_t    auxSts { 0 };
-	bool bootSinkPresent();              // the boot display's HPD pin
+	bool bootSinkPresent(uint32_t *sample = nullptr);              // the boot display's HPD pin
 	DpTrain::Sink bootDpSink {};
 	DpTrain::Link bootDpLink {};
 	bool bootDpLinkKnown { false };
