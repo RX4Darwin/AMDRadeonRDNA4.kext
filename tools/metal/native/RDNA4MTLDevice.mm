@@ -265,9 +265,23 @@ namespace {
 struct Pooled { rdna4_t *gpu; rdna4_buffer_t buf; void *cpu; uint64_t bytes; CFAbsoluteTime at; };
 constexpr uint64_t kPoolBytes = 128ull << 20;
 constexpr size_t kPoolCount = 1024;
+// The kext enforces 1 GiB of host memory per client. Leave headroom for new
+// textures while the compositor still holds the previous frame's resources.
+constexpr uint64_t kHostWorkingSet = 768ull << 20;
 std::mutex gPoolLock;
 std::vector<Pooled> gPool;
 uint64_t gPooledBytes;
+
+uint64_t hostLiveBytes()
+{
+	return static_cast<uint64_t>(MAX(gHostLive.load(), (int64_t)0));
+}
+
+uint64_t hostWorkingSetBytes()
+{
+	std::lock_guard<std::mutex> hold(gPoolLock);
+	return hostLiveBytes() + gPooledBytes;
+}
 
 // The entries older than 2 s out of the pool, freed by the caller (outside the lock).
 void poolExpired(std::vector<Pooled> &out, CFAbsoluteTime now)
@@ -346,7 +360,9 @@ void poolPut(rdna4_t *gpu, rdna4_buffer_t buf, void *cpu, uint64_t bytes)
 	{
 		std::lock_guard<std::mutex> hold(gPoolLock);
 		poolExpired(freed, now);
-		if (gPooledBytes + bytes <= kPoolBytes && gPool.size() < kPoolCount) {
+		// The buffer being returned is still included in gHostLive.
+		if (hostLiveBytes() + gPooledBytes <= kHostWorkingSet &&
+		    gPooledBytes + bytes <= kPoolBytes && gPool.size() < kPoolCount) {
 			gPool.push_back({ gpu, buf, cpu, bytes, now });
 			gPooledBytes += bytes;
 		} else {
@@ -354,6 +370,37 @@ void poolPut(rdna4_t *gpu, rdna4_buffer_t buf, void *cpu, uint64_t bytes)
 		}
 	}
 	poolFree(freed);
+}
+
+// Cached buffers still occupy the kext's memory and buffer quotas until freed.
+bool poolPurge(rdna4_t *gpu)
+{
+	std::vector<Pooled> freed;
+	{
+		std::lock_guard<std::mutex> hold(gPoolLock);
+		for (size_t i = 0; i < gPool.size();) {
+			if (gPool[i].gpu != gpu) {
+				i++;
+				continue;
+			}
+			gPooledBytes -= gPool[i].bytes;
+			freed.push_back(gPool[i]);
+			gPool[i] = gPool.back();
+			gPool.pop_back();
+		}
+	}
+	poolFree(freed);
+	return !freed.empty();
+}
+
+kern_return_t allocHostBuffer(rdna4_t *gpu, uint64_t bytes, rdna4_buffer_t *buf, void **cpu)
+{
+	if (poolTake(gpu, bytes, buf, cpu))
+		return KERN_SUCCESS;
+	kern_return_t kr = rdna4_alloc_host(gpu, bytes, buf, cpu);
+	if (kr == kIOReturnNoResources && poolPurge(gpu))
+		kr = rdna4_alloc_host(gpu, bytes, buf, cpu);
+	return kr;
 }
 }   // namespace
 
@@ -414,7 +461,7 @@ static void deviceIdle(RDNA4MTLDevice *device);   // (below: the device's work q
 	const uint64_t bytes = ((length ?: 1) + 4095) & ~4095ull;
 	const StatTime timed { kStatAllocUs };
 	statAdd(kStatAllocs, 1), statAdd(kStatAllocBytes, bytes);
-	const kern_return_t kr = poolTake(device.gpu, bytes, &_buf, &_cpu) ? KERN_SUCCESS : rdna4_alloc_host(device.gpu, bytes, &_buf, &_cpu);
+	const kern_return_t kr = allocHostBuffer(device.gpu, bytes, &_buf, &_cpu);
 	if (kr) {
 		rdna4Error([NSString stringWithFormat:@"a buffer of %lu bytes", (unsigned long)length], kr);
 		return nil;
@@ -999,6 +1046,10 @@ static char gCopyKey;
 		_offset = 0;
 		_rowBytes = (d.width * _fm->bpp + 255) & ~(NSUInteger)255;
 		_memory = [[RDNA4MTLBuffer alloc] initWithDevice:device length:_rowBytes * d.height options:MTLResourceStorageModeShared];
+		if (!_memory) {
+			CFRelease(surface);
+			return nil;
+		}
 		[_memory keepOwner:^{ CFRelease(surface); }];
 		[_memory countAsShadow];
 	} else {
@@ -6347,10 +6398,10 @@ static void padSlot(uint32_t *page, uint32_t n)
 - (BOOL)supportsTextureOutOfBoundsReads { return YES; }
 - (BOOL)supportsViewportAndScissorArray { return YES; }
 
-- (uint64_t)recommendedMaxWorkingSetSize { return 1ull << 30; }
-// What it has allocated (host memory: the kext's per-client limit is 3 GiB): answered 0, Core Animation kept its surfaces until WindowServer
-// passed the limit and aborted (2.7 GB after a login with 11 apps, 2026-11-20); measured against the working set above, it gives them up.
-- (NSUInteger)currentAllocatedSize { return (NSUInteger)MAX(gHostLive.load(), (int64_t)0); }
+- (uint64_t)recommendedMaxWorkingSetSize { return kHostWorkingSet; }
+// Core Animation compares this with the recommended set. Cached host buffers
+// still consume the kext quota, even after their Metal resources are released.
+- (NSUInteger)currentAllocatedSize { return (NSUInteger)hostWorkingSetBytes(); }
 - (NSUInteger)maxThreadgroupMemoryLength { return 32768; }
 
 - (MTLAccelerationStructureSizes)accelerationStructureSizesWithDescriptor:(MTLAccelerationStructureDescriptor *)d

@@ -43,6 +43,13 @@ using namespace GfxReg;
 
 namespace {
 
+uint64_t hostFailureTimeUs() {
+	clock_sec_t seconds;
+	clock_usec_t micros;
+	clock_get_calendar_microtime(&seconds, &micros);
+	return static_cast<uint64_t>(seconds) * 1000000 + micros;
+}
+
 bool detailedFlipTrace() {
 	return rdna4TraceLevel >= 2;
 }
@@ -2642,16 +2649,35 @@ IOReturn RDNA4Compute::hostChecks(const void *owner, uint64_t bytes, uint64_t fl
 	RtClient *c = vmClientFor(owner);
 	if (!c || !dmaReady || !busMasterSet)
 		return kIOReturnUnsupported;
-	if (!bytes || bytes > kHostMaxBuffer || (flags & ~static_cast<uint64_t>(RDNA4_HOST_EXECUTABLE | RDNA4_HOST_READ_ONLY)))
-		return bytes > kHostMaxBuffer ? kIOReturnNoResources : kIOReturnBadArgument;
-	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
-	if (rounded < bytes || rounded > kHostMaxBuffer ||
-	    (counted && (rounded > kHostMaxClient - c->hostBytes || rounded > kHostMaxTotal - hostBytesTotal)))
+	if (bytes > kHostMaxBuffer) {
+		RLOG("host buffer size limit: unix_us=%llu vmid=%u request %llu bytes, max %llu",
+		     hostFailureTimeUs(), c->vmid, bytes, kHostMaxBuffer);
 		return kIOReturnNoResources;
+	}
+	if (!bytes || (flags & ~static_cast<uint64_t>(RDNA4_HOST_EXECUTABLE | RDNA4_HOST_READ_ONLY)))
+		return kIOReturnBadArgument;
+	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	if (rounded < bytes || rounded > kHostMaxBuffer)
+		return kIOReturnNoResources;
+	if (counted && (rounded > kHostMaxClient - c->hostBytes || rounded > kHostMaxTotal - hostBytesTotal)) {
+		RLOG("host allocation quota: unix_us=%llu vmid=%u request %llu bytes, client %llu/%llu, total %llu/%llu",
+		     hostFailureTimeUs(), c->vmid, rounded, c->hostBytes, kHostMaxClient, hostBytesTotal, kHostMaxTotal);
+		return kIOReturnNoResources;
+	}
 	uint32_t slot = 0;
 	while (slot < bufferCap() && buffers[slot].owner)
 		slot++;
-	return slot == bufferCap() || clientOverQuota(owner, false) ? kIOReturnNoResources : kIOReturnSuccess;
+	if (slot == bufferCap()) {
+		RLOG("host buffer table full: unix_us=%llu vmid=%u %u slots, request %llu bytes",
+		     hostFailureTimeUs(), c->vmid, bufferCap(), rounded);
+		return kIOReturnNoResources;
+	}
+	if (clientOverQuota(owner, false)) {
+		RLOG("host buffer client quota: unix_us=%llu vmid=%u %u slots, request %llu bytes",
+		     hostFailureTimeUs(), c->vmid, kClientBuffers, rounded);
+		return kIOReturnNoResources;
+	}
+	return kIOReturnSuccess;
 }
 
 // `memory` (wired; `imported`: prepared here, completed when freed) and its user view (`map`, or none for the caller's own range at
@@ -2708,6 +2734,8 @@ IOReturn RDNA4Compute::mapHostLocked(const void *owner, IOMemoryDescriptor *memo
 	if (segments)
 		IOFree(segments, segBytes);
 	if (!mapped) {
+		RLOG("host DMA mapping failed: unix_us=%llu vmid=%u %llu bytes, imported %u",
+		     hostFailureTimeUs(), c->vmid, rounded, static_cast<unsigned>(imported));
 		(void)dma->clearMemoryDescriptor();
 		dma->release();
 		if (pageBuses)
