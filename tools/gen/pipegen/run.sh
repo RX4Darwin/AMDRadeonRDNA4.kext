@@ -28,7 +28,8 @@
 #       '/drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_4_1_0_*' \
 #       '/drivers/gpu/drm/amd/include/asic_reg/dce/dce_11_0_*' \
 #       '/drivers/gpu/drm/amd/include/asic_reg/nbif/nbif_6_3_1_*' \
-#       /include/drm/display/drm_dp.h /include/drm/display/drm_dsc.h /include/linux/hdmi.h && git checkout
+#       /include/drm/display/drm_dp.h /include/drm/display/drm_dsc.h /include/drm/display/drm_dsc_helper.h \
+#       /drivers/gpu/drm/display/drm_dsc_helper.c /include/linux/hdmi.h && git checkout
 #
 # How it works: pipegen.c includes dcn401_resource.c for Linux's own register
 # tables and block constructors, builds one fake pipe (stream, plane, link),

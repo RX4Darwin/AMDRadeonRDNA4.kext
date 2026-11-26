@@ -1,6 +1,6 @@
 # Display Stream Compression (DSC), plan
 
-Status, 2026-11-25: planned; host-only by Sunneva's choice. The rig's Samsung reports DPCD 1.2 / HBR2 (17.3 Gbit/s) over
+Status, 2026-11-26: steps 1 and 2 done (host-tested); host-only by Sunneva's choice. The rig's Samsung reports DPCD 1.2 / HBR2 (17.3 Gbit/s) over
 DisplayPort and has no DP 1.4 setting, though its EDID lists 3840x2160@120 (1188 MHz): it cannot take DSC, so nothing here
 can run on the card until someone with a DP 1.4 DSC monitor tries it.
 
@@ -19,6 +19,12 @@ compresses the stream (to 8-12 bits per pixel) so both fit. The README lists it 
    `drm_dsc_pps_payload_pack` (drivers/gpu/drm/display/drm_dsc_helper.c, MIT: add to lib/linux's sparse set). Port the
    arithmetic into a freestanding `src/dsc.cpp` and hold it against the Linux functions on the host for a table of modes,
    sinks and links (byte-for-byte PPS).
+   **Done:** `src/dsc.cpp` (`Dsc::choose`, `Dsc::pps`; integer only, the QP tables from `tools/gen/pipegen/mkqp.py`).
+   `tools/gen/pipegen/dscgen.sh` runs Linux's own code (dc_dsc.c, dcn20/dcn401_dsc.c, rc_calc*.c, drm_dsc_helper.c) over
+   3 sinks x 12 timings (4K 60-240 Hz, 1440p240, 5K, 8K, 1080p) x 8/10/12 bpc x 4 links x 2 clock sets into
+   test/ref/dsc_linux.inc; `make test` (test/dsc-test.cpp) requires the same decision, configuration, 128-byte PPS, OPTC
+   bytes per pixel, RC buffer size and chunk size: 864 cases, 308 with DSC, all equal. Learned on the way: amdgpu counts
+   the DSC stream overhead only when the sink's branch caps (DPCD 0x0A0) are passed, as the SST path does.
 3. **Register sequence:** a DSC scenario in tools/gen/pipegen: DML with DSC on, `stream->timing.flags.DSC` and `dsc_cfg`, a DSC
    engine (and ODM 2:1 where DML asks for it at 144 Hz) on the pipe; record `link_set_dpms_on` (DSC engine config and enable,
    OPTC bytes per pixel, the stream encoder's DSC control and PPS SDP, the sink's DSC_ENABLE at DPCD 0x160 as an AUX write).

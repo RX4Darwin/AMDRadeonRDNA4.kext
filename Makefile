@@ -328,6 +328,10 @@ DMUBLOAD_TEST = $(HOST)/dmubload-test
 $(DMUBLOAD_TEST): test/dmubload-test.cpp src/dmubload.cpp src/dmubload.hpp test/ref/dmub_start_linux.inc
 	@mkdir -p $(HOST)
 	$(CXX) -std=c++17 -Wall -O1 -o $@ test/dmubload-test.cpp src/dmubload.cpp
+DSC_TEST      = $(HOST)/dsc-test
+$(DSC_TEST): test/dsc-test.cpp src/dsc.cpp src/dsc.hpp src/amdgpu/dsc_qp444.h src/dptrain.cpp src/dptrain.hpp test/ref/dsc_linux.inc
+	@mkdir -p $(HOST)
+	$(CXX) -std=c++17 -Wall -O1 -o $@ test/dsc-test.cpp src/dsc.cpp src/dptrain.cpp
 $(PVSTREAM_TEST): test/pvstream-test.cpp src/pvstream.cpp src/pvstream.hpp src/pvopcodes.inc src/pvdevinfo.inc
 	@mkdir -p $(HOST)
 	$(CXX) -std=c++17 -Wall -O1 -o $@ test/pvstream-test.cpp src/pvstream.cpp
@@ -349,12 +353,13 @@ $(HOST)/test-w12k-pm4: test/test-w12k-pm4.cpp src/pm4.cpp src/pm4.hpp
 check-isa:
 	bash test/check-isa.sh
 
-test: $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(FSR1_TEST) $(DMUBLOAD_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
+test: $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(FSR1_TEST) $(DMUBLOAD_TEST) $(DSC_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
 	@if [ -f $(ROM) ]; then echo "$(ATOMDUMP) $(ROM)"; $(ATOMDUMP) $(ROM); else echo "$(ATOMDUMP)   (no $(ROM))"; $(ATOMDUMP); fi
 	$(PVSTREAM_TEST)
 	$(PVDRAW_TEST)
 	$(FSR1_TEST)
 	$(DMUBLOAD_TEST)
+	$(DSC_TEST)
 	$(HOST)/test-gfx12tri
 	$(HOST)/test-gfx12tricol
 	$(HOST)/test-w12k-pm4

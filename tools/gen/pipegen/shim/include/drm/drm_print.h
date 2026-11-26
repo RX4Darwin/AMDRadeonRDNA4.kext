@@ -12,3 +12,5 @@
 #define drm_err(...) do {} while (0)
 #define drm_warn(...) do {} while (0)
 #define drm_info(...) do {} while (0)
+struct drm_printer;
+void drm_printf(struct drm_printer *p, const char *f, ...);

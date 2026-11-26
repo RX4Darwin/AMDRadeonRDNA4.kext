@@ -6,7 +6,10 @@ these changes: linux/slab.h gained kzalloc_objs, kmalloc_objs, kvzalloc_obj
 and kvmalloc_obj; linux/device.h is new; drm/display/drm_dp_helper.h now
 includes Linux's drm_dp.h; the placeholder ObjectID.h,
 atomfirmwareid.h, atom.h and amdgpu.h were dropped in favour of the real
-headers.
+headers. For dscgen (drm_dsc_helper.c): linux/export.h, kernel.h, module.h,
+init.h, errno.h, byteorder/generic.h and drm/drm_fixed.h are new,
+drm/drm_print.h gained drm_printf, and drm/display/drm_dsc_helper.h was
+dropped in favour of Linux's.
 
 Navi48-MacOS is under this licence:
 
