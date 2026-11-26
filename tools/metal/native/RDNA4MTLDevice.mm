@@ -1410,25 +1410,42 @@ static char gCopyKey;
 - (void)generateMipmaps
 {
 	[self wroteAll];
+	if (_levels < 2)
+		return;
+
 	const uint32_t bpp = self.bpp;
+	uint8_t *const base = self.bytes;
+	const NSUInteger slices = MAX(_slices, (NSUInteger)1);
 	for (NSUInteger l = 1; l < _levels; l++) {
 		const NSUInteger w = MAX(_width >> l, (NSUInteger)1), h = MAX(_height >> l, (NSUInteger)1);
 		const NSUInteger pw = MAX(_width >> (l - 1), (NSUInteger)1), ph = MAX(_height >> (l - 1), (NSUInteger)1);
-		for (NSUInteger z = 0; z < MAX(_slices, (NSUInteger)1); z++)   // (each slice of an array or cube)
-			for (NSUInteger y = 0; y < h; y++)
+		const NSUInteger srcRow = l == 1 ? _rowBytes : _levelRow[l - 1];
+		const NSUInteger srcSlice = l == 1 ? _slicePitch : _levelSlice[l - 1];
+		const NSUInteger dstRow = _levelRow[l];
+		const NSUInteger right = pw > 1 ? bpp : 0;
+		for (NSUInteger z = 0; z < slices; z++) {
+			const uint8_t *src = base + _levelOffset[l - 1] + z * srcSlice;
+			uint8_t *dst = base + _levelOffset[l] + z * _levelSlice[l];
+			for (NSUInteger y = 0; y < h; y++) {
+				const uint8_t *top = src + 2 * y * srcRow;
+				uint8_t *out = dst + y * dstRow;
+				if (bpp != 4) {   // nearest for formats of other than four 8-bit channels
+					for (NSUInteger x = 0; x < w; x++)
+						memcpy(out + x * bpp, top + 2 * x * bpp, bpp);
+					continue;
+				}
+				const uint8_t *bottom = src + MIN(2 * y + 1, ph - 1) * srcRow;
 				for (NSUInteger x = 0; x < w; x++) {
-					uint8_t *out = [self at:l x:x y:y z:z];
-					if (bpp != 4) {   // ponytail: nearest for formats of other than four 8-bit channels
-						memcpy(out, [self at:l - 1 x:MIN(2 * x, pw - 1) y:MIN(2 * y, ph - 1) z:z], bpp);
-						continue;
-					}
-					for (int c = 0; c < 4; c++) {
-						unsigned sum = 0;
-						for (int k = 0; k < 4; k++)
-							sum += [self at:l - 1 x:MIN(2 * x + (k & 1), pw - 1) y:MIN(2 * y + (k >> 1), ph - 1) z:z][c];
-						out[c] = (uint8_t)((sum + 2) / 4);
+					const uint8_t *a = top + 8 * x;
+					const uint8_t *b = bottom + 8 * x;
+					uint8_t *pixel = out + 4 * x;
+					for (NSUInteger c = 0; c < 4; c++) {
+						const unsigned sum = a[c] + a[right + c] + b[c] + b[right + c];
+						pixel[c] = (uint8_t)((sum + 2) / 4);
 					}
 				}
+			}
+		}
 	}
 }
 
