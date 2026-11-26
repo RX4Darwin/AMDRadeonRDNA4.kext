@@ -259,6 +259,11 @@ Keep only a boot-arg that changes a default on purpose ([Boot arguments](#boot-a
 driver's (`amfi_get_out_of_my_way=0x1`, Lilu's). Then install the kext and the package of the same release (step 6 above
 replaces 0.3's per-component install scripts) and reboot.
 
+0.4.0 also brings the Metal bundle in `/Library/GPUBundles`, which 0.3.3 did not have, so **SIP and AMFI must be relaxed
+as in step 5 above** even if 0.3.3 ran without it. Without it the boot reaches user space and then loops with
+`disallowing unsupported code signature page shift` and `unable to create a validated cs_blob object`: WindowServer
+refusing the bundle, not the driver crashing.
+
 ### Metal, OpenGL and Vulkan
 
 `AMDRadeonRDNA4-<version>.pkg` (step 5 above) comes with each release; to build it: `make PVGPU=1 all metal-helper mesa
