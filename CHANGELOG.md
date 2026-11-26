@@ -5,6 +5,10 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- **AMD's firmware comes from a submodule**: `lib/linux-firmware` (upstream linux-firmware, pinned at the commit the firmware
+  shipped so far came from, sparse: only the amdgpu files the driver embeds and AMD's licence) replaces the download in
+  `tools/build/fetch-firmware.sh`, which now sets the submodule up. The Navi 48 firmware is byte for byte what it was; builds now
+  also carry the Navi 44 set (RX 9060 XT) wherever that was missing.
 - **MetalFX's spatial upscaler works on the card, as AMD FSR 1**: MetalFX's own came back empty on our device, so games that ask
   for it got no upscaling. Quake II's Metal port with `r_metalfx 1` draws its view at half size and FSR brings it to full size, in 8-bit
   and in HDR colour.

@@ -34,7 +34,7 @@ name.
 
 Everything that differs between the cards (VRAM size, shader engines, display paths, the compute pool's place) is read
 from the card, not assumed (`src/sku.hpp` holds only the names and compute-unit counts). One kext carries the firmware of
-both chips when both sets are in `firmware/amdgpu/` (`tools/build/fetch-firmware.sh` fetches both); a card whose set the
+both chips when both sets are in `lib/linux-firmware/amdgpu/` (`tools/build/fetch-firmware.sh` fetches both); a card whose set the
 build lacks stops at the firmware stage with a message that says so.
 
 On an RX 9060 XT under Linux, reading the display engine's registers one after another (`tools/linux/linux-capture.sh`)
@@ -398,7 +398,7 @@ pointers are refused at load, with the reason in the kernel log.
 Clone with the submodules (`git clone --recursive`, or `git submodule update --init`; they are in `lib/`).
 
 ```sh
-tools/build/fetch-firmware.sh   # once: AMD's firmware for the compute bring-up (both chips' sets), into firmware/amdgpu/
+tools/build/fetch-firmware.sh   # once: AMD's firmware for the compute bring-up (both chips' sets), into lib/linux-firmware/amdgpu/
 make                            # the kext and the programs (x86_64, macOS 11 and later)
 make PVGPU=1                    # the Metal path: the driver's own Metal driver by default (OpenGL, Vulkan via MoltenVK), paravirtual with rdna4-pvgpu=1
 make PVGPU=1 metal-helper       # the shader translator for it

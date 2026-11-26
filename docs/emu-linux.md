@@ -27,7 +27,7 @@ cat vbios.bin discovery.bin > vbios+discovery.bin          # also what `make tes
 
 ATOM_ROM=vbios.bin ROM_DEVICE_ID=0x7590 bash tools/vm/emu-build.sh rom      # -> Build/emu/rdna4-7590.rom
 export ROM=$PWD/Build/emu/rdna4-7590.rom FLASH=$PWD/vbios+discovery.bin
-bash tools/vm/emu-linux.sh 3 --diag --dev "chip=navi44,fwdir=$PWD/firmware/amdgpu"
+bash tools/vm/emu-linux.sh 3 --diag --dev "chip=navi44,fwdir=$PWD/lib/linux-firmware/amdgpu"
 ```
 
 `fwdir=` stands in for the PSP's signature check, for either chip. No signature is verified: contents are compared. A

@@ -103,7 +103,7 @@ kmod_info.o: buildrev.h
 # with nothing in it when the firmware is not there.
 fwblobs.o: $(ROOT)/src/fwblobs.S fwconfig.h
 	@if grep -q NO_FIRMWARE fwconfig.h; then \
-		echo "no firmware in firmware/amdgpu (tools/build/fetch-firmware.sh): the kext is built without it"; \
+		echo "no firmware in lib/linux-firmware/amdgpu (tools/build/fetch-firmware.sh): the kext is built without it"; \
 		echo "" | $(CC) $(TARGET) -x c -c - -o $@; \
 	else \
 		echo "$(CC) $(TARGET) -I$(ROOT) -include fwconfig.h -c $(ROOT)/src/fwblobs.S -o $@"; \

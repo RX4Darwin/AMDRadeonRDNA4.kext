@@ -20,3 +20,8 @@
 	url = https://github.com/torvalds/linux.git
 	shallow = true
 	update = none
+[submodule "lib/linux-firmware"]
+	path = lib/linux-firmware
+	url = https://gitlab.com/kernel-firmware/linux-firmware.git
+	update = none
+	shallow = true

@@ -83,12 +83,12 @@ LILU_SHIM    = $(BUILD)/liluhdr
 LILU_STAMP   = $(LILU_SHIM)/.stamp
 
 # AMD firmware for the compute bring-up (src/compute.cpp, stage 2+): the
-# linux-firmware blobs in firmware/amdgpu/ (tools/build/fetch-firmware.sh).
+# linux-firmware blobs in lib/linux-firmware/amdgpu/ (tools/build/fetch-firmware.sh).
 # There is one set a chip (src/fwset.hpp), and the display microcontroller's
 # firmware, which both chips take. A set is embedded when all of it and the
 # display firmware are present; with no set the kext builds without firmware
 # and those stages report it.
-FW_DIR       = firmware/amdgpu
+FW_DIR       = lib/linux-firmware/amdgpu
 FW_COMMON    = $(FW_DIR)/dcn_4_0_1_dmcub.bin
 FW_NAVI48    = $(FW_DIR)/psp_14_0_3_sos.bin $(FW_DIR)/smu_14_0_3.bin \
                $(FW_DIR)/sdma_7_0_1.bin $(FW_DIR)/gc_12_0_1_pfp.bin \
@@ -159,8 +159,8 @@ kext: check-config $(LILU_STAMP)
 	@# The licences of what the binary contains; AMD's firmware license only with its firmware.
 	@rm -rf $(KEXT)/Contents/Resources; \
 	sh tools/package/licenses.sh kext $(KEXT)/Contents/Resources; \
-	if ! grep -q NO_FIRMWARE $(OBJDIR)/fwconfig.h && [ -f $(FW_DIR)/LICENSE.amdgpu ]; then \
-		cp $(FW_DIR)/LICENSE.amdgpu $(KEXT)/Contents/Resources/LICENSE.amdgpu; fi
+	if ! grep -q NO_FIRMWARE $(OBJDIR)/fwconfig.h && [ -f lib/linux-firmware/LICENSES/LICENSE.amdgpu ]; then \
+		cp lib/linux-firmware/LICENSES/LICENSE.amdgpu $(KEXT)/Contents/Resources/LICENSE.amdgpu; fi
 	@# Minimal, ad-hoc code signature so kextutil is happier during testing.
 	@codesign --force --sign - $(KEXT) 2>/dev/null || true
 	@echo "Built $(KEXT) for $(ARCH) (min macOS $(DEPLOY))"

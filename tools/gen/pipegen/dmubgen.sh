@@ -7,12 +7,12 @@
 #   tools/gen/pipegen/dmubgen.sh <linux tree> [firmware] [vbios bytes]
 #
 # The Linux tree is the one run.sh takes (its sparse checkout is enough). The firmware defaults to
-# firmware/amdgpu/dcn_4_0_1_dmcub.bin (tools/build/fetch-firmware.sh), the VBIOS size to 128 KiB.
+# lib/linux-firmware/amdgpu/dcn_4_0_1_dmcub.bin (tools/build/fetch-firmware.sh), the VBIOS size to 128 KiB.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../../.." && pwd)
 L=$(cd "$1" && pwd)
-FW=${2:-$repo/firmware/amdgpu/dcn_4_0_1_dmcub.bin}
+FW=${2:-$repo/lib/linux-firmware/amdgpu/dcn_4_0_1_dmcub.bin}
 VBIOS=${3:-0x20000}
 D=$L/drivers/gpu/drm/amd/display
 B=$repo/Build/dmubgen

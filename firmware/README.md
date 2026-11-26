@@ -4,7 +4,7 @@ Nothing in this directory but this file is in the repository.
 
 | What | Where it comes from | Used by |
 |---|---|---|
-| `amdgpu/*.bin`, `amdgpu/LICENSE.amdgpu` | `tools/build/fetch-firmware.sh` fetches them from linux-firmware. AMD allows their redistribution under the licence fetched with them. | The kext embeds them (`src/fwblobs.S`) for the compute bring-up. Without them it builds and says so in the stages that need them. |
+| AMD's firmware (`*.bin`, `LICENSE.amdgpu`) | Not here any more: the submodule `lib/linux-firmware` (upstream linux-firmware, sparse, at a pinned commit), set up by `tools/build/fetch-firmware.sh`. AMD allows their redistribution under that licence. | The kext embeds them (`src/fwblobs.S`) for the compute bring-up. Without them it builds and says so in the stages that need them. |
 | `Sapphire.RX9070XT.16384.241213.rom` | A dump of the test card's 2 MiB flash. It is the card vendor's, so it is not distributed here. TechPowerUp's VGA BIOS collection has it: <https://www.techpowerup.com/vgabios/274368/sapphire-rx9070xt-16384-241213-1>. Put it at this path, or name another file with `make test ROM=<file>`. | `make test` parses its AtomBIOS tables and IP discovery binary (`test/atomdump.cpp`); the emulator's option ROM is made from it (`tools/vm/emu-build.sh`). |
 
 Without the ROM dump `make test` leaves out the checks that parse it, says so, and runs the rest; the emulator's ROM

@@ -3281,9 +3281,9 @@ struct FakePsp {
 static int testPsp() {
 	int failures = 0;
 	std::vector<uint8_t> sosFile, smuFile;
-	if (!readFile("firmware/amdgpu/psp_14_0_3_sos.bin", sosFile) ||
-	    !readFile("firmware/amdgpu/smu_14_0_3.bin", smuFile)) {
-		printf("\npsp: firmware/amdgpu/ blobs absent, skipped\n");
+	if (!readFile("lib/linux-firmware/amdgpu/psp_14_0_3_sos.bin", sosFile) ||
+	    !readFile("lib/linux-firmware/amdgpu/smu_14_0_3.bin", smuFile)) {
+		printf("\npsp: lib/linux-firmware/amdgpu/ blobs absent, skipped\n");
 		return 0;
 	}
 
@@ -3386,10 +3386,10 @@ static int testPsp() {
 static int testGfxImages() {
 	int failures = 0;
 	static const char *const names[] = {
-		"firmware/amdgpu/sdma_7_0_1.bin", "firmware/amdgpu/gc_12_0_1_pfp.bin",
-		"firmware/amdgpu/gc_12_0_1_me.bin", "firmware/amdgpu/gc_12_0_1_mec.bin",
-		"firmware/amdgpu/gc_12_0_1_uni_mes.bin", "firmware/amdgpu/gc_12_0_1_imu.bin",
-		"firmware/amdgpu/gc_12_0_1_rlc.bin",
+		"lib/linux-firmware/amdgpu/sdma_7_0_1.bin", "lib/linux-firmware/amdgpu/gc_12_0_1_pfp.bin",
+		"lib/linux-firmware/amdgpu/gc_12_0_1_me.bin", "lib/linux-firmware/amdgpu/gc_12_0_1_mec.bin",
+		"lib/linux-firmware/amdgpu/gc_12_0_1_uni_mes.bin", "lib/linux-firmware/amdgpu/gc_12_0_1_imu.bin",
+		"lib/linux-firmware/amdgpu/gc_12_0_1_rlc.bin",
 	};
 	std::vector<uint8_t> files[7];
 	for (int i = 0; i < 7; i++)
@@ -3481,18 +3481,18 @@ static int testNavi44Firmware() {
 	}
 
 	static const char *const names[] = {
-		"firmware/amdgpu/sdma_7_0_0.bin", "firmware/amdgpu/gc_12_0_0_pfp.bin",
-		"firmware/amdgpu/gc_12_0_0_me.bin", "firmware/amdgpu/gc_12_0_0_mec.bin",
-		"firmware/amdgpu/gc_12_0_0_uni_mes.bin", "firmware/amdgpu/gc_12_0_0_imu.bin",
-		"firmware/amdgpu/gc_12_0_0_rlc.bin",
+		"lib/linux-firmware/amdgpu/sdma_7_0_0.bin", "lib/linux-firmware/amdgpu/gc_12_0_0_pfp.bin",
+		"lib/linux-firmware/amdgpu/gc_12_0_0_me.bin", "lib/linux-firmware/amdgpu/gc_12_0_0_mec.bin",
+		"lib/linux-firmware/amdgpu/gc_12_0_0_uni_mes.bin", "lib/linux-firmware/amdgpu/gc_12_0_0_imu.bin",
+		"lib/linux-firmware/amdgpu/gc_12_0_0_rlc.bin",
 	};
 	std::vector<uint8_t> sosFile, smuFile, files[7];
-	bool present = readFile("firmware/amdgpu/psp_14_0_2_sos.bin", sosFile) &&
-	               readFile("firmware/amdgpu/smu_14_0_2.bin", smuFile);
+	bool present = readFile("lib/linux-firmware/amdgpu/psp_14_0_2_sos.bin", sosFile) &&
+	               readFile("lib/linux-firmware/amdgpu/smu_14_0_2.bin", smuFile);
 	for (int i = 0; i < 7 && present; i++)
 		present = readFile(names[i], files[i]);
 	if (!present) {
-		printf("\nnavi44: firmware/amdgpu/ blobs of the Navi 44 set absent, the firmware checks skipped\n");
+		printf("\nnavi44: lib/linux-firmware/amdgpu/ blobs of the Navi 44 set absent, the firmware checks skipped\n");
 		return failures;
 	}
 

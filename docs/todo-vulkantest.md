@@ -102,7 +102,7 @@ If the machine does not get to the desktop at all, take `rdna4-compute` out of t
    Anything but `0x00c0`: stop and say so.
 
 2. The firmware into the build. This downloads 13 files and AMD's licence text from the linux-firmware repository
-   into `firmware/amdgpu/`, which git ignores:
+   into `lib/linux-firmware/amdgpu/`, which git ignores:
 
    ```bash
    tools/build/fetch-firmware.sh

@@ -2215,7 +2215,7 @@ void RDNA4Compute::gfxPmExperiment(uint32_t mask) {
 
 bool RDNA4Compute::stagePsp() {
 #ifdef AMDRadeonRDNA4_NO_FIRMWARE
-	CLOG("psp: this build carries no firmware (firmware/amdgpu/ was empty at build time)");
+	CLOG("psp: this build carries no firmware (lib/linux-firmware/amdgpu/ was empty at build time)");
 	publishResult("firmware", "FAIL none in this kext: tools/build/fetch-firmware.sh, then make clean && make");
 	return false;
 #else
