@@ -402,7 +402,7 @@ static void make_state(const struct cfg *c)
 	stream->output_color_space = c->y420 ? COLOR_SPACE_YCBCR709 : COLOR_SPACE_SRGB;
 	stream->qs_bit = 1;                      /* send "full range" in the AVI infoframe: a desktop */
 	stream->content_type = DISPLAY_CONTENT_TYPE_GRAPHICS;
-	stream->clamping.c_depth = COLOR_DEPTH_888; stream->clamping.pixel_encoding = c->t.pixel_encoding;
+	stream->clamping.c_depth = c->t.display_color_depth; stream->clamping.pixel_encoding = c->t.pixel_encoding;
 	stream->clamping.clamping_level = CLAMPING_FULL_RANGE;
 	stream->out_transfer_func.type = TF_TYPE_BYPASS;
 	stream->test_pattern.type = DP_TEST_PATTERN_VIDEO_MODE;
@@ -447,7 +447,7 @@ static void make_state(const struct cfg *c)
 	pipe->stream_res.pix_clk_params.encoder_object_id = eid.encoder;
 	pipe->stream_res.pix_clk_params.signal_type = signal;
 	pipe->stream_res.pix_clk_params.controller_id = CONTROLLER_ID_D0 + c->pipe;
-	pipe->stream_res.pix_clk_params.color_depth = COLOR_DEPTH_888;
+	pipe->stream_res.pix_clk_params.color_depth = c->t.display_color_depth;
 	pipe->stream_res.pix_clk_params.pixel_encoding = c->t.pixel_encoding;
 	/* dcn401_build_pipe_pix_clk_params: a 4:2:0 TMDS stream enters the DIG two pixels a cycle */
 	/* dcn401_build_pipe_pix_clk_params: a DisplayPort stream enters the DIG 2, 4 or 8 pixels a cycle above 1, 2 or 4
@@ -933,7 +933,8 @@ int main(int argc, char **argv)
 	c.t.vic = v[15];
 	c.t.aspect_ratio = v[4] * 9 == v[8] * 16 ? ASPECT_RATIO_16_9 : v[4] * 3 == v[8] * 4 ? ASPECT_RATIO_4_3 : ASPECT_RATIO_NO_DATA;
 	c.t.pixel_encoding = c.y420 ? PIXEL_ENCODING_YCBCR420 : PIXEL_ENCODING_RGB;
-	c.t.display_color_depth = COLOR_DEPTH_888;
+	/* PIPEGEN_BPC=10: 10 bits a component on the wire (Linux's own choice for the Samsung at 4K144 with DSC) */
+	c.t.display_color_depth = getenv("PIPEGEN_BPC") && atoi(getenv("PIPEGEN_BPC")) == 10 ? COLOR_DEPTH_101010 : COLOR_DEPTH_888;
 	if (c.pipe < (c.dp ? 0 : 1) || c.pipe > 3 || c.dig > 3 || c.link > 3 || c.hpd > 5 || !v[12]) { fprintf(stderr, "bad configuration\n"); return 2; }
 
 	/* The display the firmware lit: the 3840x2160@60 CVT-RB raster the GOP uses on a 4K sink, the heaviest

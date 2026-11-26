@@ -117,6 +117,9 @@ namespace P0Hpd1Uhd {
 namespace P0Hpd1Dsc144 {
 #include "pipe2_linux_p0_dp1_dsc144.inc"
 }
+namespace P0Hpd1Dsc144b10 {
+#include "pipe2_linux_p0_dp1_dsc144_10.inc"
+}
 namespace P0Hpd1Dsc60 {
 #include "pipe2_linux_p0_dp1_dsc60.inc"
 }
@@ -301,6 +304,10 @@ constexpr size_t kTableCount = sizeof(kTables) / sizeof(kTables[0]);
 // Not in kTables: one mode and no mode registers, and use() must never pick it (useDsc()).
 constexpr Table kDscTable = { P0Hpd1Dsc144::kConfig, P0Hpd1Dsc144::kGen, sizeof(P0Hpd1Dsc144::kGen) / sizeof(Gen), nullptr, 0,
                               P0Hpd1Dsc144::kModeTimings, 1, nullptr, P0Hpd1Dsc144::kAux, countOf(P0Hpd1Dsc144::kAux), nullptr, 0 };
+// The same at 10 bits a component, as Linux runs the Samsung at 4K144.
+constexpr Table kDsc10Table = { P0Hpd1Dsc144b10::kConfig, P0Hpd1Dsc144b10::kGen, sizeof(P0Hpd1Dsc144b10::kGen) / sizeof(Gen),
+                                nullptr, 0, P0Hpd1Dsc144b10::kModeTimings, 1, nullptr, P0Hpd1Dsc144b10::kAux,
+                                countOf(P0Hpd1Dsc144b10::kAux), nullptr, 0 };
 // The same at the GOP's 3840x2160@60 (533.25 MHz, one pixel a cycle), DSC forced on: a card test that tells the DSC set-up
 // from the 144 Hz rate.
 constexpr Table kDsc60Table = { P0Hpd1Dsc60::kConfig, P0Hpd1Dsc60::kGen, sizeof(P0Hpd1Dsc60::kGen) / sizeof(Gen), nullptr, 0,
@@ -391,7 +398,14 @@ bool use(uint8_t hpd, bool tmds, uint8_t pipe, bool uhd, bool y420) {
 // 3840x2160 at 729 MHz (82 Hz) uncompressed on HBR3: the DIG two pixels a cycle without DSC (rdna4-dscboot=3).
 constexpr Table kHiTable = { P0Hpd1Hi::kConfig, P0Hpd1Hi::kGen, sizeof(P0Hpd1Hi::kGen) / sizeof(Gen), nullptr, 0,
                              P0Hpd1Hi::kModeTimings, 1, nullptr, P0Hpd1Hi::kAux, countOf(P0Hpd1Hi::kAux), nullptr, 0 };
-void useDsc(int variant) { cur = variant == 2 ? &kDsc60Table : variant == 3 ? &kHiTable : &kDscTable; }
+void useDsc(int variant) {
+	switch (variant) {
+	case 2: cur = &kDsc60Table; break;
+	case 3: cur = &kHiTable; break;
+	case 4: cur = &kDsc10Table; break;
+	default: cur = &kDscTable; break;
+	}
+}
 
 bool isUhd(const Config &c) { return c.timing.hActive >= kUhdWidth; }
 
@@ -464,11 +478,13 @@ size_t encodingSteps(bool y420, ModeSet::Step *out, size_t cap) {
 constexpr uint32_t kDigFifoCtrl0 = 0x209b, kDigPixelsPerCycle = 0x300;
 
 // What a plan step writes, but with the DIG's pixels a cycle of the encoding
-// the pipe runs.
+// the pipe runs: a 4:2:0 table's pipe runs RGB too. An RGB table's own value
+// stands: two pixels a cycle there are Linux's for a stream above 720 MHz
+// (the DSC 4K144 table: forced to one, the FIFO overflowed, 2026-11-26).
 static uint32_t digInputMode(const Gen &g, uint32_t value, bool y420) {
 	const Config &c = cur->config;
 
-	if (g.seg != 2 || g.dword != kDigFifoCtrl0 + c.dig * kDigStride || !(g.mask & kDigPixelsPerCycle))
+	if (!c.y420 || g.seg != 2 || g.dword != kDigFifoCtrl0 + c.dig * kDigStride || !(g.mask & kDigPixelsPerCycle))
 		return value;
 
 	return (value & ~kDigPixelsPerCycle) | (y420 ? 0x100 : 0);

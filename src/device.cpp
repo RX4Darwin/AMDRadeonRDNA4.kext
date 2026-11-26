@@ -3427,7 +3427,8 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 		}
 		boot.link = DpTrain::Link { 4, DpTrain::kHbr3, dscBoot != 3 };
 		FBLOG("dscboot: pipe 0 to be lit again (test %u: %s) on four HBR3 lanes (DISPCLK target %u kHz)", dscBoot,
-		      dscBoot == 2 ? "3840x2160@60, DSC forced" : dscBoot == 3 ? "3840x2160 at 729 MHz, no DSC" : "3840x2160@144, DSC",
+		      dscBoot == 2 ? "3840x2160@60, DSC forced" : dscBoot == 3 ? "3840x2160 at 729 MHz, no DSC" :
+		      dscBoot == 4 ? "3840x2160@144, DSC, 10 bpc" : "3840x2160@144, DSC",
 		      dispclkTargetKHz());
 	}
 	boot.target.connectorObjId = connector;
@@ -3500,6 +3501,9 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 		const uint8_t clear = 0x07;
 		uint8_t later[2] {};
 		(void)dpcdWrite(sinkAuxInst, 0x20f, &clear, 1);
+		// The OPTC's sticky underflow flag cleared too (OPTC_UNDERFLOW_CLEAR [12]): whether it comes back tells a
+		// pipe that is late every frame from one that was late once while lighting.
+		regWriteDmu(2, 0x1aca, regReadDmu(2, 0x1aca) | (1u << 12));
 		for (int i = 0; i < 2; i++) {
 			IOSleep(i ? 2000 : 1000);
 			const bool r = dpcdRead(sinkAuxInst, 0x20f, &later[i], 1);

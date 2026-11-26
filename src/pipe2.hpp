@@ -76,7 +76,7 @@ bool use(uint8_t hpd, bool tmds = false, uint8_t pipe = 1, bool uhd = false, boo
 // The boot display's pipe 0 on the first DisplayPort connector lit at 3840x2160@144 with DSC (docs/dsc-plan.md): Linux's
 // sequence for the rig's Samsung's DSC decoder (its DPCD 0x060 caps) on four HBR3 lanes with FEC, DISPCLK 1.39 GHz.
 // A card test of the DSC sequence (rdna4-dscboot=1), selected by this alone (use() never picks it).
-void useDsc(int variant = 1);   // rdna4-dscboot: 1 4K144 DSC, 2 4K60 DSC forced, 3 4K at 729 MHz uncompressed
+void useDsc(int variant = 1);   // rdna4-dscboot: 1 4K144 DSC, 2 4K60 DSC forced, 3 4K at 729 MHz uncompressed, 4 4K144 DSC 10 bpc
 // Whether a table lights its pipe at 3840x2160; whether the connector on that
 // HPD pin has one.
 constexpr uint16_t kUhdWidth = 3840;
