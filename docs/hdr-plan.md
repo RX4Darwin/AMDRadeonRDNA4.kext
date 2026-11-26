@@ -37,8 +37,9 @@ enc3_stream_encoder_update_dp_info_packets); off clears GSP3. The mastering prim
 
 ## Next
 
-- Not run: display sleep/wake and system sleep with HDR on (the packet is only sent again at the next switch), and a
-  mode switch while in HDR.
+- Display sleep and wake with HDR on passed on the card (2026-11-26): macOS switches the mode again after the wake, so the
+  packet is sent again and the Samsung's tone mapping came back active. Not run: system sleep and a resolution change
+  while in HDR.
 - Signal BT.2020 (a VSC SDP with colorimetry, DPCD 0x2210 bit 3) and fill the mastering data from macOS's
   IOFBHDRMetaData (kIOFBHDRMetaDataAttribute) or the EDID.
 - 10 bits a component on the link (FMT bit depth, DIG pixel depth, MSA) for the twins; check the DP bandwidth at

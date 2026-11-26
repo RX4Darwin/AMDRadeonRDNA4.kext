@@ -9,7 +9,7 @@ otherwise). The newest version is on top. How versions and branches work is in `
   an HDR10 copy of every mode, which is what macOS needs to offer HDR, and switching HDR on sends the boot display (DP)
   the HDR static metadata (PQ). The link stays 8 bits a component. On Tahoe 26.6.2 with the rig's Samsung Odyssey G70D,
   macOS reported HDR support, and the monitor's HDR Tone Mapping went active with HDR on and greyed out with it off; the
-  picture looked normal. The Lenovo (no HDR) got no copies. Not run: sleep with HDR on. Plan in docs/hdr-plan.md.
+  picture looked normal. The Lenovo (no HDR) got no copies. Display sleep and wake with HDR on passed; system sleep not run. Plan in docs/hdr-plan.md.
 
 - The primary DisplayPort framebuffer can offer EDID modes larger than the firmware console using a separate scanout
   surface and the boot pipe’s Linux DML table. This requires a single connected display. A second display at attach
