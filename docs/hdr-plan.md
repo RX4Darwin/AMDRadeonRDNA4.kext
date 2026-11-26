@@ -2,8 +2,8 @@
 
 Status, 2026-11-26: with `rdna4-hdr=1` (and `rdna4-vrr=1`, which serves the timing range) macOS offers HDR on the rig's
 Samsung, and switching it on sends the HDR static metadata (PQ): the Samsung's "HDR Tone Mapping" goes active with HDR
-on and greyed out with it off, and the picture looked normal. The link stays 8 bits a component and BT.2020 is not
-signalled yet. Off by default.
+on and greyed out with it off, and the picture looked normal. BT.2020 is signalled in a VSC SDP (link stable; not yet
+judged by eye). The link stays 8 bits a component. Off by default.
 
 ## What the monitors and macOS have
 
@@ -35,13 +35,21 @@ and the secondary stream's master enable, as Linux (vpg3_update_generic_info_pac
 enc3_stream_encoder_update_dp_info_packets); off clears GSP3. The mastering primaries, luminance, MaxCLL and MaxFALL are
 0 ("unknown"). Card: DP0_DP_SEC_CNTL 0x00800001 with HDR on, the Samsung's tone mapping follows.
 
+## Step 3 (done, 2026-11-26): BT.2020
+
+If the sink takes colorimetry from a VSC SDP (DPCD 0x2210 bit 3; the Samsung reads 0x08), HDR on also sends a VSC SDP
+revision 5 (mod_build_vsc_infopacket: DB16 = RGB | BT.2020 RGB, DB17 = 8 bpc full range) in VPG packet 0 with
+DP_SEC_GSP0_ENABLE, and sets MSA MISC1 bit 6 so the sink takes colorimetry from it (dcn401 set_stream_attribute).
+HDR off clears GSP0 and the bit, which leaves the MSA's own colorimetry as before. Card: DP_SEC_CNTL 0x00900001,
+DP_MSA_MISC 0x40, no HPD drop or retrain afterwards; macOS kept HDR on across a reboot and the packets went out at its
+first switch. Not judged by eye yet (colours should look the same as with PQ alone on a monitor that assumed BT.2020).
+
 ## Next
 
 - Display sleep and wake with HDR on passed on the card (2026-11-26): macOS switches the mode again after the wake, so the
   packet is sent again and the Samsung's tone mapping came back active. Not run: system sleep and a resolution change
   while in HDR.
-- Signal BT.2020 (a VSC SDP with colorimetry, DPCD 0x2210 bit 3) and fill the mastering data from macOS's
-  IOFBHDRMetaData (kIOFBHDRMetaDataAttribute) or the EDID.
+- Fill the mastering data from macOS's IOFBHDRMetaData (kIOFBHDRMetaDataAttribute) or the EDID.
 - 10 bits a component on the link (FMT bit depth, DIG pixel depth, MSA) for the twins; check the DP bandwidth at
   2560x1440@144 and 4K (DSC).
 - What WindowServer renders in HDR mode at 32 bpp (PQ-encoded 8 bit? a 10-bit or FP16 surface would need another depth
