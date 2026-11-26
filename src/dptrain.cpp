@@ -219,6 +219,11 @@ bool parseCaps(const uint8_t *caps, size_t len, Sink &out) {
 	return out.rev >= 0x10 && rate && lanes;
 }
 
+bool parseExtendedCaps(const uint8_t (&base)[16], const uint8_t (&extended)[16], Sink &out) {
+	return (base[0x0e] & 0x80) && extended[0] >= 0x13 && extended[0] >= base[0] &&
+	       (extended[6] & 1) && parseCaps(extended, sizeof(extended), out);
+}
+
 // dc_dsc_parse_dsc_dpcd and its helpers (dsc_buff_block_size_from_dpcd, dsc_line_buff_depth_from_dpcd,
 // dsc_throughput_from_dpcd, dsc_bpp_increment_div_from_dpcd), dsc[i] = DPCD 0x060 + i.
 bool parseDscCaps(const uint8_t dsc[16], DscCaps &out) {
