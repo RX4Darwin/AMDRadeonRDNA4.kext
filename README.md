@@ -143,19 +143,23 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 - In the paravirtual mode (`rdna4-pvgpu=1`): no ray tracing, Metal heaps, argument buffers or indirect command buffers,
   and at most 16 textures a stage (so Chrome's WebGL via Dawn does not run). The native driver (the default) has these.
 - Display Stream Compression (DSC) beyond one mode: 3840x2160 at 144 Hz works on the DisplayPort boot display behind
-  a 3840x2160 OpenCore console. Not on a second display, not in other DSC modes (4K120), and not after the monitor
-  is unplugged while it runs. The display clock it raises (1400 MHz) stays up until reboot.
+  a 3840x2160 OpenCore console, beside a second display too. Not on a second display itself, not in other DSC modes
+  (4K120), and not after the monitor is unplugged while it runs.
+- Lowering the display clock again: a mode faster than 650 MHz raises it (700 MHz for 2560x1440@144, 1400 MHz for
+  4K144 over DSC), and it stays there until reboot.
+- Modes larger than the OpenCore console on a DisplayPort boot display (from a separate surface) only when it is the
+  only display connected; with a second display the desktop stays at the console's size or smaller. Not for an HDMI
+  boot display.
 - Variable refresh (FreeSync) by default: with `rdna4-vrr=1` it works on DisplayPort monitors, the boot display included
-  (48-144 Hz on the rig's two), at the timings at the monitor's top rate (on a 4K144 monitor not yet at 4K: that needs
-  DSC).
+  (48-144 Hz on the rig's two), at the timings at the monitor's top rate. At 4K144 over DSC it has not been tried.
 - DisplayPort MST, HDR output to the monitor.
 - Audio over HDMI and DisplayPort.
 - Hardware video decode and encode (VCN).
 - GFXOFF (the graphics block powered down when idle) on by default: it works with `rdna4-gfxoff=1` (about 3 W less while
   the screen is still or the displays sleep), but has not yet run long or through a system sleep. Memory clock scaling with
-  two 4K displays lit: the memory clock is held at its top level then (two 4K planes underflowed when it dropped); with one
-  display, or a 4K one beside a smaller one, memory scales and its deep sleep works (`rdna4-uclk=<MHz>` holds a minimum
-  always).
+  two 4K displays lit, or a boot display mode above 600 MHz (2560x1440@144, 4K144): the memory clock is held at its top
+  level then (the planes underflowed when it dropped); with one display at 4K60 or less, or a 4K one beside a smaller one,
+  memory scales and its deep sleep works (`rdna4-uclk=<MHz>` holds a minimum always).
 - The Navi 44 cards (RX 9060 XT, RX 9060) under macOS: matched and given their firmware, measured under Linux and in the
   emulator, not yet run on one (see *Supported cards*).
 
