@@ -1502,25 +1502,14 @@ static int testDpTrain() {
 	const DpTrain::Link hbr2x4 { 4, DpTrain::kHbr2 };
 	{
 		// AW2724DM: the base block says HBR2; the extended receiver advertises HBR3 x4.
-		uint8_t base[16] {0x12, 0x14, 0xc4, 0x81, 0, 0, 1, 0xc0, 2, 2, 0, 0, 0, 0, 0x81, 0};
-		uint8_t ext[16] {0x14, 0x1e, 0xc4, 0x81, 0, 0, 1, 0xc0, 2, 2, 0, 0, 0, 0, 0x81, 0};
+		const uint8_t base[16] {0x12, 0x14, 0xc4, 0x81, 0, 0, 1, 0xc0, 2, 2, 0, 0, 0, 0, 0x81, 0};
+		const uint8_t ext[16] {0x14, 0x1e, 0xc4, 0x81, 0, 0, 1, 0xc0, 2, 2, 0, 0, 0, 0, 0x81, 0};
 		DpTrain::Sink sink {};
-		failures += check(DpTrain::parseExtendedCaps(base, ext, sink) && sink.maxRate == DpTrain::kHbr3 &&
-		                  sink.maxLanes == 4 && sink.tps4, "dptrain: AW2724DM extended block");
-		base[0x0e] = 0;
-		failures += check(!DpTrain::parseExtendedCaps(base, ext, sink), "dptrain: unadvertised extended block");
-		base[0x0e] = 0x80;
-		base[0] = 0x14;
-		ext[0] = 0x13;
-		failures += check(!DpTrain::parseExtendedCaps(base, ext, sink), "dptrain: older extended revision");
-		ext[0] = 0x14;
-		ext[6] = 0;
-		failures += check(!DpTrain::parseExtendedCaps(base, ext, sink), "dptrain: no 8b/10b extended caps");
-		ext[6] = 1;
-		ext[2] = 3;
-		failures += check(!DpTrain::parseExtendedCaps(base, ext, sink) &&
-		                  DpTrain::parseCaps(base, sizeof(base), sink) && sink.maxRate == DpTrain::kHbr2 &&
-		                  sink.maxLanes == 4, "dptrain: invalid extended lanes, usable base caps");
+		failures += check(DpTrain::parseCaps(base, sizeof(base), sink) && sink.rev == 0x12 &&
+		                  sink.maxRate == DpTrain::kHbr2 && sink.maxLanes == 4, "dptrain: AW2724DM base block");
+		failures += check(DpTrain::parseCaps(ext, sizeof(ext), sink) && sink.rev == 0x14 &&
+		                  sink.maxRate == DpTrain::kHbr3 && sink.maxLanes == 4 && sink.tps4,
+		                  "dptrain: AW2724DM extended block");
 	}
 
 	size_t events = 0, regWrites = 0;

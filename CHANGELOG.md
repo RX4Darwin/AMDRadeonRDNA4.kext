@@ -6,7 +6,7 @@ otherwise). The newest version is on top. How versions and branches work is in `
 ## After 0.4.0 (on `next`, no number yet)
 
 - The boot framebuffer serves up to four EDID blocks over DisplayPort. On the maintainer's Samsung 4K display, macOS
-  received the third block (DisplayID) and 2560×1440 ran at 143.98 Hz with the display series from PR #28.
+  received the full 384-byte EDID, including the DisplayID extension.
 
 - **AMD's firmware comes from a submodule**: `lib/linux-firmware` (upstream linux-firmware, pinned at the commit the firmware
   shipped so far came from, sparse: only the amdgpu files the driver embeds and AMD's licence) replaces the download in
