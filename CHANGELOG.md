@@ -5,6 +5,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- HDR, first step (`rdna4-hdr=1`, off by default, needs `rdna4-vrr=1`): on a display whose EDID takes PQ the driver lists
+  an HDR10 copy of every mode, which is what macOS needs to offer HDR. Nothing is sent to the monitor for HDR yet, so the
+  picture with HDR on is not right. On Tahoe 26.6.2 with the rig's Samsung Odyssey G70D, macOS reported HDR support and
+  switched it on and off; the Lenovo (no HDR) got no copies. Plan in docs/hdr-plan.md.
+
 - The primary DisplayPort framebuffer can offer EDID modes larger than the firmware console using a separate scanout
   surface and the boot pipe’s Linux DML table. This requires a single connected display. A second display at attach
   keeps the boot framebuffer on its console-sized surface. Host tests cover QHD and UHD plane programming and restoration of a

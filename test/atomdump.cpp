@@ -3121,6 +3121,64 @@ static int testNdrv() {
 	failures += check(tr.status(Ndrv::cscGetNextResolution, &res, ret) && ret == Ndrv::kBadArgument,
 	                  "ndrv: unknown previous mode not refused");
 
+	// HDR (docs/hdr-plan.md): every table mode once more as an HDR10 twin, after the modes; the twins' timings say
+	// 10 bpc, BT.2020, HDR10, the modes' 8 bpc, sRGB, SDR; a twin switches like its mode and is never the default.
+	{
+		Ndrv::Translator ht;
+		ht.init(table, n, bootId, lenovo, sizeof(lenovo), fb.backend());
+		ht.hdr = true;
+		Ndrv::VDResolutionInfoRec hr {};
+		hr.csPreviousDisplayModeID = Ndrv::kDisplayModeIDFindFirst;
+		size_t seen = 0;
+		bool twinsOk = true;
+		while (ht.status(Ndrv::cscGetNextResolution, &hr, ret) && ret == Ndrv::kSuccess && hr.csDisplayModeID > 0 &&
+		       seen <= 2 * n) {
+			const bool twin = seen >= n;
+			const Modes::Mode &m = table[twin ? seen - n : seen];
+			Ndrv::VDDetailedTimingRec dt {};
+			dt.csDisplayModeID = hr.csDisplayModeID;
+			twinsOk &= hr.csDisplayModeID == (twin ? ht.idFor(m) | Ndrv::Translator::kHdrIdBit : ht.idFor(m)) &&
+			           hr.csHorizontalPixels == m.t.hActive &&
+			           ht.status(Ndrv::cscGetDetailedTiming, &dt, ret) && ret == Ndrv::kSuccess &&
+			           dt.csHorizontalActive == m.t.hActive && dt.csPixelEncoding == 0x01 &&
+			           dt.csBitsPerColorComponent == (twin ? 0x04 : 0x02) &&
+			           dt.csColorimetry == (twin ? 0x100 : 0x02) && dt.csDynamicRange == (twin ? 0x02 : 0x01);
+			hr.csPreviousDisplayModeID = hr.csDisplayModeID;
+			seen++;
+		}
+		failures += check(seen == 2 * n && twinsOk && hr.csDisplayModeID == Ndrv::kDisplayModeIDNoMore,
+		                  "ndrv: HDR walk %zu/%zu entries, twins %d, end 0x%x", seen, 2 * n, twinsOk, hr.csDisplayModeID);
+		const int32_t bootTwin = Ndrv::kBootModeId | Ndrv::Translator::kHdrIdBit;
+		Ndrv::VDTimingInfoRec ti {};
+		ti.csTimingMode = bootTwin;
+		Ndrv::VDSwitchInfoRec sw {};
+		sw.csData = bootTwin;
+		sw.csMode = Ndrv::kDepthMode1;
+		failures += check(ht.status(Ndrv::cscGetModeTiming, &ti, ret) && ret == Ndrv::kSuccess &&
+		                  !(ti.csTimingFlags & Ndrv::kDisplayModeDefaultFlag) &&
+		                  ht.control(Ndrv::cscSwitchMode, &sw, ret) && ret == Ndrv::kSuccess &&
+		                  ht.currentModeId() == bootTwin,
+		                  "ndrv: HDR twin of the boot mode: flags 0x%x, switch 0x%x", ti.csTimingFlags, ret);
+		// Edid::takesPq: a CTA block with an HDR Static Metadata block whose EOTFs include PQ (the Samsung's bytes).
+		uint8_t pq[256] {};
+		memcpy(pq, lenovo, 128);
+		const uint8_t cta[] = { 0x02, 0x03, 0x0a, 0x00, 0xe5, 0x06, 0x05, 0x01, 0x60, 0x5b };
+		memcpy(pq + 128, cta, sizeof(cta));
+		auto fixSum = [&pq] {
+			uint8_t sum = 0;
+			for (size_t i = 128; i < 255; i++)
+				sum = static_cast<uint8_t>(sum + pq[i]);
+			pq[255] = static_cast<uint8_t>(0x100 - sum);
+		};
+		fixSum();
+		const bool withPq = Edid::takesPq(pq, sizeof(pq));
+		const bool sdrOnly = Edid::takesPq(lenovo, sizeof(lenovo));
+		pq[134] = 0x01;   // traditional SDR only
+		fixSum();
+		failures += check(withPq && !sdrOnly && !Edid::takesPq(pq, sizeof(pq)), "edid: takesPq %d, Lenovo %d", withPq,
+		                  sdrOnly);
+	}
+
 	// Pick a non-boot mode for the per-mode checks.
 	const Modes::Mode *other = nullptr;
 	for (size_t i = 0; i < n && !other; i++)

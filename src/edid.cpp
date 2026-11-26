@@ -404,6 +404,8 @@ bool parseCtaBlock(const uint8_t ext[128], CtaCaps &out) {
 			} else if (tag == 7 && len >= 1 && p[0] == 14) {   // Y420 Video Data Block
 				for (uint8_t i = 1; i < len && out.y420OnlyCount < 8; i++)
 					out.y420Only[out.y420OnlyCount++] = p[i];
+			} else if (tag == 7 && len >= 2 && p[0] == 6) {    // HDR Static Metadata Data Block
+				out.hdrEotfs = p[1];
 			} else if (tag == 7 && len >= 1 && p[0] == 15) {   // Y420 Capability Map
 				y420MapAll = len == 1;
 
@@ -444,6 +446,15 @@ bool parseCtaBlock(const uint8_t ext[128], CtaCaps &out) {
 		}
 	}
 	return true;
+}
+
+bool takesPq(const uint8_t *edid, size_t len) {
+	for (size_t off = BlockSize; edid && off + BlockSize <= len; off += BlockSize) {
+		CtaCaps cta {};
+		if (blockChecksumOk(edid + off) && parseCtaBlock(edid + off, cta) && (cta.hdrEotfs & 0x04))
+			return true;
+	}
+	return false;
 }
 
 Hdmi2Caps hdmi2Caps(const uint8_t *edid, size_t len) {

@@ -149,6 +149,12 @@ int32_t Translator::idFor(const Modes::Mode &m) const {
 }
 
 const Modes::Mode *Translator::modeFor(int32_t id) const {
+	if (hdr && isHdrId(id)) {
+		for (size_t i = 0; i < count; i++)
+			if ((idFor(modes[i]) | kHdrIdBit) == id)
+				return &modes[i];
+		return nullptr;
+	}
 	const size_t n = total();
 	for (size_t i = 0; i < n; i++)
 		if (idFor(at(i)) == id)
@@ -348,14 +354,17 @@ int32_t Translator::getNextResolution(VDResolutionInfoRec &r) const {
 		return kSuccess;
 	}
 	const Modes::Mode *m = nullptr;
+	int32_t id = 0;
 	if (prev == kDisplayModeIDFindFirst) {
 		m = &modes[0];
+		id = idFor(*m);
 	} else if (prev == kDisplayModeIDCurrent) {
 		m = modeFor(current);
+		id = current;
 	} else {
-		const size_t n = total();
+		const size_t n = entries();
 		size_t i = 0;
-		while (i < n && idFor(at(i)) != prev)
+		while (i < n && entryId(i) != prev)
 			i++;
 		if (i == n) {
 			// Unknown ID, or kDisplayModeIDFindFirstProgrammable: there
@@ -367,13 +376,14 @@ int32_t Translator::getNextResolution(VDResolutionInfoRec &r) const {
 			r.csDisplayModeID = kDisplayModeIDNoMore;
 			return kSuccess;
 		}
-		m = &at(i + 1);
+		m = &entry(i + 1);
+		id = entryId(i + 1);
 	}
 	if (!m) {
 		r.csDisplayModeID = kDisplayModeIDInvalid;
 		return kBadArgument;
 	}
-	r.csDisplayModeID    = idFor(*m);
+	r.csDisplayModeID    = id;
 	r.csHorizontalPixels = m->t.hActive;
 	r.csVerticalLines    = m->t.vActive;
 	r.csRefreshRate      = Modes::refresh1616(m->t);
@@ -414,7 +424,7 @@ int32_t Translator::getModeTiming(VDTimingInfoRec &r) const {
 	// of the default mode instead ("Using a scaled resolution..."), so the
 	// driver would never see the switch.
 	r.csTimingFlags = kDisplayModeValidFlag | kDisplayModeSafeFlag;
-	if (m->id == bootModeId)
+	if (m->id == bootModeId && !isHdrId(r.csTimingMode))
 		r.csTimingFlags |= kDisplayModeDefaultFlag;
 	return kSuccess;
 }
@@ -471,6 +481,12 @@ int32_t Translator::getTimingRanges(VDDisplayTimingRangeRec &r) const {
 	r.csMaxFrameRate = base.range.maxVHz;
 	// CoreDisplay calls a timing above 165 MHz two links (DVI's rule) and refuses it if the range allows only one.
 	r.csMaxNumLinks = 2;
+	if (hdr) {
+		r.csSupportedPixelEncoding = kRangeEncodingRGB444;
+		r.csSupportedBitsPerColorComponent = kRangeBpc8 | kRangeBpc10;
+		r.csSupportedColorimetryModes = kRangeColorimetrySRGB | kRangeColorimetryBT2020;
+		r.csSupportedDynamicRangeModes = kRangeDynamicSDR | kRangeDynamicHDR10;
+	}
 	return kSuccess;
 }
 
@@ -512,6 +528,13 @@ int32_t Translator::getDetailedTiming(VDDetailedTimingRec &r) const {
 	r.csVerticalSyncPulseWidth   = t.vSyncWidth;
 	r.csHorizontalSyncConfig     = t.hSyncPositive ? kSyncPositivePolarityMask : 0;
 	r.csVerticalSyncConfig       = t.vSyncPositive ? kSyncPositivePolarityMask : 0;
+	if (hdr) {   // both twins say what they are
+		const bool pq = isHdrId(id);
+		r.csPixelEncoding         = kRangeEncodingRGB444;
+		r.csBitsPerColorComponent = pq ? kRangeBpc10 : kRangeBpc8;
+		r.csColorimetry           = pq ? kRangeColorimetryBT2020 : kRangeColorimetrySRGB;
+		r.csDynamicRange          = pq ? kRangeDynamicHDR10 : kRangeDynamicSDR;
+	}
 	return kSuccess;
 }
 

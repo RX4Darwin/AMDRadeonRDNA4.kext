@@ -109,6 +109,11 @@ NDRV_SAME_FIELD(VDDetailedTimingRec, csPixelClock);
 NDRV_SAME_FIELD(VDDetailedTimingRec, csHorizontalActive);
 NDRV_SAME_FIELD(VDDetailedTimingRec, csVerticalSyncConfig);
 NDRV_SAME_FIELD(VDDetailedTimingRec, csNumLinks);
+// Fields IOMacOSVideo.h still calls reserved: IOGraphicsTypes.h's V2 names.
+static_assert(offsetof(Ndrv::VDDisplayTimingRangeRec, csSupportedPixelEncoding) == offsetof(::VDDisplayTimingRangeRec, csReserved6) &&
+              offsetof(Ndrv::VDDetailedTimingRec, csPixelEncoding) == offsetof(::VDDetailedTimingRec, csReserved3) &&
+              offsetof(Ndrv::VDDetailedTimingRec, csColorimetry) == offsetof(::VDDetailedTimingRec, csReserved4),
+              "colour fields");
 static_assert(Ndrv::cscGetCurMode == ::cscGetCurMode && Ndrv::cscGetSync == ::cscGetSync &&
               Ndrv::cscGetConnection == ::cscGetConnection &&
               Ndrv::cscGetModeTiming == ::cscGetModeTiming &&
@@ -611,6 +616,12 @@ bool vrrWanted() {
 	return Trial::bootArg("rdna4-vrr", vrr) && vrr;
 }
 
+// rdna4-hdr=1 and a sink whose EDID takes PQ.
+bool hdrWanted(const uint8_t *edid, size_t edidLen) {
+	uint32_t hdr = 0;
+	return Trial::bootArg("rdna4-hdr", hdr) && hdr && Edid::takesPq(edid, edidLen);
+}
+
 // Once head 0's device exists: what head 2 serves.
 // The modes of the sink whose EDID is in h->edid that the head can serve, and
 // the one it starts in: the first, in table order (native first), whose
@@ -699,6 +710,7 @@ void head2Init(Head2 *h, RDNA4Device &dev, const Modes::Mode *mode, size_t n) {
 	}
 	h->ndrv.init(switching ? h->table : mode, switching ? n : 1, mode->id, h->edid, h->edidLen, be);
 	h->ndrv.adaptiveSync = vrrWanted();
+	h->ndrv.hdr = hdrWanted(h->edid, h->edidLen);
 	if (gScaledOffered)
 		offerScaledOn(h);
 	for (size_t i = 0; switching && i < n; i++) {
@@ -1392,6 +1404,10 @@ IOReturn head2DriverIO(Head2 *h, void *contents, UInt32 commandCode, uint16_t &c
 			if (t->csReserved2)   // a variable-refresh timing
 				HLOG(h, "ndrv: variable timing 0x%x %ux%u, %u lines of extension -> 0x%x", t->csDisplayModeAlias,
 				     t->csHorizontalActive, t->csVerticalActive, t->csReserved2, r);
+			if (t->csBitsPerColorComponent || t->csColorimetry || t->csDynamicRange)
+				HLOG(h, "ndrv: timing 0x%x colour: encoding 0x%x, bpc 0x%x, colorimetry 0x%x, range 0x%x",
+				     t->csDisplayModeAlias, t->csPixelEncoding, t->csBitsPerColorComponent, t->csColorimetry,
+				     t->csDynamicRange);
 		}
 		return static_cast<IOReturn>(r);
 	}
@@ -1538,6 +1554,7 @@ void attach(FbEntry &e) {
 		      pvGpu ? pvGpu : guest, bench, cold, dsc);
 	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidAll, dev.edidAllLen, be);
 	st->ndrv.adaptiveSync = vrr;
+	st->ndrv.hdr = hdrWanted(dev.edidAll, dev.edidAllLen);
 #ifdef AMDRadeonRDNA4_PVGPU
 	// A test boot's level (rdna4-trial) is only known once NVRAM is; the heads' framebuffers are told before macOS asks.
 	uint32_t pvTrial = 0, pvDisp = 0;
@@ -1675,6 +1692,10 @@ IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 comma
 		if (t->csReserved2)   // a variable-refresh timing
 			FBLOG("ndrv: variable timing 0x%x %ux%u, %u lines of extension -> 0x%x (%s)", t->csDisplayModeAlias,
 			      t->csHorizontalActive, t->csVerticalActive, t->csReserved2, ret, answered ? "rdna4" : "boot");
+		if (t->csBitsPerColorComponent || t->csColorimetry || t->csDynamicRange)
+			FBLOG("ndrv: timing 0x%x colour: encoding 0x%x, bpc 0x%x, colorimetry 0x%x, range 0x%x",
+			      t->csDisplayModeAlias, t->csPixelEncoding, t->csBitsPerColorComponent, t->csColorimetry,
+			      t->csDynamicRange);
 	}
 	// Mode switches are rare and the interesting part: always logged.
 	if (csc && !isStatus && code == Ndrv::cscSwitchMode) {

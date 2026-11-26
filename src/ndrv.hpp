@@ -188,10 +188,16 @@ struct VDDisplayTimingRangeRec {
 	uint16_t csCharSizeReserved1;
 	uint32_t csMinMax[24];                                            // min/max h active .. v border bottom
 	uint32_t csMaxNumLinks, csMinLink0PixelClock, csMaxLink0PixelClock, csMinLink1PixelClock, csMaxLink1PixelClock;
-	uint32_t csReserved6, csReserved7, csReserved8;
+	uint16_t csSupportedPixelEncoding, csSupportedBitsPerColorComponent;      // IODisplayTimingRangeV2's names, kIORange*
+	uint16_t csSupportedColorimetryModes, csSupportedDynamicRangeModes;
+	uint32_t csReserved8;
 };
 // IOGraphicsTypes.h's supportedSyncFlags bits.
 constexpr uint32_t kRangeSupportsSeparateSyncs = 0x01, kRangeSupportsVRR = 0x10;
+// Its colour bits (kIORangePixelEncoding*, kIORangeBitsPerColorComponent*, kIORangeColorimetry*, kIORangeDynamicRange*),
+// the same values a timing's single fields take (kIOPixelEncoding*, ...).
+constexpr uint16_t kRangeEncodingRGB444 = 0x01, kRangeBpc8 = 0x02, kRangeBpc10 = 0x04, kRangeColorimetrySRGB = 0x02,
+                   kRangeColorimetryBT2020 = 0x100, kRangeDynamicSDR = 0x01, kRangeDynamicHDR10 = 0x02;
 
 struct VDDetailedTimingRec {
 	uint32_t csTimingSize;
@@ -225,7 +231,8 @@ struct VDDetailedTimingRec {
 	uint32_t csVerticalSyncLevel;
 	uint32_t csNumLinks;
 	uint32_t csReserved2;         // IODetailedTimingInformationV2::verticalBlankingExtension (lines)
-	uint32_t csReserved3, csReserved4;
+	uint16_t csPixelEncoding, csBitsPerColorComponent;   // IODetailedTimingInformationV2's colour fields (kIO*)
+	uint16_t csColorimetry, csDynamicRange;
 	uint32_t csReserved5, csReserved6, csReserved7, csReserved8;
 };
 
@@ -301,6 +308,12 @@ public:
 	// rdna4-vrr=1 (docs/freesync-plan.md): answer cscGetTimingRanges, with variable refresh between the EDID's rates, and
 	// take the timings macOS installs from the EDID (programmable slots); CoreDisplay offers variable refresh only on those.
 	bool adaptiveSync { false };
+	// rdna4-hdr=1 on a sink that takes PQ (docs/hdr-plan.md): the range (served only with adaptiveSync) also offers 10 bits
+	// a component, BT.2020 and HDR10, and every table mode is listed a second time as HDR10 (its ID | kHdrIdBit):
+	// CoreDisplay offers HDR only for a mode with such a twin. Nothing is programmed for it yet.
+	bool hdr { false };
+	static constexpr int32_t kHdrIdBit = 0x20000000;
+	static bool isHdrId(int32_t id) { return id > 0 && (id & kHdrIdBit) && !isSlotId(id); }
 	bool control(uint16_t code, void *params, int32_t &ret);
 
 	int32_t currentModeId() const { return current; }
@@ -347,6 +360,9 @@ private:
 	int32_t setDetailedTiming(const VDDetailedTimingRec &r);
 
 	size_t total() const { return count + __atomic_load_n(&scaledCount, __ATOMIC_ACQUIRE); }
+	size_t entries() const { return total() + (hdr ? count : 0); }   // what macOS lists: the modes, then their HDR10 twins
+	int32_t entryId(size_t i) const { return i < total() ? idFor(at(i)) : idFor(modes[i - total()]) | kHdrIdBit; }
+	const Modes::Mode &entry(size_t i) const { return i < total() ? at(i) : modes[i - total()]; }
 	const Modes::Mode &at(size_t i) const { return i < count ? modes[i] : scaledModes[i - count]; }
 	const Modes::Mode *modeFor(int32_t id) const;
 	bool surface(const Modes::Mode &m, Surface &out) const;

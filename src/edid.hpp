@@ -169,6 +169,7 @@ struct CtaCaps {
 	// HDMI Forum vendor block (OUI C4-5D-D8), HDMI 2.0:
 	bool     scdcPresent { false };  // the sink has the SCDC registers (scrambling control)
 	uint32_t hfMaxTmdsKHz { 0 };     // Max_TMDS_Character_Rate; 0 = no more than 340 MHz
+	uint8_t  hdrEotfs   { 0 };       // HDR Static Metadata block's EOTF bits (CTA-861-G 7.5.13): bit 2 = SMPTE ST 2084 (PQ)
 	size_t   dtdCount   { 0 };       // additional 18-byte timings in the block
 	DetailedTiming firstDtd {};      // valid when dtdCount > 0
 	DetailedTiming dtds[MaxCtaDtds] {};   // dtds[0..dtdCount)
@@ -185,6 +186,9 @@ struct Hdmi2Caps {
 	uint32_t maxTmdsKHz;
 };
 Hdmi2Caps hdmi2Caps(const uint8_t *edid, size_t len);
+
+// Whether a CTA extension of the EDID says the sink takes SMPTE ST 2084 (PQ, HDR10) in its HDR Static Metadata block.
+bool takesPq(const uint8_t *edid, size_t len);
 
 // Whether a CTA extension of the EDID lists `vic` among its video formats.
 // The mode table may not show it: a DTD of the same size and rate wins
