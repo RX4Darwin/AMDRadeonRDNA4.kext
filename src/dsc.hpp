@@ -50,14 +50,41 @@ uint32_t streamKbps(const Timing &t);
 // not possible or not needed (the stream fits the link uncompressed: Linux does not enable it then).
 bool choose(const DpTrain::DscCaps &sink, const Timing &t, uint32_t linkKbps, const Source &src, Config &out);
 
+// The computed rate-control parameters (drm_dsc_config's, those that depend on the mode): the PPS and the encoder's
+// registers both take them.
+struct Params {
+	uint16_t sliceWidth, sliceHeight;
+	uint16_t initialXmitDelay, initialDecDelay;
+	uint8_t  initialScaleValue;
+	uint16_t scaleIncrement, scaleDecrement;
+	uint8_t  firstLineBpgOffset;
+	uint16_t nflBpgOffset, sliceBpgOffset;
+	uint16_t initialOffset, finalOffset;
+	uint8_t  flatnessMin, flatnessMax;
+	uint8_t  quantLimit;          // rc_quant_incr_limit0 and 1
+	int8_t   qpMin[15], qpMax[15], bpgOffset[15];   // rc_range_params
+};
+
 // The picture parameter set the sink is sent (dsc2_get_packed_pps), and what the encoder's registers take beside it.
 struct Pps {
 	uint8_t  bytes[128];
 	uint32_t bytesPerPixel;       // the OPTC's: slice_chunk_size << 28 / slice_width, rounded up
 	uint32_t rcBufferModelSize;   // rc_bits
 	uint16_t chunkSize;           // slice_chunk_size
+	Params   params;
 };
 bool pps(const Config &c, const Timing &t, Pps &out);
+
+// DCN 4.01's DSC engine registers for the stream (dsc_write_to_registers), in the order Linux writes them; the
+// offsets are engine 0's (the engines are kEngineStride dwords apart, segment 2). `odm`: the engine is one of several.
+constexpr size_t kEngineRegs = 28;
+constexpr uint32_t kEngineStride = 0x5c;
+extern const uint16_t kEngineReg[kEngineRegs];
+void engineRegs(const Config &c, const Timing &t, const Pps &p, bool odm, uint32_t (&out)[kEngineRegs]);
+
+// The PPS as the stream encoder sends it: four secondary-data packets of a header dword (HB0-3) and eight payload
+// dwords, little endian (enc3_dp_set_dsc_pps_info_packet through the VPG's generic packets).
+void ppsPackets(const Pps &p, uint32_t (&out)[4][9]);
 
 }  // namespace Dsc
 

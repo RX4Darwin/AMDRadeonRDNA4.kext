@@ -197,6 +197,12 @@ int median3(int a, int b, int c) {
 	return b;
 }
 
+// The fixed rate-control values of _do_calc_rc_params (rc_model_size, rc_edge_factor, rc_tgt_offset_*) and its buffer
+// thresholds, already >> 6 as the PPS and the registers take them (896, 1792, ... 8064).
+constexpr uint16_t kRcModelSize = 8192;
+constexpr uint8_t kRcEdgeFactor = 6, kRcTgtOffset = 3;
+constexpr uint8_t kRcBufThresh6[14] = { 14, 28, 42, 56, 70, 84, 98, 105, 112, 119, 121, 123, 125, 126 };
+
 // dsc_roundf(n / d) for n >= 0, d > 0: round half up
 int roundDiv(int64_t n, int64_t d) { return static_cast<int>((2 * n + d) / (2 * d)); }
 
@@ -273,8 +279,7 @@ bool pps(const Config &c, const Timing &t, Pps &out) {
 	if (!qpSet(static_cast<uint8_t>(bpc), false, b, qpMin) || !qpSet(static_cast<uint8_t>(bpc), true, b, qpMax))
 		return false;
 	offsets(b, ofs);
-	constexpr int kModel = 8192;
-	static constexpr uint16_t kThresh[14] = { 896, 1792, 2688, 3584, 4480, 5376, 6272, 6720, 7168, 7616, 7744, 7872, 8000, 8064 };
+	constexpr int kModel = kRcModelSize;
 
 	// dscc_compute_dsc_parameters and drm_dsc_compute_rc_parameters (not native 4:2:x, convert_rgb)
 	uint32_t scaleValue = static_cast<uint8_t>(8 * kModel / (kModel - initialOffset));
@@ -302,9 +307,27 @@ bool pps(const Config &c, const Timing &t, Pps &out) {
 	                        static_cast<uint64_t>(groupsPerLine) * static_cast<uint32_t>(firstLine);
 	const uint64_t hrd = ceilDiv(rbsMin * 16, b);
 	out.rcBufferModelSize = static_cast<uint32_t>(hrd * b / 16);
-	const uint32_t decDelay = static_cast<uint16_t>(hrd - static_cast<uint64_t>(xmit));
 	out.chunkSize = static_cast<uint16_t>(chunk);
 	out.bytesPerPixel = static_cast<uint32_t>((static_cast<uint64_t>(chunk) * 0x10000000 + (sw - 1)) / sw);
+
+	Params &m = out.params;
+	m.sliceWidth = static_cast<uint16_t>(sw);
+	m.sliceHeight = static_cast<uint16_t>(sh);
+	m.initialXmitDelay = static_cast<uint16_t>(xmit);
+	m.initialDecDelay = static_cast<uint16_t>(hrd - static_cast<uint64_t>(xmit));
+	m.initialScaleValue = static_cast<uint8_t>(scaleValue);
+	m.scaleIncrement = static_cast<uint16_t>(scaleIncrement);
+	m.scaleDecrement = static_cast<uint16_t>(scaleDecrement);
+	m.firstLineBpgOffset = static_cast<uint8_t>(firstLine);
+	m.nflBpgOffset = static_cast<uint16_t>(nfl);
+	m.sliceBpgOffset = static_cast<uint16_t>(sliceBpg);
+	m.initialOffset = static_cast<uint16_t>(initialOffset);
+	m.finalOffset = static_cast<uint16_t>(finalOffset16);
+	m.flatnessMin = static_cast<uint8_t>(flatMin);
+	m.flatnessMax = static_cast<uint8_t>(flatMax);
+	m.quantLimit = static_cast<uint8_t>(limit);
+	for (int i = 0; i < 15; i++)
+		m.qpMin[i] = static_cast<int8_t>(qpMin[i]), m.qpMax[i] = static_cast<int8_t>(qpMax[i]), m.bpgOffset[i] = static_cast<int8_t>(ofs[i]);
 
 	// drm_dsc_pps_payload_pack (the thresholds >> 6, as dsc_update_from_dsc_parameters leaves them)
 	uint8_t *p = out.bytes;
@@ -314,33 +337,87 @@ bool pps(const Config &c, const Timing &t, Pps &out) {
 	p[5] = static_cast<uint8_t>(b);
 	be16(p + 6, t.vActive);
 	be16(p + 8, t.hActive);
-	be16(p + 10, sh);
-	be16(p + 12, sw);
+	be16(p + 10, m.sliceHeight);
+	be16(p + 12, m.sliceWidth);
 	be16(p + 14, chunk);
-	p[16] = static_cast<uint8_t>((xmit & 0x300) >> 8);
-	p[17] = static_cast<uint8_t>(xmit);
-	be16(p + 18, decDelay);
-	p[21] = static_cast<uint8_t>(scaleValue);
-	be16(p + 22, scaleIncrement);
-	p[24] = static_cast<uint8_t>((scaleDecrement & 0xf00) >> 8);
-	p[25] = static_cast<uint8_t>(scaleDecrement);
-	p[27] = static_cast<uint8_t>(firstLine);
-	be16(p + 28, nfl);
-	be16(p + 30, sliceBpg);
-	be16(p + 32, static_cast<uint32_t>(initialOffset));
-	be16(p + 34, finalOffset16);
-	p[36] = static_cast<uint8_t>(flatMin);
-	p[37] = static_cast<uint8_t>(flatMax);
-	be16(p + 38, kModel);
-	p[40] = 6;
-	p[41] = static_cast<uint8_t>(limit);
-	p[42] = static_cast<uint8_t>(limit);
-	p[43] = 3 | 3 << 4;
+	p[16] = static_cast<uint8_t>((m.initialXmitDelay & 0x300) >> 8);
+	p[17] = static_cast<uint8_t>(m.initialXmitDelay);
+	be16(p + 18, m.initialDecDelay);
+	p[21] = m.initialScaleValue;
+	be16(p + 22, m.scaleIncrement);
+	p[24] = static_cast<uint8_t>((m.scaleDecrement & 0xf00) >> 8);
+	p[25] = static_cast<uint8_t>(m.scaleDecrement);
+	p[27] = m.firstLineBpgOffset;
+	be16(p + 28, m.nflBpgOffset);
+	be16(p + 30, m.sliceBpgOffset);
+	be16(p + 32, m.initialOffset);
+	be16(p + 34, m.finalOffset);
+	p[36] = m.flatnessMin;
+	p[37] = m.flatnessMax;
+	be16(p + 38, kRcModelSize);
+	p[40] = kRcEdgeFactor;
+	p[41] = m.quantLimit;
+	p[42] = m.quantLimit;
+	p[43] = kRcTgtOffset | kRcTgtOffset << 4;
 	for (int i = 0; i < 14; i++)
-		p[44 + i] = static_cast<uint8_t>(kThresh[i] >> 6);
+		p[44 + i] = kRcBufThresh6[i];
 	for (int i = 0; i < 15; i++)
-		be16(p + 58 + 2 * i, static_cast<uint32_t>(qpMin[i] << 11 | qpMax[i] << 6 | (ofs[i] & 0x3f)) & 0xffff);
+		be16(p + 58 + 2 * i, static_cast<uint32_t>(m.qpMin[i] << 11 | m.qpMax[i] << 6 | (m.bpgOffset[i] & 0x3f)) & 0xffff);
 	return true;
+}
+
+// DSC_TOP0_DSC_DEBUG_CONTROL, DSCCIF0_DSCCIF_CONFIG0, DSCC0_DSCC_CONFIG0, _CONFIG1, _INTERRUPT_CONTROL0, _PPS_CONFIG0..22
+// (dcn_4_1_0_offset.h).
+const uint16_t kEngineReg[kEngineRegs] = { 0x3001, 0x3005, 0x300a, 0x300b, 0x300e, 0x3012, 0x3013, 0x3014, 0x3015, 0x3016,
+                                           0x3017, 0x3018, 0x3019, 0x301a, 0x301b, 0x301c, 0x301d, 0x301e, 0x301f, 0x3020,
+                                           0x3021, 0x3022, 0x3023, 0x3024, 0x3025, 0x3026, 0x3027, 0x3028 };
+
+void engineRegs(const Config &c, const Timing &t, const Pps &pps, bool odm, uint32_t (&out)[kEngineRegs]) {
+	const Params &m = pps.params;
+	const uint32_t bpc = t.bpc;
+	auto range = [&m](int i) {   // RANGE_MIN_QPn [4:0], RANGE_MAX_QPn [9:5], RANGE_BPG_OFFSETn [15:10]
+		return static_cast<uint32_t>(m.qpMin[i] & 0x1f) | static_cast<uint32_t>(m.qpMax[i] & 0x1f) << 5 |
+		       static_cast<uint32_t>(m.bpgOffset[i] & 0x3f) << 10;
+	};
+	auto thresh = [](int i) {
+		return static_cast<uint32_t>(kRcBufThresh6[i]) | kRcBufThresh6[i + 1] << 8 | kRcBufThresh6[i + 2] << 16 |
+		       static_cast<uint32_t>(kRcBufThresh6[i + 3]) << 24;
+	};
+	out[0] = 0;                                                       // DSC_DBG_EN
+	out[1] = bpc << 16;                                               // INPUT_PIXEL_FORMAT RGB (0), BITS_PER_COMPONENT
+	out[2] = ((odm || c.slicesH > 1) ? 0xfu : 0) | (c.slicesH - 1) << 4 | (c.versionMinor == 1 ? 0 : 1u << 8) |
+	         (c.slicesV - 1) << 16;                                   // ICH reset at EOL, slices, alternate ICH
+	out[3] = pps.rcBufferModelSize;
+	out[4] = 0;                                                       // no overflow interrupts
+	out[5] = c.versionMinor | static_cast<uint32_t>(c.lineBufferBits) << 24 | bpc << 28;
+	out[6] = (c.bpp16 & 0x3ff) | 1u << 12 | (c.blockPrediction ? 1u << 13 : 0) | static_cast<uint32_t>(pps.chunkSize) << 16;
+	out[7] = t.hActive | t.vActive << 16;
+	out[8] = m.sliceWidth | static_cast<uint32_t>(m.sliceHeight) << 16;
+	out[9] = m.initialXmitDelay;                                      // (INITIAL_DEC_DELAY is not written)
+	out[10] = m.initialScaleValue | static_cast<uint32_t>(m.scaleIncrement) << 16;
+	out[11] = m.scaleDecrement | static_cast<uint32_t>(m.firstLineBpgOffset) << 16;
+	out[12] = m.nflBpgOffset | static_cast<uint32_t>(m.sliceBpgOffset) << 16;
+	out[13] = 0;                                                      // NSL_BPG_OFFSET, SECOND_LINE_OFFSET_ADJ
+	out[14] = m.initialOffset | static_cast<uint32_t>(m.finalOffset) << 16;
+	out[15] = m.flatnessMin | static_cast<uint32_t>(m.flatnessMax) << 8 | static_cast<uint32_t>(kRcModelSize) << 16;
+	out[16] = kRcEdgeFactor | static_cast<uint32_t>(m.quantLimit) << 8 | static_cast<uint32_t>(m.quantLimit) << 16 |
+	          static_cast<uint32_t>(kRcTgtOffset) << 24 | static_cast<uint32_t>(kRcTgtOffset) << 28;
+	out[17] = thresh(0);
+	out[18] = thresh(4);
+	out[19] = thresh(8);
+	out[20] = kRcBufThresh6[12] | static_cast<uint32_t>(kRcBufThresh6[13]) << 8 | range(0) << 16;
+	for (int i = 0; i < 7; i++)
+		out[21 + i] = range(1 + 2 * i) | range(2 + 2 * i) << 16;
+}
+
+void ppsPackets(const Pps &p, uint32_t (&out)[4][9]) {
+	for (int k = 0; k < 4; k++) {
+		out[k][0] = 0x007f1000;                                       // HB1 0x10 (PPS), HB2 0x7f: 128 bytes
+		for (int i = 0; i < 8; i++) {
+			const uint8_t *d = p.bytes + 32 * k + 4 * i;
+			out[k][1 + i] = d[0] | d[1] << 8 | d[2] << 16 | static_cast<uint32_t>(d[3]) << 24;
+		}
+	}
 }
 
 }  // namespace Dsc

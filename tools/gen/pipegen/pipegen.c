@@ -73,6 +73,8 @@ struct cfg {
 	bool train;    /* the "dplink" scenario: light a DisplayPort stream on a dark pipe, training its link */
 	bool dual;     /* the "dpdual" scenario: an HDMI stream on a DisplayPort connector, through a passive DP++ adapter */
 	bool y420;     /* "y420": the HDMI stream in YCbCr 4:2:0, half the TMDS clock (amdgpu's force_yuv420_output) */
+	bool dsc;      /* "dsc" (after dplink, sink kind d): the stream compressed, as dc_dsc_compute_config chooses */
+	struct dc_dsc_config dsc_cfg;
 	int sink_swing, sink_pre;     /* the drive the simulated sink asks for before it reports lock */
 	char sink_kind;               /* its capabilities: sink_reset() */
 	struct dc_crtc_timing t;      /* the new stream */
@@ -89,9 +91,11 @@ struct cfg {
 #include "bounding_boxes/dcn4_soc_bb.h"
 
 static struct dml2_display_cfg_programming *g_prog;
+static enum dml2_output_link_dp_rate g_dsc_rate = dml2_dp_rate_hbr3;   /* the "dsc" stream's link (dsc_choose) */
+static unsigned g_dsc_lanes = 4;
 
 static void dml_stream(struct dml2_display_cfg *d, int i, const struct dc_crtc_timing *t, bool hdmi,
-		       unsigned surf_w, unsigned surf_h)
+		       unsigned surf_w, unsigned surf_h, const struct dc_dsc_config *dsc)
 {
 	struct dml2_stream_parameters *s = &d->stream_descriptors[i];
 	struct dml2_plane_parameters *p = &d->plane_descriptors[i];
@@ -105,13 +109,19 @@ static void dml_stream(struct dml2_display_cfg *d, int i, const struct dc_crtc_t
 	s->timing.v_blank_end = t->v_total - t->v_front_porch - h;
 	s->timing.pixel_clock_khz = t->pix_clk_100hz / 10;
 	s->timing.bpc = 8;
-	s->timing.dsc.enable = dml2_dsc_disable;
+	s->timing.dsc.enable = dsc ? dml2_dsc_enable : dml2_dsc_disable;
+	if (dsc) {      /* what dml21_translation_helper takes from the stream: its DSC config, link HBR3 x4 */
+		s->timing.dsc.dsc_compressed_bpp_x16 = dsc->bits_per_pixel;
+		s->timing.dsc.overrides.num_slices = dsc->num_slices_h;
+		s->output.output_dp_link_rate = g_dsc_rate;
+	}
 	s->timing.drr_config.disallowed = true;
 	s->timing.vblank_nom = t->v_total - h;
-	s->output.output_dp_lane_count = 4;
+	s->output.output_dp_lane_count = dsc ? g_dsc_lanes : 4;
 	s->output.output_encoder = hdmi ? dml2_hdmi : dml2_dp;
 	s->output.output_format = t->pixel_encoding == PIXEL_ENCODING_YCBCR420 ? dml2_420 : dml2_444;
-	s->output.output_dp_link_rate = dml2_dp_rate_na;
+	if (!dsc)
+		s->output.output_dp_link_rate = dml2_dp_rate_na;
 	s->output.output_disabled = true;
 	s->overrides.odm_mode = dml2_odm_mode_auto;
 	s->overrides.disable_dynamic_odm = true;
@@ -169,8 +179,8 @@ static void run_dml(struct cfg *c)
 	d->minimize_det_reallocation = true;
 	d->overrides.enable_subvp_implicit_pmo = true;
 	d->num_streams = 2; d->num_planes = 2;
-	dml_stream(d, 0, &c->lit, false, 0, 0);
-	dml_stream(d, 1, &c->t, true, c->surf_w, c->surf_h);
+	dml_stream(d, 0, &c->lit, false, 0, 0, NULL);
+	dml_stream(d, 1, &c->t, !c->dsc, c->surf_w, c->surf_h, c->dsc ? &c->dsc_cfg : NULL);
 	bmp.dml2_instance = inst; bmp.display_config = d; bmp.programming = g_prog;
 	if (!dml2_build_mode_programming(&bmp)) { fprintf(stderr, "DML: mode not supported\n"); exit(1); }
 
@@ -178,6 +188,11 @@ static void run_dml(struct cfg *c)
 	c->vstartup = g->dcn4x.vstartup_lines; c->vupdate_offset = g->dcn4x.vupdate_offset_pixels;
 	c->vupdate_width = g->dcn4x.vupdate_vupdate_width_pixels; c->vready_offset = g->dcn4x.vready_offset_pixels;
 	c->pstate_keepout = g->dcn4x.pstate_keepout_start_lines;
+	if (g_prog->plane_programming[1].num_dpps_required != 1) {
+		fprintf(stderr, "DML: the new pipe needs %u DPPs (ODM): not modelled here\n",
+			g_prog->plane_programming[1].num_dpps_required);
+		exit(1);
+	}
 	fprintf(stderr, "DML: dispclk %lu kHz, dpprefclk %lu kHz, dcfclk %lu kHz; new pipe dppclk %lu kHz, det %u segments, "
 		"vstartup %d\n", g_prog->min_clocks.dcn4x.dispclk_khz, g_prog->min_clocks.dcn4x.dpprefclk_khz,
 		g_prog->min_clocks.dcn4x.active.dcfclk_khz, g_prog->plane_programming[1].min_clocks.dcn4x.dppclk_khz,
@@ -217,6 +232,13 @@ static void sink_reset(const struct cfg *c)
 	g_dpcd[0x002] = c->sink_kind == 'c' ? 0x84 : 0xc4;        /* enhanced framing, TPS3, four lanes */
 	g_dpcd[0x003] = c->sink_kind == 'a' ? 0x81 : 0x01;        /* TPS4, 0.5 % down-spread */
 	g_dpcd[0x00e] = c->sink_kind == 'b' ? 0x01 : 0x00;        /* TRAINING_AUX_RD_INTERVAL */
+	if (c->sink_kind == 'd') {     /* kind a with a DSC 1.2 decoder and FEC (dscgen.c's first sink) */
+		static const uint8_t dsc[16] = { 0x01, 0x21, 0x00, 0x05, 0x2b, 0x00, 0x01, 0x00,
+						 0x00, 0x07, 0x06, 0x11, 0x08, 0x00, 0x00, 0x00 };
+		g_dpcd[0x000] = 0x14; g_dpcd[0x003] = 0x81;
+		memcpy(&g_dpcd[0x060], dsc, sizeof(dsc));
+		g_dpcd[0x090] = 0x01;                                 /* FEC_CAPABLE */
+	}
 	g_sink_swing = c->sink_swing; g_sink_pre = c->sink_pre;
 }
 
@@ -269,6 +291,12 @@ bool dm_helpers_dp_write_dpcd(struct dc_context *ctx, const struct dc_link *link
 	if (address <= 0x101 && address + size > 0x100)     /* a new rate or lane count: the lock is gone */
 		memset(&g_dpcd[0x202], 0, 6);
 	return true;
+}
+
+bool dm_helpers_dp_write_dsc_enable(struct dc_context *ctx, const struct dc_stream_state *stream, bool enable)
+{	/* amdgpu_dm_helpers.c, SST: DP_DSC_ENABLE = 1 (decoding) or 0 on the sink */
+	const uint8_t v = enable;
+	return dm_helpers_dp_write_dpcd(ctx, stream->link, 0x160, &v, 1);
 }
 
 void write_scdc_data(struct ddc_service *ddc, uint32_t pix_clk, bool lte_340_scramble)
@@ -333,6 +361,8 @@ static void make_state(const struct cfg *c)
 		}
 
 		sink_reset(c);
+		if (c->dsc && !other)   /* the link the DSC config was chosen against (dsc_choose) */
+			want.link_rate = LINK_RATE_HIGH3;
 		dc->link_srv = link_create_link_service();
 		link->dpcd_caps.dpcd_rev.raw = g_dpcd[0x000];
 		link->dpcd_caps.max_ln_count.raw = g_dpcd[0x002];
@@ -355,6 +385,13 @@ static void make_state(const struct cfg *c)
 
 	stream->ctx = &g_ctx; stream->link = link; stream->sink = sink; stream->signal = signal;
 	stream->timing = c->t;
+	if (c->dsc) {
+		stream->timing.flags.DSC = 1;
+		stream->timing.dsc_cfg = c->dsc_cfg;
+		pipe->stream_res.dsc = g_pool.dscs[c->pipe];
+		link->dpcd_caps.fec_cap.raw = g_dpcd[0x090];
+		memcpy(link->dpcd_caps.dsc_caps.dsc_basic_caps.raw, &g_dpcd[0x060], 16);
+	}
 	stream->phy_pix_clk = c->t.pix_clk_100hz / 10 / (c->y420 ? 2 : 1);
 	stream->src = (struct rect){ 0, 0, w, h }; stream->dst = stream->src;
 	stream->output_color_space = c->y420 ? COLOR_SPACE_YCBCR709 : COLOR_SPACE_SRGB;
@@ -475,6 +512,15 @@ static void sequence(const struct cfg *c)
 		 * belongs to a lit pipe. */
 		rec_poke_field(TO_DCN10_MPC(g_pool.mpc)->mpc_regs->MPCC_OPP_ID[c->pipe], 0xf, 0xf);
 		rec_mark("require:mpcc_opp_id_none", TO_DCN10_MPC(g_pool.mpc)->mpc_regs->MPCC_OPP_ID[c->pipe]);
+		if (pipe->stream_res.dsc) {
+			/* dsc401_enable asserts that the engine is not running for another OPP: on a dark pipe it is
+			 * off and forwards nothing, which the plan requires (an engine in use belongs to a lit pipe) */
+			struct dcn401_dsc *d = TO_DCN401_DSC(pipe->stream_res.dsc);
+
+			rec_poke_field(d->dsc_regs->DSC_TOP_CONTROL, d->dsc_mask->DSC_CLOCK_EN, 0);
+			rec_poke_field(d->dsc_regs->DSCRM_DSC_FORWARD_CONFIG, d->dsc_mask->DSCRM_DSC_FORWARD_EN, 0);
+			rec_mark("require:dsc_off", d->dsc_regs->DSCRM_DSC_FORWARD_CONFIG);
+		}
 	}
 
 	/* What dcn401_init_hw does once for every block, lit or not, repeated for the blocks this pipe uses in case
@@ -697,6 +743,8 @@ static void sequence_init(void)
 	rec_mark("end", 0);
 }
 
+static bool g_dsc;     /* the "dsc" scenario: setup() creates the DSC engines */
+
 static void setup(void)
 {
 	struct dc_context *ctx = &g_ctx;
@@ -725,6 +773,12 @@ static void setup(void)
 		g_pool.opps[i] = dcn401_opp_create(ctx, i);
 		g_pool.timing_generators[i] = dcn401_timing_generator_create(ctx, i);
 	}
+	if (g_dsc) {    /* the "dsc" scenario's engines; their constructor's clock-gating writes are not the pipe's */
+		const int keep = nev;
+		for (int i = 0; i < 4; i++)
+			g_pool.dscs[i] = dcn401_dsc_create(ctx, i);
+		nev = keep;
+	}
 	for (int i = 0; i < 4; i++)        /* dcn401_init_hw */
 		g_pool.opps[i]->mpc_tree_params.opp_id = g_pool.opps[i]->inst;
 	g_pool.mpc = dcn401_mpc_create(ctx, 4, 4);
@@ -736,6 +790,44 @@ static void setup(void)
 	g_dc.caps.color.mpc.ocsc = 1; g_dc.caps.color.mpc.preblend = true; g_dc.caps.color.mpc.num_3dluts = 4;
 	g_dc.caps.post_blend_color_processing = true; g_dc.caps.vtotal_limited_by_fp2 = true;
 	g_dc.config.use_spl = true; g_dc.config.prefer_easf = true;
+}
+
+/* ---- "dsc": the configuration amdgpu chooses for the stream, as apply_dsc_policy_for_stream asks
+ * dc_dsc_compute_config for it: the sink's DPCD 0x060 caps (no branch device), the default options, the link (HBR3 x4
+ * or PIPEGEN_DP_LINK) with FEC
+ * (dp_link_bandwidth_kbps), DCN 4.01's encoder with the bounding box's top DISPCLK (2 GHz) and DSCCLK a third of it
+ * (dcn401_get_max_clock_khz), ODM combine up to 4 (dcn401_resource_construct). */
+static unsigned dsc_max_clock(struct clk_mgr *m, enum clk_type t) { return t == CLK_TYPE_DSCCLK ? 2000000 / 3 : 2000000; }
+
+static void dsc_choose(struct cfg *c)
+{
+	static const uint8_t no_branch[3];
+	static struct clk_mgr_funcs funcs = { .get_max_clock_khz = dsc_max_clock };
+	struct dsc_dec_dpcd_caps caps = { 0 };
+	struct dc_dsc_config_options opt;
+	const char *other = getenv("PIPEGEN_DP_LINK");          /* as make_state: "lanes rate", else HBR3 x4 */
+	unsigned lanes = 4, rate = LINK_RATE_HIGH3;
+
+	if (other && sscanf(other, "%u %u", &lanes, &rate) != 2) { fprintf(stderr, "bad PIPEGEN_DP_LINK\n"); exit(2); }
+	g_dsc_lanes = lanes;
+	g_dsc_rate = rate == LINK_RATE_HIGH3 ? dml2_dp_rate_hbr3 : rate == LINK_RATE_HIGH2 ? dml2_dp_rate_hbr2 : dml2_dp_rate_hbr;
+	const uint32_t kbps = rate * LINK_RATE_REF_FREQ_IN_KHZ * BITS_PER_DP_BYTE * lanes / 10000 *
+			      (DATA_EFFICIENCY_8b_10b_x10000 / 100 * DATA_EFFICIENCY_8b_10b_FEC_EFFICIENCY_x100);
+
+	setup();
+	sink_reset(c);
+	g_clk_mgr.funcs = &funcs;
+	g_dc.caps.max_odm_combine_factor = 4;
+	dc_dsc_get_default_config_option(&g_dc, &opt);
+	if (!dc_dsc_parse_dsc_dpcd(&g_dc, &g_dpcd[0x060], no_branch, &caps) ||
+	    dc_bandwidth_in_kbps_from_timing(&c->t, DC_LINK_ENCODING_DP_8b_10b) <= kbps ||
+	    !dc_dsc_compute_config(g_pool.dscs[c->pipe], &caps, &opt, kbps, &c->t, DC_LINK_ENCODING_DP_8b_10b, &c->dsc_cfg)) {
+		fprintf(stderr, "DSC: not used on this link (the stream fits uncompressed, or no configuration fits)\n");
+		exit(1);
+	}
+	fprintf(stderr, "DSC: %u x %u slices of %u lines, %u.%04u bpp, version 1.%u, line buffer %u\n", c->dsc_cfg.num_slices_h,
+		c->dsc_cfg.num_slices_v, c->t.v_addressable / c->dsc_cfg.num_slices_v, c->dsc_cfg.bits_per_pixel / 16,
+		c->dsc_cfg.bits_per_pixel % 16 * 625, c->dsc_cfg.version_minor, c->dsc_cfg.linebuf_depth);
 }
 
 int main(int argc, char **argv)
@@ -762,6 +854,7 @@ int main(int argc, char **argv)
 		c.dp = c.train = g_link_detail = true;
 		c.sink_kind = argv[2][0]; c.sink_swing = atoi(argv[3]); c.sink_pre = atoi(argv[4]);
 		argv += 4; argc -= 4;
+		if (argc > 1 && !strcmp(argv[1], "dsc")) { c.dsc = g_dsc = true; argv++; argc--; }
 	}
 	if (argc > 3 && !strcmp(argv[1], "on")) {
 		c.surf_w = (unsigned)strtoul(argv[2], NULL, 0); c.surf_h = (unsigned)strtoul(argv[3], NULL, 0);
@@ -774,8 +867,8 @@ int main(int argc, char **argv)
 				"  dp: the reference for retiming a lit DisplayPort stream instead of the second-pipe plan\n"
 				"  dpdual: an HDMI stream on a DisplayPort connector (a passive DP++ adapter)\n"
 				"  y420: (after dpdual, or alone for HDMI) the HDMI stream in YCbCr 4:2:0\n"
-				"  dplink K S P: light a DisplayPort stream, training its link against a simulated sink of kind\n"
-				"                K (a, b, c) that wants voltage swing S and pre-emphasis P\n"
+				"  dplink K S P [dsc]: light a DisplayPort stream, training its link against a simulated sink of kind\n"
+				"                K (a, b, c, d) that wants voltage swing S and pre-emphasis P; dsc (kind d): compressed\n"
 				"  on W H: the plane shows the top-left of a W x H surface, as after a mode switch\n");
 		return 2;
 	}
@@ -796,6 +889,8 @@ int main(int argc, char **argv)
 	c.lit.h_total = 4000; c.lit.h_addressable = 3840; c.lit.h_front_porch = 48; c.lit.h_sync_width = 32;
 	c.lit.v_total = 2222; c.lit.v_addressable = 2160; c.lit.v_front_porch = 3; c.lit.v_sync_width = 5;
 	c.lit.pix_clk_100hz = 5332500;
+	if (c.dsc)
+		dsc_choose(&c);
 	run_dml(&c);
 
 	for (int run = 0; run < 2; run++) {

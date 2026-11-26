@@ -112,3 +112,8 @@ dc/link/protocols/link_dp_phy.c
 dc/link/protocols/link_dp_training.c
 dc/link/protocols/link_dp_training_8b_10b.c
 dc/link/protocols/link_dpcd.c
+dc/dsc/dc_dsc.c
+dc/dsc/rc_calc.c
+dc/dsc/rc_calc_dpi.c
+dc/dsc/dcn20/dcn20_dsc.c
+dc/dml/dsc/rc_calc_fpu.c

@@ -1,6 +1,6 @@
 # Display Stream Compression (DSC), plan
 
-Status, 2026-11-26: steps 1 and 2 done (host-tested); host-only by Sunneva's choice. The rig's Samsung reports DPCD 1.2 / HBR2 (17.3 Gbit/s) over
+Status, 2026-11-26: steps 1 and 2 done, step 3's reference and register values done (host-tested); host-only by Sunneva's choice. The rig's Samsung reports DPCD 1.2 / HBR2 (17.3 Gbit/s) over
 DisplayPort and has no DP 1.4 setting, though its EDID lists 3840x2160@120 (1188 MHz): it cannot take DSC, so nothing here
 can run on the card until someone with a DP 1.4 DSC monitor tries it.
 
@@ -30,6 +30,18 @@ compresses the stream (to 8-12 bits per pixel) so both fit. The README lists it 
    OPTC bytes per pixel, the stream encoder's DSC control and PPS SDP, the sink's DSC_ENABLE at DPCD 0x160 as an AUX write).
    Tables for 3840x2160@120 and @144 on the DP connectors, for the second pipe and for a mode switch on the boot display
    (as test/ref/dp_retime_linux.inc). Host test: the kext's plan equals Linux's table.
+   **Done so far:** pipegen's `dplink d S P dsc` scenario: a sink with a DSC 1.2 decoder and FEC (kind d), the configuration
+   from Linux's own `dc_dsc_compute_config` (on the link of `PIPEGEN_DP_LINK`, HBR3 x4 by default), DML with DSC, DSC
+   engines in the pool (their constructor's clock-gating writes left out of the trace). The recorded `link_set_dpms_on`
+   has FEC ready (DPCD 0x120) before training, the DSCCLK DTO (phase = modulo = 1), the engine's registers
+   (`dsc_write_to_registers`) and `dsc401_enable` (forward to the pipe's OPP), the OPTC's DSC mode, bytes per pixel and
+   slice width, the PPS as four VPG secondary-data packets after DSC_ENABLE (DPCD 0x160) = 1, and the same again on
+   wake; the engine set up a second time in the plane programming. `run.sh` writes test/ref/dsc_regs_linux.inc for 11
+   streams (4K 60-144 Hz, 1440p at 645 MHz; HBR3/HBR2, x1 to x4: 9.125 to 16 bpp, 2 or 4 slices) and `src/dsc.cpp`'s
+   `engineRegs` and `ppsPackets` give the same values (`make test`). Linux's choice needs DISPCLK 1.29 GHz at 4K120 and
+   1.38 GHz at 4K144 on one pipe (no ODM in DML at 2 GHz), well above the 650 MHz the kext holds: step 4 raises it.
+   Left for step 3: the kext's plan (the static part of the trace as a table, the computed values put in) and its host
+   test against the whole trace; ODM 2:1 (DML wants it at 5K) is not modelled.
 4. **Kext:** `ModeSet`/`Pipe2` gain the DSC steps when the chosen mode needs compression; the link bandwidth check
    (`dp-modes-above-boot`) counts the compressed rate; `modes.cpp` offers 4K 120/144 only when the sink has DSC and the link fits.
 5. **On a card, later:** needs a DP 1.4 DSC monitor: the mode, a still and a moving picture, display sleep/wake, mode switches

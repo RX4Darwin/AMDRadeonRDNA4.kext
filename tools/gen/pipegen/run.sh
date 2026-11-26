@@ -79,6 +79,7 @@ cc() { # source, object: compile if the object is older
 cc "$here/pipegen.c" "$B/obj/pipegen.o"
 cc "$here/rec.c" "$B/obj/rec.o"
 while read -r f; do cc "$D/$f" "$B/obj/L_$(echo "$f" | tr / _ | sed 's/\.c$/.o/')"; done < "$here/linux-sources.txt"
+cc "$L/drivers/gpu/drm/display/drm_dsc_helper.c" "$B/obj/L_drm_dsc_helper.o"   # DSC's PPS (the "dsc" scenario)
 for f in $(find "$M/src" -name '*.c' ! -name dml2_top_legacy.c | sort); do cc "$f" "$B/obj/M_$(basename "$f" .c).o"; done
 
 # Whatever is still undefined is Linux code this path never reaches: stub it.
@@ -214,3 +215,31 @@ done
 python3 "$here/mktrain.py" "$(git -C "$L" rev-parse HEAD)" $runs > "$B/dp_train_linux.inc"
 cp -f "$B/dp_train_linux.inc" "$repo/test/ref/dp_train_linux.inc"
 echo "wrote test/ref/dp_train_linux.inc"
+
+# The reference for the host test of DSC (src/dsc.cpp, docs/dsc-plan.md step 3): Linux lighting a compressed DisplayPort
+# stream on pipe 1 (DIG0, link 0, HPD1) for a sink with a DSC 1.2 decoder (kind d), on links from HBR3 x4 down to HBR3 x1.
+# mkdsc.py keeps the DSC engine's registers, the OPTC's bytes per pixel and slice width, and the PPS packets.
+runs=""
+n=0
+while read -r lanes rate t; do
+	n=$((n + 1))
+	# shellcheck disable=SC2086
+	PIPEGEN_DP_LINK="$lanes $rate" "$B/pipegen" dplink d 0 0 dsc 1 0 0 1 $t 0 > "$B/dsc-$n.txt"
+	runs="$runs $lanes:$rate:$B/dsc-$n.txt"
+done <<'TIMINGS'
+4 30 3840 176 88 296 2160 8 10 72 1188000 1 1
+4 30 3840 48 32 80 2160 3 5 146 1332750 1 0
+4 20 3840 176 88 296 2160 8 10 72 1188000 1 1
+4 20 3840 48 32 80 2160 3 5 146 1332750 1 0
+2 20 3840 176 88 296 2160 8 10 72 594000 1 1
+2 20 2560 48 32 80 1440 3 5 33 645000 1 0
+2 30 3840 176 88 296 2160 8 10 72 1188000 1 1
+2 30 3840 48 32 80 2160 3 5 146 1332750 1 0
+2 30 2560 48 32 80 1440 3 5 33 645000 1 0
+1 30 3840 176 88 296 2160 8 10 72 594000 1 1
+1 30 2560 48 32 80 1440 3 5 33 645000 1 0
+TIMINGS
+# shellcheck disable=SC2086
+python3 "$here/mkdsc.py" "$(git -C "$L" rev-parse --short=12 HEAD)" $runs > "$B/dsc_regs_linux.inc"
+cp -f "$B/dsc_regs_linux.inc" "$repo/test/ref/dsc_regs_linux.inc"
+echo "wrote test/ref/dsc_regs_linux.inc ($n timings)"

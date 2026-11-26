@@ -329,7 +329,7 @@ $(DMUBLOAD_TEST): test/dmubload-test.cpp src/dmubload.cpp src/dmubload.hpp test/
 	@mkdir -p $(HOST)
 	$(CXX) -std=c++17 -Wall -O1 -o $@ test/dmubload-test.cpp src/dmubload.cpp
 DSC_TEST      = $(HOST)/dsc-test
-$(DSC_TEST): test/dsc-test.cpp src/dsc.cpp src/dsc.hpp src/amdgpu/dsc_qp444.h src/dptrain.cpp src/dptrain.hpp test/ref/dsc_linux.inc
+$(DSC_TEST): test/dsc-test.cpp src/dsc.cpp src/dsc.hpp src/amdgpu/dsc_qp444.h src/dptrain.cpp src/dptrain.hpp test/ref/dsc_linux.inc test/ref/dsc_regs_linux.inc
 	@mkdir -p $(HOST)
 	$(CXX) -std=c++17 -Wall -O1 -o $@ test/dsc-test.cpp src/dsc.cpp src/dptrain.cpp
 $(PVSTREAM_TEST): test/pvstream-test.cpp src/pvstream.cpp src/pvstream.hpp src/pvopcodes.inc src/pvdevinfo.inc

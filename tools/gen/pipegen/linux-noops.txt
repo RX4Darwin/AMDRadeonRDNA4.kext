@@ -7,3 +7,6 @@ dm_helpers_is_hdr_on
 edp_set_panel_assr
 dp_set_panel_mode
 dm_helpers_dp_write_hblank_reduction
+dc_fpu_begin
+dc_fpu_end
+dc_assert_fp_enabled
