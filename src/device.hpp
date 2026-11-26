@@ -278,6 +278,11 @@ public:
 	uint32_t bootDpMaxKHz();
 	uint32_t bootDpLinkKHz { 0 };   // what the firmware's link carries at 8 bpc, read when the mode table is built
 	uint32_t dispclkTargetKHz();
+	// DISPCLK raised for a mode (clk.cpp): what it needs, and up to what the kext raises it.
+	static constexpr uint32_t kDispclkCeilingKHz = 1400000;
+	uint32_t dispclkHeldKHz { 0 };
+	uint32_t dispclkForKHz(uint32_t pixelKHz);
+	bool raiseDispclkFor(uint32_t pixelKHz);
 	DpTrain::Result retrainBootLink(const char *why);
 	// rdna4-dcninit=1, a test of lighting the displays when nothing set them up, on a warm card, in a cold start's
 	// order: once the kext's DMUB firmware runs and the display clocks are raised (smuStarted). The lit extra pipes

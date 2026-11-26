@@ -130,6 +130,10 @@ Beside the Lenovo (HDMI, second pipe) the table's 14 DET segments overlapped the
 the Lenovo dark. The relight now gives pipe 0 what is left, as a second pipe's lighting does: 13 segments, 144.000 Hz,
 both displays clean (card, 2026-11-26).
 
+DISPCLK and DPPCLK follow the mode (raiseDispclkFor): about 4 % above its pixel clock, rounded up to 100 MHz, raised
+before the switch and never lowered until reboot, up to 1400 MHz. No `rdna4-dispclk` needed: 650 at boot, 700 for
+2560x1440@144, 1400 for the DSC stream (144.010 Hz beside the Lenovo, card, 2026-11-26).
+
 Card tests: `rdna4-dscboot=1` (8 bpc) or `=4` (10 bpc) with `rdna4-dispclk=1400` boots into the DSC stream.
 
 ## Notes

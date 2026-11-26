@@ -2875,7 +2875,7 @@ void RDNA4Device::buildModeTable() {
 		const size_t n = Modes::build(edidAll, edidAllLen, Modes::Limits { 0, 0, dsc.pixelClockKHz }, listed, Modes::MaxModes);
 		if (Modes::match(listed, n, dsc) >= 0) {
 			Modes::ensure(modeTable, modeCount, Modes::MaxModes, dsc, Modes::SourceBoot);
-			FBLOG("modes: 3840x2160@144 offered over DSC (DISPCLK %u kHz)", dispclkTargetKHz());
+			FBLOG("modes: 3840x2160@144 offered over DSC (DISPCLK raised to %u kHz for it)", dispclkForKHz(dsc.pixelClockKHz));
 		}
 	}
 	for (size_t i = 0; i < modeCount; i++) {
@@ -3053,7 +3053,9 @@ bool RDNA4Device::bootSinkPresent() {
 }
 
 uint32_t RDNA4Device::bootDpMaxKHz() {
-	const uint32_t boot = bootTimingValid ? bootTiming.pixelClockKHz : 0, dispclk = dispclkTargetKHz();
+	// DISPCLK is raised for a faster mode (raiseDispclkFor): up to kDispclkCeilingKHz less its margin.
+	const uint32_t boot = bootTimingValid ? bootTiming.pixelClockKHz : 0;
+	const uint32_t dispclk = dispclkTargetKHz() ? kDispclkCeilingKHz - kDispclkCeilingKHz / 25 : 0;
 	if (!bootDpLinkKHz || !dispclk)
 		return boot;
 	const uint32_t most = bootDpLinkKHz < dispclk ? bootDpLinkKHz : dispclk;
@@ -3586,13 +3588,12 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	return ok;
 }
 
-// 3840x2160@144 needs DSC on four HBR3 lanes, DISPCLK at DML's 1384.6 MHz (rdna4-dispclk=1400) and a console of that
-// size for the plane Linux's table shows, on the boot pipe the table is for (docs/dsc-plan.md).
+// 3840x2160@144 needs DSC on four HBR3 lanes, DISPCLK raised to DML's 1384.6 MHz (raiseDispclkFor, when switched to)
+// and a console of that size for the plane Linux's table shows, on the boot pipe the table is for (docs/dsc-plan.md).
 bool RDNA4Device::dscModeFits(const Edid::DetailedTiming &t) {
-	constexpr uint32_t kDscDispclkKHz = 1384600;
 	return pipe.valid() && pipe.signal == Pipe::Signal::DpSst && !pipe.otg && !pipe.hubp && !pipe.dig && !pipe.link &&
 	       pipe.hpd == 1 && bootDpLinkKnown && bootDpSink.hasDsc && bootDpSink.maxRate >= DpTrain::kHbr3 &&
-	       bootDpSink.maxLanes >= 4 && dispclkTargetKHz() >= kDscDispclkKHz && fbDepth == 32 &&
+	       bootDpSink.maxLanes >= 4 && dispclkTargetKHz() && dispclkForKHz(t.pixelClockKHz) <= kDispclkCeilingKHz && fbDepth == 32 &&
 	       fbWidth == t.hActive && fbHeight == t.vActive && fbRowBytes == t.hActive * 4u;
 }
 
@@ -3730,6 +3731,11 @@ bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {
 IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	// Into or out of the DSC stream: pipe 0 lit again from the other table; a mode other than the 3840x2160 table's is
 	// then switched to from there as usual.
+	if (!raiseDispclkFor(m.t.pixelClockKHz)) {
+		FBLOG("modes: switch to id %u refused: DISPCLK %u kHz for it not held (held %u)", m.id,
+		      dispclkForKHz(m.t.pixelClockKHz), dispclkHeldKHz);
+		return kIOReturnUnsupported;
+	}
 	const bool toDsc = Edid::sameTiming(m.t, Pipe2::dscTiming());
 	if (toDsc || dscLit) {
 		if (toDsc && dscLit)

@@ -366,6 +366,39 @@ uint32_t RDNA4Device::dispclkTargetKHz()
 	return mhz * 1000;
 }
 
+/*
+ * DISPCLK and DPPCLK for a mode of this pixel clock: what DML asks for one pipe comes to about 4 % above it (1384.6 MHz
+ * at 1332.75, 3840x2160@144 over DSC); rounded up to 100 MHz, never under dispclkTargetKHz. Raised when a mode needs
+ * more than is held, never lowered: the lit pipes' DPP clocks are fractions of DPPCLK (their DTOs), so a higher one
+ * only runs them faster. False if the firmware did not meet it or it is above kDispclkCeilingKHz.
+ * ponytail: held until reboot after a fast mode; lowering needs every lit pipe's DTO set again, as Linux does.
+ */
+uint32_t RDNA4Device::dispclkForKHz(uint32_t pixelKHz)
+{
+	const uint32_t target = dispclkTargetKHz();
+	const uint32_t need = (pixelKHz + pixelKHz / 25 + 99999) / 100000 * 100000;
+
+	return target && need > target ? need : target;
+}
+
+bool RDNA4Device::raiseDispclkFor(uint32_t pixelKHz)
+{
+	const uint32_t target = dispclkTargetKHz(), need = dispclkForKHz(pixelKHz);
+
+	// (rdna4-dispclk=0: the firmware's clocks, as before; a mode the target covers: what raiseDisplayClocks holds)
+	if (!target || need <= target || need <= dispclkHeldKHz)
+		return true;
+	if (need > kDispclkCeilingKHz)
+		return false;
+	if (!smu || !smuSetHardMin(kPpclkDispclk, "DISPCLK (for the mode)", need / 1000) ||
+	    !smuSetHardMin(kPpclkDppclk, "DPPCLK (for the mode)", need / 1000))
+		return false;
+
+	dispclkHeldKHz = need;
+	logDispclkDivider();
+	return true;
+}
+
 /* Whether every clock a 3840x2160 pipe needs is held high enough. */
 bool RDNA4Device::raiseDisplayClocks()
 {
@@ -387,6 +420,8 @@ bool RDNA4Device::raiseDisplayClocks()
 	}
 
 	logDispclkDivider();
+	if (met)   // (also after a wake: the firmware's minimums are the target's again, a fast mode raises them anew)
+		dispclkHeldKHz = dispclkTargetKHz();
 
 	return met;
 }
