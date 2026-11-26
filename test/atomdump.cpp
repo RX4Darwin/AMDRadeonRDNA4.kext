@@ -1500,6 +1500,29 @@ struct TrainRig {
 static int testDpTrain() {
 	int failures = 0;
 	const DpTrain::Link hbr2x4 { 4, DpTrain::kHbr2 };
+	{
+		// AW2724DM: the base block says HBR2; the extended receiver advertises HBR3 x4.
+		uint8_t base[16] {0x12, 0x14, 0xc4, 0x81, 0, 0, 1, 0xc0, 2, 2, 0, 0, 0, 0, 0x81, 0};
+		uint8_t ext[16] {0x14, 0x1e, 0xc4, 0x81, 0, 0, 1, 0xc0, 2, 2, 0, 0, 0, 0, 0x81, 0};
+		DpTrain::Sink sink {};
+		failures += check(DpTrain::parseExtendedCaps(base, ext, sink) && sink.maxRate == DpTrain::kHbr3 &&
+		                  sink.maxLanes == 4 && sink.tps4, "dptrain: AW2724DM extended block");
+		base[0x0e] = 0;
+		failures += check(!DpTrain::parseExtendedCaps(base, ext, sink), "dptrain: unadvertised extended block");
+		base[0x0e] = 0x80;
+		base[0] = 0x14;
+		ext[0] = 0x13;
+		failures += check(!DpTrain::parseExtendedCaps(base, ext, sink), "dptrain: older extended revision");
+		ext[0] = 0x14;
+		ext[6] = 0;
+		failures += check(!DpTrain::parseExtendedCaps(base, ext, sink), "dptrain: no 8b/10b extended caps");
+		ext[6] = 1;
+		ext[2] = 3;
+		failures += check(!DpTrain::parseExtendedCaps(base, ext, sink) &&
+		                  DpTrain::parseCaps(base, sizeof(base), sink) && sink.maxRate == DpTrain::kHbr2 &&
+		                  sink.maxLanes == 4, "dptrain: invalid extended lanes, usable base caps");
+	}
+
 	size_t events = 0, regWrites = 0;
 	for (const TrainRun &run : kTrainRuns) {
 		TrainRig rig(run.kind, run.swing, run.pre);
@@ -3102,6 +3125,47 @@ static int testNdrv() {
 	failures += check(tr2.status(Ndrv::cscGetDDCBlock, &ddcRec, ret) && ret == Ndrv::kSuccess &&
 	                  memcmp(ddcRec.ddcBlockData, plain, 128) == 0,
 	                  "ndrv: complete EDID not served unchanged");
+
+	// The boot ID refers to the console even when the firmware stretches it onto QHD.
+	Edid::DetailedTiming wire {241500, 2560, 160, 48, 32, 1440, 41, 3, 5, true, false, false}, hd {};
+	Edid::vicTiming(16, hd);
+	Modes::Mode stretched[] = {
+		{1, wire, wire.refreshMilliHz(), true, Modes::SourceDtd},
+		{2, hd, hd.refreshMilliHz(), false, Modes::SourceVic}
+	};
+	failures += check(Modes::stretchedConsole(stretched, 2, 1920, 1080, wire) == 1 &&
+	                  Modes::stretchedConsole(stretched, 1, 1920, 1080, wire) == -1 &&
+	                  Modes::stretchedConsole(stretched, 2, 2560, 1440, wire) == -1,
+	                  "ndrv: 1080p boot surface and QHD wire mode have distinct IDs");
+	stretched[1].refreshMilliHz = 120000;
+	failures += check(Modes::stretchedConsole(stretched, 2, 1920, 1080, wire) == -1,
+	                  "ndrv: a 120 Hz mode cannot describe the 60 Hz console");
+
+	// A DP monitor with its DisplayID timing past the CTA extension.
+	uint8_t extended[512] {};
+	memcpy(extended, plain, 128);
+	extended[126] = 3;
+	extended[128] = 0x02;
+	extended[256] = extended[384] = 0x70;
+	extended[385] = 0x20;
+	for (size_t offset = 0; offset < sizeof(extended); offset += 128)
+		fixChecksum(extended + offset);
+	tr2.init(table, n, bootId, extended, sizeof(extended), fb.backend());
+	for (unsigned block = 1; block <= 4; ++block) {
+		ddcRec.ddcBlockNumber = block;
+		failures += check(tr2.status(Ndrv::cscGetDDCBlock, &ddcRec, ret) && ret == Ndrv::kSuccess &&
+		                  !memcmp(ddcRec.ddcBlockData, extended + (block - 1) * 128, 128),
+		                  "ndrv: full DP EDID block %u", block);
+	}
+	extended[258] ^= 1;
+	tr2.init(table, n, bootId, extended, sizeof(extended), fb.backend());
+	ddcRec.ddcBlockNumber = 1;
+	failures += check(tr2.status(Ndrv::cscGetDDCBlock, &ddcRec, ret) && ret == Ndrv::kSuccess &&
+	                  ddcRec.ddcBlockData[126] == 1 && Edid::blockChecksumOk(ddcRec.ddcBlockData),
+	                  "ndrv: truncated DP EDID reports the valid prefix");
+	ddcRec.ddcBlockNumber = 3;
+	failures += check(tr2.status(Ndrv::cscGetDDCBlock, &ddcRec, ret) && ret == Ndrv::kBadArgument,
+	                  "ndrv: invalid extension excluded");
 
 	// Mode switch: a refused switch keeps the current mode.
 	fb.switchRet = Ndrv::kUnsupported;

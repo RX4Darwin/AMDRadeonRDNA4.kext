@@ -1466,13 +1466,11 @@ void attach(FbEntry &e) {
 		}
 	}
 #endif
-	// rdna4-vrr=1: macOS gets every EDID block the sink has, not only the first extension: the Samsung's 144 Hz timings
-	// are in a DisplayID block past it, and CoreDisplay gives only those (at the EDID's top rate) a variable copy.
+	// The boot display can advertise its fixed as well as variable timings past the first EDID extension.
 	const bool vrr = vrrWanted();
 	if (vrr && be.switchTo == deviceSwitchTo)
 		be.setRefresh = deviceSetRefresh;
-	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, vrr ? dev.edidAll : dev.edidData,
-	              vrr ? dev.edidAllLen : dev.edidLen, be);
+	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidAll, dev.edidAllLen, be);
 	st->ndrv.adaptiveSync = vrr;
 #ifdef AMDRadeonRDNA4_PVGPU
 	// A test boot's level (rdna4-trial) is only known once NVRAM is; the heads' framebuffers are told before macOS asks.
@@ -1508,8 +1506,8 @@ void attach(FbEntry &e) {
 #endif
 	e.state = st;
 	bootState = st;
-	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
-	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
+	FBLOG("ndrv: answering for %p: %lu mode(s), cached EDID %lu bytes", e.fb,
+	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidAllLen));
 	fillHeads(dev);
 	// Behind the extra heads' slots, below the compute pool (128 MiB).
 	VramBench::run(dev.fbPhysBase, ((dev.fbLength + (1ull << 20) - 1) & ~((1ull << 20) - 1)) +

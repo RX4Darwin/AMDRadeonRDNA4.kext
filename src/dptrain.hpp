@@ -83,6 +83,8 @@ struct Sink {
 };
 // From DPCD 0x000 on (at least four bytes). False if they are not a sink's.
 bool parseCaps(const uint8_t *caps, size_t len, Sink &out);
+// DPCD 0x2200 must be advertised and describe a legacy 8b/10b link that this driver can train.
+bool parseExtendedCaps(const uint8_t (&base)[16], const uint8_t (&extended)[16], Sink &out);
 // From DPCD 0x060 on: false if the sink has no DSC decoder or a field holds a value Linux refuses.
 bool parseDscCaps(const uint8_t dsc[16], DscCaps &out);
 
