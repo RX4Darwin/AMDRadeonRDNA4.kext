@@ -2948,6 +2948,7 @@ struct FakeBackend {
 	uint32_t refreshExt = 0;
 	int      hdrCalls = 0;
 	bool     hdrOn = false;
+	Modes::Mode lastSwitch {};
 
 	static bool surfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) {
 		auto *b = static_cast<FakeBackend *>(ctx);
@@ -2956,9 +2957,10 @@ struct FakeBackend {
 		out = { b->base, b->pitch, m.t.hActive, m.t.vActive };
 		return true;
 	}
-	static int32_t switchTo(void *ctx, const Modes::Mode &, bool) {
+	static int32_t switchTo(void *ctx, const Modes::Mode &m, bool) {
 		auto *b = static_cast<FakeBackend *>(ctx);
 		b->switches++;
+		b->lastSwitch = m;
 		return b->switchRet;
 	}
 	static void setPower(void *ctx, bool on) {
@@ -3045,6 +3047,30 @@ static int testScaledModes() {
 	sw.csData = tr.idFor(table[2]);
 	sw.csMode = Ndrv::kDepthMode1;
 	failures += check(tr.control(Ndrv::cscSwitchMode, &sw, ret) && ret == Ndrv::kSuccess && !tr.scaledFrame(w, h), "scaled: back to a real mode");
+	{   // HDR (docs/hdr-plan.md): a twin below the base runs as a frame of its size on the base mode; the base's own twin as itself
+		Ndrv::Translator ht;
+		ht.init(table, 3, 2, nullptr, 0, fb.backend());
+		ht.hdr = true;
+		Ndrv::VDSwitchInfoRec hs {};
+		hs.csMode = Ndrv::kDepthMode1;
+		hs.csData = ht.idFor(table[2]);
+		const bool real = ht.control(Ndrv::cscSwitchMode, &hs, ret) && ret == Ndrv::kSuccess &&
+		                  fb.lastSwitch.source != Modes::SourceScaled && !ht.scaledFrame(w, h);
+		const int before = fb.switches;
+		hs.csData = ht.idFor(table[2]) | Ndrv::Translator::kHdrIdBit;
+		const bool twin = ht.control(Ndrv::cscSwitchMode, &hs, ret) && ret == Ndrv::kSuccess && fb.switches == before + 1 &&
+		                  fb.lastSwitch.source == Modes::SourceScaled && fb.lastSwitch.t.hActive == 1920 &&
+		                  ht.scaledFrame(w, h) && w == 1920 && h == 1080;
+		Ndrv::VDDetailedTimingRec dt {};
+		dt.csDisplayModeID = hs.csData;
+		const bool listed = ht.status(Ndrv::cscGetDetailedTiming, &dt, ret) && ret == Ndrv::kSuccess &&
+		                    dt.csHorizontalActive == 1920 && dt.csPixelClock == table[2].t.pixelClockKHz * 1000ull;
+		hs.csData = ht.idFor(table[1]) | Ndrv::Translator::kHdrIdBit;
+		const bool native = ht.control(Ndrv::cscSwitchMode, &hs, ret) && ret == Ndrv::kSuccess &&
+		                    fb.lastSwitch.source != Modes::SourceScaled && fb.lastSwitch.t.hActive == 3840 && !ht.scaledFrame(w, h);
+		failures += check(real && twin && listed && native, "scaled: HDR twins: real %d, twin %d, listed %d, native %d", real, twin,
+		                  listed, native);
+	}
 	tr.init(table, 3, 2, nullptr, 0, fb.backend());
 	sw = {};
 	sw.csData = Ndrv::kBootModeId + static_cast<int32_t>(s[2].id);

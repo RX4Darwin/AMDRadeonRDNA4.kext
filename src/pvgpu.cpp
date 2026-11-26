@@ -725,6 +725,7 @@ private:
 		uint64_t back[2], mc[3], va[3], flipFence;
 		uint8_t hubp, otg, queued, mode;   // otg: the one hubp feeds; mode: rdna4_pvpresent when it was set up
 		uint32_t triedW, triedH;      // the frame size a mode switch was last tried for
+		uint32_t loggedW, loggedH;    // the frame size the present path last logged (one line a change of size)
 		bool flips;
 		bool paused;                  // flipping stopped while a frame went by the CPU; the next frame on the card resumes it
 	};
@@ -8560,8 +8561,19 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	const uint64_t base = md ? gSurfaceFns.baseOffset(s) : 0, bpr = md ? gSurfaceFns.bytesPerRow(s) : 0;
 	const uint32_t width = bpr && h.width < bpr / 4 ? h.width : static_cast<uint32_t>(bpr / 4);
 
-	// larger than the head both ways: a scaled mode's frame, scaled down into the scanout (else the head's part of it is copied)
-	const bool scaled = frameW > h.width && frameH > h.height && bpr / 4 >= frameW && scaleKernel();
+	// larger than the head both ways: a scaled mode's frame, scaled down into the scanout (else the head's part of it is copied); and
+	// smaller in a scaled mode (an HDR twin below the monitor's size, Ndrv::Translator::runFor): scaled up to it
+	uint32_t scaledW = 0, scaledH = 0;
+	const bool larger = frameW > h.width && frameH > h.height;
+	const bool smaller = frameW && frameH && frameW <= h.width && frameH <= h.height && (frameW < h.width || frameH < h.height) &&
+	                     PvScanout::scaledFrame(port, scaledW, scaledH) && scaledW == frameW && scaledH == frameH;
+	const bool scaled = (larger || smaller) && bpr / 4 >= frameW && scaleKernel();
+	if (frameW != sm.loggedW || frameH != sm.loggedH) {
+		sm.loggedW = frameW, sm.loggedH = frameH;
+		pvlog("host: present: port %u: frames of %ux%u (format 0x%08x, %llu bytes a row) on a %ux%u head (pitch %u); scaled mode %ux%u: %s",
+		      port, frameW, frameH, format, bpr, h.width, h.height, h.pitch, scaledW, scaledH,
+		      scaled ? (larger ? "scaled down" : "scaled up") : "copied");
+	}
 	const uint32_t height = scaled ? frameH : md && h.height < gSurfaceFns.height(s) ? h.height : md ? gSurfaceFns.height(s) : 0;
 	uint64_t handle = 0, src = 0;
 	const CardSurface *card = cardSurface(s);

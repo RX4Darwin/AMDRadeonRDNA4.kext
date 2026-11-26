@@ -316,6 +316,9 @@ public:
 	bool hdr { false };
 	static constexpr int32_t kHdrIdBit = 0x20000000;
 	static bool isHdrId(int32_t id) { return id > 0 && (id & kHdrIdBit) && !isSlotId(id); }
+	// An HDR twin of a mode smaller than a 3840x2160-class monitor (Modes::scaleBase) is listed with the mode's timing (CoreDisplay
+	// pairs the twins by timing) but runs as a scaled frame: the head on the base mode, macOS's frame of the mode's size scaled up
+	// to it when presented, as AMD's Windows driver does. A monitor then only ever gets its native HDR signal (docs/hdr-plan.md).
 	bool control(uint16_t code, void *params, int32_t &ret);
 
 	int32_t currentModeId() const { return current; }
@@ -366,7 +369,9 @@ private:
 	int32_t entryId(size_t i) const { return i < total() ? idFor(at(i)) : idFor(modes[i - total()]) | kHdrIdBit; }
 	const Modes::Mode &entry(size_t i) const { return i < total() ? at(i) : modes[i - total()]; }
 	const Modes::Mode &at(size_t i) const { return i < count ? modes[i] : scaledModes[i - count]; }
-	const Modes::Mode *modeFor(int32_t id) const;
+	const Modes::Mode *modeFor(int32_t id) const;   // the mode as listed
+	const Modes::Mode *runFor(int32_t id) const;    // as it runs: an HDR twin below the base mode as a scaled frame
+	mutable Modes::Mode hdrFrames[Modes::MaxModes] {};
 	bool surface(const Modes::Mode &m, Surface &out) const;
 
 	int32_t getCurMode(VDSwitchInfoRec &r) const;

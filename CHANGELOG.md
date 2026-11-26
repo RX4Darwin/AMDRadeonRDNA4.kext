@@ -9,7 +9,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
   an HDR10 copy of every mode, which is what macOS needs to offer HDR, and switching HDR on sends the boot display (DP)
   the HDR static metadata (PQ) and, where the sink takes it, BT.2020 in a VSC SDP. The link stays 8 bits a component. On Tahoe 26.6.2 with the rig's Samsung Odyssey G70D,
   macOS reported HDR support, and the monitor's HDR Tone Mapping went active with HDR on and greyed out with it off; the
-  picture looked normal. The Lenovo (no HDR) got no copies. Display sleep and wake with HDR on passed; system sleep not
+  picture looked normal. In a mode below a 4K monitor's size, HDR keeps the monitor on its 4K mode and scales the
+  desktop up (as Windows does): the Samsung showed a real 2560x1440 HDR signal shrunk into its upper-left.
+  The Lenovo (no HDR) got no copies. Display sleep and wake with HDR on passed; system sleep not
   run. Plan in docs/hdr-plan.md.
 
 - Native Metal generates mip levels directly in VRAM for large Managed R16Unorm and RG16Unorm 2D textures,

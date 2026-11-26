@@ -167,6 +167,21 @@ bool Translator::isSlotId(int32_t id) {
 	return id >= kSlotIdBase && id < kSlotIdBase + static_cast<int32_t>(kSlots);
 }
 
+const Modes::Mode *Translator::runFor(int32_t id) const {
+	const Modes::Mode *m = modeFor(id);
+	const Modes::Mode *base = m && hdr && isHdrId(id) ? Modes::scaleBase(modes, count) : nullptr;
+	if (!base || (m->t.hActive >= base->t.hActive && m->t.vActive >= base->t.vActive))
+		return m;
+	Modes::Mode &f = hdrFrames[m - modes];   // (a twin is of a table mode: modes[0..count))
+	f = *base;
+	f.id = m->id;
+	f.t.hActive = m->t.hActive;
+	f.t.vActive = m->t.vActive;
+	f.native = false;
+	f.source = Modes::SourceScaled;
+	return &f;
+}
+
 // A slot by its own ID, or the ready one holding `id` as its alias.
 Translator::Slot *Translator::slotFor(int32_t id) {
 	if (isSlotId(id))
@@ -205,7 +220,7 @@ void Translator::setScaled(const Modes::Mode *scaled, size_t n) {
 }
 
 bool Translator::scaledFrame(uint32_t &width, uint32_t &height) const {
-	const Modes::Mode *m = modeFor(current);
+	const Modes::Mode *m = runFor(current);
 	if (!m || m->source != Modes::SourceScaled)
 		return false;
 	width = m->t.hActive;
@@ -335,7 +350,7 @@ bool Translator::control(uint16_t code, void *params, int32_t &ret) {
 // --- Status ------------------------------------------------------------------
 
 int32_t Translator::getCurMode(VDSwitchInfoRec &r) const {
-	const Modes::Mode *m = modeFor(current);
+	const Modes::Mode *m = runFor(current);
 	Surface s {};
 	if (!m || !surface(*m, s))
 		return kUnsupported;
@@ -393,7 +408,7 @@ int32_t Translator::getNextResolution(VDResolutionInfoRec &r) const {
 }
 
 int32_t Translator::getVideoParameters(VDVideoParametersInfoRec &r) const {
-	const Modes::Mode *m = modeFor(r.csDisplayModeID);
+	const Modes::Mode *m = runFor(r.csDisplayModeID);
 	Surface s {};
 	if (!m || r.csDepthMode != kDepthMode1 || !r.csVPBlockPtr || !surface(*m, s))
 		return kBadArgument;
@@ -583,11 +598,13 @@ int32_t Translator::getSync(VDSyncInfoRec &r) const {
 // --- Control -----------------------------------------------------------------
 
 int32_t Translator::switchMode(VDSwitchInfoRec &r) {
-	const Modes::Mode *m = modeFor(r.csData);
+	const Modes::Mode *m = runFor(r.csData);
 	Surface s {};
 	if (!m || r.csMode != kDepthMode1 || !surface(*m, s))
 		return kBadArgument;
-	const bool same = m == modeFor(current);   // an installed timing for the mode already on needs no switch
+	// an installed timing for the mode already on, or its HDR twin running the same way, needs no switch
+	const Modes::Mode *was = runFor(current);
+	const bool same = was && was->source == m->source && Edid::sameTiming(was->t, m->t);
 	if (!same) {
 		int32_t err = be.switchTo ? be.switchTo(be.ctx, *m, m->id == bootModeId) : kUnsupported;
 		if (err != kSuccess)

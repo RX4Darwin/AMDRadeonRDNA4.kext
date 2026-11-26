@@ -55,7 +55,15 @@ and VSC SDP; a build that logged frames larger than the head saw none), so this 
 2560x1440 HDR signal, but it is not proven. Windows (AMD 32.0.32015.7029) does not settle it: at "2560x1440" with HDR it
 fills the screen, but it sends the monitor 3840x2160@144 and scales the 2560x1440 desktop on the card (QueryDisplayConfig:
 target signal 3840x2160, source 2560x1440), so the monitor never sees a 2560x1440 HDR signal there. Doing the same would
-avoid the question: an HDR twin of a size below the native one keeps the native timing and scales the plane up. (A first reading blamed the BT.2020 VSC SDP and removed it, 4a43e45; switching HDR on and off had changed both
+avoid the question: an HDR twin of a size below the native one keeps the native timing and scales the frame up.
+
+Done that way (2026-11-26): an HDR twin of a mode smaller than the monitor's 3840x2160-class base mode (Modes::scaleBase) is
+listed with its own timing (CoreDisplay pairs twins by timing) but runs like a "looks like" mode (Translator::runFor): the
+head on the base mode, macOS's frame of the mode's size in host memory, and the present path scales it up with scale.cl
+(an area filter, near nearest-neighbour going up). On the rig: 2560x1440 (low resolution) with HDR fills the screen
+(Sunneva, by eye); the log says "frames of 2560x1440 ... on a 3840x2160 head ...: scaled up". Costs: that HDR mode runs
+at the base mode's refresh (4K60 here; Windows sends 4K144 over DSC), and one boot of the build before showed the
+desktop even smaller, not understood (the next build, which only added the log line, was right). (A first reading blamed the BT.2020 VSC SDP and removed it, 4a43e45; switching HDR on and off had changed both
 packets. Reverted.)
 
 ## Next
