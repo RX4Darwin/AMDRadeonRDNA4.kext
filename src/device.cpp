@@ -663,8 +663,7 @@ bool RDNA4Device::readEDID(uint8_t inst, uint8_t *edid, size_t count,
 	return true;
 }
 
-// The extension blocks past the first (E-DDC segments) into edidMore, in order, logged with their DisplayID timings:
-// the mode table takes them, macOS's EDID stays the base block and the first extension.
+// Cache blocks 2 and 3 from E-DDC segment 1 in wire order.
 void RDNA4Device::readMoreEdidBlocks(uint8_t inst, uint8_t blocks) {
 	edidMoreLen = 0;
 	for (uint8_t b = 2; b <= blocks && b <= 3; b++) {
@@ -2808,7 +2807,7 @@ void RDNA4Device::buildModeTable() {
 		      bootTiming.pixelClockKHz);
 	}
 
-	// The EDID with its blocks past the first extension (DisplayID timings), for the table alone.
+	// The EDID with its blocks past the first extension (DisplayID timings), for the mode table and the boot framebuffer.
 	memcpy(edidAll, edidData, sizeof(edidData));
 	memcpy(edidAll + sizeof(edidData), edidMore, sizeof(edidMore));
 	edidAllLen = edidLen == sizeof(edidData) ? edidLen + edidMoreLen : edidLen;
