@@ -5293,8 +5293,9 @@ IOReturn RDNA4Device::setBootRefresh(const Modes::Mode &m, uint32_t extLines) {
 }
 
 // The boot display's HDR static metadata on (EOTF = PQ) or off, as Linux sends it (vpg3_update_generic_info_packet into
-// packet 3, then DP_SEC_GSP3_ENABLE and the secondary stream's master enable). DP only. BT.2020 in a VSC SDP (with MSA
-// MISC1 bit 6) is left out: the Samsung then showed the desktop shrunk into its upper-left corner (docs/hdr-plan.md).
+// packet 3, then DP_SEC_GSP3_ENABLE and the secondary stream's master enable), and, if the sink takes colorimetry from a
+// VSC SDP, BT.2020 in one (packet 0, GSP0) with MSA MISC1 bit 6 pointing the sink at it. Off restores the MSA's own
+// colorimetry. DP only.
 IOReturn RDNA4Device::setBootHdr(bool on) {
 	if (!pipe.valid() || pipe.isTmds())
 		return kIOReturnUnsupported;
@@ -5303,23 +5304,35 @@ IOReturn RDNA4Device::setBootHdr(bool on) {
 	auto update = [&](uint32_t reg, uint32_t mask, uint32_t value) {
 		regWriteDmu(2, reg + o, (regReadDmu(2, reg + o) & ~mask) | value);
 	};
-	if (on) {
-		update(kVpgMemPwr, kMemLightSleepDis | kMemLightSleepForce, kMemLightSleepDis);   // vpg31_poweron
+	auto writePacket = [&](uint32_t index, const uint32_t (&sdp)[9]) {
 		for (int i = 0; i < 50 && (regReadDmu(2, kVpgStatus + o) & kStatusConflict); i++)
 			IODelay(10);
 		update(kVpgStatus, kStatusConflictClr, kStatusConflictClr);
-		update(kVpgAccessCtrl, 0xff, kPacket * 9);
-		uint32_t sdp[9];
-		staticMetadataSdp(sdp);
+		update(kVpgAccessCtrl, 0xff, index * 9);
 		for (uint32_t d : sdp)
 			regWriteDmu(2, kVpgData + o, d);
-		update(kVpgImmediate, 1u << kPacket, 1u << kPacket);
+		update(kVpgImmediate, 1u << index, 1u << index);
+	};
+	uint8_t features = 0;
+	const bool vsc = on && dpcdRead(sinkAuxInst, kDpcdFeatureList, &features, 1) && (features & kVscColorimetrySupported);
+	if (on) {
+		uint32_t sdp[9];
+		update(kVpgMemPwr, kMemLightSleepDis | kMemLightSleepForce, kMemLightSleepDis);   // vpg31_poweron
+		staticMetadataSdp(sdp);
+		writePacket(kPacket, sdp);
+		if (vsc) {
+			vscBt2020Sdp(sdp);
+			writePacket(kVscPacket, sdp);
+		}
 	}
-	update(kDpSecCntl, kSecGsp3Enable, on ? kSecGsp3Enable : 0);
+	update(kDpSecCntl, kSecGsp3Enable | kSecGsp0Enable, (on ? kSecGsp3Enable : 0) | (vsc ? kSecGsp0Enable : 0));
 	if (regReadDmu(2, kDpSecCntl + o))
 		update(kDpSecCntl, kSecStreamEnable, kSecStreamEnable);
-	FBLOG("hdr: boot display metadata %s: DP%u_DP_SEC_CNTL=0x%08x VPG_GENERIC_STATUS=0x%08x", on ? "on (PQ)" : "off",
-	      static_cast<unsigned>(o / Pipe::Reg::kDigStride), regReadDmu(2, kDpSecCntl + o), regReadDmu(2, kVpgStatus + o));
+	update(kMsaMisc, kMisc1VscColorimetry, vsc ? kMisc1VscColorimetry : 0);
+	FBLOG("hdr: boot display metadata %s, BT.2020 %s (DPCD 0x2210 = 0x%02x): DP%u_DP_SEC_CNTL=0x%08x DP_MSA_MISC=0x%08x "
+	      "VPG_GENERIC_STATUS=0x%08x", on ? "on (PQ)" : "off", vsc ? "in a VSC SDP" : "not signalled", features,
+	      static_cast<unsigned>(o / Pipe::Reg::kDigStride), regReadDmu(2, kDpSecCntl + o), regReadDmu(2, kMsaMisc + o),
+	      regReadDmu(2, kVpgStatus + o));
 	return kIOReturnSuccess;
 }
 

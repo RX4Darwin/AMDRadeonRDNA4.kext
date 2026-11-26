@@ -154,8 +154,8 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
   (48-144 Hz on the rig's two), at the timings at the monitor's top rate. At 4K144 over DSC it has not been tried.
 - DisplayPort MST.
 - HDR by default: with `rdna4-hdr=1` (and `rdna4-vrr=1`) macOS offers HDR on a DisplayPort boot display whose EDID takes
-  HDR10, and the monitor gets the HDR metadata (PQ); BT.2020 is not signalled, the link stays 8 bits a component, and the
-  mastering data is left to the monitor. Not on a second display or over HDMI.
+  HDR10, and the monitor gets the HDR metadata (PQ) and BT.2020; the link stays 8 bits a component, and the mastering
+  data is left to the monitor. Not on a second display or over HDMI.
 - Audio over HDMI and DisplayPort.
 - Hardware video decode and encode (VCN).
 - GFXOFF (the graphics block powered down when idle) on by default: it works with `rdna4-gfxoff=1` (about 3 W less while
