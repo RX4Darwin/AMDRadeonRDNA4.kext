@@ -123,6 +123,8 @@ void Translator::init(const Modes::Mode *table, size_t n, uint32_t bootId,
 	be = backend;
 	current = kBootModeId;
 	syncState = kDPMSSyncOn;
+	for (Slot &sl : slots)
+		sl = Slot {};
 	// Without the boot entry the IDs could not be tied to what IOBootNDRV
 	// already reported, so the mode requests stay with it.
 	bool haveBoot = false;
@@ -141,6 +143,42 @@ const Modes::Mode *Translator::modeFor(int32_t id) const {
 	for (size_t i = 0; i < n; i++)
 		if (idFor(at(i)) == id)
 			return &at(i);
+	const Slot *sl = slotFor(id);
+	return sl ? sl->mode : nullptr;
+}
+
+bool Translator::isSlotId(int32_t id) {
+	return id >= kSlotIdBase && id < kSlotIdBase + static_cast<int32_t>(kSlots);
+}
+
+// A slot by its own ID, or the ready one holding `id` as its alias.
+Translator::Slot *Translator::slotFor(int32_t id) {
+	if (isSlotId(id))
+		return &slots[id - kSlotIdBase];
+	for (Slot &sl : slots)
+		if (sl.mode && sl.timing.csDisplayModeState == kDMSModeReady &&
+		    sl.timing.csDisplayModeAlias == static_cast<uint32_t>(id))
+			return &sl;
+	return nullptr;
+}
+
+// The table mode a timing from macOS is: the same raster, the clock within 0.1 %, progressive, no borders. Polarities and
+// the variable-refresh extension do not take part (the table's own timing is what gets programmed).
+const Modes::Mode *Translator::tableMatch(const VDDetailedTimingRec &t) const {
+	constexpr uint32_t kInterlaced = 0x4;   // kIOInterlacedCEATiming
+	if ((t.csSignalConfig & kInterlaced) || t.csHorizontalBorderLeft || t.csHorizontalBorderRight ||
+	    t.csVerticalBorderTop || t.csVerticalBorderBottom)
+		return nullptr;
+	for (size_t i = 0; i < count; i++) {
+		const Edid::DetailedTiming &m = modes[i].t;
+		const uint64_t hz = static_cast<uint64_t>(m.pixelClockKHz) * 1000;
+		const uint64_t diff = t.csPixelClock > hz ? t.csPixelClock - hz : hz - t.csPixelClock;
+		if (t.csHorizontalActive == m.hActive && t.csHorizontalBlanking == m.hBlank &&
+		    t.csHorizontalSyncOffset == m.hSyncOffset && t.csHorizontalSyncPulseWidth == m.hSyncWidth &&
+		    t.csVerticalActive == m.vActive && t.csVerticalBlanking == m.vBlank &&
+		    t.csVerticalSyncOffset == m.vSyncOffset && t.csVerticalSyncPulseWidth == m.vSyncWidth && diff * 1000 <= hz)
+			return &modes[i];
+	}
 	return nullptr;
 }
 
@@ -188,6 +226,11 @@ bool Translator::status(uint16_t code, void *params, int32_t &ret) {
 		if (!haveModes)
 			return false;
 		ret = getModeTiming(*static_cast<VDTimingInfoRec *>(params));
+		return true;
+	case cscGetTimingRanges:
+		if (!haveModes || !adaptiveSync)
+			return false;
+		ret = getTimingRanges(*static_cast<VDDisplayTimingRangeRec *>(params));
 		return true;
 	case cscGetDetailedTiming:
 		if (!haveModes)
@@ -243,6 +286,11 @@ bool Translator::control(uint16_t code, void *params, int32_t &ret) {
 			return false;
 		ret = switchMode(*static_cast<VDSwitchInfoRec *>(params));
 		return true;
+	case cscSetDetailedTiming:
+		if (!count || !adaptiveSync)
+			return false;
+		ret = setDetailedTiming(*static_cast<const VDDetailedTimingRec *>(params));
+		return true;
 	case cscSetSync:
 		if (!be.setPower)
 			return false;
@@ -284,6 +332,11 @@ int32_t Translator::getCurMode(VDSwitchInfoRec &r) const {
 
 int32_t Translator::getNextResolution(VDResolutionInfoRec &r) const {
 	const int32_t prev = r.csPreviousDisplayModeID;
+	if (adaptiveSync && (prev == kDisplayModeIDFindFirstProgrammable || isSlotId(prev))) {
+		const int32_t next = prev == kDisplayModeIDFindFirstProgrammable ? kSlotIdBase : prev + 1;
+		r.csDisplayModeID = isSlotId(next) ? next : kDisplayModeIDNoMore;
+		return kSuccess;
+	}
 	const Modes::Mode *m = nullptr;
 	if (prev == kDisplayModeIDFindFirst) {
 		m = &modes[0];
@@ -356,9 +409,78 @@ int32_t Translator::getModeTiming(VDTimingInfoRec &r) const {
 	return kSuccess;
 }
 
+// The range the modes span (IOFBTimingRange): pixel and line rates and every timing field's limits from the mode table (the
+// EDID's line-rate limits are not to be trusted: 69-69 kHz on the rig's Samsung), the frame rates from the EDID's range
+// limits, variable refresh between them when the EDID has them.
+int32_t Translator::getTimingRanges(VDDisplayTimingRangeRec &r) const {
+	if (r.csRangeSize && r.csRangeSize < sizeof(VDDisplayTimingRangeRec))
+		return kBadArgument;
+	Edid::BaseInfo base {};
+	if (!count || !Edid::parseBaseBlock(edid, edidLen, base) || !base.range.present || !base.range.minVHz ||
+	    base.range.maxVHz <= base.range.minVHz)
+		return kBadArgument;
+	r = VDDisplayTimingRangeRec {};
+	r.csRangeSize = sizeof(VDDisplayTimingRangeRec);
+	r.csMinPixelClock = ~0ull;
+	r.csMinLineRate = ~0u;
+	for (int i = 0; i < 12; i++)
+		r.csMinMax[2 * i] = ~0u;
+	auto span = [&r](int field, uint32_t v) {
+		r.csMinMax[2 * field] = v < r.csMinMax[2 * field] ? v : r.csMinMax[2 * field];
+		r.csMinMax[2 * field + 1] = v > r.csMinMax[2 * field + 1] ? v : r.csMinMax[2 * field + 1];
+	};
+	for (size_t i = 0; i < count; i++) {
+		const Edid::DetailedTiming &t = modes[i].t;
+		const uint64_t hz = static_cast<uint64_t>(t.pixelClockKHz) * 1000;
+		const uint32_t hTotal = t.hActive + t.hBlank, vTotal = t.vActive + t.vBlank;
+		const uint32_t line = hTotal ? static_cast<uint32_t>(hz / hTotal) : 0;
+		r.csMinPixelClock = hz < r.csMinPixelClock ? hz : r.csMinPixelClock;
+		r.csMaxPixelClock = hz > r.csMaxPixelClock ? hz : r.csMaxPixelClock;
+		r.csMinLineRate = line < r.csMinLineRate ? line : r.csMinLineRate;
+		r.csMaxLineRate = line > r.csMaxLineRate ? line : r.csMaxLineRate;
+		r.csMaxHorizontalTotal = hTotal > r.csMaxHorizontalTotal ? hTotal : r.csMaxHorizontalTotal;
+		r.csMaxVerticalTotal = vTotal > r.csMaxVerticalTotal ? vTotal : r.csMaxVerticalTotal;
+		span(0, t.hActive), span(1, t.hBlank), span(2, t.hSyncOffset), span(3, t.hSyncWidth);
+		span(4, t.vActive), span(5, t.vBlank), span(6, t.vSyncOffset), span(7, t.vSyncWidth);
+		for (int f = 8; f < 12; f++)
+			span(f, 0);                                       // no borders
+	}
+	// CoreDisplay refused the table's slowest mode (640x480 at the minimum pixel clock) without a margin, so every limit
+	// gets one; what is accepted is still decided by the slot match against the table.
+	auto lower = [](auto v) { return v - v / 64 - (v ? 1 : 0); };
+	auto upper = [](auto v) { return v + v / 64 + 1; };
+	r.csMinPixelClock = lower(r.csMinPixelClock), r.csMaxPixelClock = upper(r.csMaxPixelClock);
+	r.csMinLineRate = lower(r.csMinLineRate), r.csMaxLineRate = upper(r.csMaxLineRate);
+	r.csMaxHorizontalTotal = upper(r.csMaxHorizontalTotal), r.csMaxVerticalTotal = upper(r.csMaxVerticalTotal);
+	for (int f = 0; f < 8; f++)
+		r.csMinMax[2 * f] = lower(r.csMinMax[2 * f]), r.csMinMax[2 * f + 1] = upper(r.csMinMax[2 * f + 1]);
+	for (uint8_t &c : r.csCharSize)
+		c = 1;
+	r.csTimingRangeSyncFlags = kRangeSupportsSeparateSyncs | kRangeSupportsVRR;
+	r.csMinFrameRate = base.range.minVHz;
+	r.csMaxFrameRate = base.range.maxVHz;
+	// CoreDisplay calls a timing above 165 MHz two links (DVI's rule) and refuses it if the range allows only one.
+	r.csMaxNumLinks = 2;
+	return kSuccess;
+}
+
 int32_t Translator::getDetailedTiming(VDDetailedTimingRec &r) const {
+	if (r.csTimingSize && r.csTimingSize < sizeof(VDDetailedTimingRec))
+		return kBadArgument;
+	if (const Slot *sl = adaptiveSync ? slotFor(r.csDisplayModeID) : nullptr) {
+		const int32_t id = r.csDisplayModeID;
+		if (sl->mode) {
+			r = sl->timing;
+		} else {
+			r = VDDetailedTimingRec {};
+			r.csDisplayModeState = kDMSModeFree;
+		}
+		r.csTimingSize    = sizeof(VDDetailedTimingRec);
+		r.csDisplayModeID = id;
+		return kSuccess;
+	}
 	const Modes::Mode *m = modeFor(r.csDisplayModeID);
-	if (!m || (r.csTimingSize && r.csTimingSize < sizeof(VDDetailedTimingRec)))
+	if (!m)
 		return kBadArgument;
 	const Edid::DetailedTiming &t = m->t;
 	const int32_t id = r.csDisplayModeID;
@@ -432,16 +554,40 @@ int32_t Translator::switchMode(VDSwitchInfoRec &r) {
 	Surface s {};
 	if (!m || r.csMode != kDepthMode1 || !surface(*m, s))
 		return kBadArgument;
-	if (r.csData != current) {
+	const bool same = m == modeFor(current);   // an installed timing for the mode already on needs no switch
+	if (!same) {
 		int32_t err = be.switchTo ? be.switchTo(be.ctx, *m, m->id == bootModeId) : kUnsupported;
 		if (err != kSuccess)
 			return err;
-		current = r.csData;
-		// The backend may place the new mode's surface elsewhere.
-		if (!surface(*m, s))
-			return kBadArgument;
 	}
+	current = r.csData;
+	// The backend may place the new mode's surface elsewhere.
+	if (!same && !surface(*m, s))
+		return kBadArgument;
 	r.csBaseAddr = static_cast<uintptr_t>(1 | s.physBase);
+	return kSuccess;
+}
+
+// IONDRVFramebuffer::setDetailedTiming: free a slot, or give it a timing and the mode ID (alias) macOS knows it by.
+int32_t Translator::setDetailedTiming(const VDDetailedTimingRec &r) {
+	const int32_t id = r.csDisplayModeID;
+	if (!isSlotId(id) || (r.csTimingSize && r.csTimingSize < sizeof(VDDetailedTimingRec)))
+		return kBadArgument;
+	Slot &sl = slots[id - kSlotIdBase];
+	if (r.csDisplayModeState == kDMSModeFree) {
+		sl = Slot {};
+		return kSuccess;
+	}
+	const Modes::Mode *m = tableMatch(r);
+	if (!m)
+		return kBadArgument;
+	for (Slot &other : slots)                                 // one slot per alias
+		if (&other != &sl && other.mode && other.timing.csDisplayModeAlias == r.csDisplayModeAlias)
+			other = Slot {};
+	sl.timing = r;
+	sl.timing.csTimingSize = sizeof(VDDetailedTimingRec);
+	sl.timing.csDisplayModeSeed = ++slotSeed;
+	sl.mode = m;
 	return kSuccess;
 }
 

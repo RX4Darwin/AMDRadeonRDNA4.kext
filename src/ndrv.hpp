@@ -44,6 +44,7 @@ enum : uint16_t {
 	cscGetNextResolution  = 17,
 	cscGetVideoParameters = 18,
 	cscGetDDCBlock        = 27,
+	cscGetTimingRanges    = 30,
 	cscGetDetailedTiming  = 31,
 	cscSupportsHardwareCursor = 22,
 	cscGetHardwareCursorDrawState = 23,
@@ -52,6 +53,7 @@ enum : uint16_t {
 	cscSetGamma           = 4,
 	cscSwitchMode         = 10,
 	cscSetSync            = 11,
+	cscSetDetailedTiming  = 31,
 	cscSetHardwareCursor  = 22,
 	cscDrawHardwareCursor = 23,
 };
@@ -68,6 +70,7 @@ constexpr int32_t  kDisplayModeIDCurrent      = 0;
 constexpr int32_t  kDisplayModeIDInvalid      = -1;    // 0xFFFFFFFF
 constexpr int32_t  kDisplayModeIDFindFirst    = -2;    // kDisplayModeIDFindFirstResolution
 constexpr int32_t  kDisplayModeIDNoMore       = -3;    // kDisplayModeIDNoMoreResolutions
+constexpr int32_t  kDisplayModeIDFindFirstProgrammable = -4;
 constexpr uint16_t kDepthMode1                = 128;
 constexpr uint32_t kDeclROMtables             = 0x6465636c;   // 'decl'
 constexpr uint32_t kTimingInvalid             = 0;
@@ -83,6 +86,8 @@ constexpr uint32_t kConnectionInactive        = 1u << 9;    // nothing connected
 constexpr uint32_t kDDCBlockTypeEDID          = 0;
 constexpr uint32_t kSyncPositivePolarityMask  = 1;
 constexpr uint32_t kDMSModeReady              = 0;
+constexpr uint32_t kDMSModeNotReady           = 1;
+constexpr uint32_t kDMSModeFree               = 2;
 constexpr uint8_t  kDPMSSyncOn                = 0;
 constexpr uint8_t  kDPMSSyncOff               = 7;
 constexpr uint8_t  kDPMSSyncMask              = 7;     // H, V, composite sync
@@ -169,6 +174,25 @@ struct VDDDCBlockRec {
 	uint8_t  ddcBlockData[128];
 };
 
+// IONDRVFramebuffer publishes it as the property IOFBTimingRange (IODisplayTimingRange, the same layout).
+struct VDDisplayTimingRangeRec {
+	uint32_t csRangeSize, csRangeType, csRangeVersion, csRangeReserved;
+	uint32_t csRangeBlockIndex, csRangeGroup, csRangeBlockCount, csRangeFlags;
+	uint64_t csMinPixelClock, csMaxPixelClock;                        // Hz
+	uint32_t csMaxPixelError;
+	uint32_t csTimingRangeSyncFlags;                                  // kRangeSupports*
+	uint32_t csTimingRangeSignalLevels, csTimingRangeSupportedSignalConfigs;
+	uint32_t csMinFrameRate, csMaxFrameRate, csMinLineRate, csMaxLineRate;   // Hz
+	uint32_t csMaxHorizontalTotal, csMaxVerticalTotal, csMaxTotalReserved1, csMaxTotalReserved2;
+	uint8_t  csCharSize[14];                                          // h active .. v total
+	uint16_t csCharSizeReserved1;
+	uint32_t csMinMax[24];                                            // min/max h active .. v border bottom
+	uint32_t csMaxNumLinks, csMinLink0PixelClock, csMaxLink0PixelClock, csMinLink1PixelClock, csMaxLink1PixelClock;
+	uint32_t csReserved6, csReserved7, csReserved8;
+};
+// IOGraphicsTypes.h's supportedSyncFlags bits.
+constexpr uint32_t kRangeSupportsSeparateSyncs = 0x01, kRangeSupportsVRR = 0x10;
+
 struct VDDetailedTimingRec {
 	uint32_t csTimingSize;
 	uint32_t csTimingType;
@@ -200,7 +224,8 @@ struct VDDetailedTimingRec {
 	uint32_t csVerticalSyncConfig;
 	uint32_t csVerticalSyncLevel;
 	uint32_t csNumLinks;
-	uint32_t csReserved2, csReserved3, csReserved4;
+	uint32_t csReserved2;         // IODetailedTimingInformationV2::verticalBlankingExtension (lines)
+	uint32_t csReserved3, csReserved4;
 	uint32_t csReserved5, csReserved6, csReserved7, csReserved8;
 };
 
@@ -271,6 +296,9 @@ public:
 	// is not ours to answer (the caller then passes it on to IOBootNDRV);
 	// otherwise `ret` holds the IOReturn for IONDRVFramebuffer.
 	bool status(uint16_t code, void *params, int32_t &ret);
+	// rdna4-vrr=1 (docs/freesync-plan.md): answer cscGetTimingRanges, with variable refresh between the EDID's rates, and
+	// take the timings macOS installs from the EDID (programmable slots); CoreDisplay offers variable refresh only on those.
+	bool adaptiveSync { false };
 	bool control(uint16_t code, void *params, int32_t &ret);
 
 	int32_t currentModeId() const { return current; }
@@ -299,6 +327,21 @@ private:
 	int32_t  current { kBootModeId };
 	uint8_t  syncState { kDPMSSyncOn };
 	bool     connected { true };
+	// Programmable timings (cscSetDetailedTiming): each holds a timing macOS installed under an arbitrary mode ID (the
+	// alias), accepted only if it is one of the table's modes, which it then stands for.
+	struct Slot {
+		VDDetailedTimingRec timing;
+		const Modes::Mode  *mode;
+	};
+	static constexpr size_t  kSlots = 8;
+	static constexpr int32_t kSlotIdBase = 0x40000000;   // the slots' own IDs, apart from the table's
+	Slot     slots[kSlots] {};
+	uint32_t slotSeed { 0 };
+	static bool isSlotId(int32_t id);
+	Slot *slotFor(int32_t id);
+	const Slot *slotFor(int32_t id) const { return const_cast<Translator *>(this)->slotFor(id); }
+	const Modes::Mode *tableMatch(const VDDetailedTimingRec &t) const;
+	int32_t setDetailedTiming(const VDDetailedTimingRec &r);
 
 	size_t total() const { return count + __atomic_load_n(&scaledCount, __ATOMIC_ACQUIRE); }
 	const Modes::Mode &at(size_t i) const { return i < count ? modes[i] : scaledModes[i - count]; }
@@ -310,6 +353,7 @@ private:
 	int32_t getVideoParameters(VDVideoParametersInfoRec &r) const;
 	int32_t getModeTiming(VDTimingInfoRec &r) const;
 	int32_t getDetailedTiming(VDDetailedTimingRec &r) const;
+	int32_t getTimingRanges(VDDisplayTimingRangeRec &r) const;
 	int32_t getConnection(VDDisplayConnectInfoRec &r) const;
 	int32_t getDDCBlock(VDDDCBlockRec &r) const;
 	int32_t getSync(VDSyncInfoRec &r) const;

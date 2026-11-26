@@ -3184,6 +3184,66 @@ static int testNdrv() {
 	                  !Ndrv::spareSurface(kBar, k1080, kBar, 256 * kMiB, 0, 720, spare),
 	                  "ndrv: spare surface refuses a console outside the range");
 
+	// Programmable timings (rdna4-vrr=1): the slots IONDRVFramebuffer installs EDID timings in, matched to the table.
+	{
+		Ndrv::Translator pt;
+		FakeBackend pb;
+		pt.adaptiveSync = true;
+		pt.init(table, n, bootId, lenovo, sizeof(lenovo), pb.backend());
+		Ndrv::VDResolutionInfoRec pr {};
+		pr.csPreviousDisplayModeID = Ndrv::kDisplayModeIDFindFirstProgrammable;
+		int32_t first = 0;
+		size_t slots = 0;
+		while (pt.status(Ndrv::cscGetNextResolution, &pr, ret) &&
+		       ret == Ndrv::kSuccess && pr.csDisplayModeID > 0 && slots < 20) {
+			first = first ? first : pr.csDisplayModeID;
+			slots++;
+			pr.csPreviousDisplayModeID = pr.csDisplayModeID;
+		}
+		failures += check(slots == 8 && pr.csDisplayModeID == Ndrv::kDisplayModeIDNoMore, "ndrv: %zu programmable slots", slots);
+		Ndrv::VDDetailedTimingRec look {};
+		look.csDisplayModeID = first;
+		failures += check(pt.status(Ndrv::cscGetDetailedTiming, &look, ret) && ret == Ndrv::kSuccess &&
+		                  look.csDisplayModeState == Ndrv::kDMSModeFree, "ndrv: a new slot is not free");
+		// The other mode's timing under an arbitrary ID, with a variable-refresh extension, as CoreDisplay installs it.
+		Ndrv::VDDetailedTimingRec set {};
+		set.csDisplayModeID = otherId;
+		failures += check(tr.status(Ndrv::cscGetDetailedTiming, &set, ret) && ret == Ndrv::kSuccess, "ndrv: other's timing");
+		const uint32_t kAlias = 0x80001003;
+		set.csTimingSize = sizeof(set);
+		set.csDisplayModeID = first;
+		set.csDisplayModeAlias = kAlias;
+		set.csDisplayModeState = Ndrv::kDMSModeReady;
+		set.csReserved2 = 1000;
+		failures += check(pt.control(Ndrv::cscSetDetailedTiming, &set, ret) && ret == Ndrv::kSuccess, "ndrv: a table timing refused");
+		look = {};
+		look.csDisplayModeID = static_cast<int32_t>(kAlias);
+		failures += check(pt.status(Ndrv::cscGetDetailedTiming, &look, ret) && ret == Ndrv::kSuccess &&
+		                  look.csReserved2 == 1000 && look.csHorizontalActive == other->t.hActive &&
+		                  look.csDisplayModeState == Ndrv::kDMSModeReady, "ndrv: the installed timing reads back wrong");
+		Ndrv::VDSwitchInfoRec psw {};
+		psw.csData = static_cast<int32_t>(kAlias);
+		psw.csMode = Ndrv::kDepthMode1;
+		failures += check(pt.control(Ndrv::cscSwitchMode, &psw, ret) && ret == Ndrv::kSuccess && pb.switches == 1 &&
+		                  pt.currentModeId() == static_cast<int32_t>(kAlias), "ndrv: switch to the installed timing");
+		psw.csData = pt.idFor(*other);
+		failures += check(pt.control(Ndrv::cscSwitchMode, &psw, ret) && ret == Ndrv::kSuccess && pb.switches == 1,
+		                  "ndrv: the same mode by its table ID switched again");
+		Ndrv::VDDetailedTimingRec odd = set;
+		odd.csVerticalBlanking += 7;
+		odd.csDisplayModeID = first + 1;
+		failures += check(pt.control(Ndrv::cscSetDetailedTiming, &odd, ret) && ret == Ndrv::kBadArgument,
+		                  "ndrv: a timing outside the table taken");
+		Ndrv::VDDetailedTimingRec freeIt {};
+		freeIt.csDisplayModeID = first;
+		freeIt.csDisplayModeState = Ndrv::kDMSModeFree;
+		psw.csData = static_cast<int32_t>(kAlias);
+		failures += check(pt.control(Ndrv::cscSetDetailedTiming, &freeIt, ret) && ret == Ndrv::kSuccess &&
+		                  pt.control(Ndrv::cscSwitchMode, &psw, ret) && ret == Ndrv::kBadArgument,
+		                  "ndrv: a freed slot still switches");
+		failures += check(!tr.control(Ndrv::cscSetDetailedTiming, &set, ret), "ndrv: slots without rdna4-vrr");
+	}
+
 	printf("\nndrv: %zu modes (boot = 100 = %ux%u, other e.g. %d = %ux%u), EDID/DPMS %s\n", n,
 	       table[bootIdx].t.hActive, table[bootIdx].t.vActive, otherId, other->t.hActive,
 	       other->t.vActive, failures ? "MISMATCH" : "ok");

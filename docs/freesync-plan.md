@@ -1,7 +1,8 @@
 # Variable refresh (FreeSync / DisplayPort Adaptive-Sync), plan
 
-Status, 2026-11-26: step 0 (what macOS asks for) run once on the card; how macOS decides to offer "Variable" refresh is not
-known yet.
+Status, 2026-11-26: with `rdna4-vrr=1` macOS offers "Variable" refresh on the Lenovo (card-verified); choosing it still runs
+the fixed timing (no DRR programmed yet). The Samsung gets no variable mode yet (its 144 Hz timings are outside the EDID
+blocks macOS reads).
 
 ## What the monitors and macOS have
 
@@ -22,9 +23,34 @@ The boot display answered 'vrr?' = 1 and its modes' timing carried the extension
 normal again without the probe: keep the probe off unless asked. So the decision is made elsewhere (a property AMD's driver
 publishes, a mode flag, or CoreDisplay's own checks), to be found in Apple's binaries before any hardware work.
 
+## Step 1: how CoreDisplay decides (Tahoe 26.6, x86_64, from its code and its debug log)
+
+- A display is Adaptive-Sync capable (IODisplayInstallTimings) when CoreDisplay's preference `enableAdaptiveSync` is on
+  (default true), the EDID's base block says digital DisplayPort (byte 20 & 0x8f == 0x85) and continuous frequency (byte 24
+  bit 0), and the framebuffer's IOFBTimingRange has kIORangeSupportsVRR; the rates are the EDID range descriptor's V min/max.
+- Only timings CoreDisplay installs itself from the EDID get a variable copy (IOFBInstallMode): those within 1 Hz of the
+  maximum rate get `verticalBlankingExtension` lines down to the minimum, installed beside the fixed one. The driver's own
+  modes never do. On IONDRVFramebuffer an installed timing goes to the NDRV as cscSetDetailedTiming in a programmable slot
+  (cscGetNextResolution from kDisplayModeIDFindFirstProgrammable, cscGetDetailedTiming, then cscSwitchMode to the
+  0x8000xxxx alias); the extension arrives in VDDetailedTimingRec's csReserved2.
+- Before that, each timing has to pass CheckTimingWithRange against IOFBTimingRange. Silent refusals found: a timing above
+  165 MHz counts as two links (DVI's rule), so csMaxNumLinks must be 2; the table's slowest mode needed a margin below the
+  minimum pixel clock.
+- CoreDisplay's debug log names every decision: `sudo log config --subsystem com.apple.CoreDisplay --mode
+  "level:debug,persist:debug"` (the rig has a sudoers entry for it), then `log show --last boot --debug` after a reboot.
+  tools: a probe that calls CheckTimingWithRange inside CoreDisplay (anchored on CDNotificationRegisterCallbackBlock)
+  settled which field refused a timing.
+
+The translator (src/ndrv.cpp, only with `rdna4-vrr=1`) answers cscGetTimingRanges and keeps 8 programmable slots; a
+timing macOS installs is accepted only if it is a table mode (same raster, clock within 0.1 %), which it then stands for.
+
+Left: the Samsung's 144 Hz timings are in its DisplayID blocks, and IODisplayEDID holds only the first 256 bytes;
+the hardware (step 3); an early black-screen boot on 2026-11-26 with this kext (nothing logged, the next boot fine,
+probably unrelated).
+
 ## Plan
 
-1. Find what makes macOS offer Variable: look for 'vrr?', verticalBlankingExtension and Adaptive-Sync strings in IOGraphics
+1. (Done, see above.) Find what makes macOS offer Variable: look for 'vrr?', verticalBlankingExtension and Adaptive-Sync strings in IOGraphics
    (IOFramebuffer), SkyLight/CoreDisplay (the shared cache) and an AMD framebuffer kext of Tahoe's, and what each reads.
 2. Present that for a DP sink with Adaptive-Sync (EDID range, DPCD 0x007 bit 6).
 3. Hardware, from Linux (pipegen, as the rest): OTG DRR (V_TOTAL_MIN/MAX, the flip as the event that ends the extended blank),

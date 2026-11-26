@@ -100,6 +100,10 @@ NDRV_SAME_SIZE(VDDDCBlockRec);
 NDRV_SAME_FIELD(VDDDCBlockRec, ddcBlockType);
 NDRV_SAME_FIELD(VDDDCBlockRec, ddcBlockData);
 NDRV_SAME_SIZE(VDDetailedTimingRec);
+NDRV_SAME_SIZE(VDDisplayTimingRangeRec);
+NDRV_SAME_FIELD(VDDisplayTimingRangeRec, csMinFrameRate);
+NDRV_SAME_FIELD(VDDisplayTimingRangeRec, csCharSizeReserved1);
+NDRV_SAME_FIELD(VDDisplayTimingRangeRec, csMaxNumLinks);
 NDRV_SAME_FIELD(VDDetailedTimingRec, csDisplayModeID);
 NDRV_SAME_FIELD(VDDetailedTimingRec, csPixelClock);
 NDRV_SAME_FIELD(VDDetailedTimingRec, csHorizontalActive);
@@ -585,6 +589,12 @@ uint64_t surfaceFloor(const Head2 *h, const RDNA4Device &dev) {
 	return dev.fbPhysBase + dev.fbLength + h->slot * kHeadSlotBytes;
 }
 
+// rdna4-vrr=1: offer variable refresh (docs/freesync-plan.md).
+bool vrrWanted() {
+	uint32_t vrr = 0;
+	return Trial::bootArg("rdna4-vrr", vrr) && vrr;
+}
+
 // Once head 0's device exists: what head 2 serves.
 // The modes of the sink whose EDID is in h->edid that the head can serve, and
 // the one it starts in: the first, in table order (native first), whose
@@ -664,6 +674,7 @@ void head2Init(Head2 *h, RDNA4Device &dev, const Modes::Mode *mode, size_t n) {
 	if (switching)
 		be.switchTo = head2SwitchTo;
 	h->ndrv.init(switching ? h->table : mode, switching ? n : 1, mode->id, h->edid, h->edidLen, be);
+	h->ndrv.adaptiveSync = vrrWanted();
 	if (gScaledOffered)
 		offerScaledOn(h);
 	for (size_t i = 0; switching && i < n; i++) {
@@ -1338,8 +1349,20 @@ IOReturn head2DriverIO(Head2 *h, void *contents, UInt32 commandCode, uint16_t &c
 	auto *pb = static_cast<NdrvControlParameters *>(contents);
 	code = pb->code;
 	int32_t r = 0;
-	if (isStatus ? h->ndrv.status(code, pb->params, r) : h->ndrv.control(code, pb->params, r))
+	if (isStatus ? h->ndrv.status(code, pb->params, r) : h->ndrv.control(code, pb->params, r)) {
+		if (isStatus && code == Ndrv::cscGetTimingRanges) {
+			auto *g = static_cast<const Ndrv::VDDisplayTimingRangeRec *>(pb->params);
+			HLOG(h, "ndrv: timing range %llu-%llu Hz, %u modes -> 0x%x", g->csMinPixelClock, g->csMaxPixelClock,
+			     static_cast<unsigned>(h->ndrv.modeCount()), r);
+		}
+		if (!isStatus && code == Ndrv::cscSetDetailedTiming) {
+			auto *t = static_cast<const Ndrv::VDDetailedTimingRec *>(pb->params);
+			if (t->csReserved2)   // a variable-refresh timing
+				HLOG(h, "ndrv: variable timing 0x%x %ux%u, %u lines of extension -> 0x%x", t->csDisplayModeAlias,
+				     t->csHorizontalActive, t->csVerticalActive, t->csReserved2, r);
+		}
 		return static_cast<IOReturn>(r);
+	}
 	return static_cast<IOReturn>(Ndrv::bootReply(isStatus, code));
 }
 
@@ -1421,6 +1444,7 @@ void attach(FbEntry &e) {
 	}
 #endif
 	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidData, dev.edidLen, be);
+	st->ndrv.adaptiveSync = vrrWanted();
 #ifdef AMDRadeonRDNA4_PVGPU
 	// A test boot's level (rdna4-trial) is only known once NVRAM is; the heads' framebuffers are told before macOS asks.
 	uint32_t pvTrial = 0, pvDisp = 0;
@@ -1548,6 +1572,17 @@ IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 comma
 	if (commandCode == kIONDRVOpenCommand && ret == kIOReturnSuccess && !e->tried)
 		attach(*e);
 
+	if (csc && isStatus && code == Ndrv::cscGetTimingRanges) {
+		auto *g = static_cast<const Ndrv::VDDisplayTimingRangeRec *>(static_cast<NdrvControlParameters *>(contents)->params);
+		FBLOG("ndrv: timing range %llu-%llu Hz, %u modes -> 0x%x (%s)", g->csMinPixelClock, g->csMaxPixelClock,
+		      e->state ? static_cast<unsigned>(e->state->ndrv.modeCount()) : 0u, ret, answered ? "rdna4" : "boot");
+	}
+	if (csc && !isStatus && code == Ndrv::cscSetDetailedTiming) {
+		auto *t = static_cast<const Ndrv::VDDetailedTimingRec *>(static_cast<NdrvControlParameters *>(contents)->params);
+		if (t->csReserved2)   // a variable-refresh timing
+			FBLOG("ndrv: variable timing 0x%x %ux%u, %u lines of extension -> 0x%x (%s)", t->csDisplayModeAlias,
+			      t->csHorizontalActive, t->csVerticalActive, t->csReserved2, ret, answered ? "rdna4" : "boot");
+	}
 	// Mode switches are rare and the interesting part: always logged.
 	if (csc && !isStatus && code == Ndrv::cscSwitchMode) {
 		auto *pb = static_cast<NdrvControlParameters *>(contents);
