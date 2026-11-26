@@ -257,6 +257,7 @@ public:
 	void secondPipeKeepMsaIgnore();
 	// The same for the boot display (the firmware keeps its link: the bit is looked at after its pin comes back).
 	IOReturn setBootRefresh(const Modes::Mode &m, uint32_t extLines);
+	IOReturn setBootHdr(bool on);   // HDR static metadata (PQ) to the boot display, DP only (docs/hdr-plan.md)
 	void bootKeepMsaIgnore();
 	uint32_t otgFramesInASecond(uint8_t otg);   // debug.rdna4_otghz
 	IOReturn setPipeRefresh(uint8_t otg, uint8_t aux, const Edid::DetailedTiming &t, uint32_t extLines);

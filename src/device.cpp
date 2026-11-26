@@ -18,6 +18,7 @@
 #include "dpdual.hpp"
 #include "dcninit.hpp"
 #include "compute.hpp"
+#include "hdr.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMessage.h>
@@ -5288,6 +5289,36 @@ IOReturn RDNA4Device::setSecondPipeRefresh(const Modes::Mode &m, uint32_t extLin
 // The boot display: its pipe and the sink the firmware lit it on.
 IOReturn RDNA4Device::setBootRefresh(const Modes::Mode &m, uint32_t extLines) {
 	return pipe.valid() && !pipe.isTmds() ? setPipeRefresh(pipe.otg, sinkAuxInst, m.t, extLines) : kIOReturnUnsupported;
+}
+
+// The boot display's HDR static metadata on (EOTF = PQ) or off, as Linux sends it (vpg3_update_generic_info_packet into
+// packet 3, then DP_SEC_GSP3_ENABLE and the secondary stream's master enable). DP only.
+IOReturn RDNA4Device::setBootHdr(bool on) {
+	if (!pipe.valid() || pipe.isTmds())
+		return kIOReturnUnsupported;
+	using namespace Hdr;
+	const uint32_t o = digOff();
+	auto update = [&](uint32_t reg, uint32_t mask, uint32_t value) {
+		regWriteDmu(2, reg + o, (regReadDmu(2, reg + o) & ~mask) | value);
+	};
+	if (on) {
+		update(kVpgMemPwr, kMemLightSleepDis | kMemLightSleepForce, kMemLightSleepDis);   // vpg31_poweron
+		for (int i = 0; i < 50 && (regReadDmu(2, kVpgStatus + o) & kStatusConflict); i++)
+			IODelay(10);
+		update(kVpgStatus, kStatusConflictClr, kStatusConflictClr);
+		update(kVpgAccessCtrl, 0xff, kPacket * 9);
+		uint32_t sdp[9];
+		staticMetadataSdp(sdp);
+		for (uint32_t d : sdp)
+			regWriteDmu(2, kVpgData + o, d);
+		update(kVpgImmediate, 1u << kPacket, 1u << kPacket);
+	}
+	update(kDpSecCntl, kSecGsp3Enable, on ? kSecGsp3Enable : 0);
+	if (regReadDmu(2, kDpSecCntl + o))
+		update(kDpSecCntl, kSecStreamEnable, kSecStreamEnable);
+	FBLOG("hdr: boot display metadata %s: DP%u_DP_SEC_CNTL=0x%08x VPG_GENERIC_STATUS=0x%08x", on ? "on (PQ)" : "off",
+	      static_cast<unsigned>(o / Pipe::Reg::kDigStride), regReadDmu(2, kDpSecCntl + o), regReadDmu(2, kVpgStatus + o));
+	return kIOReturnSuccess;
 }
 
 void RDNA4Device::bootKeepMsaIgnore() {

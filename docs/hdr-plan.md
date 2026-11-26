@@ -1,8 +1,9 @@
 # HDR output (HDR10 to the monitor), plan
 
 Status, 2026-11-26: with `rdna4-hdr=1` (and `rdna4-vrr=1`, which serves the timing range) macOS offers HDR on the rig's
-Samsung and switches it on and off. Nothing is sent to the monitor for it yet: the link stays 8 bits a component with no
-HDR metadata, so the picture with HDR on is not right yet. Off by default.
+Samsung, and switching it on sends the HDR static metadata (PQ): the Samsung's "HDR Tone Mapping" goes active with HDR
+on and greyed out with it off, and the picture looked normal. The link stays 8 bits a component and BT.2020 is not
+signalled yet. Off by default.
 
 ## What the monitors and macOS have
 
@@ -25,15 +26,24 @@ never the default. On the rig: `hdrprobe` (CoreDisplay_Display_SupportsHDRMode) 
 Lenovo; `hdrprobe <id> on` makes CoreDisplay set mode 0x20000066 at depth 0 (32 bpp, unchanged), NSScreen's potential
 EDR goes 1.0 -> 2.0; `off` sets 0x66 again.
 
+## Step 2 (done, 2026-11-26)
+
+After every switch the translator tells the backend whether the mode is an HDR twin (`Backend::setHdr`). The boot
+display's backend (`RDNA4Device::setBootHdr`, DP only) writes the HDR static metadata SDP (type 0x87, version 0x13,
+CTA-861-G Dynamic Range and Mastering InfoFrame with EOTF = PQ) into VPG generic packet 3 and sets DP_SEC_GSP3_ENABLE
+and the secondary stream's master enable, as Linux (vpg3_update_generic_info_packet,
+enc3_stream_encoder_update_dp_info_packets); off clears GSP3. The mastering primaries, luminance, MaxCLL and MaxFALL are
+0 ("unknown"). Card: DP0_DP_SEC_CNTL 0x00800001 with HDR on, the Samsung's tone mapping follows.
+
 ## Next
 
-2. Tell the backend when the mode is an HDR twin (`Translator::isHdrId(current)`), and on DP send the HDR static
-   metadata (SDP type 0x87, CTA-861-G Dynamic Range and Mastering InfoFrame: EOTF = PQ, the display's primaries and
-   luminance from the EDID or macOS's IOFBHDRMetaData via kIOFBHDRMetaDataAttribute) through a DP_SEC GSP slot, as Linux
-   (dcn401 stream encoder, `dc_stream.hdr_static_metadata`); signal BT.2020 in the MSA MISC bits or a VSC SDP. Card
-   check: the Samsung's OSD reports HDR.
-3. 10 bits a component on the link (FMT bit depth, DIG pixel depth, MSA) for the twins; check the DP bandwidth at
-   2560x1440@144 and 4K (DSC).
-4. What WindowServer renders in HDR mode at 32 bpp (PQ-encoded 8 bit? a 10-bit or FP16 surface would need another depth
-   mode, kDepthMode2 with 30-bit pixels) and whether the plane's gamma (cscSetGamma) has to be linear in HDR.
-5. HDMI: the same InfoFrame through the HDMI generic packets (the Lenovo is SDR only, so no rig test yet).
+- Not run: display sleep/wake and system sleep with HDR on (the packet is only sent again at the next switch), and a
+  mode switch while in HDR.
+- Signal BT.2020 (a VSC SDP with colorimetry, DPCD 0x2210 bit 3) and fill the mastering data from macOS's
+  IOFBHDRMetaData (kIOFBHDRMetaDataAttribute) or the EDID.
+- 10 bits a component on the link (FMT bit depth, DIG pixel depth, MSA) for the twins; check the DP bandwidth at
+  2560x1440@144 and 4K (DSC).
+- What WindowServer renders in HDR mode at 32 bpp (PQ-encoded 8 bit? a 10-bit or FP16 surface would need another depth
+  mode, kDepthMode2 with 30-bit pixels) and whether the plane's gamma (cscSetGamma) has to be linear in HDR.
+- HDMI and the second pipe: the same InfoFrame through the HDMI generic packets, and setHdr on head 2's backend
+  (the Lenovo is SDR only, so no rig test yet).

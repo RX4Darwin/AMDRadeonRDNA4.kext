@@ -330,6 +330,10 @@ int32_t deviceSetRefresh(void *ctx, const Modes::Mode &m, uint32_t extLines) {
 	return static_cast<RDNA4Device *>(ctx)->setBootRefresh(m, extLines);
 }
 
+int32_t deviceSetHdr(void *ctx, bool on) {
+	return static_cast<RDNA4Device *>(ctx)->setBootHdr(on);
+}
+
 int32_t deviceSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 	auto *dev = static_cast<RDNA4Device *>(ctx);
 	if (m.source != Modes::SourceScaled)
@@ -1542,6 +1546,8 @@ void attach(FbEntry &e) {
 	const bool vrr = vrrWanted();
 	if (vrr && be.switchTo == deviceSwitchTo)
 		be.setRefresh = deviceSetRefresh;
+	if (be.switchTo == deviceSwitchTo)
+		be.setHdr = deviceSetHdr;
 	uint32_t guest = 0, bench = 0, cold = 0, dsc = 0;
 	if (!pvGpu && !(Trial::option("rdna4-pvgpu", guest) && guest) &&
 	    !(Trial::option("rdna4-vrambench", bench) && bench) && !(Trial::option("rdna4-coldboot", cold) && cold) &&

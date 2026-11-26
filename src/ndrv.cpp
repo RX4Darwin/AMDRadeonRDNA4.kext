@@ -602,6 +602,8 @@ int32_t Translator::switchMode(VDSwitchInfoRec &r) {
 	const uint32_t ext = sl && sl->mode ? sl->timing.csReserved2 : 0;
 	if (be.setRefresh && (ext || variable) && be.setRefresh(be.ctx, *m, ext) == kSuccess)
 		variable = ext != 0;
+	if (hdr && be.setHdr)   // every switch: a relit pipe may have lost the packet
+		(void)be.setHdr(be.ctx, isHdrId(current));
 	r.csBaseAddr = static_cast<uintptr_t>(1 | s.physBase);
 	return kSuccess;
 }

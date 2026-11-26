@@ -42,6 +42,7 @@
 #include "../src/codeobj.hpp"
 #include "../src/gpuheap.hpp"
 #include "../src/flip.hpp"
+#include "../src/hdr.hpp"
 #include "../src/gpuvm.hpp"
 #include "../src/vmid.hpp"
 #include "../src/ptpages.hpp"
@@ -2944,6 +2945,8 @@ struct FakeBackend {
 	bool     powerOn = true;
 	int      refreshCalls = 0;
 	uint32_t refreshExt = 0;
+	int      hdrCalls = 0;
+	bool     hdrOn = false;
 
 	static bool surfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) {
 		auto *b = static_cast<FakeBackend *>(ctx);
@@ -2968,9 +2971,16 @@ struct FakeBackend {
 		b->refreshExt = ext;
 		return Ndrv::kSuccess;
 	}
+	static int32_t setHdr(void *ctx, bool on) {
+		auto *b = static_cast<FakeBackend *>(ctx);
+		b->hdrCalls++;
+		b->hdrOn = on;
+		return Ndrv::kSuccess;
+	}
 	Ndrv::Backend backend() {
 		Ndrv::Backend be { this, surfaceFor, switchTo, setPower };
 		be.setRefresh = setRefresh;
+		be.setHdr = setHdr;
 		return be;
 	}
 };
@@ -3154,11 +3164,19 @@ static int testNdrv() {
 		Ndrv::VDSwitchInfoRec sw {};
 		sw.csData = bootTwin;
 		sw.csMode = Ndrv::kDepthMode1;
+		const int hdrBefore = fb.hdrCalls;
 		failures += check(ht.status(Ndrv::cscGetModeTiming, &ti, ret) && ret == Ndrv::kSuccess &&
 		                  !(ti.csTimingFlags & Ndrv::kDisplayModeDefaultFlag) &&
 		                  ht.control(Ndrv::cscSwitchMode, &sw, ret) && ret == Ndrv::kSuccess &&
-		                  ht.currentModeId() == bootTwin,
-		                  "ndrv: HDR twin of the boot mode: flags 0x%x, switch 0x%x", ti.csTimingFlags, ret);
+		                  ht.currentModeId() == bootTwin && fb.hdrOn && fb.hdrCalls == hdrBefore + 1,
+		                  "ndrv: HDR twin of the boot mode: flags 0x%x, switch 0x%x, hdr %d", ti.csTimingFlags, ret, fb.hdrOn);
+		sw.csData = Ndrv::kBootModeId;
+		failures += check(ht.control(Ndrv::cscSwitchMode, &sw, ret) && ret == Ndrv::kSuccess && !fb.hdrOn &&
+		                  fb.hdrCalls == hdrBefore + 2, "ndrv: back from the HDR twin: hdr %d", fb.hdrOn);
+		uint32_t sdp[9];
+		Hdr::staticMetadataSdp(sdp);
+		failures += check(sdp[0] == 0x4c1d8700 && sdp[1] == 0x00021a01 && !sdp[2] && !sdp[8],
+		                  "hdr: static metadata SDP 0x%08x 0x%08x", sdp[0], sdp[1]);
 		// Edid::takesPq: a CTA block with an HDR Static Metadata block whose EOTFs include PQ (the Samsung's bytes).
 		uint8_t pq[256] {};
 		memcpy(pq, lenovo, 128);

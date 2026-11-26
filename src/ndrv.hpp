@@ -291,6 +291,8 @@ struct Backend {
 	int32_t (*getHardwareCursorDrawState)(void *ctx, VDHardwareCursorDrawStateRec &state);
 	// `m` (the mode on) with variable refresh down to `extLines` lines more than its V total, or fixed (0).
 	int32_t (*setRefresh)(void *ctx, const Modes::Mode &m, uint32_t extLines);
+	// Optional (hdr): after each switch, whether the mode is an HDR10 twin; the sink is told (HDR metadata) or untold.
+	int32_t (*setHdr)(void *ctx, bool on);
 };
 
 class Translator {
@@ -310,7 +312,7 @@ public:
 	bool adaptiveSync { false };
 	// rdna4-hdr=1 on a sink that takes PQ (docs/hdr-plan.md): the range (served only with adaptiveSync) also offers 10 bits
 	// a component, BT.2020 and HDR10, and every table mode is listed a second time as HDR10 (its ID | kHdrIdBit):
-	// CoreDisplay offers HDR only for a mode with such a twin. Nothing is programmed for it yet.
+	// CoreDisplay offers HDR only for a mode with such a twin. Switching to a twin calls Backend::setHdr.
 	bool hdr { false };
 	static constexpr int32_t kHdrIdBit = 0x20000000;
 	static bool isHdrId(int32_t id) { return id > 0 && (id & kHdrIdBit) && !isSlotId(id); }
