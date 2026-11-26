@@ -470,7 +470,7 @@ private:
 	bool smuHardMinMet(uint32_t clk);
 	bool smuSetHardMin(uint32_t clk, const char *name, uint32_t mhz);
 	bool dscLit { false };   // rdna4-dscboot: pipe 0 runs Linux's DSC test stream (coldStart); mode switches refused
-	bool readReceiverCaps(uint8_t aux, uint8_t (&caps)[16], DpTrain::Sink &sink);   // DPCD 0x000, or the extended block at 0x2200 (Linux's rule)
+	bool readReceiverCaps(uint8_t aux, uint8_t (&caps)[16]);   // DPCD 0x000, or the extended block at 0x2200 (Linux's rule)
 	void readDscCaps(uint8_t aux, DpTrain::Sink &sink, const char *who);   // DPCD 1.4: the sink's DSC decoder, logged
 	void memoryClockFollowDisplays();   // UCLK held at its top level while an extra display runs a 4K-class mode (clk.cpp)
 	bool raiseDisplayClocks();

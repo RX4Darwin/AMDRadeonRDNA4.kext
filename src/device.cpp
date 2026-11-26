@@ -3064,12 +3064,14 @@ bool RDNA4Device::readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link) {
 	// Receiver capability, then what the firmware told the sink: LINK_BW_SET,
 	// LANE_COUNT_SET, and from 0x202 on how the lanes are doing.
 	uint8_t caps[16] {}, set[2] {}, status[6] {};
-	if (!readReceiverCaps(sinkAuxInst, caps, sink) || !dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) ||
+	if (!readReceiverCaps(sinkAuxInst, caps) || !dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) ||
 	    !dpcdRead(sinkAuxInst, 0x202, status, sizeof(status))) {
-		FBLOG("dptrain: no usable receiver caps or link status on AUX%u", sinkAuxInst);
+		FBLOG("dptrain: the sink's DPCD did not answer on AUX%u", sinkAuxInst);
 		return false;
 	}
-	readDscCaps(sinkAuxInst, sink, "dptrain");
+	const bool parsed = DpTrain::parseCaps(caps, sizeof(caps), sink);
+	if (parsed)
+		readDscCaps(sinkAuxInst, sink, "dptrain");
 	link = DpTrain::Link { static_cast<uint8_t>(set[1] & 0x1f), set[0] };
 	FBLOG("dptrain: sink DPCD %u.%u, up to %u lane(s) at rate 0x%02x%s%s, reading interval 0x%02x; the firmware's "
 	      "link: %u lane(s) at rate 0x%02x (LANE_COUNT_SET 0x%02x); lanes %02x %02x, aligned %u", caps[0] >> 4,
@@ -3077,7 +3079,7 @@ bool RDNA4Device::readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link) {
 	      sink.tps4 ? ", TPS4" : "", caps[0x0e], link.lanes, link.rate, set[1], status[0],
 	      status[1], status[2] & 1);
 	const bool lanes = link.lanes == 1 || link.lanes == 2 || link.lanes == 4;
-	const bool known = lanes && link.lanes <= sink.maxLanes && link.rate >= DpTrain::kRbr &&
+	const bool known = parsed && lanes && link.lanes <= sink.maxLanes && link.rate >= DpTrain::kRbr &&
 	                   link.rate <= sink.maxRate;
 	if (!known)
 		FBLOG("dptrain: that is not a link this sink says it has: it will not be retrained");
@@ -4273,7 +4275,7 @@ bool RDNA4Device::readSecondDpSink(uint8_t aux) {
 	uint8_t caps[16] {};
 	xp().aux = aux;
 	xp().sink = {};
-	if (!readReceiverCaps(aux, caps, xp().sink)) {
+	if (!readReceiverCaps(aux, caps) || !DpTrain::parseCaps(caps, sizeof(caps), xp().sink)) {
 		xp().sink = {};
 		FBLOG("pipe2: no DisplayPort receiver capability on AUX%u", aux);
 		return false;
@@ -4287,19 +4289,17 @@ bool RDNA4Device::readSecondDpSink(uint8_t aux) {
 
 // The receiver capability (DPCD 0x000..0x00F), as Linux's retrieve_link_cap reads it: when TRAINING_AUX_RD_INTERVAL has
 // EXT_RECEIVER_CAP_FIELD_PRESENT, the extended block at 0x2200 stands in for it (a DP 1.3+ sink may report 1.2 and HBR2
-// at 0x000 for old sources); if it cannot be read or validated, use the base block.
-bool RDNA4Device::readReceiverCaps(uint8_t aux, uint8_t (&caps)[16], DpTrain::Sink &sink) {
+// at 0x000 for old sources); if that read fails, the base block stays.
+bool RDNA4Device::readReceiverCaps(uint8_t aux, uint8_t (&caps)[16]) {
 	if (!dpcdRead(aux, 0x000, caps, sizeof(caps)))
 		return false;
 	uint8_t ext[16] {};
-	if ((caps[0x0e] & 0x80) && dpcdRead(aux, 0x2200, ext, sizeof(ext)) &&
-	    DpTrain::parseExtendedCaps(caps, ext, sink)) {
+	if ((caps[0x0e] & 0x80) && dpcdRead(aux, 0x2200, ext, sizeof(ext))) {
 		FBLOG("dpcd: AUX%u: extended receiver capability: DPCD %u.%u rate 0x%02x (at 0x000: %u.%u rate 0x%02x)", aux, ext[0] >> 4,
 		      ext[0] & 0xf, ext[1], caps[0] >> 4, caps[0] & 0xf, caps[1]);
 		memcpy(caps, ext, sizeof(ext));
-		return true;
 	}
-	return DpTrain::parseCaps(caps, sizeof(caps), sink);
+	return true;
 }
 
 // A DPCD 1.4 sink's DSC decoder (DPCD 0x060..0x06F, docs/dsc-plan.md step 1): into sink.dsc, logged. Read only; nothing uses
