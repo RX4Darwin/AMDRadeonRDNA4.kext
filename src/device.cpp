@@ -2708,6 +2708,8 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 static uint32_t gSnapLines;   // wakediff lines of the current comparison
 
 RDNA4Device::~RDNA4Device() {
+	OSSafeReleaseNULL(dpAperture);
+	OSSafeReleaseNULL(dpVram);
 	freeHardwareCursor();
 	if (cursorTrailLock) {
 		IOLockFree(cursorTrailLock);
@@ -3375,7 +3377,7 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	// on this warm card it has to be the address the GOP's HUBP0 scans.
 	const uint64_t gop = coldBoot ? coldGopSurface : bootScanout();
 	uint64_t surface = 0;
-	if (!consoleMcAddress(surface) || surface != gop) {
+	if (!consoleMcAddress(surface) || (surface != gop && !(dpAperture && gop == dpPlaneMc))) {
 		FBLOG("dcninit: not run: the console's computed address 0x%llx is not the GOP's 0x%llx", surface, gop);
 		useSlotTable();
 		return false;
@@ -3440,7 +3442,8 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	t.alone = true;   // its VM aperture left as the hardware has it, as amdgpu leaves it on a discrete card
 	t.encoderObjId = path.encoderObjId;
 	t.connectorObjId = connector;
-	t.surface = surface;
+	// The cold-light table fetches a full 4K plane even when the saved desktop is smaller.
+	t.surface = dpAperture ? dpPlaneMc : surface;
 	t.depth = Pipe2::Depth::Plane;
 	t.linkRate = boot.link.rate;
 	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
@@ -3543,10 +3546,15 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	FBLOG("dcninit: %s%s%s; OTG0 measured %u.%03u Hz, HUBP0_DCHUBP_CNTL 0x%08x", ok ? "boot pipe lit again" : "FAILED",
 	      *why ? ": " : "", why, mHz / 1000, mHz % 1000, regReadDmu(2, 0x05f4));
 	// Lit at the table's timing, with the table's request timing: the mode it ran before the power loss set again.
-	if (ok && !dscLit && !nearTiming(wanted, table)) {
+	const Modes::Mode *desktop = dpAperture ? findMode(currentModeId) : nullptr;
+	if (ok && !dscLit && (desktop || !nearTiming(wanted, table))) {
 		liveTiming = reqTiming = table;
 		liveTimingValid = reqTimingValid = true;
-		const IOReturn back = applyMode(Modes::Mode { currentModeId, wanted, wanted.refreshMilliHz(), false, Modes::SourceBoot });
+		const Modes::Mode previous {currentModeId, wanted, wanted.refreshMilliHz(), false, Modes::SourceBoot};
+		surfaceRecovery = false;   // a hardware reset invalidates a warm modeset snapshot
+		const IOReturn back = applyMode(desktop ? *desktop : previous);
+		if (desktop && back != kIOReturnSuccess)
+			ok = false;
 		FBLOG("dcninit: the mode before the power loss (%ux%u at %u kHz) set again: %s (0x%x)", wanted.hActive, wanted.vActive,
 		      wanted.pixelClockKHz, back == kIOReturnSuccess ? "done" : "FAILED, the table's timing kept", back);
 	}
@@ -3574,6 +3582,137 @@ bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {
 	return true;
 }
 
+namespace {
+// DCN 4.01 DP0 MSA and pipe-zero HUBP registers.
+constexpr uint32_t kDpPixelFormat = 0x211f, kDpMsaColor = 0x2120, kDpMsaMisc = 0x2124;
+constexpr uint32_t kStreamControl = 0x2122, kEarliestLo = 0x061c, kEarliestHi = 0x061d;
+constexpr uint32_t kMasterUpdateLock = 0x1b89;
+}
+
+uint32_t RDNA4Device::dpSurfaceClockLimit() {
+	// Keep the running stream encoding. Bits per pixel affect bandwidth even for an ARGB8888 framebuffer.
+	const uint32_t format = regReadDmu(2, kDpPixelFormat), color = regReadDmu(2, kDpMsaColor);
+	const unsigned depth = (format >> 8) & 7;
+	if ((format & 0x10031) || (regReadDmu(2, kDpMsaMisc) & 0xc0) || (color & 0x06000000) ||
+	    (color >> 29) != depth || (depth != 1 && depth != 2))
+		return 0;
+	DpTrain::Link link {};
+	DpTrain::Sink sink {};
+	if (!readBootDpLink(sink, link))
+		return 0;
+	uint8_t compression = 0, lanes[3] {};
+	if (!dpcdRead(sinkAuxInst, 0x202, lanes, sizeof(lanes)) || !DpTrain::linkUp(lanes, link.lanes) ||
+	    (sink.rev >= 0x14 && (!dpcdRead(sinkAuxInst, 0x160, &compression, 1) || (compression & 1))))
+		return 0;
+	return DpTrain::bandwidthKbps(link) / (depth == 1 ? 24u : 30u);
+}
+
+bool RDNA4Device::singleDpPipe() const {
+	for (unsigned i = 1; i < Pipe::kMaxOtg; i++)
+		if (regReadDmu(2, Pipe::Reg::kOtgControl + i * Pipe::Reg::kOtgStride) & 1)
+			return false;
+	return true;
+}
+
+bool RDNA4Device::bootEdidMatches() {
+	uint8_t block[Edid::BlockSize];
+	for (size_t offset = 0; offset < edidAllLen; offset += sizeof(block)) {
+		if (!readEDID(sinkAuxInst, block, sizeof(block), static_cast<uint8_t>(offset & 255),
+		              static_cast<uint8_t>(offset / 256)) || memcmp(block, edidAll + offset, sizeof(block)))
+			return false;
+	}
+	return edidAllLen != 0;
+}
+
+void RDNA4Device::prepareDpSurface(uint64_t extraSlotsBytes, bool clocksExpected) {
+	ExtraHold hold(*this);
+	if (!modesetRequested || !extraLock || !modeCount || !liveTimingValid || !bootTimingValid || fbDepth != 32 ||
+	    !pipe.valid() || pipe.signal != Pipe::Signal::DpSst || pipe.otg || pipe.opp || pipe.dig || pipe.link ||
+	    pipe.hubp || pipe.hpd != 1 || coldBoot || bootReleased || dscLit || !bootSinkPresent() ||
+	    pipe.pitchPx * 4u != fbRowBytes || pipe.viewportW != fbWidth || pipe.viewportH != fbHeight ||
+	    fbLength < uint64_t(fbRowBytes) * fbHeight || !consoleMcAddress(dpConsoleMc) || bootScanout() != dpConsoleMc)
+		return;
+	for (const auto &head : extra)
+		if (head.edidLen)
+			return;
+	if (!singleDpPipe() || !Pipe2::use(1, false, 0, true))
+		return;
+	struct Restore { RDNA4Device &dev; ~Restore() { dev.useSlotTable(); } } restore { *this };
+	const auto &model = Pipe2::config().timing;   // the generator's backing surface for this table
+	const uint32_t clock = clocksExpected ? max(dispclkTargetKHz(), bootTiming.pixelClockKHz) : bootTiming.pixelClockKHz;
+	const Modes::Limits limits {model.hActive, model.vActive, min(clock, dpSurfaceClockLimit())};
+	if (!limits.maxPixelClockKHz || (fbWidth >= limits.maxHActive && fbHeight >= limits.maxVActive))
+		return;
+	Modes::Mode candidates[Modes::MaxModes];
+	const size_t count = Modes::build(edidAll, edidAllLen, limits, candidates, Modes::MaxModes);
+	size_t kept = 0;
+	for (size_t i = 0; i < count && modeCount + kept < Modes::MaxModes; ++i)
+		if (largerThanConsole(candidates[i].t) && Pipe2::modeKnown(candidates[i].t))
+			candidates[kept++] = candidates[i];
+	if (!kept)
+		return;
+	auto *bar = pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+	if (!bar || bar->getPhysicalAddress() != fbPhysBase ||
+	    !Ndrv::spareSurface(fbPhysBase, fbLength, fbPhysBase, bar->getLength(), model.hActive, model.vActive, dpSurface))
+		return;
+	const uint64_t offset = dpSurface.physBase - fbPhysBase;
+	const uint64_t length = round_page_64(uint64_t(dpSurface.rowBytes) * dpSurface.height + 128);
+	const uint64_t span = offset + length, reserved = span + extraSlotsBytes;
+	dpPlaneMc = dpConsoleMc + offset;
+	const uint32_t hi = regReadDmu(2, kDmcubRegion4OffsetHigh), lo = regReadDmu(2, kDmcubRegion4Offset);
+	const uint64_t mailbox = (uint64_t(hi) << 32) | lo;
+	if (reserved > bar->getLength() || mailbox >= (1ull << 48) || lo == ~0u || mailbox <= dpConsoleMc + reserved)
+		return;
+	dpVram = IODeviceMemory::withSubRange(bar, 0, span);
+	dpAperture = IODeviceMemory::withSubRange(bar, offset, length);
+	auto *map = dpAperture ? dpAperture->map(kIOMapWriteCombineCache) : nullptr;
+	if (!dpVram || !map || !map->getVirtualAddress()) {
+		OSSafeReleaseNULL(map);
+		OSSafeReleaseNULL(dpVram);
+		OSSafeReleaseNULL(dpAperture);
+		return;
+	}
+	bzero(reinterpret_cast<void *>(map->getVirtualAddress()), length);
+	__asm__ volatile("sfence" ::: "memory");
+	map->release();
+	displayReserve = reserved;
+	for (size_t i = 0; i < kept; ++i)
+		Modes::ensure(modeTable, modeCount, Modes::MaxModes, candidates[i].t, candidates[i].source);
+	owner->setProperty("Modes,Count", static_cast<uint64_t>(modeCount), 32);
+	FBLOG("modes: %zu larger DisplayPort modes on a separate aperture, pitch %u", kept, dpSurface.rowBytes);
+}
+
+bool RDNA4Device::surfaceLatched(uint64_t mc, uint32_t pitch, uint32_t width, uint32_t height) {
+	for (unsigned i = 0; i < 60; ++i) {
+		const uint32_t stream = regReadDmu(2, kStreamControl);
+		const uint64_t shown = (uint64_t(regReadDmu(2, kEarliestHi) & 0xffff) << 32) |
+		                       (regReadDmu(2, kEarliestLo) & 0xffffff00);
+		if (shown == mc && bootScanout() == mc && (regReadDmu(2, Pipe::Reg::kHubpSurfacePitch) & 0xffff) + 1 == pitch &&
+		    regReadDmu(2, Pipe::Reg::kHubpViewportDim) == (width | (height << 16)) &&
+		    stream != ~0u && (stream & 0x10001) == 0x10001)
+			return true;
+		IOSleep(1);
+	}
+	return false;
+}
+
+bool RDNA4Device::restoreDpPlane() {
+	const uint32_t lock = regReadDmu(2, kMasterUpdateLock);
+	if (lock == ~0u)
+		return false;
+	if (lock & 1)
+		regWriteDmu(2, kMasterUpdateLock, lock & ~1u);
+	if (!runPlan(surfaceReturn) || !surfaceLatched(returnMc, returnPitch, returnWidth, returnHeight))
+		return false;
+	surfaceRecovery = false;
+	return true;
+}
+
+bool RDNA4Device::dpPlaneReady() {
+	ExtraHold hold(*this);
+	return !surfaceRecovery || (displayPowerOn && restoreDpPlane());
+}
+
 IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	if (dscLit) {
 		FBLOG("modes: switch to id %u refused: the boot display runs the DSC test stream (rdna4-dscboot)", m.id);
@@ -3588,13 +3727,18 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		FBLOG("modes: switch to id %u refused: no programmable HDMI or DisplayPort pipe", m.id);
 		return kIOReturnUnsupported;
 	}
-	// The plane scans the console's memory: a mode larger than that (the
-	// firmware's own timing over a console it stretches) would scan past it.
-	if (m.t.hActive > fbWidth || m.t.vActive > fbHeight) {
+	// Only an enumerated EDID mode can use the reserved larger plane.
+	ExtraHold hold(*this);
+	const bool larger = largerThanConsole(m.t);
+	const auto *listed = larger ? findMode(m.id) : nullptr;
+	if (larger && (!dpAperture || !listed || !Edid::sameTiming(listed->t, m.t))) {
 		FBLOG("modes: switch to id %u refused: %ux%u does not fit the %ux%u console", m.id, m.t.hActive, m.t.vActive,
 		      fbWidth, fbHeight);
 		return kIOReturnUnsupported;
 	}
+	if (surfaceRecovery && !restoreDpPlane())
+		return kIOReturnIOError;
+	const bool movePlane = dpAperture && (larger || activeDpMode() || bootScanout() == dpPlaneMc);
 	ModeSet::Target t {};
 	if (!bootPipeTarget(t)) {
 		FBLOG("modes: switch to id %u refused: no VBIOS path for HPD%u", m.id, pipe.hpd);
@@ -3625,13 +3769,19 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	// request timing it has, which is the GOP's boot mode's until a switch with values replaced it: a mode that has to
 	// deliver its lines faster than that underflows (2560x1440@120 on the 4K mode's, card, 2026-11-15), refused.
 	static ModeSet::Step modeRegs[Pipe2::kMaxModeSteps];
-	ExtraHold hold(*this);
 	struct TableBack {
 		RDNA4Device &dev;
 		bool used;
 		~TableBack() { if (used) dev.useSlotTable(); }
 	} back { *this, dp && pipe.otg == 0 && pipe.hubp == 0 && pipe.dig == 0 && pipe.hpd == 1 && Pipe2::use(1, false, 0, true) };
 	const bool known = back.used && Pipe2::modeKnown(m.t);
+	if (movePlane) {
+		if (!back.used || (larger && (!known || !singleDpPipe() || !bootSinkPresent() ||
+		                              !bootEdidMatches() || m.t.pixelClockKHz > dpSurfaceClockLimit())))
+			return kIOReturnUnsupported;
+		t.surface = larger ? dpPlaneMc : dpConsoleMc;
+		t.pitch = (larger ? dpSurface.rowBytes : fbRowBytes) / 4;
+	}
 	if (!reqTimingValid) {
 		reqTiming = bootTiming;
 		reqTimingValid = bootTimingValid;
@@ -3678,14 +3828,51 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		FBLOG("modes: DisplayPort, link untouched: DTO %u + %u / %u -> %u + %u / %u, DP_VID_M 0x%x -> 0x%x",
 		      dtoNow.integer, dtoNow.phase, dtoNow.modulo, t.dto.integer, t.dto.phase, t.dto.modulo,
 		      vidMNow, t.vidM);
-	if (runPlan(modePlan)) {
+	if (movePlane) {
+		ModeSet::Target undo = t;
+		undo.from = t.to;
+		undo.to = liveTiming;
+		undo.dto = dtoNow;
+		undo.vidM = vidMNow;
+		returnMc = bootScanout();
+		returnPitch = (regReadDmu(2, Pipe::Reg::kHubpSurfacePitch) & 0xffff) + 1;
+		const uint32_t viewport = regReadDmu(2, Pipe::Reg::kHubpViewportDim);
+		returnWidth = viewport & 0x3fff;
+		returnHeight = (viewport >> 16) & 0x3fff;
+		undo.pitch = max(returnPitch, static_cast<uint32_t>(liveTiming.hActive));
+		undo.dpMaxKHz = max(undo.dpMaxKHz, liveTiming.pixelClockKHz);
+		if ((regReadDmu(2, kMasterUpdateLock) & 1) || !surfaceLatched(returnMc, returnPitch, returnWidth, returnHeight) ||
+		    !ModeSet::build(undo, surfaceReturn, &why))
+			return kIOReturnUnsupported;
+		// Each locked field the forward plan touches, including the generated DML steps,
+		// goes back to its actual old value (the firmware may have left the scaler on).
+		if (!ModeSet::capturePlane(surfaceReturn, pipeRead, this))
+			return kIOReturnUnsupported;
+		surfaceRecovery = true;
+	}
+	bool applied = runPlan(modePlan);
+	uint64_t periodNs = 0;
+	if (applied && movePlane) {
+		applied = surfaceLatched(t.surface, t.pitch, m.t.hActive, m.t.vActive);
+		periodNs = applied ? measureFramePeriodNs() : 0;
+		const uint64_t measured = periodNs ? 1000000000000ull / periodNs : 0;
+		const uint64_t expected = m.t.refreshMilliHz();
+		applied = expected && measured * 100 >= expected * 99 && measured * 100 <= expected * 101;
+	}
+	if (applied) {
+		if (dpAperture) {
+			surfaceRecovery = false;
+			currentModeId = m.id;
+			__atomic_store_n(&dpActiveId, larger ? m.id : 0, __ATOMIC_RELEASE);
+		}
 		liveTiming = m.t;
 		if (t.nextra)
 			reqTiming = m.t;
 		// The firmware taking SET_PIXEL_CLOCK does not show the PLL runs at
 		// the new rate: time the OTG's frames. An unchanged clock would give
 		// the old pixel clock over the new totals, not this refresh.
-		const uint64_t periodNs = measureFramePeriodNs();
+		if (!movePlane)
+			periodNs = measureFramePeriodNs();
 		const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
 		FBLOG("modes: now %ux%u@%u.%03u, measured %u.%03u Hz", m.t.hActive, m.t.vActive,
 		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, mHz / 1000, mHz % 1000);
@@ -3700,6 +3887,11 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		return kIOReturnSuccess;
 	}
 
+	if (movePlane) {
+		const bool restored = restoreDpPlane();
+		FBLOG("modes: surface switch failed, previous plane %s", restored ? "restored" : "recovery pending");
+		return kIOReturnIOError;
+	}
 	// Put the previous timing back so the display is not left dark.
 	aim(m.t, liveTiming);
 	bool restored = ModeSet::build(t, modePlan, &why) && runPlan(modePlan);

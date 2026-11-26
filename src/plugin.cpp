@@ -302,16 +302,21 @@ ScaledMemory gBootScaledMemory;
 bool gScaledOffered { false };                  // our accelerator serves WindowServer: it can present their frames
 bool gApertureRouted { false };                 // wrapGetApertureRange is in: without it a scaled mode's aperture would be cut from BAR0
 
-// Ndrv::Backend over RDNA4Device. Every mode reuses the boot surface: modes
-// never exceed the GOP framebuffer and keep its pitch (see device.hpp).
+// NDRV reports the same aperture and pitch the pipe uses for this mode.
 bool deviceSurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) {
 	auto *dev = static_cast<RDNA4Device *>(ctx);
+	if (dev->dpAperture && !dev->dpPlaneReady())
+		return false;
 	if (m.source == Modes::SourceScaled) {
 		out = { dev->fbPhysBase, m.t.hActive * 4u, m.t.hActive, m.t.vActive };   // (the base is only reported: wrapGetApertureRange)
 		return true;
 	}
-	if (m.t.hActive > dev->fbWidth || m.t.vActive > dev->fbHeight)
-		return false;
+	if (dev->largerThanConsole(m.t)) {
+		if (!dev->dpAperture)
+			return false;
+		out = {dev->dpSurface.physBase, dev->dpSurface.rowBytes, m.t.hActive, m.t.vActive};
+		return true;
+	}
 	out = { dev->fbPhysBase, dev->fbRowBytes, m.t.hActive, m.t.vActive };
 	return true;
 }
@@ -597,7 +602,7 @@ void createHeads(IOPCIDevice *pci) {
 constexpr uint64_t kHeadSlotBytes = 34ull << 20;
 
 uint64_t surfaceFloor(const Head2 *h, const RDNA4Device &dev) {
-	return dev.fbPhysBase + dev.fbLength + h->slot * kHeadSlotBytes;
+	return dev.fbPhysBase + dev.displaySpan() + h->slot * kHeadSlotBytes;
 }
 
 // rdna4-vrr=1: offer variable refresh (docs/freesync-plan.md).
@@ -720,9 +725,9 @@ void fillHead(Head2 *h, RDNA4Device &dev) {
 			h->rangeBase = base;
 			h->rangeLen = mem->getLength();
 			// With the compute bring-up the surface has to end below the compute pool, which never starts
-			// under RDNA4Compute::kPoolFloor.
-			if (computeStage && h->rangeLen > RDNA4Compute::kPoolFloor)
-				h->rangeLen = RDNA4Compute::kPoolFloor;
+			// under kPoolFloor or the enlarged display reservation.
+			if (computeStage)
+				h->rangeLen = min(h->rangeLen, max(RDNA4Compute::kPoolFloor, dev.displayReserve));
 			break;
 		}
 	}
@@ -1393,6 +1398,11 @@ IOReturn head2DriverIO(Head2 *h, void *contents, UInt32 commandCode, uint16_t &c
 // nothing for head 2: hand out its surface instead (retained, as the original
 // does).
 IODeviceMemory *wrapGetVRAMRange(void *fb) {
+	for (const auto &entry : fbTable)
+		if (entry.fb == fb && entry.state && entry.state->dev.dpVram) {
+			entry.state->dev.dpVram->retain();
+			return entry.state->dev.dpVram;
+		}
 	Head2 *h = headFor(fb);
 	if (h && h->vram) {
 		h->vram->retain();
@@ -1405,6 +1415,11 @@ IODeviceMemory *wrapGetVRAMRange(void *fb) {
 // the other heads and the compute pool. Retained, as the original's is; a descriptor passed as IODeviceMemory, as the original does.
 IODeviceMemory *wrapGetApertureRange(void *fb, IOPixelAperture aperture) {
 	if (aperture == kIOFBSystemAperture) {
+		for (const auto &entry : fbTable)
+			if (entry.fb == fb && entry.state && entry.state->dev.activeDpMode()) {
+				entry.state->dev.dpAperture->retain();
+				return entry.state->dev.dpAperture;
+			}
 		uint32_t width, height;
 		ScaledMemory *memory = nullptr;
 		if (Head2 *h = headFor(fb)) {
@@ -1470,6 +1485,11 @@ void attach(FbEntry &e) {
 	const bool vrr = vrrWanted();
 	if (vrr && be.switchTo == deviceSwitchTo)
 		be.setRefresh = deviceSetRefresh;
+	uint32_t guest = 0, bench = 0, cold = 0, dsc = 0;
+	if (orgGetVRAMRange && gApertureRouted && !pvGpu && !(Trial::option("rdna4-pvgpu", guest) && guest) &&
+	    !(Trial::option("rdna4-vrambench", bench) && bench) && !(Trial::option("rdna4-coldboot", cold) && cold) &&
+	    !(Trial::option("rdna4-dscboot", dsc) && dsc))
+		dev.prepareDpSurface(RDNA4Device::kMaxExtra * kHeadSlotBytes + (2ull << 20), computeStage >= RDNA4Compute::StageGfx);
 	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidAll, dev.edidAllLen, be);
 	st->ndrv.adaptiveSync = vrr;
 #ifdef AMDRadeonRDNA4_PVGPU
@@ -1510,7 +1530,7 @@ void attach(FbEntry &e) {
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidAllLen));
 	fillHeads(dev);
 	// Behind the extra heads' slots, below the compute pool (128 MiB).
-	VramBench::run(dev.fbPhysBase, ((dev.fbLength + (1ull << 20) - 1) & ~((1ull << 20) - 1)) +
+	VramBench::run(dev.fbPhysBase, ((dev.displaySpan() + (1ull << 20) - 1) & ~((1ull << 20) - 1)) +
 	                               RDNA4Device::kMaxExtra * kHeadSlotBytes + (2ull << 20));
 
 	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
@@ -1532,7 +1552,7 @@ void attach(FbEntry &e) {
 	// when asked for: it must never be the reason the desktop is missing.
 	if (computeStage && dev.isAmd) {
 		RDNA4Compute::Env env { pci, svc, dev.mmioBase(), dev.mmioSize(), dev.discovery(),
-		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
+		                        dev.fbPhysBase, dev.displayReserve ? dev.displayReserve : dev.fbLength, dev.liveFramePeriodNs(),
 		                        createVblankService, deviceCursorProbe, &dev };
 		env.smuReady = deviceSmuReady;
 		dev.compute = &st->compute;   // its sleep and wake from the device's notifiers (rdna4-syssleep without rdna4-pm)
@@ -2021,6 +2041,8 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 			FBLOG("head2: not available: no IONDRVFramebuffer::start route (error %d)",
 			      patcher.getError());
 		patcher.clearError();
+	}
+	{
 		KernelPatcher::RouteRequest vram {
 			"__ZN17IONDRVFramebuffer12getVRAMRangeEv", wrapGetVRAMRange, orgGetVRAMRange,
 		};
@@ -2031,7 +2053,6 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 			      "will not map the second head", patcher.getError());
 		patcher.clearError();
 	}
-#ifdef AMDRadeonRDNA4_PVGPU
 	{
 		KernelPatcher::RouteRequest aperture {
 			"__ZN17IONDRVFramebuffer16getApertureRangeEi", wrapGetApertureRange, orgGetApertureRange,
@@ -2040,6 +2061,7 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 		FBLOG("modes: IONDRVFramebuffer::getApertureRange %s", gApertureRouted ? "routed" : "NOT routed: no scaled modes");
 		patcher.clearError();
 	}
+#ifdef AMDRadeonRDNA4_PVGPU
 	{   // (pass-through unless our accelerator serves WindowServer)
 		uint32_t accel = 0;
 		gAccelCursor = Trial::bootArg("rdna4-accel", accel) && accel == 4;
@@ -2450,12 +2472,13 @@ bool bootModes(const Modes::Mode *&table, size_t &n, uint32_t &width, uint32_t &
 
 	const RDNA4Device &dev = bootState->dev;
 	uint32_t liveW, liveH;
+	const auto *large = dev.activeDpMode();
 	const bool live = dev.liveSize(liveW, liveH) && liveW && liveW <= dev.fbWidth && liveH && liveH <= dev.fbHeight;
 
 	table = dev.modeTable;
 	n = dev.modeCount;
-	width = live ? liveW : dev.fbWidth;
-	height = live ? liveH : dev.fbHeight;
+	width = large ? large->t.hActive : live ? liveW : dev.fbWidth;
+	height = large ? large->t.vActive : live ? liveH : dev.fbHeight;
 	return true;
 }
 
@@ -2798,6 +2821,10 @@ bool PvScanout::cursorMove(uint32_t port, int32_t x, int32_t y, bool visible)
 	});
 }
 
+bool PvScanout::fixedFrontBuffer(uint32_t port) {
+	return port == 0 && !pvBootHead && bootState && bootState->dev.dpVram;
+}
+
 bool PvScanout::head(uint32_t port, Head &out)
 {
 	if (port == 0 && pvBootHead) {
@@ -2815,8 +2842,12 @@ bool PvScanout::head(uint32_t port, Head &out)
 		if (!bootState)
 			return false;
 
-		// the mode it runs in now (bootModes), from the console's start at its pitch (deviceSurfaceFor); else the console's size
+		// Use the committed scanout geometry for native presents, including the first frame after a switch.
 		const RDNA4Device &dev = bootState->dev;
+		if (const auto *large = dev.activeDpMode()) {
+			out = {dev.dpSurface.physBase, dev.dpSurface.rowBytes, large->t.hActive, large->t.vActive};
+			return true;
+		}
 		const Modes::Mode *table;
 		size_t n;
 		uint32_t width = dev.fbWidth, height = dev.fbHeight;

@@ -94,6 +94,8 @@ struct Plan {
 	size_t    count;
 	Dmub::Cmd cmds[kMaxCmds];
 	size_t    ncmds;
+	// Writes held by the OTG lock, for restoring the exact plane on a failed surface switch.
+	size_t planeBegin, planeEnd;
 };
 
 struct DpDto {
@@ -125,6 +127,9 @@ struct Target {
 	// otherwise: at the monitor's native size the firmware runs the scaler
 	// 1:1 (DSCL_MODE 1), and its request timing goes with that.
 	bool        scalerOff;
+	// A zero address keeps the current plane. pitch is in 32-bit pixels.
+	uint64_t    surface;
+	uint32_t    pitch;
 };
 
 // The first DP_VID_M (against a DP_VID_N of 0x8000) of a stream on a link with
@@ -169,6 +174,9 @@ constexpr uint32_t tmdsKHz(uint32_t pixelClockKHz, bool y420) { return y420 ? pi
 // Build the plan for `t`. Returns false (and `why`) if the target or the
 // timings cannot be expressed.
 bool build(const Target &t, Plan &out, const char **why);
+
+// Replace the locked plane writes in a return plan with the values in use before the switch.
+bool capturePlane(Plan &rollback, uint32_t (*read)(void *, uint8_t, uint32_t), void *ctx);
 
 // Display sleep of an HDMI pipe running `t.to`: what amdgpu's DPMS off comes
 // down to for the sink. AVMUTE, the stream encoder off, and the PHY's clock

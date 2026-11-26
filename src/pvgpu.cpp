@@ -8775,7 +8775,7 @@ void RDNA4PvHost::setUpFlips(ScanoutMap &sm, uint32_t port)
 	uint8_t hubp = 0;
 	uint64_t mc = 0;
 
-	if (gPresentOnCard != 1 || !gCompute->rtScanoutHubp(sm.phys, hubp, mc))
+	if (PvScanout::fixedFrontBuffer(port) || gPresentOnCard != 1 || !gCompute->rtScanoutHubp(sm.phys, hubp, mc))
 		return;
 
 	sm.hubp = hubp;

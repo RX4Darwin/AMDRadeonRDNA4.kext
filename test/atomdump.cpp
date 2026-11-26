@@ -1098,6 +1098,68 @@ static const ModeSet::Step *findWrite(const ModeSet::Plan &p, uint32_t dw, size_
 	return last;
 }
 
+// Exercise the actual boot-pipe Linux rows and the locked surface writes, including a
+// 1080p drawable whose firmware timing and scaler were already set for QHD.
+static int testLargerDpSurface() {
+	if (!Pipe2::use(1, false, 0, true))
+		return check(false, "surface: boot DP table unavailable");
+	const auto uhd = Pipe2::config().timing;
+	const Edid::DetailedTiming qhd {241500, 2560, 160, 48, 32, 1440, 41, 3, 5, true, false, false};
+	int failures = 0;
+	for (const auto &mode : {qhd, uhd}) {
+		ModeSet::Target t {};
+		t.dp = true;
+		t.from = qhd;
+		t.to = mode;
+		t.dpMaxKHz = 650000;
+		t.dto = {0, mode.pixelClockKHz * 1000, 720000000};
+		t.vidM = ModeSet::dpVidM(mode.pixelClockKHz, 540000);
+		t.scalerOff = true;
+		t.surface = 0x12345000000ull;
+		t.pitch = uhd.hActive;
+		ModeSet::Step dml[Pipe2::kMaxModeSteps];
+		t.extra = dml;
+		t.nextra = Pipe2::modeSteps(mode, dml, Pipe2::kMaxModeSteps);
+		ModeSet::Plan forward {}, rollback {};
+		if (!t.nextra || !ModeSet::build(t, forward, nullptr))
+			return check(false, "surface: no generated forward plan for %ux%u", mode.hActive, mode.vActive);
+		ModeSet::Target undo = t;
+		undo.from = mode;
+		undo.to = qhd;
+		if (!ModeSet::build(undo, rollback, nullptr))
+			return check(false, "surface: no return plan");
+		PlanRegs regs;
+		regs.set(2, 0x0607, 1919);
+		regs.set(2, 0x060b, 0x123);
+		regs.set(2, 0x060a, 0x40000000);
+		regs.set(2, 0x05eb, 1920u | (1080u << 16));
+		regs.set(2, 0x0d19, 1);
+		const PlanRegs home = regs;
+		failures += check(ModeSet::capturePlane(rollback, PlanRegs::read, &regs), "surface: capture boot plane");
+		regs.run(forward);
+		failures += check(regs.get(2, 0x0607) == t.pitch - 1 && regs.get(2, 0x060a) == uint32_t(t.surface) &&
+		                  regs.get(2, 0x060b) == t.surface >> 32 && regs.get(2, 0x05eb) ==
+		                  (uint32_t(mode.hActive) | (uint32_t(mode.vActive) << 16)), "surface: pitch, address and viewport");
+		regs.run(rollback);
+		for (size_t i = rollback.planeBegin; i < rollback.planeEnd; ++i) {
+			const auto &field = rollback.steps[i];
+			const uint32_t mask = field.op == ModeSet::Op::Update ? field.mask : ~0u;
+			failures += check(((regs.get(field.seg, field.dword) ^ home.get(field.seg, field.dword)) & mask) == 0,
+			                  "surface: restore %s", field.what);
+		}
+		regs.set(2, 0x0607, ~0u);
+		failures += check(!ModeSet::capturePlane(rollback, PlanRegs::read, &regs), "surface: unreadable pitch");
+		t.pitch = mode.hActive - 1;
+		failures += check(!ModeSet::build(t, forward, nullptr), "surface: reject undersized pitch");
+		t.pitch = uhd.hActive;
+		t.surface++;
+		failures += check(!ModeSet::build(t, forward, nullptr), "surface: reject misaligned address");
+	}
+	if (!failures)
+		printf("surface: generated QHD and UHD plane switches and stretched-console restoration passed\n");
+	return failures;
+}
+
 static int testModeSet() {
 	int failures = 0;
 	Edid::DetailedTiming t1080 {}, t720 {};
@@ -5881,6 +5943,7 @@ int main(int argc, char **argv) {
 	failures += testNdrv();
 	failures += testScaledModes();
 	failures += testModeSet();
+	failures += testLargerDpSurface();
 	failures += testDpRetime();
 	failures += testPipe2();
 	failures += testDpTrain();

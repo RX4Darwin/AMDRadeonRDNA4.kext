@@ -933,7 +933,9 @@ void RDNA4Device::cursorDsclDecide() {
 	const bool asked = PE_parse_boot_argn("rdna4-cursordscl", &want, sizeof(want)) && want == 1;
 	const uint32_t mode = regReadDmu(2, kDsclSclMode + dpp) & 7;
 	const uint32_t recout = regReadDmu(2, kDsclRecoutSize + dpp), mpc = regReadDmu(2, kDsclMpcSize + dpp);
-	const uint32_t w = fbWidth, h = fbHeight, size = w | (h << 16);
+	const auto *large = activeDpMode();
+	const uint32_t w = large ? large->t.hActive : fbWidth, h = large ? large->t.vActive : fbHeight;
+	const uint32_t size = w | (h << 16);
 	const bool bypass = mode == 6, wrong = recout != size || mpc != size;
 	const char *kase;
 	if (bypass)

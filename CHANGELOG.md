@@ -5,6 +5,10 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- The primary DisplayPort framebuffer can offer EDID modes larger than the firmware console using a separate scanout
+  surface and the boot pipe’s Linux DML table. Host tests cover QHD and UHD plane programming and restoration of a
+  stretched 1080p console. Hardware validation of this implementation is pending.
+
 - The boot framebuffer serves up to four EDID blocks over DisplayPort. On the maintainer's Samsung 4K display, macOS
   received the third block (DisplayID) and 2560×1440 ran at 143.98 Hz with the display series from PR #28.
 
