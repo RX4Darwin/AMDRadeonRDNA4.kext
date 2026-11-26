@@ -74,9 +74,10 @@ sink is in D0), by `DpTrain` for a `Link::fec`; pipegen took one pixel a cycle f
 no overflow; OPTC DSC mode, 2.0 bytes per pixel, 960-pixel slices; encoder told "compressed"; FEC active, the sink decodes FEC
 with 0 errors.
 
-Next for 144 Hz: a test of the two-pixel path the monitor surely accepts (4K120 at 1188 MHz with DSC is the same path; an
-uncompressed mode above 720 MHz from the EDID needs more than HBR3 has), and reading what the GOP or Windows program for this
-monitor at 144 Hz (the rig boots Windows) to compare with Linux's sequence.
+Next for 144 Hz: a reference from a working driver. The rig has no Linux any more (Windows and macOS only), and reading DCN
+registers under Windows needs a kernel tool (RW-Everything's driver is on Microsoft's blocklist). The plan: one boot of a Linux
+live USB (kernel 6.13 or later) with the Samsung at 3840x2160@144, `sudo bash tools/linux/linux-capture.sh --snap-only`, and the
+dump diffed against pipe2_linux_p0_dp1_dsc144.inc. Sunneva, 2026-11-26: not now.
 
 ## Notes
 
