@@ -3020,7 +3020,7 @@ bool RDNA4Device::readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link) {
 	// Receiver capability, then what the firmware told the sink: LINK_BW_SET,
 	// LANE_COUNT_SET, and from 0x202 on how the lanes are doing.
 	uint8_t caps[16] {}, set[2] {}, status[6] {};
-	if (!dpcdRead(sinkAuxInst, 0x000, caps, sizeof(caps)) || !dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) ||
+	if (!readReceiverCaps(sinkAuxInst, caps) || !dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) ||
 	    !dpcdRead(sinkAuxInst, 0x202, status, sizeof(status))) {
 		FBLOG("dptrain: the sink's DPCD did not answer on AUX%u", sinkAuxInst);
 		return false;
@@ -3959,7 +3959,7 @@ bool RDNA4Device::readSecondDpSink(uint8_t aux) {
 	uint8_t caps[16] {};
 	xp().aux = aux;
 	xp().sink = {};
-	if (!dpcdRead(aux, 0x000, caps, sizeof(caps)) || !DpTrain::parseCaps(caps, sizeof(caps), xp().sink)) {
+	if (!readReceiverCaps(aux, caps) || !DpTrain::parseCaps(caps, sizeof(caps), xp().sink)) {
 		xp().sink = {};
 		FBLOG("pipe2: no DisplayPort receiver capability on AUX%u", aux);
 		return false;
@@ -3968,6 +3968,21 @@ bool RDNA4Device::readSecondDpSink(uint8_t aux) {
 	      caps[0] & 0xf, xp().sink.maxLanes, xp().sink.maxRate, xp().sink.tps3 ? ", TPS3" : "",
 	      xp().sink.tps4 ? ", TPS4" : "");
 	readDscCaps(aux, xp().sink, "pipe2");
+	return true;
+}
+
+// The receiver capability (DPCD 0x000..0x00F), as Linux's retrieve_link_cap reads it: when TRAINING_AUX_RD_INTERVAL has
+// EXT_RECEIVER_CAP_FIELD_PRESENT, the extended block at 0x2200 stands in for it (a DP 1.3+ sink may report 1.2 and HBR2
+// at 0x000 for old sources); if that read fails, the base block stays.
+bool RDNA4Device::readReceiverCaps(uint8_t aux, uint8_t (&caps)[16]) {
+	if (!dpcdRead(aux, 0x000, caps, sizeof(caps)))
+		return false;
+	uint8_t ext[16] {};
+	if ((caps[0x0e] & 0x80) && dpcdRead(aux, 0x2200, ext, sizeof(ext))) {
+		FBLOG("dpcd: AUX%u: extended receiver capability: DPCD %u.%u rate 0x%02x (at 0x000: %u.%u rate 0x%02x)", aux, ext[0] >> 4,
+		      ext[0] & 0xf, ext[1], caps[0] >> 4, caps[0] & 0xf, caps[1]);
+		memcpy(caps, ext, sizeof(ext));
+	}
 	return true;
 }
 
