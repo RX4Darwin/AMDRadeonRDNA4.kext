@@ -76,6 +76,11 @@ size_t build(const uint8_t *edid, size_t len, const Limits &lim, Mode *out, size
 // pixel clock within 0.5%), or -1.
 int match(const Mode *modes, size_t n, const Edid::DetailedTiming &t);
 
+// A firmware scaler can send a larger raster than the surface the OS draws.
+// Identify the console by its drawable size and the running refresh.
+int stretchedConsole(const Mode *modes, size_t count, uint32_t width, uint32_t height,
+                     const Edid::DetailedTiming &wire);
+
 // Insert a timing (e.g. the timing read back from the GOP-programmed OTG)
 // if no match exists; returns its index, or -1 if `t` is unusable. A new
 // timing is appended with the next free ID so the EDID modes keep theirs;

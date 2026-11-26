@@ -266,6 +266,27 @@ int match(const Mode *modes, size_t n, const Edid::DetailedTiming &t) {
 	return best;
 }
 
+int stretchedConsole(const Mode *modes, size_t count, uint32_t width, uint32_t height,
+                     const Edid::DetailedTiming &wire) {
+	if (!width || !height || width > wire.hActive || height > wire.vActive ||
+	    (width == wire.hActive && height == wire.vActive))
+		return -1;
+	const uint32_t rate = wire.refreshMilliHz();
+	uint32_t nearest = 501;
+	int found = -1;
+	for (size_t i = 0; i < count; ++i) {
+		const Mode &m = modes[i];
+		if (m.t.hActive != width || m.t.vActive != height)
+			continue;
+		const uint32_t delta = m.refreshMilliHz > rate ? m.refreshMilliHz - rate : rate - m.refreshMilliHz;
+		if (delta < nearest) {
+			nearest = delta;
+			found = static_cast<int>(i);
+		}
+	}
+	return found;
+}
+
 int ensure(Mode *modes, size_t &n, size_t cap, const Edid::DetailedTiming &t, uint8_t source) {
 	if (!modes || !cap || !usable(t))
 		return -1;

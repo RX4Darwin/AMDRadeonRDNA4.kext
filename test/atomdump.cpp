@@ -3103,6 +3103,21 @@ static int testNdrv() {
 	                  memcmp(ddcRec.ddcBlockData, plain, 128) == 0,
 	                  "ndrv: complete EDID not served unchanged");
 
+	// The boot ID refers to the console even when the firmware stretches it onto QHD.
+	Edid::DetailedTiming wire {241500, 2560, 160, 48, 32, 1440, 41, 3, 5, true, false, false}, hd {};
+	Edid::vicTiming(16, hd);
+	Modes::Mode stretched[] = {
+		{1, wire, wire.refreshMilliHz(), true, Modes::SourceDtd},
+		{2, hd, hd.refreshMilliHz(), false, Modes::SourceVic}
+	};
+	failures += check(Modes::stretchedConsole(stretched, 2, 1920, 1080, wire) == 1 &&
+	                  Modes::stretchedConsole(stretched, 1, 1920, 1080, wire) == -1 &&
+	                  Modes::stretchedConsole(stretched, 2, 2560, 1440, wire) == -1,
+	                  "ndrv: 1080p boot surface and QHD wire mode have distinct IDs");
+	stretched[1].refreshMilliHz = 120000;
+	failures += check(Modes::stretchedConsole(stretched, 2, 1920, 1080, wire) == -1,
+	                  "ndrv: a 120 Hz mode cannot describe the 60 Hz console");
+
 	// A DP monitor with its DisplayID timing past the CTA extension.
 	uint8_t extended[512] {};
 	memcpy(extended, plain, 128);

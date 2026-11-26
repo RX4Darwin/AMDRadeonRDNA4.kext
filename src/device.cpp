@@ -2825,13 +2825,26 @@ void RDNA4Device::buildModeTable() {
 	// entry. Without a readable pipe (VM, unknown hardware), the EDID's
 	// preferred timing stands in when it matches the console geometry.
 	int bootIdx = -1;
+	const bool stretched = bootTimingValid && bootTiming.pixelClockKHz &&
+	                       (bootTiming.hActive > fbWidth || bootTiming.vActive > fbHeight);
 	if (bootTimingValid && bootTiming.pixelClockKHz) {
-		bootIdx = Modes::match(modeTable, modeCount, bootTiming);
-		if (bootIdx >= 0)
-			bootTiming.pixelClockKHz = modeTable[bootIdx].t.pixelClockKHz;
-		else
-			bootIdx = Modes::ensure(modeTable, modeCount, Modes::MaxModes, bootTiming,
-			                        Modes::SourceBoot);
+		const int wire = Modes::match(modeTable, modeCount, bootTiming);
+		if (wire >= 0)
+			bootTiming.pixelClockKHz = modeTable[wire].t.pixelClockKHz;
+		if (stretched) {
+			bootIdx = Modes::stretchedConsole(modeTable, modeCount, fbWidth, fbHeight, bootTiming);
+			if (bootIdx < 0) {
+				// No EDID mode describes the drawable console. Leave its geometry to IOBootNDRV.
+				modeCount = 0;
+				liveTiming = bootTiming;
+				liveTimingValid = true;
+				FBLOG("modes: no matching EDID mode for the stretched %ux%u console", fbWidth, fbHeight);
+				return;
+			}
+		} else {
+			bootIdx = wire >= 0 ? wire : Modes::ensure(modeTable, modeCount, Modes::MaxModes,
+			                                           bootTiming, Modes::SourceBoot);
+		}
 	} else if (edidLen) {
 		Edid::DetailedTiming pref {};
 		if (Edid::preferredTiming(edidData, edidLen, pref) &&
@@ -2851,7 +2864,7 @@ void RDNA4Device::buildModeTable() {
 	}
 
 	currentModeId = defaultModeId = modeTable[bootIdx].id;
-	liveTiming = modeTable[bootIdx].t;
+	liveTiming = stretched ? bootTiming : modeTable[bootIdx].t;
 	liveTimingValid = bootTimingValid;
 	for (size_t i = 0; i < modeCount; i++) {
 		const Modes::Mode &m = modeTable[i];
