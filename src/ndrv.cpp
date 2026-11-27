@@ -625,6 +625,18 @@ int32_t Translator::switchMode(VDSwitchInfoRec &r) {
 	return kSuccess;
 }
 
+void Translator::relit() {
+	const Modes::Mode *m = runFor(current);
+	if (!m || !be.switchTo || be.switchTo(be.ctx, *m, m->id == bootModeId) != kSuccess)
+		return;
+	const Slot *sl = slotFor(current);
+	const uint32_t ext = sl && sl->mode ? sl->timing.csReserved2 : 0;
+	if (be.setRefresh && (ext || variable) && be.setRefresh(be.ctx, *m, ext) == kSuccess)
+		variable = ext != 0;
+	if (hdr && be.setHdr)
+		(void)be.setHdr(be.ctx, isHdrId(current));
+}
+
 // IONDRVFramebuffer::setDetailedTiming: free a slot, or give it a timing and the mode ID (alias) macOS knows it by.
 int32_t Translator::setDetailedTiming(const VDDetailedTimingRec &r) {
 	const int32_t id = r.csDisplayModeID;

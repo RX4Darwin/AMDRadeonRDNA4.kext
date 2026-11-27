@@ -452,6 +452,7 @@ void RDNA4Device::smuStarted()
 
 	logDisplayClocks();
 	uhdClocks = raiseDisplayClocks();
+	uclkKnown = false;   // a firmware started again (after a power loss) has forgotten the hard minimum
 	memoryClockFollowDisplays();
 }
 

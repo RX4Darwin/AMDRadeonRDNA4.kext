@@ -330,10 +330,16 @@ public:
 	bool coldStartPending { false };   // a wake's power loss whose cold start (coldStartHeads) has not run yet
 	void captureGopState();    // the GOP's scanout address, DCHUB timer and boot link, for a later cold start
 	uint32_t vramMark { 0 };   // what sleepWakeMessage wrote into VRAM before sleep (0: nothing)
+	uint32_t sleepRebar[6] {};   // the Resizable BAR controls before sleep (OpenCore's sizes: a power loss sets the defaults)
+	uint32_t sleepRebarCount { 0 };
 	uint64_t coldGopSurface { 0 };
 	// Where HUBP0 scans (HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS and _HIGH): the GOP's console on a warm card.
 	uint64_t bootScanout() const { return regReadDmu(2, 0x060a) | static_cast<uint64_t>(regReadDmu(2, 0x060b) & 0xffff) << 32; }
 	uint32_t coldGopTimer { 0 };
+	// DCHUBBUB's arbiter (DCHUBBUB_ARB_DF_REQ_OUTSTAND 0x04f9 to _TIMEOUT_ENABLE 0x0526) as the boot runs it (keepArbiter)
+	static constexpr uint32_t kGopArbFirst = 0x04f9, kGopArbCount = 0x0526 - 0x04f9 + 1;
+	uint32_t coldGopArb[kGopArbCount] {};
+	bool coldGopArbKnown { false };
 	void takeExtraDown();
 	bool consoleMcAddress(uint64_t &mc);
 	void logBootLink(const char *when);
@@ -427,6 +433,10 @@ private:
 	// The card's PCI config space (and its PCIe link, power state, Resizable BAR), the two bridges of its own PCIe
 	// switch above it, and three registers over MMIO: what a reset or a sleep leaves (`when` names the moment).
 	void logPciState(const char *when);
+	void saveRebar();
+	bool asicInit(const char *when);
+	void keepArbiter();
+	void restoreRebar();
 	// rdna4-syssleep=1: logPciState at the system's sleep and wake (roadmap item 5, stage 2).
 	IONotifier *sleepWakeNotifier { nullptr };
 	// Without rdna4-pm the runtime's own sleep and wake are driven from here: powerWillSleep at the system's sleep

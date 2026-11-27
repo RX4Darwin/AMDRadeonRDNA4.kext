@@ -5,6 +5,12 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- System sleep again with the 1 GiB BAR, HDR and audio: after the card's power loss the wake now sets the Resizable BAR
+  sizes back (they came back at 256 MiB: both displays black), runs the VBIOS's asic_init, sets the display arbiter
+  (watermarks, memory clock change control) back to the boot's (flickering lines on both displays), puts each display
+  back into macOS's mode (a 144 Hz Lenovo relit at 60 Hz stayed black) and sets its audio up again. On the rig: both
+  displays clean after the wake, with the memory clock held and free (HDR on), audio outputs back.
+
 - Audio over DisplayPort, first steps (`rdna4-audio=1`, off by default): the boot display's audio is programmed as
   Linux does it, and the card's audio function is handed to Apple's AppleGFXHDA, which then lists the monitor as a
   sound output; each DisplayPort display gets its own, from its EDID. On the rig the Samsung Odyssey G70D and the

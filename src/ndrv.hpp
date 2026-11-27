@@ -322,6 +322,10 @@ public:
 	bool control(uint16_t code, void *params, int32_t &ret);
 
 	int32_t currentModeId() const { return current; }
+	const Modes::Mode *runningMode() const { return runFor(current); }   // the current mode as the pipe runs it
+	// The pipe was lit again from nothing (the cold start after a power loss) in a mode of the cold start's: the current one
+	// programmed again, with its refresh and HDR as switchMode leaves them.
+	void relit();
 
 	// Whether a display is on the connector. Without one cscGetConnection
 	// says so and there is no DDC block: macOS takes the framebuffer offline

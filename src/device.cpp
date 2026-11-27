@@ -2385,6 +2385,7 @@ IOReturn RDNA4Device::sleepWakeMessage(void *target, void *, UInt32 type, IOServ
 	};
 	if (type == kIOMessageSystemWillSleep) {
 		dev->logPciState("before sleep");
+		dev->saveRebar();
 		dev->vramMark = vramWord(true, 0x5a5a1234) == 0x5a5a1234 ? 0x5a5a1234 : 0;
 		if (dev->drivesRuntimePower()) {   // the engines quiesced while the card has power
 			dev->compute->powerSleepRequest();
@@ -2410,6 +2411,45 @@ IOReturn RDNA4Device::sleepWakeMessage(void *target, void *, UInt32 type, IOServ
 	return kIOReturnSuccess;
 }
 
+
+// The VBIOS's asic_init (table 0, decoded): wait for C2PMSG_33 to read 0x80000000 (4 s); if it does not and the strap (REG 0x50
+// bits 31:24) is 1, ask the bootloader with 0x70000 in C2PMSG_35 and wait again; then the tail: REG 6 = (REG 0xde3 - 1) >> 11,
+// REG 0x53 |= 0x200. The GOP runs it at boot; after a mode-1 reset (coldReset) and after a power loss (a system sleep) nothing
+// else does, as amdgpu_device_resume runs amdgpu_device_asic_init for a card that needs posting.
+bool RDNA4Device::asicInit(const char *when) {
+	if (!rmmio || !ipDiscovery.isValid())
+		return false;
+	uint32_t c2p33 = 0, c2p35 = 0;
+	if (!ipDiscovery.regByteOffset(IpDiscovery::HwMp0, 0, 0, 0x61, c2p33) || !ipDiscovery.regByteOffset(IpDiscovery::HwMp0, 0, 0, 0x63, c2p35) ||
+	    c2p33 + 4 > rmmioSize || c2p35 + 4 > rmmioSize)
+		return false;
+	c2p33 /= 4, c2p35 /= 4;
+	auto waitFor = [&](uint32_t dword, uint32_t mask, uint32_t want, uint32_t ms) {
+		for (uint32_t t = 0; t < ms; t++) {
+			if ((rmmio[dword] & mask) == want)
+				return true;
+			IOSleep(1);
+		}
+		return false;
+	};
+	const uint32_t before6 = rmmio[0x0006], before53 = rmmio[0x0053];
+	const uint32_t strap = rmmio[0x50] & 0xff000000;
+	bool vmbx = waitFor(c2p33, 0xffffffff, 0x80000000, 4000);
+	if (!vmbx && strap == 0x01000000) {
+		rmmio[c2p35] = 0x70000;
+		const bool done = waitFor(c2p35, 0xffffffff, 0x80000000, 4000);
+		rmmio[0x50] &= 0x00ffffff;
+		vmbx = done && waitFor(c2p33, 0xffffffff, 0x80000000, 4000);
+	}
+	const uint32_t de3 = rmmio[0x0de3];
+	if (de3) {
+		rmmio[0x0006] = (de3 - 1) >> 11;
+		rmmio[0x0053] |= 0x200;
+	}
+	FBLOG("cold: %s: asic_init: C2PMSG_33 %s (0x%08x, strap 0x%08x); [0x0006] 0x%08x -> 0x%08x [0x0053] 0x%08x -> 0x%08x [0x0de3] 0x%08x",
+	      when, vmbx ? "ready" : "NOT ready", rmmio[c2p33], strap, before6, rmmio[0x0006], before53, rmmio[0x0053], de3);
+	return vmbx;
+}
 
 // Stage (b): amdgpu_device_mode1_reset as Linux runs it on MP1 14.0.2/3, then the VBIOS's asic_init. Not the
 // IP blocks: the PSP's sOS, the SMU's features, DMUB, the display and the compute runtime are as dead afterwards as
@@ -2492,24 +2532,7 @@ bool RDNA4Device::coldReset() {
 	      rmmio[c2p33], rmmio[c2p81], pciDevice->configRead16(kIOPCIConfigCommand),
 	      pciDevice->configRead32(kIOPCIConfigBaseAddress1), pciDevice->configRead32(kIOPCIConfigBaseAddress0));
 
-	// The VBIOS's asic_init (table 0, decoded): wait for C2PMSG_33 to read 0x80000000 (4 s); if it does not and the
-	// strap (REG 0x50 bits 31:24) is 1, ask the bootloader with 0x70000 in C2PMSG_35 and wait again; then the tail:
-	// REG 6 = (REG 0xde3 - 1) >> 11, REG 0x53 |= 0x200.
-	const uint32_t strap = rmmio[0x50] & 0xff000000;
-	bool vmbx = waitFor(c2p33, 0xffffffff, 0x80000000, 4000);
-	if (!vmbx && strap == 0x01000000) {
-		rmmio[c2p35] = 0x70000;
-		const bool done = waitFor(c2p35, 0xffffffff, 0x80000000, 4000);
-		rmmio[0x50] &= 0x00ffffff;
-		vmbx = done && waitFor(c2p33, 0xffffffff, 0x80000000, 4000);
-	}
-	const uint32_t de3 = rmmio[0x0de3];
-	if (de3) {
-		rmmio[0x0006] = (de3 - 1) >> 11;
-		rmmio[0x0053] |= 0x200;
-	}
-	FBLOG("cold: asic_init: C2PMSG_33 %s (0x%08x, strap 0x%08x); [0x0006] 0x%08x [0x0053] 0x%08x [0x0de3] 0x%08x",
-	      vmbx ? "ready" : "NOT ready", rmmio[c2p33], strap, rmmio[0x0006], rmmio[0x0053], de3);
+	const bool vmbx = asicInit("after the reset");
 
 	// VRAM after: whether the pattern survived, and whether a new one reads back.
 	if (vram) {
@@ -2523,12 +2546,52 @@ bool RDNA4Device::coldReset() {
 	return boot && sized && vmbx;
 }
 
+// The Resizable BAR controls (extended capability 0x15) before a system sleep. A power loss sets them to the card's defaults
+// (BAR0 256 MiB, BAR2 2 MiB), and neither the firmware's resume nor IOPCIFamily sets OpenCore's sizes again (ResizeAppleGpuBars:
+// 1 GiB on the rig): the VRAM beyond 256 MiB went out of reach of everything mapped through BAR0, and both displays stayed black
+// after the wake (2026-11-27).
+void RDNA4Device::saveRebar() {
+	IOByteCount rebar = 0;
+	sleepRebarCount = 0;
+	if (!pciDevice || !pciDevice->extendedFindPCICapability(-0x15, &rebar) || !rebar)
+		return;
+	const uint32_t count = (pciDevice->extendedConfigRead32(rebar + 8) >> 5) & 7;   // NBAR, in entry 0's control
+	for (; sleepRebarCount < count && sleepRebarCount < 6; sleepRebarCount++)
+		sleepRebar[sleepRebarCount] = pciDevice->extendedConfigRead32(rebar + 8 + 8 * sleepRebarCount);
+}
+
+// After the power loss, as amdgpu_device_resize_fb_bar does it: memory decoding off, the sizes, the BARs' addresses again (a size
+// change can clear their low address bits), decoding back on.
+void RDNA4Device::restoreRebar() {
+	IOByteCount rebar = 0;
+	if (!sleepRebarCount || !pciDevice || !pciDevice->extendedFindPCICapability(-0x15, &rebar) || !rebar)
+		return;
+	bool differ = false;
+	for (uint32_t i = 0; i < sleepRebarCount; i++)
+		differ |= ((pciDevice->extendedConfigRead32(rebar + 8 + 8 * i) ^ sleepRebar[i]) & 0x3f00) != 0;
+	if (!differ)
+		return;
+	uint32_t bars[6];
+	for (uint32_t i = 0; i < 6; i++)
+		bars[i] = pciDevice->configRead32(static_cast<uint8_t>(kIOPCIConfigBaseAddress0 + 4 * i));
+	const uint16_t command = pciDevice->configRead16(kIOPCIConfigCommand);
+	pciDevice->configWrite16(kIOPCIConfigCommand, static_cast<uint16_t>(command & ~kIOPCICommandMemorySpace));
+	for (uint32_t i = 0; i < sleepRebarCount; i++)
+		pciDevice->extendedConfigWrite32(rebar + 8 + 8 * i, sleepRebar[i]);
+	for (uint32_t i = 0; i < 6; i++)
+		pciDevice->configWrite32(static_cast<uint8_t>(kIOPCIConfigBaseAddress0 + 4 * i), bars[i]);
+	pciDevice->configWrite16(kIOPCIConfigCommand, command);
+	FBLOG("cold: pci powered on: Resizable BAR sizes set again as before the sleep (BAR0 2^%u MiB)", (sleepRebar[0] >> 8) & 0x3f);
+}
+
 // The card's IOPCIDevice powered on again after a sleep: IOPCIFamily has restored its config space, so its registers
 // answer (unposted). The runtime's wake bring-up (on its own thread) runs from here without rdna4-pm.
 IOReturn RDNA4Device::pciPowerMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t) {
 	auto *dev = static_cast<RDNA4Device *>(target);
 	if (type == kIOMessageDeviceHasPoweredOn) {
+		dev->restoreRebar();
 		dev->logPciState("pci powered on");
+		(void)dev->asicInit("pci powered on");
 		// The card powered off with the system (it has no power states of its own): it lost its power. Said here too, not only
 		// at kIOMessageSystemWillPowerOn: in a dark wake (the system woken by a PCIe PME, a USB key press here) the card powers
 		// on long before that message, which only comes with the full wake, and the bring-up below would run warm (no displays).
@@ -3599,7 +3662,38 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 		FBLOG("dcninit: the mode before the power loss (%ux%u at %u kHz) set again: %s (0x%x)", wanted.hActive, wanted.vActive,
 		      wanted.pixelClockKHz, back == kIOReturnSuccess ? "done" : "FAILED, the table's timing kept", back);
 	}
+	if (ok)
+		keepArbiter();
 	return ok;
+}
+
+// DCHUBBUB's arbiter (watermarks, DRAM state, memory clock change control) as the boot's cold start leaves it running: the GOP's
+// values with what dcn401_init_hw changes (13 of the 46 on the rig). The kext programs none of it otherwise, so after a power
+// loss it was at its reset values, and the memory clock changed under the scanout: flickering lines on both displays after a
+// system sleep, which only a held memory clock calmed (card, 2026-11-27). Kept at a boot, set again after a power loss (change
+// control, 0x0524, last).
+void RDNA4Device::keepArbiter() {
+	constexpr uint32_t kChangeCntl = 0x0524 - kGopArbFirst;
+	if (!coldBoot || !coldGopArbKnown) {
+		for (uint32_t i = 0; i < kGopArbCount; i++)
+			coldGopArb[i] = regReadDmu(2, kGopArbFirst + i);
+		coldGopArbKnown = true;
+		return;
+	}
+	uint32_t differ = 0, first = 0, was = 0;
+	for (uint32_t i = 0; i < kGopArbCount; i++) {
+		const uint32_t now = regReadDmu(2, kGopArbFirst + i);
+		if (now == coldGopArb[i])
+			continue;
+		if (!differ++)
+			first = i, was = now;
+		if (i != kChangeCntl)
+			regWriteDmu(2, kGopArbFirst + i, coldGopArb[i]);
+	}
+	if (regReadDmu(2, kGopArbFirst + kChangeCntl) != coldGopArb[kChangeCntl])
+		regWriteDmu(2, kGopArbFirst + kChangeCntl, coldGopArb[kChangeCntl]);
+	FBLOG("dcninit: DCHUBBUB arbiter: %u of %u registers differed from the boot's, set again (first 0x%04x: 0x%08x, the boot's 0x%08x)",
+	      differ, kGopArbCount, kGopArbFirst + first, was, coldGopArb[first]);
 }
 
 // 3840x2160@144 needs DSC on four HBR3 lanes, DISPCLK raised to DML's 1384.6 MHz (raiseDispclkFor, when switched to)

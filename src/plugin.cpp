@@ -913,7 +913,20 @@ void coldStartHeads(RDNA4Device &dev) {
 	RDNA4Device::ExtraHold hold(dev);
 	uint32_t relight = 0;
 
-	(void)dev.coldStart(relight);
+	// After a power loss (a system sleep, 2026-11-27) the cold start lights the pipes in its own modes (the boot one's, a head's boot
+	// level): macOS's are programmed again where they differ. The Lenovo, relit at 1080p60 while macOS had it at 144 Hz, got 144 Hz's
+	// variable refresh range: frames stretched to 20 Hz, a black screen. Its dcn401_init_hw also takes the displays' audio down.
+	auto inMacOsMode = [](Ndrv::Translator &t, const Edid::DetailedTiming *live) {
+		const Modes::Mode *m = t.runningMode();
+		if (m && live && !Edid::sameTiming(*live, m->t))
+			t.relit();
+	};
+	if (dev.coldStart(relight)) {
+		if (bootState)
+			inMacOsMode(bootState->ndrv, dev.liveMode());
+		if (gAudioOn)
+			(void)dev.enableBootAudio();
+	}
 	for (size_t i = 0; i < headCount; i++) {
 		Head2 *h = heads[i];
 
@@ -927,6 +940,10 @@ void coldStartHeads(RDNA4Device &dev) {
 		dev.breadcrumb(step);
 		dev.extraAuxPadsAfterPowerLoss();
 		dev.lightSecondPipe(head2Level, h->surface.physBase);
+		if (!pending && dev.xp().lit)
+			inMacOsMode(h->ndrv, &dev.xp().target.now);
+		if (gAudioOn && dev.xp().lit)
+			(void)dev.enableExtraAudio();
 		// A head the cold boot left dark at start (fillHead) set up as a lit one: its modes, switching and power.
 		size_t n = 0;
 		const Modes::Mode *mode = pending && dev.xp().lit ? head2BuildTable(h, dev, n) : nullptr;
