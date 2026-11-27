@@ -106,6 +106,11 @@ OTG), and its framebuffer the pin of that DIG's endpoint (0x03 + 2 x DIG); frame
 On the rig the boot set up DIG0 for the Samsung and DIG1 for the Lenovo, each from its EDID, and Sound settings list
 both. Not heard yet.
 
+Display sleep and wake with rdna4-audio=1 (2026-11-27): both displays came back, the driver set up both endpoints again
+on wake (DIG1 then DIG0), and both outputs stayed listed; CoreAudio answered throughout. The first `system_profiler
+SPAudioDataType` after the wake took about 70 s (its helper in an uninterruptible wait), the next one 0.2 s; cause unknown
+(our endpoint setup on wake, AppleGFXHDA, or another audio driver on the rig).
+
 ## Later steps
 
 2. Whatever IOFramebuffer attributes AppleGFXHDA asks of our framebuffer.
