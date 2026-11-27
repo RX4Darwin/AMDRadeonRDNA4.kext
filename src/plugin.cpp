@@ -3094,9 +3094,62 @@ static bool pvOnCursorPipe(uint32_t port, Call call)
 	return ok;
 }
 
+// The image scaled by `sx`, `sy` (16.16, the head over the frame) into `out` (straight ARGB, tightly packed), bilinear on
+// premultiplied colour; false when it would not fit the plane.
+static bool scaleCursor(const uint32_t *argb, uint32_t w, uint32_t h, uint32_t pitch, uint32_t sx, uint32_t sy, uint32_t *out,
+                        uint32_t &ow, uint32_t &oh)
+{
+	ow = static_cast<uint32_t>((static_cast<uint64_t>(w) * sx + 0xffff) >> 16);
+	oh = static_cast<uint32_t>((static_cast<uint64_t>(h) * sy + 0xffff) >> 16);
+	if (!ow || !oh || ow > 128 || oh > 128)
+		return false;
+	auto px = [&](int32_t x, int32_t y, int c) -> uint32_t {   // channel c of the source, premultiplied (alpha for c == 3), 0 outside
+		if (x < 0 || y < 0 || x >= static_cast<int32_t>(w) || y >= static_cast<int32_t>(h))
+			return 0;
+		const uint32_t v = argb[y * pitch + x], a = v >> 24;
+		return c == 3 ? a : ((v >> (8 * c)) & 0xff) * a / 255;
+	};
+	for (uint32_t y = 0; y < oh; y++)
+		for (uint32_t x = 0; x < ow; x++) {
+			// the source position of the pixel's centre, 16.16
+			const int64_t fx = ((static_cast<int64_t>(2 * x + 1) << 16 << 16) / sx - (1 << 16)) / 2;
+			const int64_t fy = ((static_cast<int64_t>(2 * y + 1) << 16 << 16) / sy - (1 << 16)) / 2;
+			const int32_t x0 = static_cast<int32_t>(fx >> 16), y0 = static_cast<int32_t>(fy >> 16);
+			const uint32_t ax = static_cast<uint32_t>(fx & 0xffff), ay = static_cast<uint32_t>(fy & 0xffff);
+			uint32_t ch[4];
+			for (int c = 0; c < 4; c++) {
+				const uint64_t top = static_cast<uint64_t>(px(x0, y0, c)) * (0x10000 - ax) + static_cast<uint64_t>(px(x0 + 1, y0, c)) * ax;
+				const uint64_t bot = static_cast<uint64_t>(px(x0, y0 + 1, c)) * (0x10000 - ax) + static_cast<uint64_t>(px(x0 + 1, y0 + 1, c)) * ax;
+				ch[c] = static_cast<uint32_t>((top * (0x10000 - ay) + bot * ay + (1ull << 31)) >> 32);
+			}
+			const uint32_t a = ch[3];
+			for (int c = 0; c < 3; c++)   // straight again (setCursorPixels premultiplies)
+				ch[c] = a ? (ch[c] * 255 + a / 2) / a : 0;
+			out[y * ow + x] = a << 24 | (ch[2] > 255 ? 255 : ch[2]) << 16 | (ch[1] > 255 ? 255 : ch[1]) << 8 | (ch[0] > 255 ? 255 : ch[0]);
+		}
+	return true;
+}
+
+// In a scaled mode (a "looks like" size, an HDR twin below the monitor's) the image is scaled as the frames are, from the frame to
+// the head: unscaled it was two thirds of its size on a 4K head showing 2560x1440 HDR (2026-11-27). macOS sends the image again
+// after a mode change.
 bool PvScanout::cursorImage(uint32_t port, const uint32_t *argb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t hotX, uint32_t hotY)
 {
+	uint32_t frameW, frameH;
+	Head lit;
+	const bool scaled = scaledFrame(port, frameW, frameH) && head(port, lit) && frameW && frameH &&
+	                    (lit.width != frameW || lit.height != frameH);
+
 	return pvOnCursorPipe(port, [&](RDNA4Device &dev) {
+		static uint32_t big[128 * 128];   // (under the device's cursor lock)
+		uint32_t w, h;
+		if (scaled) {
+			const uint32_t sx = static_cast<uint32_t>((static_cast<uint64_t>(lit.width) << 16) / frameW);
+			const uint32_t sy = static_cast<uint32_t>((static_cast<uint64_t>(lit.height) << 16) / frameH);
+			if (scaleCursor(argb, width, height, pitch, sx, sy, big, w, h))
+				return dev.setCursorPixels(big, w, h, w, static_cast<uint32_t>((static_cast<uint64_t>(hotX) * sx) >> 16),
+				                           static_cast<uint32_t>((static_cast<uint64_t>(hotY) * sy) >> 16)) == kIOReturnSuccess;
+		}
 		return dev.setCursorPixels(argb, width, height, pitch, hotX, hotY) == kIOReturnSuccess;
 	});
 }

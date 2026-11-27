@@ -5,6 +5,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- The hardware cursor is scaled with the frames in scaled modes: with HDR at 2560x1440 on a 4K monitor it was two thirds of
+  its size (the "looks like" sizes had it too large). On the rig the Samsung's cursor came out at its size and on target.
+
 - System sleep again with the 1 GiB BAR, HDR and audio: after the card's power loss the wake now sets the Resizable BAR
   sizes back (they came back at 256 MiB: both displays black), runs the VBIOS's asic_init, sets the display arbiter
   (watermarks, memory clock change control) back to the boot's (flickering lines on both displays), puts each display
