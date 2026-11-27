@@ -5386,8 +5386,10 @@ IOReturn RDNA4Device::enableExtraAudio() {
 }
 
 IOReturn RDNA4Device::enableBootAudio() {
-	if (!pipe.valid() || pipe.isTmds())
+	if (!pipe.valid() || pipe.isTmds()) {
+		FBLOG("audio: the boot display is %s: no audio for it now", pipe.valid() ? "on HDMI" : "not lit");
 		return kIOReturnUnsupported;
+	}
 	return enableAudio(pipe.dig, edidAll, edidAllLen);
 }
 

@@ -63,7 +63,14 @@ head on the base mode, macOS's frame of the mode's size in host memory, and the 
 (an area filter, near nearest-neighbour going up). On the rig: 2560x1440 (low resolution) with HDR fills the screen
 (Sunneva, by eye); the log says "frames of 2560x1440 ... on a 3840x2160 head ...: scaled up". Costs: that HDR mode runs
 at the base mode's refresh (4K60 here; Windows sends 4K144 over DSC), and one boot of the build before showed the
-desktop even smaller, not understood (the next build, which only added the log line, was right). (A first reading blamed the BT.2020 VSC SDP and removed it, 4a43e45; switching HDR on and off had changed both
+desktop even smaller, not understood (the next build, which only added the log line, was right).
+
+NOT RELIABLE (2026-11-27): in some boots WindowServer presents 1280x1024 frames (BGRA, 5120 bytes a row) on the Samsung's
+port while the twin runs scaled ("frames of 1280x1024 ... scaled mode 2560x1440: copied"), and the monitor gets a small
+copy instead of the desktop; macOS's screenshot is still a full 2560x1440. In other boots the frames are 2560x1440 and
+scaled up. Switching HDR off and on again within a bad boot keeps 1280x1024. Where that size comes from is not known
+(nothing in the driver or the bundle makes it). Running the twin on the 4K144 DSC mode instead of 4K60 (to keep the
+twin's refresh) showed the same 1280x1024 frames and was reverted. On the rig HDR is left off until this is found. (A first reading blamed the BT.2020 VSC SDP and removed it, 4a43e45; switching HDR on and off had changed both
 packets. Reverted.)
 
 ## Next

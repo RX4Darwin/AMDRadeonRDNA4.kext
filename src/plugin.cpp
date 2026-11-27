@@ -350,7 +350,7 @@ int32_t deviceSetHdr(void *ctx, bool on) {
 	return static_cast<RDNA4Device *>(ctx)->setBootHdr(on);
 }
 
-bool gAudioOn;   // the displays' audio was set up (rdna4-audio=1 or debug.rdna4_hda): set up again after each switch
+bool gAudioOn;   // the displays' audio is wanted (rdna4-audio=1 or debug.rdna4_hda): set up again after each switch
 
 int32_t deviceSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 	auto *dev = static_cast<RDNA4Device *>(ctx);
@@ -365,7 +365,10 @@ int32_t deviceSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 	if (!base || !scaledMemoryFor(gBootScaledMemory, gBootScaled, gBootScaledCount))
 		return kIOReturnNoMemory;
 	const Edid::DetailedTiming *live = dev->liveMode();
-	return live && Edid::sameTiming(*live, base->t) ? kIOReturnSuccess : dev->applyMode(*base);
+	const IOReturn ret = live && Edid::sameTiming(*live, base->t) ? kIOReturnSuccess : dev->applyMode(*base);
+	if (ret == kIOReturnSuccess && gAudioOn)
+		(void)dev->enableBootAudio();   // as for a real mode (also when the pipe could not take it at attach)
+	return ret;
 }
 
 void deviceSetPower(void *ctx, bool on) {
@@ -1698,12 +1701,14 @@ void processGfxHda(void *, KernelPatcher &patcher, size_t index, mach_vm_address
 
 // The boot display's audio set up and the audio function handed to AppleGFXHDA (rdna4-audio=1, or debug.rdna4_hda=1).
 void startAudio() {
-	gAudioOn = gHdaDev && gHdaDev->enableBootAudio() == kIOReturnSuccess;
+	gAudioOn = true;   // (a display that cannot take it now gets it at its next switch or power-on)
+	if (gHdaDev)
+		(void)gHdaDev->enableBootAudio();
 	for (size_t i = 0; i < headCount; i++)
 		if (Head2 *h = heads[i]; h->dev && h->connected) {
 			RDNA4Device::ExtraHold hold(*h->dev);
 			h->dev->selectExtra(h->slot);
-			gAudioOn |= h->dev->enableExtraAudio() == kIOReturnSuccess;
+			(void)h->dev->enableExtraAudio();
 		}
 	offerHdaToApple(gHdaGpu);
 }
