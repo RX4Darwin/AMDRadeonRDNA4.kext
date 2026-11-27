@@ -117,7 +117,7 @@ Listening on the Samsung: nothing, with its engine running and the Odyssey the d
 while Music was open. The tables had DCCG_AUDIO_DTO1_MODULE (0xaf) = 0: build_audio_output takes the DP DTO's source
 clock (DPREFCLK) from the state's clock manager, which pipegen's state did not have, so the DTO that makes the 24 MHz
 audio clock had module 0. pipegen now gives it DPREFCLK (720 MHz, the bounding box's, as Linux falls back to; module
-7200000), and the host test checks the module of every DIG's table. With it, sound plays through the Samsung (heard, 2026-11-27).
+7200000), and the host test checks the module of every DIG's table. With it, sound plays through the Samsung (heard, 2026-11-27) and Music no longer flickers.
 
 ## Later steps
 
