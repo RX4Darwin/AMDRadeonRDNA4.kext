@@ -661,6 +661,8 @@ static void sequence_drr(void)
  * audio is PIPEGEN_AUDIO="<mfr id> <product id> <SAD, 3 bytes hex> <speaker allocation> <name>", as
  * dm_helpers_parse_edid_caps and amdgpu_dm_fill_audio_info read them (ids little endian from EDID bytes 8-11);
  * default: the rig's Samsung (Odyssey G70D: LPCM 2 channels, 32/44.1/48 kHz, 16/20/24 bit, front left/right). */
+static int dp_ref_khz(struct clk_mgr *m) { return m->dprefclk_khz; }   /* (dce12_get_dp_ref_freq_khz, no spread) */
+
 static void sequence_audio(const struct cfg *c)
 {
 	struct dc *dc = &g_dc;
@@ -698,6 +700,14 @@ static void sequence_audio(const struct cfg *c)
 	pipe->link_config.dp_link_settings = stream->link->cur_link_settings;   /* the link as it runs (make_state) */
 	const struct link_hwss *link_hwss = get_link_hwss(stream->link, &pipe->link_res);
 	struct audio_output out = { 0 };
+
+	/* build_audio_output asks the state's clock manager for DPREFCLK, the DP audio DTO's source (the DTO's module);
+	 * without one it is 0 and the DTO stops (no sound) */
+	static struct clk_mgr_funcs dp_ref_funcs;
+	dp_ref_funcs = *g_clk_mgr.funcs;
+	dp_ref_funcs.get_dp_ref_clk_frequency = dp_ref_khz;
+	g_clk_mgr.funcs = &dp_ref_funcs;
+	g_new->clk_mgr = &g_clk_mgr;
 
 	rec_mark("begin:init", 0);
 	audio->funcs->hw_init(audio);

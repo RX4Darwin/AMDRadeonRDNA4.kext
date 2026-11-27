@@ -1,7 +1,7 @@
 # Audio over HDMI and DisplayPort, plan
 
-Status, 2026-11-27: macOS lists "Odyssey G70D" as a DisplayPort sound output (2 channels, 48 kHz) after
-`sudo sysctl debug.rdna4_hda=1` and `=2`; whether sound comes out is not checked yet (needs someone at the monitor). The route found so far is Apple's own GPU-audio driver,
+Status, 2026-11-27: with `rdna4-audio=1` macOS lists each DisplayPort display as a sound output (2 channels, 48 kHz),
+and sound plays through the Samsung (heard); the Lenovo's is not listened to yet. The route found so far is Apple's own GPU-audio driver,
 AppleGFXHDA, which still ships on Tahoe (AppleHDA itself is gone; the rig's onboard audio runs on SimpleHDA).
 
 ## What the card and macOS have
@@ -110,6 +110,14 @@ Display sleep and wake with rdna4-audio=1 (2026-11-27): both displays came back,
 on wake (DIG1 then DIG0), and both outputs stayed listed; CoreAudio answered throughout. The first `system_profiler
 SPAudioDataType` after the wake took about 70 s (its helper in an uninterruptible wait), the next one 0.2 s; cause unknown
 (our endpoint setup on wake, AppleGFXHDA, or another audio driver on the rig).
+
+## No sound: the audio clock (2026-11-27)
+
+Listening on the Samsung: nothing, with its engine running and the Odyssey the default output; the picture flickered
+while Music was open. The tables had DCCG_AUDIO_DTO1_MODULE (0xaf) = 0: build_audio_output takes the DP DTO's source
+clock (DPREFCLK) from the state's clock manager, which pipegen's state did not have, so the DTO that makes the 24 MHz
+audio clock had module 0. pipegen now gives it DPREFCLK (720 MHz, the bounding box's, as Linux falls back to; module
+7200000), and the host test checks the module of every DIG's table. With it, sound plays through the Samsung (heard, 2026-11-27).
 
 ## Later steps
 

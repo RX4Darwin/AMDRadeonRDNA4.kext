@@ -80,7 +80,7 @@ static const Step kDig0[] = {
 	{ 2, 0x0386, 0xffffffff, 0x00000054 },   // begin:configure: write_indirect_azalia_reg
 	{ 2, 0x0387, 0x00000001, 0x00000000 },   // begin:configure: write_indirect_azalia_reg
 	{ 1, 0x00ab, 0x00000030, 0x00000010 },   // begin:dto: dce_aud_wall_dto_setup
-	{ 1, 0x00af, 0xffffffff, 0x00000000 },   // begin:dto: dce_aud_wall_dto_setup
+	{ 1, 0x00af, 0xffffffff, 0x006ddd00 },   // begin:dto: dce_aud_wall_dto_setup
 	{ 1, 0x00ae, 0xffffffff, 0x0003a980 },   // begin:dto: dce_aud_wall_dto_setup
 	{ 1, 0x00ab, 0x00100000, 0x00100000 },   // begin:dto: dce_aud_wall_dto_setup
 	{ 2, 0x0386, 0xffffffff, 0x00000054 },   // begin:enable: read_indirect_azalia_reg
@@ -168,7 +168,7 @@ static const Step kDig1[] = {
 	{ 2, 0x038c, 0xffffffff, 0x00000054 },   // begin:configure: write_indirect_azalia_reg
 	{ 2, 0x038d, 0x00000001, 0x00000000 },   // begin:configure: write_indirect_azalia_reg
 	{ 1, 0x00ab, 0x00000030, 0x00000010 },   // begin:dto: dce_aud_wall_dto_setup
-	{ 1, 0x00af, 0xffffffff, 0x00000000 },   // begin:dto: dce_aud_wall_dto_setup
+	{ 1, 0x00af, 0xffffffff, 0x006ddd00 },   // begin:dto: dce_aud_wall_dto_setup
 	{ 1, 0x00ae, 0xffffffff, 0x0003a980 },   // begin:dto: dce_aud_wall_dto_setup
 	{ 1, 0x00ab, 0x00100000, 0x00100000 },   // begin:dto: dce_aud_wall_dto_setup
 	{ 2, 0x038c, 0xffffffff, 0x00000054 },   // begin:enable: read_indirect_azalia_reg
@@ -256,7 +256,7 @@ static const Step kDig2[] = {
 	{ 2, 0x0392, 0xffffffff, 0x00000054 },   // begin:configure: write_indirect_azalia_reg
 	{ 2, 0x0393, 0x00000001, 0x00000000 },   // begin:configure: write_indirect_azalia_reg
 	{ 1, 0x00ab, 0x00000030, 0x00000010 },   // begin:dto: dce_aud_wall_dto_setup
-	{ 1, 0x00af, 0xffffffff, 0x00000000 },   // begin:dto: dce_aud_wall_dto_setup
+	{ 1, 0x00af, 0xffffffff, 0x006ddd00 },   // begin:dto: dce_aud_wall_dto_setup
 	{ 1, 0x00ae, 0xffffffff, 0x0003a980 },   // begin:dto: dce_aud_wall_dto_setup
 	{ 1, 0x00ab, 0x00100000, 0x00100000 },   // begin:dto: dce_aud_wall_dto_setup
 	{ 2, 0x0392, 0xffffffff, 0x00000054 },   // begin:enable: read_indirect_azalia_reg
@@ -344,7 +344,7 @@ static const Step kDig3[] = {
 	{ 2, 0x0398, 0xffffffff, 0x00000054 },   // begin:configure: write_indirect_azalia_reg
 	{ 2, 0x0399, 0x00000001, 0x00000000 },   // begin:configure: write_indirect_azalia_reg
 	{ 1, 0x00ab, 0x00000030, 0x00000010 },   // begin:dto: dce_aud_wall_dto_setup
-	{ 1, 0x00af, 0xffffffff, 0x00000000 },   // begin:dto: dce_aud_wall_dto_setup
+	{ 1, 0x00af, 0xffffffff, 0x006ddd00 },   // begin:dto: dce_aud_wall_dto_setup
 	{ 1, 0x00ae, 0xffffffff, 0x0003a980 },   // begin:dto: dce_aud_wall_dto_setup
 	{ 1, 0x00ab, 0x00100000, 0x00100000 },   // begin:dto: dce_aud_wall_dto_setup
 	{ 2, 0x0398, 0xffffffff, 0x00000054 },   // begin:enable: read_indirect_azalia_reg

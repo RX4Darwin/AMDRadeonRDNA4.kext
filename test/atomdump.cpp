@@ -3102,6 +3102,14 @@ static int testAudio() {
 			memcpy(samsung + d + 5, "Odyssey G70D\n", 13);
 	cta(samsung + 128, { 0x09, 0x07, 0x07 });
 
+	for (int d = 0; d < 4; d++) {   // DCCG_AUDIO_DTO1_MODULE (DMU segment 1, 0xaf): DPREFCLK, never 0 (a stopped DTO: no sound)
+		uint32_t module = 0;
+		for (size_t i = 0; i < Audio::kDigCount[d]; i++)
+			if (Audio::kDigSteps[d][i].seg == 1 && Audio::kDigSteps[d][i].reg == 0xaf)
+				module = Audio::kDigSteps[d][i].value;
+		failures += check(module == 7200000, "audio: DIG%d DP audio DTO module %u (720 MHz DPREFCLK)", d, module);
+	}
+
 	Audio::Sink s {};
 	failures += check(Audio::sinkFromEdid(samsung, sizeof(samsung), s) && s.sadCount == 1 && !strcmp(s.name, "Odyssey G70D") &&
 	                  s.manufacturer == 0x2d4c && s.speakers == 1, "audio: Samsung sink %s, %u SADs", s.name, s.sadCount);
