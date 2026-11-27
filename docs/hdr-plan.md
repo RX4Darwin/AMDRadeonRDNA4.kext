@@ -65,20 +65,21 @@ head on the base mode, macOS's frame of the mode's size in host memory, and the 
 at the base mode's refresh (4K60 here; Windows sends 4K144 over DSC), and one boot of the build before showed the
 desktop even smaller, not understood (the next build, which only added the log line, was right).
 
-NOT RELIABLE (2026-11-27): in some boots WindowServer presents 1280x1024 frames (BGRA, 5120 bytes a row) on the Samsung's
+FIXED (d136d1e), was NOT RELIABLE (2026-11-27): in some boots WindowServer presents 1280x1024 frames (BGRA, 5120 bytes a row) on the Samsung's
 port while the twin runs scaled ("frames of 1280x1024 ... scaled mode 2560x1440: copied"), and the monitor gets a small
 copy instead of the desktop; macOS's screenshot is still a full 2560x1440. In other boots the frames are 2560x1440 and
 scaled up. Switching HDR off and on again within a bad boot keeps 1280x1024. Where that size comes from is not known
 (nothing in the driver or the bundle makes it). Running the twin on the 4K144 DSC mode instead of 4K60 (to keep the
-twin's refresh) showed the same 1280x1024 frames and was reverted. On the rig HDR is left off until this is found. (A first reading blamed the BT.2020 VSC SDP and removed it, 4a43e45; switching HDR on and off had changed both
+twin's refresh) showed the same 1280x1024 frames and was reverted.  (A first reading blamed the BT.2020 VSC SDP and removed it, 4a43e45; switching HDR on and off had changed both
 packets. Reverted.)
 
 A lead (2026-11-27): in that bad boot the Samsung's framebuffer had IOFBDependentIndex 1 (wrapFbOpen numbers the framebuffers in
 the order they open), and our AGDC answer for a framebuffer's mode (RDNA4DeviceControl::framebufferQuery, attribute 0x711 query
 0x10) took the dependent index for the head. It now takes the framebuffer's head (PvScanout::portOf) and logs its answer
 ("accel: framebuffer N (dependent index D) is head H: mode WxH"). The next boot had the two agree and HDR at 1440p ran right
-(frames 2560x1440, scaled up); a boot where they differ has not come up since, and the old mapping does not explain the number
-1280x1024 (head 1 is the Lenovo's 1920x1080).
+(frames 2560x1440, scaled up). The boot after that had them differ (the Samsung's framebuffer at dependent index 1, as in the bad
+boot) and HDR at 1440p ran right too: frames 2560x1440 scaled up, the desktop filling the screen (seen). So the wrong head was the
+cause, though how it came to 1280x1024 rather than the Lenovo's 1920x1080 is not worked out.
 
 ## Next
 
