@@ -193,6 +193,14 @@ KernelPatcher::KextInfo kextIOPCIFamily {
 	KernelPatcher::KextInfo::Unloaded,
 };
 
+// AppleGFXHDA (system kernel collection, loaded only once debug.rdna4_hda hands it the audio function): a few of its
+// functions logged, to see how it ties the audio function to our framebuffers (docs/audio-plan.md).
+const char *kPathAppleGFXHDA = "/System/Library/Extensions/AppleGFXHDA.kext/Contents/MacOS/AppleGFXHDA";
+KernelPatcher::KextInfo kextAppleGFXHDA {
+	"com.apple.driver.AppleGFXHDA", &kPathAppleGFXHDA, 1, {true}, {},
+	KernelPatcher::KextInfo::Unloaded,
+};
+
 mach_vm_address_t orgDoDriverIO { 0 };
 mach_vm_address_t orgVslNew { 0 };
 mach_vm_address_t orgVslDispose { 0 };
@@ -1530,6 +1538,36 @@ UInt16 wrapExtConfigRead16(IOPCIDevice *that, IOByteCount offset) {
 	return that == gHdaDevice && offset == kIOPCIConfigDeviceID ? kHdaSpoofId : value;
 }
 
+// AppleGFXHDA ties the audio function to a framebuffer by properties (its AppleDisplay match handler): the same
+// hda-gfx on both, and the framebuffer's connector-type (kConnectorDisplayPort 0x400, HDMI 0x800). Both rig monitors
+// are on DisplayPort. ponytail: every framebuffer under the GPU is called DisplayPort; take it from the head's
+// connector when an HDMI display is to have audio.
+void tieFramebuffersToHda(IOPCIDevice *gpu) {
+	IORegistryIterator *it = IORegistryIterator::iterateOver(gpu, gIOServicePlane, kIORegistryIterateRecursively);
+	if (!it)
+		return;
+	uint8_t dp[4] = { 0x00, 0x04, 0x00, 0x00 };
+	uint8_t dpSignal[4] = { 0x10, 0x00, 0x00, 0x00 };   // kIOFBAVSignalTypeDP (av-signal-type, read on each framebuffer event)
+	unsigned n = 0, other = 0;
+	while (IORegistryEntry *e = it->getNextObject())
+		if (e->metaCast("IOFramebuffer")) {   // (by name: the kext does not link IOGraphics)
+			// audio-codec-info: byte 0 the codec's address, byte 1 non-zero, byte 2 the pin's node ID. The boot display's audio
+			// is Azalia endpoint 0 (src/audio_linux.inc), AMD's codec's first pin, 0x03; the others get the next pins.
+			const bool boot = !strcmp(e->getName(), ".Display_boot");
+			const uint8_t pin = static_cast<uint8_t>(boot ? 0x03 : 0x05 + 2 * other++);
+			uint8_t codecInfo[4] = { 0x00, 0x01, pin, 0x00 };
+			uint8_t pipeNo[4] = { static_cast<uint8_t>(boot ? 1 : 1 + other), 0, 0, 0 };
+			e->setProperty("hda-gfx", "onboard-1");
+			e->setProperty("connector-type", dp, sizeof(dp));
+			e->setProperty("av-signal-type", dpSignal, sizeof(dpSignal));
+			e->setProperty("audio-codec-info", codecInfo, sizeof(codecInfo));
+			e->setProperty("AAPL,DisplayPipe", pipeNo, sizeof(pipeNo));
+			n++;
+		}
+	it->release();
+	FBLOG("audio: %u framebuffers marked hda-gfx onboard-1, connector-type DisplayPort", n);
+}
+
 void offerHdaToApple(IOPCIDevice *gpu) {
 	IORegistryEntry *bus = gpu ? gpu->getParentEntry(gIOServicePlane) : nullptr;
 	OSIterator *it = bus ? bus->getChildIterator(gIOServicePlane) : nullptr;
@@ -1553,6 +1591,8 @@ void offerHdaToApple(IOPCIDevice *gpu) {
 		gHdaDevice = d;
 		uint8_t spoofed[4] = { kHdaSpoofId & 0xff, kHdaSpoofId >> 8, 0, 0 };
 		d->setProperty("device-id", spoofed, sizeof(spoofed));
+		d->setProperty("hda-gfx", "onboard-1");
+		tieFramebuffersToHda(gpu);
 		d->setProperty("rdna4-hda", kOSBooleanTrue);
 		d->registerService();
 		FBLOG("audio: HDA function %04x at function 1 offered to AppleGFXHDAEGController as %04x", id, kHdaSpoofId);
@@ -1561,13 +1601,105 @@ void offerHdaToApple(IOPCIDevice *gpu) {
 	it->release();
 }
 
+// The logged AppleGFXHDA functions: their arguments as pointers (all of them take pointers or integers, at most four), their
+// result as it comes back (a bool's in the low byte).
+using GfxHdaFn = uint64_t (*)(void *, void *, void *, void *);
+enum { kGfxMatched, kGfxMatchedEG, kGfxProperty, kGfxEdid, kGfxRegisterFb, kGfxLocate, kGfxLocateEG, kGfxEngineDP, kGfxActivate, kGfxFns };
+mach_vm_address_t orgGfxHda[kGfxFns] {};
+
+const char *entryName(void *e) {
+	auto *r = static_cast<IORegistryEntry *>(e);
+	return r ? r->getName() : "(none)";
+}
+
+uint64_t wrapGfxMatched(void *self, void *ref, void *service, void *notifier) {
+	const uint64_t r = FunctionCast(wrapGfxMatched, orgGfxHda[kGfxMatched])(self, ref, service, notifier);
+	FBLOG("audio: AppleGFXHDA gfxMatchedHandler(%s) -> 0x%llx", entryName(service), r);
+	return r;
+}
+uint64_t wrapGfxMatchedEG(void *self, void *ref, void *service, void *notifier) {
+	const uint64_t r = FunctionCast(wrapGfxMatchedEG, orgGfxHda[kGfxMatchedEG])(self, ref, service, notifier);
+	FBLOG("audio: AppleGFXHDA EG gfxMatchedHandler(%s) -> 0x%llx", entryName(service), r);
+	return r;
+}
+uint64_t wrapGfxProperty(void *self, void *entry, void *key, void *out) {
+	const uint64_t r = FunctionCast(wrapGfxProperty, orgGfxHda[kGfxProperty])(self, entry, key, out);
+	FBLOG("audio: AppleGFXHDA property %s of %s -> 0x%llx, value 0x%x", static_cast<const char *>(key), entryName(entry), r,
+	      out ? *static_cast<uint32_t *>(out) : 0);
+	return r;
+}
+uint64_t wrapGfxEdid(void *self, void *data, void *index, void *d) {
+	const uint64_t r = FunctionCast(wrapGfxEdid, orgGfxHda[kGfxEdid])(self, data, index, d);
+	auto *o = static_cast<OSData *>(data);
+	FBLOG("audio: AppleGFXHDA edidIsValidForAudio(%u bytes, %llu) -> 0x%llx", o ? o->getLength() : 0,
+	      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(index)), r);
+	return r;
+}
+uint64_t wrapGfxRegisterFb(void *self, void *fb, void *index, void *d) {
+	const uint64_t r = FunctionCast(wrapGfxRegisterFb, orgGfxHda[kGfxRegisterFb])(self, fb, index, d);
+	FBLOG("audio: AppleGFXHDA registerFramebufferNotification(%s, %llu) -> 0x%llx", entryName(fb),
+	      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(index)), r);
+	return r;
+}
+uint64_t wrapGfxLocate(void *self, void *a, void *b, void *c) {
+	const uint64_t r = FunctionCast(wrapGfxLocate, orgGfxHda[kGfxLocate])(self, a, b, c);
+	FBLOG("audio: AppleGFXHDA locateAssociatedGraphicsController -> 0x%llx", r);
+	return r;
+}
+uint64_t wrapGfxLocateEG(void *self, void *a, void *b, void *c) {
+	const uint64_t r = FunctionCast(wrapGfxLocateEG, orgGfxHda[kGfxLocateEG])(self, a, b, c);
+	FBLOG("audio: AppleGFXHDA EG locateAssociatedGraphicsController -> 0x%llx", r);
+	return r;
+}
+uint64_t wrapGfxEngineDP(void *self, void *paths, void *index, void *head) {
+	const uint64_t r = FunctionCast(wrapGfxEngineDP, orgGfxHda[kGfxEngineDP])(self, paths, index, head);
+	FBLOG("audio: AppleGFXHDA createAudioOutputEngineDP(%llu) -> 0x%llx", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(index)), r);
+	return r;
+}
+uint64_t wrapGfxActivate(void *self, void *a, void *b, void *c) {
+	const uint64_t r = FunctionCast(wrapGfxActivate, orgGfxHda[kGfxActivate])(self, a, b, c);
+	FBLOG("audio: AppleGFXHDA activateAudioEngines -> 0x%llx", r);
+	return r;
+}
+
+void processGfxHda(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	if (index != kextAppleGFXHDA.loadIndex)
+		return;
+	KernelPatcher::RouteRequest routes[] {
+		{"__ZN21AppleGFXHDAController17gfxMatchedHandlerEPvP9IOServiceP10IONotifier", wrapGfxMatched, orgGfxHda[kGfxMatched]},
+		{"__ZN23AppleGFXHDAEGController17gfxMatchedHandlerEPvP9IOServiceP10IONotifier", wrapGfxMatchedEG, orgGfxHda[kGfxMatchedEG]},
+		{"__ZN21AppleGFXHDAController36getOSDataOrOSNumberPropertyFromEntryEP15IORegistryEntryPKcPj", wrapGfxProperty, orgGfxHda[kGfxProperty]},
+		{"__ZN21AppleGFXHDAController19edidIsValidForAudioEP6OSDatai", wrapGfxEdid, orgGfxHda[kGfxEdid]},
+		{"__ZN21AppleGFXHDAController31registerFramebufferNotificationEP13IOFramebufferj", wrapGfxRegisterFb, orgGfxHda[kGfxRegisterFb]},
+		{"__ZN21AppleGFXHDAController34locateAssociatedGraphicsControllerEv", wrapGfxLocate, orgGfxHda[kGfxLocate]},
+		{"__ZN23AppleGFXHDAEGController34locateAssociatedGraphicsControllerEv", wrapGfxLocateEG, orgGfxHda[kGfxLocateEG]},
+		{"__ZN17AppleGFXHDADriver25createAudioOutputEngineDPEP7OSArrayiP27HDAGFXHeadAssociationStruct", wrapGfxEngineDP, orgGfxHda[kGfxEngineDP]},
+		{"__ZN17AppleGFXHDADriver20activateAudioEnginesEv", wrapGfxActivate, orgGfxHda[kGfxActivate]},
+	};
+	const bool ok = patcher.routeMultiple(index, routes, kGfxFns, address, size);
+	FBLOG("audio: AppleGFXHDA loaded: its functions %s", ok ? "logged" : "NOT routed");
+	patcher.clearError();
+}
+
 int hdaSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	int value = 0;
 	const int err = sysctl_handle_int(oidp, &value, 0, req);
 	if (err || !req->newptr)
 		return err;
-	if (value != 1 || !gHdaGpu)
+	if ((value != 1 && value != 2) || !gHdaGpu)
 		return EINVAL;
+	if (value == 2) {   // the displays matched again: AppleGFXHDA only takes AppleDisplays matched after it asked for them
+		IORegistryIterator *it = IORegistryIterator::iterateOver(gHdaGpu, gIOServicePlane, kIORegistryIterateRecursively);
+		unsigned n = 0;
+		while (IORegistryEntry *e = it ? it->getNextObject() : nullptr)
+			if (e->metaCast("AppleDisplay")) {
+				static_cast<IOService *>(e)->registerService();
+				n++;
+			}
+		OSSafeReleaseNULL(it);
+		FBLOG("audio: %u AppleDisplays registered again", n);
+		return 0;
+	}
 	if (gHdaDev)
 		(void)gHdaDev->enableBootAudio();
 	offerHdaToApple(gHdaGpu);
@@ -2374,6 +2506,7 @@ void pluginStart() {
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
 	lilu.onKextLoadForce(&kextIOGraphics, 1, processGraphics, nullptr);
 	lilu.onKextLoadForce(&kextIOPCIFamily, 1, [](void *, KernelPatcher &, size_t, mach_vm_address_t, size_t) {}, nullptr);   // (its index, for debug.rdna4_hda)
+	lilu.onKextLoadForce(&kextAppleGFXHDA, 1, processGfxHda, nullptr);   // (loads only after debug.rdna4_hda=1)
 	RDNA4Accel::start();   // our own accelerator: nothing published unless debug.rdna4_accel=1 (rdna4accel.cpp)
 #ifdef AMDRadeonRDNA4_PVGPU
 	// whether this boot has the fake GPU is only known once NVRAM is (rdna4-trial): the functions are resolved in any case

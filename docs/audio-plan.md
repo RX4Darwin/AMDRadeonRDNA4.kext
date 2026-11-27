@@ -1,7 +1,7 @@
 # Audio over HDMI and DisplayPort, plan
 
-Status, 2026-11-26: step 0 done (Apple's driver takes the card's audio function and publishes an audio device for its
-codec, with no output yet). No sound yet. The route found so far is Apple's own GPU-audio driver,
+Status, 2026-11-27: macOS lists "Odyssey G70D" as a DisplayPort sound output (2 channels, 48 kHz) after
+`sudo sysctl debug.rdna4_hda=1` and `=2`; whether sound comes out is not checked yet (needs someone at the monitor). The route found so far is Apple's own GPU-audio driver,
 AppleGFXHDA, which still ships on Tahoe (AppleHDA itself is gone; the rig's onboard audio runs on SimpleHDA).
 
 ## What the card and macOS have
@@ -62,6 +62,25 @@ recorder models the Azalia index/data pair (rec_indirect) so its read-modify-wri
 - Next: why AppleGFXHDADriver makes no engine: its graphics association (AppleDisplay matching, the framebuffer's
   connector type, registerFramebufferNotification) and whether the codec's pin reports presence and ELD (HDA verbs
   through the controller, or AppleGFXHDA's own logging).
+
+## Step 2: tying AppleGFXHDA to our framebuffers (2026-11-27, an output appears)
+
+The kext logs a few AppleGFXHDA functions through Lilu routes when it loads (processGfxHda). What they showed:
+
+1. `AppleGFXHDAEGController::locateAssociatedGraphicsController` asks for `AppleDisplay` services with
+   gIOMatchedNotification and stores the notifier when the call returns; IOKit hands it the AppleDisplays that already
+   exist inside that call, and the AMD class's own `gfxMatchedHandler` (it overrides the base one) drops them since
+   their notifier is not the stored one yet. On a Mac it loads before any display; here it loads after ours. So
+   `debug.rdna4_hda=2` registers the AppleDisplays under the GPU again: then both are taken (EDIDs valid for audio,
+   `registerFramebufferNotification` on both framebuffers).
+2. On each framebuffer event it reads, from the framebuffer: `connector-type` (0x400 DisplayPort / 0x800 HDMI),
+   `av-signal-type` (IOGraphicsTypes.h's kIOFBAVSignalTypeDP 0x10, HDMI 0x08), `audio-codec-info` (byte 0 the codec's
+   address, byte 1 non-zero, byte 2 the pin's node ID; also a boot-arg of that name) and, in findValidDisplayCodec,
+   `AAPL,DisplayPipe` (non-zero, not 0xffff). The kext sets all of them, with `hda-gfx` "onboard-1" on both sides; the
+   boot display gets pin 0x03 (Azalia endpoint 0, which step 1 programs), the others the next pins.
+3. Then `createAudioOutputEngineDP` and `activateAudioEngines` run: AppleGFXHDAEngineOutputDP with its stream, DMA
+   started, and Sound settings list "Odyssey G70D" (transport DisplayPort, 2 channels, 48 kHz). macOS made it the system
+   (alert) output; the rig's was set back to its default output (~/rdna4/sysout follow).
 
 ## Later steps
 
