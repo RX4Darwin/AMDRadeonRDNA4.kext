@@ -156,8 +156,8 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 - HDR by default: with `rdna4-hdr=1` (and `rdna4-vrr=1`) macOS offers HDR on a DisplayPort boot display whose EDID takes
   HDR10, and the monitor gets the HDR metadata (PQ) and BT.2020; the link stays 8 bits a component, and the mastering
   data is left to the monitor. Not on a second display or over HDMI.
-- Audio over HDMI and DisplayPort by default: with `rdna4-audio=1` macOS lists a DisplayPort boot display as a sound
-  output (through Apple's AppleGFXHDA); not yet heard, and not set up for a second display or HDMI.
+- Audio over HDMI and DisplayPort by default: with `rdna4-audio=1` macOS lists each DisplayPort display as a sound output
+  (through Apple's AppleGFXHDA); not yet heard, and not over HDMI.
 - Hardware video decode and encode (VCN).
 - GFXOFF (the graphics block powered down when idle) on by default: it works with `rdna4-gfxoff=1` (about 3 W less while
   the screen is still or the displays sleep), but has not yet run long or through a system sleep. Memory clock scaling with

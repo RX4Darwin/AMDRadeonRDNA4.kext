@@ -7,7 +7,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 - Audio over DisplayPort, first steps (`rdna4-audio=1`, off by default): the boot display's audio is programmed as
   Linux does it, and the card's audio function is handed to Apple's AppleGFXHDA, which then lists the monitor as a
-  sound output. On the rig the Samsung Odyssey G70D appears in Sound settings; not yet heard. docs/audio-plan.md.
+  sound output; each DisplayPort display gets its own, from its EDID. On the rig the Samsung Odyssey G70D and the
+  Lenovo G25-10 appear in Sound settings; not yet heard. docs/audio-plan.md.
 
 - HDR, first step (`rdna4-hdr=1`, off by default, needs `rdna4-vrr=1`): on a display whose EDID takes PQ the driver lists
   an HDR10 copy of every mode, which is what macOS needs to offer HDR, and switching HDR on sends the boot display (DP)

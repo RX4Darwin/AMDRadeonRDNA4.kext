@@ -92,6 +92,20 @@ is set up again (a mode switch can take the audio packets down). On the rig the 
 settings listed "Odyssey G70D" and "LEN G25-10"; the Lenovo's has no Azalia endpoint set up (only the boot display's
 is), so it is most likely silent. Not heard yet.
 
+## Step 4: every DisplayPort display, from its own EDID (2026-11-27)
+
+pipegen's audio scenario runs for each stream encoder DIG0-3 with its own Azalia endpoint (amdgpu gives a stream the
+endpoint of its encoder's number); mkaudio.py writes the one-time setup (kInit, dce_aud_hw_init, which Linux only runs
+for endpoint 0) and the four tables, and each endpoint's index register. The traces carry the Samsung's audio; the kext
+encodes the monitor's own from its EDID (Audio::sinkFromEdid, as dm_helpers_parse_edid_caps reads it) into the 21
+endpoint registers dce_aud_az_configure fills for a DisplayPort SST stream (speaker allocation, ACP, the 14 audio
+descriptors, IDs, the name; Audio::sinkValue) and puts them in at the writes to the endpoint's data register. The host
+test holds the encoding to the Samsung's table and to Linux's own values for the Lenovo (pipegen with PIPEGEN_AUDIO).
+The second display's pipe gets its audio when it is lit, switched or comes back on (its DIG: the enabled front end on its
+OTG), and its framebuffer the pin of that DIG's endpoint (0x03 + 2 x DIG); framebuffers without a lit display get none.
+On the rig the boot set up DIG0 for the Samsung and DIG1 for the Lenovo, each from its EDID, and Sound settings list
+both. Not heard yet.
+
 ## Later steps
 
 2. Whatever IOFramebuffer attributes AppleGFXHDA asks of our framebuffer.

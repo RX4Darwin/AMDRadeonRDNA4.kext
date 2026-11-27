@@ -5336,23 +5336,59 @@ IOReturn RDNA4Device::setBootHdr(bool on) {
 	return kIOReturnSuccess;
 }
 
-// Audio on the boot display (docs/audio-plan.md step 1): Linux's sequence for pipe 0 / DIG0 on DisplayPort
-// (src/audio_linux.inc, made for the rig's Samsung): the Azalia endpoint describes the sink to the HD Audio codec,
-// the audio clock runs and the stream encoder sends audio packets. Only for that pipe; once a boot.
-IOReturn RDNA4Device::enableBootAudio() {
-	if (!pipe.valid() || pipe.isTmds() || pipe.otg != 0 || pipe.dig != 0) {
-		FBLOG("audio: the boot display is not DisplayPort on pipe 0 / DIG0: no audio sequence for it");
+// Audio on a lit DisplayPort stream (docs/audio-plan.md): Linux's sequence for its stream encoder `dig` and that
+// encoder's Azalia endpoint (src/audio_linux.inc), with the monitor's audio from its EDID put into the endpoint's sink
+// description (Audio::sinkValue, at the writes to the endpoint's data register). The one-time setup goes first.
+IOReturn RDNA4Device::enableAudio(uint8_t dig, const uint8_t *edid, size_t edidLen) {
+	Audio::Sink sink;
+	if (dig >= 4 || !Audio::sinkFromEdid(edid, edidLen, sink) || !sink.sadCount) {
+		FBLOG("audio: DIG%u: no audio for this display (%s)", dig, dig >= 4 ? "no such encoder" : "its EDID lists none");
 		return kIOReturnUnsupported;
 	}
-	constexpr size_t steps = sizeof(Audio::kBootDpAudio) / sizeof(Audio::kBootDpAudio[0]);
-	size_t written = 0;
-	for (const Audio::Step &s : Audio::kBootDpAudio) {
-		const uint32_t v = s.mask == 0xffffffff ? s.value : (regReadDmu(s.seg, s.reg) & ~s.mask) | s.value;
+	const uint32_t indexReg = Audio::kEndpointIndex[dig];
+	uint32_t index = 0;
+	size_t written = 0, total = Audio::kInitCount + Audio::kDigCount[dig];
+	auto run = [&](const Audio::Step &s) {
+		uint32_t value = s.value;
+		if (s.seg == 2 && s.reg == indexReg)
+			index = s.value;
+		else if (s.seg == 2 && s.reg == indexReg + 1)
+			(void)Audio::sinkValue(index, sink, value);
+		const uint32_t v = s.mask == 0xffffffff ? value : (regReadDmu(s.seg, s.reg) & ~s.mask) | (value & s.mask);
 		written += regWriteDmu(s.seg, s.reg, v);
+	};
+	for (size_t i = 0; i < Audio::kInitCount; i++)
+		run(Audio::kInit[i]);
+	index = 0;
+	for (size_t i = 0; i < Audio::kDigCount[dig]; i++)
+		run(Audio::kDigSteps[dig][i]);
+	FBLOG("audio: DIG%u (%s, %u SADs): %zu of %zu steps written; DP%u_DP_SEC_CNTL=0x%08x", dig, sink.name, sink.sadCount, written,
+	      total, dig, regReadDmu(2, Hdr::kDpSecCntl + dig * Pipe::Reg::kDigStride));
+	return written == total ? kIOReturnSuccess : kIOReturnError;
+}
+
+// The selected extra pipe's (selectExtra) stream encoder: the enabled DIG front end whose DIG_SOURCE_SELECT is its OTG, as
+// Pipe finds the boot pipe's; 0xff without one.
+uint8_t RDNA4Device::extraDig() {
+	for (uint8_t d = 0; d < Pipe::kMaxDig; d++) {
+		const uint32_t base = d * Pipe::Reg::kDigStride;
+		if ((regReadDmu(2, Pipe::Reg::kDigFeCntl + base) & 0x7) == xp().pipe && (regReadDmu(2, Pipe::Reg::kDigFeEnCntl + base) & 1))
+			return d;
 	}
-	FBLOG("audio: boot display: %zu of %zu steps written; DP0_DP_SEC_CNTL=0x%08x", written, steps,
-	      regReadDmu(2, Hdr::kDpSecCntl));
-	return written == steps ? kIOReturnSuccess : kIOReturnError;
+	return 0xff;
+}
+
+// enableAudio for the selected extra pipe, when it is lit on DisplayPort.
+IOReturn RDNA4Device::enableExtraAudio() {
+	const ExtraPipe &x = xp();
+	const uint8_t dig = x.lit && !x.hdmi ? extraDig() : 0xff;
+	return dig < 4 ? enableAudio(dig, x.edid, x.edidLen) : kIOReturnUnsupported;
+}
+
+IOReturn RDNA4Device::enableBootAudio() {
+	if (!pipe.valid() || pipe.isTmds())
+		return kIOReturnUnsupported;
+	return enableAudio(pipe.dig, edidAll, edidAllLen);
 }
 
 void RDNA4Device::bootKeepMsaIgnore() {

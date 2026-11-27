@@ -671,13 +671,14 @@ static void sequence_audio(const struct cfg *c)
 	unsigned mfr = 0x2d4c, product = 0xe06f, sad = 0x090707, speakers = 0x01;
 	char name[AUDIO_INFO_DISPLAY_NAME_SIZE_IN_CHARS] = "Odyssey G70D";
 
-	if (spec && sscanf(spec, "%x %x %x %x %19[^\n]", &mfr, &product, &sad, &speakers, name) != 5) {
+	if (spec && (memset(name, 0, sizeof(name)),   /* zeroed as amdgpu's: no tail of the default name */
+		     sscanf(spec, "%x %x %x %x %19[^\n]", &mfr, &product, &sad, &speakers, name) != 5)) {
 		fprintf(stderr, "bad PIPEGEN_AUDIO\n"); exit(2);
 	}
-	struct audio *audio = dcn401_create_audio(&g_ctx, 0);   /* the first free audio: endpoint 0 */
+	struct audio *audio = dcn401_create_audio(&g_ctx, c->dig);   /* the stream encoder's own audio endpoint, as amdgpu picks it */
 	const struct dce_audio_registers *ar = ((struct dce_audio *)audio)->regs;   /* (DCE_AUD is dce_audio.c's) */
 	rec_indirect(ar->AZALIA_F0_CODEC_ENDPOINT_INDEX, ar->AZALIA_F0_CODEC_ENDPOINT_DATA);
-	g_pool.audios[0] = audio; g_pool.audio_count = 1;
+	g_pool.audios[c->dig] = audio; g_pool.audio_count = c->dig + 1;
 	pipe->stream_res.audio = audio;
 	stream->audio_info.manufacture_id = mfr;
 	stream->audio_info.product_id = product;

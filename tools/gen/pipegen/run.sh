@@ -109,11 +109,14 @@ if [ "${1:-}" = drr ]; then
 	exit 0
 fi
 
-# "audio": audio on the lit DisplayPort boot display (pipegen.c sequence_audio: pipe 0, DIG0, link 0, HPD1, the
-# Samsung's 2560x1440@144), into src/audio_linux.inc (mkaudio.py; docs/audio-plan.md step 1).
+# "audio": audio on a lit DisplayPort stream (pipegen.c sequence_audio) through each stream encoder DIG0-3 and its
+# Azalia endpoint (the Samsung's 2560x1440@144 and EDID audio; the kext puts in the monitor's own), into
+# src/audio_linux.inc (mkaudio.py; docs/audio-plan.md). PIPEGEN_AUDIO="<sink>": the reference test/ref/audio_*.txt.
 if [ "${1:-}" = audio ]; then
-	"$B/pipegen" audio 0 0 0 1  2560 48 32 80  1440 3 5 95  604250 1 0 0 > "$B/audio.txt"
-	python3 "$here/mkaudio.py" "$(git -C "$L" rev-parse HEAD)" "$B/audio.txt" > "$B/audio_linux.inc"
+	for d in 0 1 2 3; do
+		"$B/pipegen" audio $d $d $d $((d + 1))  2560 48 32 80  1440 3 5 95  604250 1 0 0 > "$B/audio$d.txt"
+	done
+	python3 "$here/mkaudio.py" "$(git -C "$L" rev-parse HEAD)" "$B"/audio[0-3].txt > "$B/audio_linux.inc"
 	cp -f "$B/audio_linux.inc" "$repo/src/audio_linux.inc"
 	echo "wrote src/audio_linux.inc"
 	exit 0

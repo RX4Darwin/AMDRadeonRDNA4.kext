@@ -44,6 +44,7 @@
 #include "../src/hostrefusals.hpp"
 #include "../src/flip.hpp"
 #include "../src/hdr.hpp"
+#include "../src/audio.hpp"
 #include "../src/gpuvm.hpp"
 #include "../src/vmid.hpp"
 #include "../src/ptpages.hpp"
@@ -3076,6 +3077,69 @@ static int testScaledModes() {
 	sw.csData = Ndrv::kBootModeId + static_cast<int32_t>(s[2].id);
 	sw.csMode = Ndrv::kDepthMode1;
 	failures += check(tr.control(Ndrv::cscSwitchMode, &sw, ret) && ret == Ndrv::kBadArgument, "scaled: init left the frames offered");
+	return failures;
+}
+
+// Audio (docs/audio-plan.md): the endpoint's sink description encoded from a monitor's EDID (Audio::sinkFromEdid,
+// Audio::sinkValue) as Linux writes it. The Samsung's must give DIG0's table values (made with its audio); the Lenovo's
+// what Linux wrote for it (pipegen audio, PIPEGEN_AUDIO="ae30 65fe 097f07 01 LEN G25-10", on DIG1).
+static int testAudio() {
+	int failures = 0;
+	uint8_t lenovo[256] {}, samsung[256] {};
+	if (!hexToBytes(kLenovoEdidHex, lenovo, 128))
+		return check(false, "audio: Lenovo fixture");
+	const auto cta = [](uint8_t *b, const uint8_t (&sad)[3]) {
+		const uint8_t blocks[] = { 0x23, sad[0], sad[1], sad[2], 0x83, 0x01, 0x00, 0x00 };   // audio, speaker allocation
+		b[0] = 0x02, b[1] = 0x03, b[2] = 4 + sizeof(blocks);
+		memcpy(b + 4, blocks, sizeof(blocks));
+	};
+	cta(lenovo + 128, { 0x09, 0x7f, 0x07 });
+	memcpy(samsung, lenovo, 128);
+	const uint8_t ids[4] = { 0x4c, 0x2d, 0x6f, 0xe0 };
+	memcpy(samsung + 8, ids, 4);
+	for (size_t d = 54; d + 18 <= 126; d += 18)
+		if (samsung[d + 3] == 0xfc)
+			memcpy(samsung + d + 5, "Odyssey G70D\n", 13);
+	cta(samsung + 128, { 0x09, 0x07, 0x07 });
+
+	Audio::Sink s {};
+	failures += check(Audio::sinkFromEdid(samsung, sizeof(samsung), s) && s.sadCount == 1 && !strcmp(s.name, "Odyssey G70D") &&
+	                  s.manufacturer == 0x2d4c && s.speakers == 1, "audio: Samsung sink %s, %u SADs", s.name, s.sadCount);
+	uint32_t index = 0, checked = 0, wrong = 0;
+	for (size_t i = 0; i < Audio::kDigCount[0]; i++) {
+		const Audio::Step &st = Audio::kDigSteps[0][i];
+		uint32_t v = 0;
+		if (st.seg == 2 && st.reg == Audio::kEndpointIndex[0])
+			index = st.value;
+		else if (st.seg == 2 && st.reg == Audio::kEndpointIndex[0] + 1 && Audio::sinkValue(index, s, v)) {
+			checked++;
+			if ((v & st.mask) != st.value) {
+				wrong++;
+				fprintf(stderr, "  audio: Samsung 0x%02x: 0x%08x, Linux 0x%08x\n", index, v & st.mask, st.value);
+			}
+		}
+	}
+	failures += check(checked == 21 && !wrong, "audio: Samsung, %u sink registers, %u not Linux's", checked, wrong);
+
+	static const struct { uint32_t index, mask, value; } kLenovo[] = {
+		{ 0x25, 0x0307007f, 0x00020001 }, { 0x27, 0x00000040, 0x00000000 }, { 0x28, 0xffffffff, 0x7f077f01 },
+		{ 0x29, 0xffffffff, 0 }, { 0x2a, 0xffffffff, 0 }, { 0x2b, 0xffffffff, 0 }, { 0x2c, 0xffffffff, 0 },
+		{ 0x2d, 0xffffffff, 0 }, { 0x2e, 0xffffffff, 0 }, { 0x2f, 0xffffffff, 0 }, { 0x31, 0xffffffff, 0 },
+		{ 0x32, 0xffffffff, 0 }, { 0x33, 0xffffffff, 0 }, { 0x35, 0xffffffff, 0 }, { 0x3a, 0xffffffff, 0x65feae30 },
+		{ 0x3b, 0xffffffff, 0x0000000b }, { 0x3e, 0xffffffff, 0x204e454c }, { 0x3f, 0xffffffff, 0x2d353247 },
+		{ 0x40, 0xffffffff, 0x00003031 }, { 0x41, 0xffffffff, 0 }, { 0x42, 0xffffffff, 0 },
+	};
+	failures += check(Audio::sinkFromEdid(lenovo, sizeof(lenovo), s) && !strcmp(s.name, "LEN G25-10"), "audio: Lenovo sink %s", s.name);
+	wrong = 0;
+	for (const auto &e : kLenovo) {
+		uint32_t v = 0;
+		if (!Audio::sinkValue(e.index, s, v) || (v & e.mask) != e.value) {
+			wrong++;
+			fprintf(stderr, "  audio: Lenovo 0x%02x: 0x%08x, Linux 0x%08x\n", e.index, v & e.mask, e.value);
+		}
+	}
+	failures += check(!wrong, "audio: Lenovo, %u of 21 sink registers not Linux's", wrong);
+	failures += check(Audio::kEndpointIndex[1] == 0x038c && Audio::kDigCount[1] && Audio::kInitCount, "audio: tables");
 	return failures;
 }
 
@@ -6145,6 +6209,7 @@ int main(int argc, char **argv) {
 	failures += testPm4Packets();
 	failures += testCodeObject();
 	failures += testHostRefusals();
+	failures += testAudio();
 	failures += testGpuHeap();
 	failures += testFlipArithmetic();
 	failures += testGcInfo();
