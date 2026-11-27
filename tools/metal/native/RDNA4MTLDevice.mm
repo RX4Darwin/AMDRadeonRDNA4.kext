@@ -233,6 +233,7 @@ static void missingCall(id obj, NSInvocation *inv)
 - (instancetype)initNativeWithAcceleratorPort:(io_service_t)service;   // whatever the environment (the router's choice)
 - (rdna4_t *)gpu;   // nil until the kext's runtime client is open
 - (const rdna4_program_t *)mipPlanesKernel;
+- (const rdna4_program_t *)copyPlaneKernel;
 - (NSError *)drainGfx;   // waits for the draws submitted so far (the work queue)
 // A resource's gpuResourceID (argument buffers, MoltenVK's descriptor sets): the address of a 32-byte slot holding its T# or S#, which the
 // translated shader loads as it loads a bound one's (air2amdgpu.cpp). handle 0: a new slot (0 back: none left); `words` written into it.
@@ -633,6 +634,7 @@ static void bcBlock(const uint8_t *b, uint32_t bytes, bool explicitAlpha, uint8_
 - (void)writeBack;
 - (NSError *)generateMipmaps;
 - (BOOL)mipInVram:(NSUInteger)level;
+- (BOOL)copyVideoPlaneToMipBase:(RDNA4MTLTexture *)dst size:(MTLSize)size error:(NSError * __autoreleasing *)error;
 - (NSError *)transferMip:(MTLRegion)region level:(NSUInteger)level bytes:(void *)bytes
                 rowBytes:(NSUInteger)rowBytes upload:(BOOL)upload;
 @property (readonly) RDNA4MTLTexture *readCopy;   // a texture of its size and pitch, kept: what a draw reading its own target samples
@@ -1623,6 +1625,42 @@ static char gCopyKey;
 	for (NSUInteger y = 0; [self fits:r level:level] && y < r.size.height; y++)
 		memcpy([self at:level x:r.origin.x y:r.origin.y + y z:r.origin.z], (const uint8_t *)bytes + y * bpr, r.size.width * self.bpp);
 	[self shadowToSurface];
+}
+
+// A full video plane blitted to an independently allocated mip chain can go straight
+// to level zero. A subsequent GPU read of the source still refreshes its shadow normally.
+- (BOOL)copyVideoPlaneToMipBase:(RDNA4MTLTexture *)dst size:(MTLSize)size error:(NSError * __autoreleasing *)error
+{
+	if (!_surfaceRows || !_surface || _parent || _shadowAhead || !IOSurfaceGetPlaneCount(_surface) ||
+	    !dst->_mipTail.handle || dst->_device != _device || dst->_parent || dst->_format != _format ||
+	    size.depth != 1 || size.width != _width || size.height != _height ||
+	    dst->_width != _width || dst->_height != _height)
+		return NO;
+	// Import the original IOSurface, since the GPU shadow may still hold the previous frame.
+	const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(_surface);
+	if (!base || !_surfaceRowBytes)
+		return NO;
+	const NSUInteger bytes = IOSurfaceGetAllocSize(_surface), offset = _surfaceRows - base;
+	const NSUInteger row = _width * self.bpp;
+	if (!((offset | row | _surfaceRowBytes | dst.rowBytes) & 15) && offset <= bytes &&
+	    row <= bytes - offset && _height - 1 <= (bytes - offset - row) / _surfaceRowBytes) {
+		const rdna4_program_t *kernel = [_device copyPlaneKernel];
+		__attribute__((objc_precise_lifetime)) RDNA4MTLBuffer *mapped = kernel ? importedSurface(_device, _surface, (void *)base, bytes) : nil;
+		const uint32_t layout[] = { (uint32_t)(row / 16), (uint32_t)_height, (uint32_t)(_surfaceRowBytes / 16), (uint32_t)(dst.rowBytes / 16) };
+		__attribute__((objc_precise_lifetime)) id<MTLBuffer> params = mapped.device == _device ? [_device newBufferWithBytes:layout length:sizeof layout options:MTLResourceStorageModeShared] : nil;
+		if (params) {
+			const uint32_t threads[] = { 64, 1, 1 }, groups[] = { (layout[0] + 63) / 64, layout[1], 1 };
+			const struct { uint64_t buffers[3]; uint32_t dims[6]; uint64_t textures; } args =
+			    { { mapped.gpuAddress + offset, dst.gpuBase, params.gpuAddress }, { 64, 1, 1, layout[0], layout[1], 1 }, 0 };
+			const kern_return_t kr = rdna4_dispatch(_device.gpu, kernel, groups, threads, &args, sizeof args, 1000, NULL);
+			if (kr)
+				*error = rdna4Error(@"copying a video plane to mip level zero", kr);
+			else
+				[dst wroteAll];
+			return YES;
+		}
+	}
+	return NO;   // Use the existing blit if the plane cannot be imported or copied as uint4 rows.
 }
 
 - (NSError *)generateMipmapsInVram
@@ -4570,6 +4608,10 @@ static RDNA4MTLTexture *cardOnly(id<MTLTexture> t)
 		RDNA4MTLTexture *f = [(RDNA4MTLTexture *)from level:fromLevel slice:fromSlice];
 		if (!f)
 			return rdna4Error(@"the source level of a texture copy", 0);
+		if (!fromLevel && !fromSlice && !toLevel && !toSlice &&
+		    !fromOrigin.x && !fromOrigin.y && !fromOrigin.z && !toOrigin.x && !toOrigin.y && !toOrigin.z &&
+		    [f copyVideoPlaneToMipBase:(RDNA4MTLTexture *)to size:size error:&why])
+			return why;
 		[f refresh];   // (a shadowed surface's copy current)
 		const MTLRegion dstRegion = MTLRegionMake2D(toOrigin.x, toOrigin.y, size.width, size.height);
 		const BOOL fromVram = [f mipInVram:0];
@@ -5444,7 +5486,7 @@ RDNA4_ANSWER_MISSING
 	uint64_t _slotVerts[kSlots]; // (RDNA4_DRAWTIME) its draw's vertices times instances
 	uint64_t _drawTimePrev;      // the GPU timestamp of the last timed draw seen ended
 	BOOL _drawTimeGap;           // a dispatch or barrier slot since it
-	rdna4_program_t _resolve[2], _mipPlanes;
+	rdna4_program_t _resolve[2], _mipPlanes, _copyPlane;
 	rdna4_program_t _fsr[2];   // easu, rcas (upscale:into:)
 	rdna4_buffer_t _fsrMid;    // EASU's output, RCAS's input: the largest drawable upscaled so far
 }
@@ -5849,15 +5891,25 @@ static void padSlot(uint32_t *page, uint32_t n)
 
 - (const rdna4_program_t *)mipPlanesKernel
 {
+	return [self planeProgram:&_mipPlanes named:"rdna4_mip_planes"];
+}
+
+- (const rdna4_program_t *)copyPlaneKernel
+{
+	return [self planeProgram:&_copyPlane named:"rdna4_copy_plane"];
+}
+
+- (const rdna4_program_t *)planeProgram:(rdna4_program_t *)program named:(const char *)name
+{
 	@synchronized(self) {
-		if (_mipPlanes.handle)
-			return &_mipPlanes;
+		if (program->handle)
+			return program;
 		rdna4_info_t info;
 		if (!_open || rdna4_info(&_gpu, &info) || !(info.flags & RDNA4_FLAG_DMA) || (info.flags & RDNA4_FLAG_WEDGED))
 			return NULL;
 		for (const MtlKernel &kernel : kMtlKernels) {
-			if (!strcmp(kernel.name, "rdna4_mip_planes") && !rdna4_load(&_gpu, kernel.elf, kernel.size, kernel.name, &_mipPlanes))
-				return &_mipPlanes;
+			if (!strcmp(kernel.name, name) && !rdna4_load(&_gpu, kernel.elf, kernel.size, kernel.name, program))
+				return program;
 		}
 		return NULL;
 	}

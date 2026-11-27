@@ -71,3 +71,10 @@ kernel void rdna4_mip_planes(device const uint *src [[buffer(0)]], device uint *
     const uint odd = (((a >> 8) & mask) + ((b >> 8) & mask) + ((c >> 8) & mask) + ((d >> 8) & mask) + 0x00020002u) >> 2;
     dst[p.y * dstPitch + p.x] = (even & mask) | ((odd & mask) << 8);
 }
+
+kernel void rdna4_copy_plane(device const uint4 *src [[buffer(0)]], device uint4 *dst [[buffer(1)]],
+                             constant uint *layout [[buffer(2)]], uint2 p [[thread_position_in_grid]])
+{
+    if (p.x < layout[0] && p.y < layout[1])
+        dst[p.y * layout[3] + p.x] = src[p.y * layout[2] + p.x];
+}
