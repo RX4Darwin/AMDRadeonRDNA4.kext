@@ -531,12 +531,24 @@ class RDNA4DeviceControl : public AppleGraphicsDeviceControl {
 		IORegistryEntry *fb[20];
 		const uint32_t n = framebuffers(fb, 20);
 		uint32_t width = 0, height = 0, port = 0;
-		if (in[0] < n) {   // its mode: its head's (the dependent index is the head), else the console's
+		if (in[0] < n) {   // its mode: its head's, else the console's
+			uint32_t dependent = 0;
 			if (auto *dep = OSDynamicCast(OSNumber, fb[in[0]]->getProperty("IOFBDependentIndex")))
-				port = dep->unsigned32BitValue();
+				dependent = port = dep->unsigned32BitValue();
 #ifdef AMDRadeonRDNA4_PVGPU
+			// The head by the framebuffer, not its dependent index: wrapFbOpen gives each the first free slot as it opens, in no fixed order
+			// (the boots whose HDR twin frames came at 1280x1024 had the Samsung at index 1; whether this was why is not known yet)
+			const int head = PvScanout::portOf(OSDynamicCast(IOService, fb[in[0]]));
+			if (head >= 0)
+				port = static_cast<uint32_t>(head);
 			if (!PvScanout::scaledFrame(port, width, height))   // (a scaled mode's: the frame WindowServer presents)
 				(void)PvScanout::mode(port, width, height);
+			static uint32_t loggedW[20], loggedH[20];
+			if (in[1] == 0x10 && in[0] < 20 && (loggedW[in[0]] != width || loggedH[in[0]] != height)) {
+				loggedW[in[0]] = width, loggedH[in[0]] = height;
+				rdna4Log("AMDRadeonRDNA4: accel: framebuffer %u (dependent index %u) is head %d: mode %ux%u\n", in[0], dependent, head, width,
+				         height);
+			}
 #endif
 			if (!width || !height) {
 				auto *w = OSDynamicCast(OSNumber, fb[in[0]]->getProperty("Console,Width"));

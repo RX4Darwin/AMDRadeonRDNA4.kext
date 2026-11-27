@@ -73,6 +73,13 @@ scaled up. Switching HDR off and on again within a bad boot keeps 1280x1024. Whe
 twin's refresh) showed the same 1280x1024 frames and was reverted. On the rig HDR is left off until this is found. (A first reading blamed the BT.2020 VSC SDP and removed it, 4a43e45; switching HDR on and off had changed both
 packets. Reverted.)
 
+A lead (2026-11-27): in that bad boot the Samsung's framebuffer had IOFBDependentIndex 1 (wrapFbOpen numbers the framebuffers in
+the order they open), and our AGDC answer for a framebuffer's mode (RDNA4DeviceControl::framebufferQuery, attribute 0x711 query
+0x10) took the dependent index for the head. It now takes the framebuffer's head (PvScanout::portOf) and logs its answer
+("accel: framebuffer N (dependent index D) is head H: mode WxH"). The next boot had the two agree and HDR at 1440p ran right
+(frames 2560x1440, scaled up); a boot where they differ has not come up since, and the old mapping does not explain the number
+1280x1024 (head 1 is the Lenovo's 1920x1080).
+
 ## Next
 
 - Display sleep and wake with HDR on passed on the card (2026-11-26): macOS switches the mode again after the wake, so the
