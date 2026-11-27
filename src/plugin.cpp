@@ -350,10 +350,16 @@ int32_t deviceSetHdr(void *ctx, bool on) {
 	return static_cast<RDNA4Device *>(ctx)->setBootHdr(on);
 }
 
+bool gAudioOn;   // the boot display's audio was set up (rdna4-audio=1 or debug.rdna4_hda): set up again after each switch
+
 int32_t deviceSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 	auto *dev = static_cast<RDNA4Device *>(ctx);
-	if (m.source != Modes::SourceScaled)
-		return dev->applyMode(m);
+	if (m.source != Modes::SourceScaled) {
+		const IOReturn ret = dev->applyMode(m);
+		if (ret == kIOReturnSuccess && gAudioOn)
+			(void)dev->enableBootAudio();   // a mode switch can take the stream's audio packets down with it
+		return ret;
+	}
 	// the head stays on (or goes to) its largest mode; the present path scales the frames down to it
 	const Modes::Mode *base = Modes::scaleBase(dev->modeTable, dev->modeCount);
 	if (!base || !scaledMemoryFor(gBootScaledMemory, gBootScaled, gBootScaledCount))
@@ -368,6 +374,8 @@ void deviceSetPower(void *ctx, bool on) {
 		return;
 
 	static_cast<RDNA4Device *>(ctx)->setDisplayPower(on);
+	if (on && gAudioOn)
+		(void)static_cast<RDNA4Device *>(ctx)->enableBootAudio();
 }
 
 void createVblankService(IOService *framebuffer) {
@@ -1542,30 +1550,48 @@ UInt16 wrapExtConfigRead16(IOPCIDevice *that, IOByteCount offset) {
 // hda-gfx on both, and the framebuffer's connector-type (kConnectorDisplayPort 0x400, HDMI 0x800). Both rig monitors
 // are on DisplayPort. ponytail: every framebuffer under the GPU is called DisplayPort; take it from the head's
 // connector when an HDMI display is to have audio.
+void tieFramebufferToHda(IORegistryEntry *e) {
+	// audio-codec-info: byte 0 the codec's address, byte 1 non-zero, byte 2 the pin's node ID. The boot display's audio is
+	// Azalia endpoint 0 (src/audio_linux.inc), AMD's codec's first pin, 0x03; the others get the second pin (none of their
+	// endpoints is set up yet).
+	const bool boot = !strcmp(e->getName(), ".Display_boot");
+	uint8_t dp[4] = { 0x00, 0x04, 0x00, 0x00 };
+	uint8_t dpSignal[4] = { 0x10, 0x00, 0x00, 0x00 };   // kIOFBAVSignalTypeDP (av-signal-type, read on each framebuffer event)
+	uint8_t codecInfo[4] = { 0x00, 0x01, static_cast<uint8_t>(boot ? 0x03 : 0x05), 0x00 };
+	uint8_t pipeNo[4] = { static_cast<uint8_t>(boot ? 1 : 2), 0, 0, 0 };
+	e->setProperty("hda-gfx", "onboard-1");
+	e->setProperty("connector-type", dp, sizeof(dp));
+	e->setProperty("av-signal-type", dpSignal, sizeof(dpSignal));
+	e->setProperty("audio-codec-info", codecInfo, sizeof(codecInfo));
+	e->setProperty("AAPL,DisplayPipe", pipeNo, sizeof(pipeNo));
+}
+
 void tieFramebuffersToHda(IOPCIDevice *gpu) {
 	IORegistryIterator *it = IORegistryIterator::iterateOver(gpu, gIOServicePlane, kIORegistryIterateRecursively);
 	if (!it)
 		return;
-	uint8_t dp[4] = { 0x00, 0x04, 0x00, 0x00 };
-	uint8_t dpSignal[4] = { 0x10, 0x00, 0x00, 0x00 };   // kIOFBAVSignalTypeDP (av-signal-type, read on each framebuffer event)
-	unsigned n = 0, other = 0;
+	unsigned n = 0;
 	while (IORegistryEntry *e = it->getNextObject())
 		if (e->metaCast("IOFramebuffer")) {   // (by name: the kext does not link IOGraphics)
-			// audio-codec-info: byte 0 the codec's address, byte 1 non-zero, byte 2 the pin's node ID. The boot display's audio
-			// is Azalia endpoint 0 (src/audio_linux.inc), AMD's codec's first pin, 0x03; the others get the next pins.
-			const bool boot = !strcmp(e->getName(), ".Display_boot");
-			const uint8_t pin = static_cast<uint8_t>(boot ? 0x03 : 0x05 + 2 * other++);
-			uint8_t codecInfo[4] = { 0x00, 0x01, pin, 0x00 };
-			uint8_t pipeNo[4] = { static_cast<uint8_t>(boot ? 1 : 1 + other), 0, 0, 0 };
-			e->setProperty("hda-gfx", "onboard-1");
-			e->setProperty("connector-type", dp, sizeof(dp));
-			e->setProperty("av-signal-type", dpSignal, sizeof(dpSignal));
-			e->setProperty("audio-codec-info", codecInfo, sizeof(codecInfo));
-			e->setProperty("AAPL,DisplayPipe", pipeNo, sizeof(pipeNo));
+			tieFramebufferToHda(e);
 			n++;
 		}
 	it->release();
 	FBLOG("audio: %u framebuffers marked hda-gfx onboard-1, connector-type DisplayPort", n);
+}
+
+// AppleGFXHDA asks for AppleDisplays after ours exist and drops the ones IOKit hands it before its notifier is stored
+// (docs/audio-plan.md step 2): register them again once it has asked.
+void registerDisplaysAgain(IOPCIDevice *gpu) {
+	IORegistryIterator *it = gpu ? IORegistryIterator::iterateOver(gpu, gIOServicePlane, kIORegistryIterateRecursively) : nullptr;
+	unsigned n = 0;
+	while (IORegistryEntry *e = it ? it->getNextObject() : nullptr)
+		if (e->metaCast("AppleDisplay")) {
+			static_cast<IOService *>(e)->registerService();
+			n++;
+		}
+	OSSafeReleaseNULL(it);
+	FBLOG("audio: %u AppleDisplays registered again", n);
 }
 
 void offerHdaToApple(IOPCIDevice *gpu) {
@@ -1618,6 +1644,12 @@ uint64_t wrapGfxMatched(void *self, void *ref, void *service, void *notifier) {
 	return r;
 }
 uint64_t wrapGfxMatchedEG(void *self, void *ref, void *service, void *notifier) {
+	// the display's framebuffer gets the properties the handler reads (one made after debug.rdna4_hda or boot ran, too)
+	for (IORegistryEntry *e = static_cast<IORegistryEntry *>(service); e; e = e->getParentEntry(gIOServicePlane))
+		if (e->metaCast("IOFramebuffer")) {
+			tieFramebufferToHda(e);
+			break;
+		}
 	const uint64_t r = FunctionCast(wrapGfxMatchedEG, orgGfxHda[kGfxMatchedEG])(self, ref, service, notifier);
 	FBLOG("audio: AppleGFXHDA EG gfxMatchedHandler(%s) -> 0x%llx", entryName(service), r);
 	return r;
@@ -1649,6 +1681,8 @@ uint64_t wrapGfxLocate(void *self, void *a, void *b, void *c) {
 uint64_t wrapGfxLocateEG(void *self, void *a, void *b, void *c) {
 	const uint64_t r = FunctionCast(wrapGfxLocateEG, orgGfxHda[kGfxLocateEG])(self, a, b, c);
 	FBLOG("audio: AppleGFXHDA EG locateAssociatedGraphicsController -> 0x%llx", r);
+	if (!static_cast<uint32_t>(r))
+		registerDisplaysAgain(gHdaGpu);
 	return r;
 }
 uint64_t wrapGfxEngineDP(void *self, void *paths, void *index, void *head) {
@@ -1681,6 +1715,12 @@ void processGfxHda(void *, KernelPatcher &patcher, size_t index, mach_vm_address
 	patcher.clearError();
 }
 
+// The boot display's audio set up and the audio function handed to AppleGFXHDA (rdna4-audio=1, or debug.rdna4_hda=1).
+void startAudio() {
+	gAudioOn = gHdaDev && gHdaDev->enableBootAudio() == kIOReturnSuccess;
+	offerHdaToApple(gHdaGpu);
+}
+
 int hdaSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	int value = 0;
 	const int err = sysctl_handle_int(oidp, &value, 0, req);
@@ -1688,21 +1728,11 @@ int hdaSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		return err;
 	if ((value != 1 && value != 2) || !gHdaGpu)
 		return EINVAL;
-	if (value == 2) {   // the displays matched again: AppleGFXHDA only takes AppleDisplays matched after it asked for them
-		IORegistryIterator *it = IORegistryIterator::iterateOver(gHdaGpu, gIOServicePlane, kIORegistryIterateRecursively);
-		unsigned n = 0;
-		while (IORegistryEntry *e = it ? it->getNextObject() : nullptr)
-			if (e->metaCast("AppleDisplay")) {
-				static_cast<IOService *>(e)->registerService();
-				n++;
-			}
-		OSSafeReleaseNULL(it);
-		FBLOG("audio: %u AppleDisplays registered again", n);
+	if (value == 2) {   // the displays matched again by hand (done by itself once AppleGFXHDA has asked for them)
+		registerDisplaysAgain(gHdaGpu);
 		return 0;
 	}
-	if (gHdaDev)
-		(void)gHdaDev->enableBootAudio();
-	offerHdaToApple(gHdaGpu);
+	startAudio();
 	return 0;
 }
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_hda, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, hdaSysctl, "I",
@@ -1732,6 +1762,9 @@ void attach(FbEntry &e) {
 		gHdaGpu = pci;
 		gHdaDev = &dev;
 		sysctl_register_oid(&sysctl__debug_rdna4_hda);
+		uint32_t audio = 0;   // rdna4-audio=1 (docs/audio-plan.md): the boot display's audio from boot on
+		if (Trial::bootArg("rdna4-audio", audio) && audio)
+			startAudio();
 	}
 	Ndrv::Backend be { &dev, deviceSurfaceFor, deviceSwitchTo, deviceSetPower,
 	                   deviceSupportsHardwareCursor, deviceSetHardwareCursor,

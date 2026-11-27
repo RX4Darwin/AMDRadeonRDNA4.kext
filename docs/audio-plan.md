@@ -82,6 +82,16 @@ The kext logs a few AppleGFXHDA functions through Lilu routes when it loads (pro
    started, and Sound settings list "Odyssey G70D" (transport DisplayPort, 2 channels, 48 kHz). macOS made it the system
    (alert) output; the rig's was set back to its default output (~/rdna4/sysout follow).
 
+## Step 3: from boot (2026-11-27)
+
+`rdna4-audio=1`: at the boot framebuffer's attach the kext programs the boot display's audio (step 1) and hands the
+function to AppleGFXHDA (step 0); the routes tie each display's framebuffer before the match handler reads it, and
+register the AppleDisplays again once `locateAssociatedGraphicsController` has asked for them (by hand:
+`debug.rdna4_hda=2`). After every switch of the boot pipe and when the display comes back on, the boot display's audio
+is set up again (a mode switch can take the audio packets down). On the rig the boot with it came up normally and Sound
+settings listed "Odyssey G70D" and "LEN G25-10"; the Lenovo's has no Azalia endpoint set up (only the boot display's
+is), so it is most likely silent. Not heard yet.
+
 ## Later steps
 
 2. Whatever IOFramebuffer attributes AppleGFXHDA asks of our framebuffer.

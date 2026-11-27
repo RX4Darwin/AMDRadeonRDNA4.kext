@@ -5,6 +5,10 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- Audio over DisplayPort, first steps (`rdna4-audio=1`, off by default): the boot display's audio is programmed as
+  Linux does it, and the card's audio function is handed to Apple's AppleGFXHDA, which then lists the monitor as a
+  sound output. On the rig the Samsung Odyssey G70D appears in Sound settings; not yet heard. docs/audio-plan.md.
+
 - HDR, first step (`rdna4-hdr=1`, off by default, needs `rdna4-vrr=1`): on a display whose EDID takes PQ the driver lists
   an HDR10 copy of every mode, which is what macOS needs to offer HDR, and switching HDR on sends the boot display (DP)
   the HDR static metadata (PQ) and, where the sink takes it, BT.2020 in a VSC SDP. The link stays 8 bits a component. On Tahoe 26.6.2 with the rig's Samsung Odyssey G70D,
