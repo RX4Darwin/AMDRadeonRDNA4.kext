@@ -70,3 +70,20 @@ vertex float4 bindless_v(uint vid [[vertex_id]]) {
 fragment float4 bindless_f(float4 pos [[position]], array<texture2d<float>, 128> t [[texture(0)]], constant uint4 &idx [[buffer(0)]]) {
 	return t[idx[min(uint(pos.x), 3u)]].read(uint2(0));
 }
+
+struct MipPlaneVertex {
+	float4 position [[position]];
+	float2 uv;
+};
+
+vertex MipPlaneVertex mip_plane_v(uint i [[vertex_id]], device const float2 *positions [[buffer(0)]]) {
+	float2 p = positions[i];
+	return {float4(p, 0, 1), p * 0.5 + 0.5};
+}
+
+fragment float4 mip_plane_f(MipPlaneVertex in [[stage_in]], texture2d<float> y [[texture(3)]],
+                            texture2d<float> uv [[texture(5)]], sampler s [[sampler(0)]]) {
+	bool root = y.get_width() == 3840 && y.get_height() == 2160 && y.get_num_mip_levels() == 12 && uv.get_num_mip_levels() == 11;
+	bool view = y.get_width() == 960 && y.get_height() == 540 && y.get_num_mip_levels() == 2 && uv.get_num_mip_levels() == 2;
+	return float4(y.sample(s, in.uv).r, uv.sample(s, in.uv).rg, root ? 1.0 : view ? 0.5 : 0.0);
+}

@@ -19,6 +19,10 @@ otherwise). The newest version is on top. How versions and branches work is in `
   The Lenovo (no HDR) got no copies. Display sleep and wake with HDR on passed; system sleep not
   run. Plan in docs/hdr-plan.md.
 
+- Native Metal can sample large, shader-read-only Managed R16Unorm and RG16Unorm 2D textures at an implicit mip level.
+  The whole chain fits in one GFX12 linear VRAM image. On an RX 9070 XT under Tahoe, a minified draw selected the expected
+  levels from both planes and respected a two-level texture view. All levels of a decoded 4K frame matched the CPU reference.
+
 - Native Metal generates mip levels directly in VRAM for large Managed R16Unorm and RG16Unorm 2D textures,
   keeping level 0 CPU-accessible. The host fallback walks rows directly. The reported working set includes
   cached host buffers, and Metal can release them and retry a refused allocation. The per-client host limit

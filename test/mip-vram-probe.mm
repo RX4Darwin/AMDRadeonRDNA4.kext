@@ -15,15 +15,18 @@
 - (id<MTLBuffer>)memory;
 @end
 
-static int test(id<MTLDevice> dev, const char *name, MTLPixelFormat format, unsigned w, unsigned h, unsigned bpp, bool vram = true)
+static int test(id<MTLDevice> dev, const char *name, MTLPixelFormat format, unsigned w, unsigned h, unsigned bpp, bool vram = true, bool sampleOnly = true)
 {
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h mipmapped:YES];
+    d.usage = sampleOnly ? MTLTextureUsageShaderRead : (MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
     d.storageMode = MTLStorageModeManaged;
     id<ProbeTexture> texture = (id<ProbeTexture>)[dev newTextureWithDescriptor:d];
     const unsigned baseBytes = ((w * bpp + 255) & ~255u) * h;
-    if (!texture || [texture mipInVram:0] || [texture mipInVram:1] != vram ||
+    const bool wholeChain = vram && sampleOnly;
+    const bool hostOK = wholeChain ? !texture.memory : (vram ? texture.memory.length == baseBytes : texture.memory.length > baseBytes);
+    if (!texture || [texture mipInVram:0] != wholeChain || [texture mipInVram:1] != vram ||
         texture.storageMode != MTLStorageModeManaged ||
-        (vram ? texture.memory.length != baseBytes : texture.memory.length <= baseBytes)) {
+        !hostOK) {
         fprintf(stderr, "%s: incorrect backing (texture=%p, host=%lu)\n", name, texture, texture.memory.length);
         return 1;
     }
@@ -123,11 +126,92 @@ static int test(id<MTLDevice> dev, const char *name, MTLPixelFormat format, unsi
     return 0;
 }
 
+// Give each level a distinct constant colour so the pixel reports the implicit LOD.
+static int samplePlanes(id<MTLDevice> dev, NSString *path)
+{
+    NSError *error = nil;
+    id<MTLLibrary> library = [dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+    auto pipeline = [MTLRenderPipelineDescriptor new];
+    pipeline.vertexFunction = [library newFunctionWithName:@"mip_plane_v"];
+    pipeline.fragmentFunction = [library newFunctionWithName:@"mip_plane_f"];
+    pipeline.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> state = [dev newRenderPipelineStateWithDescriptor:pipeline error:&error];
+    if (!state) {
+        fprintf(stderr, "mip sampling pipeline: %s\n", error.description.UTF8String);
+        return 1;
+    }
+    id<MTLTexture> planes[2];
+    for (unsigned p = 0; p < 2; ++p) {
+        MTLPixelFormat format = p ? MTLPixelFormatRG16Unorm : MTLPixelFormatR16Unorm;
+        auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:3840 >> p height:2160 >> p mipmapped:YES];
+        d.storageMode = MTLStorageModeManaged;
+        d.usage = MTLTextureUsageShaderRead;
+        planes[p] = [dev newTextureWithDescriptor:d];
+        if (!planes[p]) return 1;
+        for (unsigned l = 0; l < d.mipmapLevelCount; ++l) {
+            NSUInteger width = MAX(d.width >> l, 1ul), height = MAX(d.height >> l, 1ul);
+            uint16_t marker = (l + 1) * 16 * 257;
+            std::vector<uint16_t> data(width * height * (p + 1), marker);
+            if (p)
+                for (size_t n = 1; n < data.size(); n += 2) data[n] = 65535 - marker;
+            [planes[p] replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:l withBytes:data.data()
+                         bytesPerRow:width * sizeof(uint16_t) * (p + 1)];
+        }
+    }
+    id<MTLCommandQueue> queue = [dev newCommandQueue];
+    const float vertices[] = {-1, -1, 3, -1, -1, 3};
+    auto positions = [dev newBufferWithBytes:vertices length:sizeof(vertices) options:MTLResourceStorageModeShared];
+    auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:160 height:100 mipmapped:NO];
+    d.usage = MTLTextureUsageRenderTarget;
+    d.storageMode = MTLStorageModeShared;
+    auto target = [dev newTextureWithDescriptor:d];
+    auto pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = target;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    for (bool view : {false, true}) {
+        if (view)
+            for (id<MTLTexture> __strong &plane : planes)
+                plane = [plane newTextureViewWithPixelFormat:plane.pixelFormat textureType:MTLTextureType2D
+                                                      levels:NSMakeRange(2, 2) slices:NSMakeRange(0, 1)];
+        // At 160x100 the horizontal derivative dominates: log2(3840/160) ~= 4.585 for Y, 3.585 for UV.
+        const int rootMarkers[][2] = {{16, 16}, {96, 80}, {89, 73}};
+        for (auto filter : {MTLSamplerMipFilterNotMipmapped, MTLSamplerMipFilterNearest, MTLSamplerMipFilterLinear}) {
+            auto sd = [MTLSamplerDescriptor new];
+            sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+            sd.mipFilter = filter;
+            auto cmd = [queue commandBuffer];
+            auto enc = [cmd renderCommandEncoderWithDescriptor:pass];
+            [enc setRenderPipelineState:state];
+            [enc setVertexBuffer:positions offset:0 atIndex:0];
+            [enc setFragmentTexture:planes[0] atIndex:3];
+            [enc setFragmentTexture:planes[1] atIndex:5];
+            [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+            uint8_t pixel[4] = {};
+            [target getBytes:pixel bytesPerRow:4 fromRegion:MTLRegionMake2D(80, 50, 1, 1) mipmapLevel:0];
+            const int viewMarker = filter == MTLSamplerMipFilterNotMipmapped ? 48 : 64;
+            const int y = view ? viewMarker : rootMarkers[filter][0], uv = view ? viewMarker : rootMarkers[filter][1];
+            if (cmd.status != MTLCommandBufferStatusCompleted || abs(pixel[0] - y) > 2 || abs(pixel[1] - uv) > 2 ||
+                abs(pixel[2] - (255 - uv)) > 2 || abs(pixel[3] - (view ? 128 : 255)) > 1) {
+                fprintf(stderr, "view=%d filter=%lu: unexpected pixel %u,%u,%u,%u\n", view, (unsigned long)filter,
+                        pixel[0], pixel[1], pixel[2], pixel[3]);
+                return 1;
+            }
+        }
+    }
+    puts("Implicit mip sampling, dimensions and level counts passed for both planes and their views");
+    return 0;
+}
+
 int main(int argc, const char **argv)
 {
     @autoreleasepool {
-        if (argc != 2) {
-            fprintf(stderr, "usage: %s <native Metal bundle executable>\n", argv[0]);
+        if (argc != 2 && argc != 3) {
+            fprintf(stderr, "usage: %s <native Metal bundle executable> [probe.metallib]\n", argv[0]);
             return 1;
         }
         if (!dlopen(argv[1], RTLD_NOW | RTLD_LOCAL)) {
@@ -156,6 +240,8 @@ int main(int argc, const char **argv)
         return test(dev, "R16 3840x2160", MTLPixelFormatR16Unorm, 3840, 2160, 2) ||
                test(dev, "RG16 1920x1080", MTLPixelFormatRG16Unorm, 1920, 1080, 4) ||
                test(dev, "RG16 2049x1025", MTLPixelFormatRG16Unorm, 2049, 1025, 4) ||
-               test(dev, "RG16 129x65", MTLPixelFormatRG16Unorm, 129, 65, 4, false);
+               test(dev, "RG16 split (shader-write usage)", MTLPixelFormatRG16Unorm, 1920, 1080, 4, true, false) ||
+               test(dev, "RG16 129x65", MTLPixelFormatRG16Unorm, 129, 65, 4, false) ||
+               (argc == 3 && samplePlanes(dev, [NSString stringWithUTF8String:argv[2]]));
     }
 }

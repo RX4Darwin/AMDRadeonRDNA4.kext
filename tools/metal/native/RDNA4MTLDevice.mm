@@ -780,7 +780,9 @@ static BOOL vramTargets(void)
 	// a mipmapped texture's levels, each an image of its own in _memory (an array's or cube's: its slices, _levelSlice apart, with the
 	// hardware's pitches for the level's size)
 	NSUInteger _levels, _levelOffset[16], _levelRow[16], _levelSlice[16];
-	rdna4_buffer_t _mipTail;   // owned by the root, with level 0 still in _memory
+	rdna4_buffer_t _mipTail;   // root-owned VRAM storage for either the tail or the entire native mip chain
+	BOOL _nativeMipChain;
+	NSUInteger _firstNativeMip, _nativeMipOffset[16];   // physical offsets on the root; views retain their first level
 	NSUInteger _mipTailStart; // root layout offset of level 1; copied into views
 	const uint8_t *_surfaceRows;   // shadowed: the IOSurface's own pixels, _surfaceRowBytes apart; _memory is the GPU's copy
 	NSUInteger _surfaceRowBytes;
@@ -844,7 +846,7 @@ static BOOL vramTargets(void)
 - (void)descriptor:(uint32_t[8])t level:(NSUInteger)level
 {
 	level = MIN(level, MAX(_levels, (NSUInteger)1) - 1);
-	if (!level || !self.gpuBase) {   // (no memory: descriptor: gives the spare texel)
+	if ((!level && !_nativeMipChain) || !self.gpuBase) {   // (no memory: descriptor: gives the spare texel)
 		[self descriptor:t];
 		return;
 	}
@@ -913,7 +915,7 @@ static char gCopyKey;
 - (uint64_t)identity { return _surface && !_surfaceRows ? (1ull << 63 | (uint64_t)IOSurfaceGetID(_surface) << 32) + _offset : self.gpuBase; }
 - (void)wroteAll
 {
-	if (_mipTailStart) {
+	if (_mipTailStart || _nativeMipChain) {
 		wrote(self.gpuBase, self.gpuBase + self.spanBytes);
 		return;
 	}
@@ -1029,6 +1031,13 @@ static char gCopyKey;
 		linearImage(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), 16384, (uint32_t)((_width + 16383) / 16384), 16384);
 		return;
 	}
+	if (_nativeMipChain && _levels > 1 && self.textureType == MTLTextureType2D) {
+		RDNA4MTLTexture *root = self.root;
+		linearImage(t, root->_mipTail.gpu, _fm->gfx, viewSel(_fm->sel, _swizzle), (uint32_t)root.width, (uint32_t)root.height, 1);
+		t[1] |= (uint32_t)(root->_levels - 1) << 12 | (uint32_t)_firstNativeMip << 25;
+		t[3] |= (uint32_t)(_firstNativeMip + _levels - 1) << 15;
+		return;
+	}
 	linearImage(t, self.gpuBase, _fm->gfx, viewSel(_fm->sel, _swizzle), (uint32_t)_width, (uint32_t)_height, (uint32_t)(_rowBytes / _fm->bpp));
 	if (_type == MTLTextureType1D)
 		t[3] = (t[3] & 0x0fffffffu) | 8u << 28;   // TYPE 1D
@@ -1142,6 +1151,8 @@ static char gCopyKey;
 	_memory = t->_memory;
 	_managed = t->_managed;
 	_mipTailStart = t->_mipTailStart;
+	_nativeMipChain = t->_nativeMipChain;
+	_firstNativeMip = t->_firstNativeMip + l;
 	_vramTarget = t->_vramTarget;
 	_vram = t->_vram;         // a multisampled texture's samples (its only memory) and how many: without them a view of one had address 0 and
 	_samples = t->_samples;   // one sample, and Chess's (SceneKit's) read of its 4x MSAA image through a view faulted and hung the draw (issue 23)
@@ -1311,6 +1322,29 @@ static char gCopyKey;
 	return self;
 }
 
+// GFX12 AddrLib GetMipOffset, linear 2D: padded extents use ceil shifts. The
+// visible extent of each Metal level still uses floor shifts. The data pitch
+// is 128-byte aligned; the space reserved per row is 256-byte aligned.
+- (BOOL)allocateNativeVideoMips:(MTLTextureDescriptor *)d
+{
+	NSUInteger total = 0, pitch[16];
+	for (NSUInteger i = _levels; i-- > 0;) {
+		const NSUInteger scale = (NSUInteger)1 << i;
+		const NSUInteger row = ((d.width + scale - 1) / scale) * _fm->bpp;
+		const NSUInteger height = (d.height + scale - 1) / scale;
+		_nativeMipOffset[i] = total;
+		pitch[i] = (row + 127) & ~(NSUInteger)127;
+		total += ((row + 255) & ~(NSUInteger)255) * height;
+	}
+	if (rdna4_alloc(_device.gpu, total, &_mipTail))
+		return NO;
+	for (NSUInteger i = 0; i < _levels; ++i)
+		_levelRow[i] = pitch[i];
+	_rowBytes = pitch[0];
+	_nativeMipChain = YES;
+	return YES;
+}
+
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)d
 {
 	if (!(self = [super init]))
@@ -1386,16 +1420,20 @@ static char gCopyKey;
 	} else {
 		const NSUInteger fullBytes = bytes;
 		_device = device;
-		if (twoD && _levels > 1 && fullBytes >= (8ull << 20) && d.storageMode == MTLStorageModeManaged &&
-		    (d.pixelFormat == MTLPixelFormatR16Unorm || d.pixelFormat == MTLPixelFormatRG16Unorm) && [device mipPlanesKernel] &&
-		    !rdna4_alloc(device.gpu, fullBytes - _levelOffset[1], &_mipTail)) {
-			_mipTailStart = _levelOffset[1];
-			bytes = _mipTailStart;
-			RTRACE(12, @"mip VRAM: format %lu %lux%lu, %lu host bytes + %llu VRAM bytes",
-			       (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bytes, _mipTail.bytes);
+		const BOOL video = twoD && _levels > 1 && fullBytes >= (8ull << 20) && d.storageMode == MTLStorageModeManaged &&
+		                   (d.pixelFormat == MTLPixelFormatR16Unorm || d.pixelFormat == MTLPixelFormatRG16Unorm) && [device mipPlanesKernel];
+		const BOOL sampleOnly = (d.usage & ~MTLTextureUsagePixelFormatView) == MTLTextureUsageShaderRead;
+		if (!(video && sampleOnly && [self allocateNativeVideoMips:d])) {
+			if (video && !rdna4_alloc(device.gpu, fullBytes - _levelOffset[1], &_mipTail)) {
+				_mipTailStart = _levelOffset[1];
+				bytes = _mipTailStart;
+			}
+			if (!(_memory = [[RDNA4MTLBuffer alloc] initWithDevice:device length:bytes options:MTLResourceStorageModeShared]))
+				return nil;
 		}
-		if (!(_memory = [[RDNA4MTLBuffer alloc] initWithDevice:device length:bytes options:MTLResourceStorageModeShared]))
-			return nil;
+		if (_mipTail.handle)
+			RTRACE(12, @"mip VRAM: format %lu %lux%lu, %lu host bytes + %llu VRAM bytes",
+			       (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)_memory.allocatedSize, _mipTail.bytes);
 	}
 	// Core Animation pools Managed textures by their reported storage mode.
 	_managed = d.storageMode == MTLStorageModeManaged;
@@ -1404,10 +1442,10 @@ static char gCopyKey;
 		const uint64_t total = (gLargeMipBytes += _largeMipBytes);
 		statMax(gLargeMipHostPeak, total);
 		gLargeMipCount++;
-		if (_mipTail.handle) {
-			gMipTailBytes += (_mipTail.bytes + 4095) & ~4095ull;
-			gMipTailCount++;
-		}
+	}
+	if (_mipTail.handle) {
+		gMipTailBytes += (_mipTail.bytes + 4095) & ~4095ull;
+		gMipTailCount++;
 	}
 	_device = device;
 	_width = d.width;
@@ -1438,15 +1476,19 @@ static char gCopyKey;
 - (MTLResourceOptions)resourceOptions { return (MTLResourceOptions)self.storageMode << MTLResourceStorageModeShift; }
 - (NSUInteger)allocatedSize
 {
-	return _memory ? _memory.allocatedSize + self.root->_mipTail.bytes : (NSUInteger)_vram.bytes;
+	return (_memory || _nativeMipChain) ? _memory.allocatedSize + self.root->_mipTail.bytes : (NSUInteger)_vram.bytes;
 }
 - (BOOL)isFramebufferOnly { return NO; }
 - (BOOL)mipInVram:(NSUInteger)level
 {
-	return _mipTailStart && _offset + _levelOffset[level] >= _mipTailStart;
+	return _nativeMipChain || (_mipTailStart && _offset + _levelOffset[level] >= _mipTailStart);
 }
 - (uint64_t)gpuAddressOfLevel:(NSUInteger)level
 {
+	if (_nativeMipChain) {
+		RDNA4MTLTexture *root = self.root;
+		return root->_mipTail.gpu + root->_nativeMipOffset[_firstNativeMip + level];
+	}
 	const NSUInteger offset = _offset + _levelOffset[level];
 	if ([self mipInVram:level])
 		return self.root->_mipTail.gpu + offset - _mipTailStart;
@@ -1483,7 +1525,7 @@ static char gCopyKey;
 	if (_vram.handle && !_parent)   // (a view's is its parent's)
 		rdna4_free(_device.gpu, &_vram);
 	if (_mipTail.handle) {
-		if (_largeMipBytes) {
+		if (_largeMipBytes || _nativeMipChain) {
 			gMipTailBytes -= (_mipTail.bytes + 4095) & ~4095ull;
 			gMipTailCount--;
 		}
@@ -1508,7 +1550,7 @@ static char gCopyKey;
 // its passes clear anyway; a GPU blit if contents matter.
 - (BOOL)vramOnly
 {
-	if (_memory.contents)
+	if (_nativeMipChain || _memory.contents)
 		return NO;
 	RTRACE(8, @"CPU access to a %lux%lu texture of format %lu, %u samples, in VRAM only: ignored", (unsigned long)_width, (unsigned long)_height,
 	       (unsigned long)_format, _samples);
@@ -1524,7 +1566,7 @@ static char gCopyKey;
 	if (!r.size.width || !r.size.height)
 		return nil;
 	const NSUInteger pitch = _levelRow[level], row = r.size.width * self.bpp;
-	const NSUInteger offset = _offset + _levelOffset[level] - _mipTailStart + r.origin.y * pitch + r.origin.x * self.bpp;
+	const NSUInteger offset = [self gpuAddressOfLevel:level] - self.root->_mipTail.gpu + r.origin.y * pitch + r.origin.x * self.bpp;
 	const NSUInteger length = (r.size.height - 1) * pitch + row;
 	const rdna4_buffer_t tail = self.root->_mipTail;
 	rdna4_t *gpu = _device.gpu;
@@ -1618,7 +1660,7 @@ static char gCopyKey;
 {
 	if (_levels < 2)
 		return nil;
-	if (_mipTailStart)
+	if (_mipTailStart || _nativeMipChain)
 		return [self generateMipmapsInVram];
 
 	[self wroteAll];
@@ -4357,7 +4399,7 @@ RDNA4_ANSWER_MISSING
 static NSError *colourOnly(id<MTLTexture> t)
 {
 	// (the CPU's: not one in the card's memory only, a multisampled one)
-	return [(id)t isKindOfClass:[RDNA4MTLTexture class]] && !((RDNA4MTLTexture *)t).isDepth && ((RDNA4MTLTexture *)t).memory ? nil
+	return [(id)t isKindOfClass:[RDNA4MTLTexture class]] && !((RDNA4MTLTexture *)t).isDepth && (((RDNA4MTLTexture *)t).memory || [(RDNA4MTLTexture *)t mipInVram:0]) ? nil
 	       : rdna4Error(@"a blit of a texture that is not a colour texture of this device in the CPU's memory", 0);
 }
 
@@ -4396,7 +4438,7 @@ static RDNA4MTLTexture *cardOnly(id<MTLTexture> t)
 	if (![(id)t isKindOfClass:[RDNA4MTLTexture class]])
 		return nil;
 	RDNA4MTLTexture *r = (RDNA4MTLTexture *)t;
-	return !r.memory && !r.isDepth && r.samples == 1 && r.gpuBase ? r : nil;
+	return !r.memory && ![r mipInVram:0] && !r.isDepth && r.samples == 1 && r.gpuBase ? r : nil;
 }
 
 - (void)copyFromBuffer:(id<MTLBuffer>)from sourceOffset:(NSUInteger)fromOffset toBuffer:(id<MTLBuffer>)to

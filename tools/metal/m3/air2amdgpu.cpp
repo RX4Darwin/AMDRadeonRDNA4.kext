@@ -1228,10 +1228,13 @@ static std::string legalize(Function &k) {
 			                                            : b.CreateAnd(b.CreateLShr(w2, 14), 0x3fff);
 			// a multisampled texture's (get_width_texture_2d_ms) has no LOD: level 0
 			Value *lod = c->arg_size() > 1 ? c->getArgOperand(1) : b.getInt32(0);
+			// A native 2D mip view carries the root extent and its first visible level.
+			if (name.ends_with("_texture_2d"))
+				lod = b.CreateAdd(lod, b.CreateAnd(b.CreateLShr(w1, 25), 31));
 			r = b.CreateIntrinsic(Intrinsic::umax, {b.getInt32Ty()}, {b.CreateLShr(b.CreateAdd(size, b.getInt32(1)), lod), b.getInt32(1)});
 		} else if (name.starts_with("get_num_mip_levels_")) {
 			// (texture): in a draw's shader, 1 plus the levels of the host's level table whose address differs from the level before
-			// (past the last, it repeats the last); elsewhere (no table) 1: every T# has LAST_LEVEL 0, its levels images of their own
+			// (past the last, it repeats the last). A native chain instead carries the visible level range in its T#.
 			r = b.getInt32(1);
 			if (drawStage) {
 				Value *before = b.CreateExtractElement(levelDescriptor(c->getArgOperand(0), b.getInt32(0)), uint64_t(0));
@@ -1240,6 +1243,12 @@ static std::string legalize(Function &k) {
 					r = b.CreateAdd(r, b.CreateZExt(b.CreateICmpNE(base, before), b.getInt32Ty()));
 					before = base;
 				}
+			}
+			if (name.ends_with("_texture_2d")) {
+				Value *t = descriptor(c->getArgOperand(0), 8);
+				Value *first = b.CreateAnd(b.CreateLShr(b.CreateExtractElement(t, 1), 25), 31);
+				Value *last = b.CreateAnd(b.CreateLShr(b.CreateExtractElement(t, 3), 15), 31);
+				r = b.CreateSelect(b.CreateICmpNE(last, b.getInt32(0)), b.CreateAdd(b.CreateSub(last, first), b.getInt32(1)), r);
 			}
 		} else if (name.starts_with("get_array_size_texture_1d_array") || name.starts_with("get_array_size_texture_2d_array")) {
 			// (texture): the T#'s layers - 1 in word4 [13:0] (pvdraw.hpp linearArray1d / linearArray2d), plus one (Quake II's water)
