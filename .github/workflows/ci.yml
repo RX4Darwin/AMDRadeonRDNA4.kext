@@ -64,6 +64,43 @@ jobs:
           print(f"Python syntax: {len(files)} files passed")
           PY
 
+      - name: OpenCore redactor smoke test
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          script = Path("tools/rig/redact-opencore.py")
+          sample = {
+              "PlatformInfo": {"Generic": {
+                  "SystemSerialNumber": "REAL-SERIAL",
+                  "MLB": "REAL-MLB",
+                  "SystemUUID": "11111111-2222-3333-4444-555555555555",
+                  "ROM": bytes.fromhex("001122334455"),
+              }},
+              "Kernel": {"Patch": [{"Comment": "keep this patch", "Enabled": True}]},
+          }
+          with tempfile.TemporaryDirectory() as temp:
+              source = Path(temp) / "config.plist"
+              output = Path(temp) / "config.redacted.plist"
+              source.write_bytes(plistlib.dumps(sample, fmt=plistlib.FMT_BINARY))
+              subprocess.run(
+                  [sys.executable, str(script), str(source), "-o", str(output)],
+                  check=True,
+              )
+              result = plistlib.loads(output.read_bytes())
+              assert result["PlatformInfo"]["Generic"]["SystemSerialNumber"] == "REDACTED-SERIAL"
+              assert result["PlatformInfo"]["Generic"]["MLB"] == "REDACTED-MLB"
+              assert result["PlatformInfo"]["Generic"]["SystemUUID"] == "REDACTED-UUID"
+              assert result["PlatformInfo"]["Generic"]["ROM"] == bytes(6)
+              assert result["Kernel"] == sample["Kernel"]
+              assert plistlib.loads(source.read_bytes()) == sample
+          print("OpenCore redactor: identity fields removed; config structure and source preserved")
+          PY
+
       - name: Native Metal bundle and mtlprobe
         run: |
           sh tools/metal/native/build.sh
