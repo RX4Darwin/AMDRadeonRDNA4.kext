@@ -1867,7 +1867,7 @@ uint32_t RDNA4Compute::gfxOffHook() {
 
 uint32_t RDNA4Compute::gfxOffMode() {
 	uint32_t v = 0;
-	if (!PE_parse_boot_argn("rdna4-gfxoff", &v, sizeof(v)))
+	if (!Trial::bootArg("rdna4-gfxoff", v))   // on by default (Trial's built-in defaults); rdna4-gfxoff=0 turns it off
 		return 0;
 	return v;
 }

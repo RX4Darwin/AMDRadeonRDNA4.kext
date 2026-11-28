@@ -69,6 +69,12 @@ Lilu **1.7.1 or newer** is needed on macOS 26 (older Lilu turns itself off there
   it moves to the other HDMI connector.
 - **HiDPI and scaled modes**, larger than the monitor ("looks like 2560x1440" on a 4K monitor), scaled on the card.
 - **Hardware cursor** on every display, HiDPI included (WindowServer then redraws nothing as the pointer moves).
+- **Variable refresh (FreeSync)** on DisplayPort monitors that take it (48-144 Hz on the rig's two), at the monitor's top
+  refresh rates, also with HDR on.
+- **HDR** on a DisplayPort boot display whose EDID takes HDR10: macOS offers it in Displays, and the monitor gets the HDR
+  metadata (PQ) and BT.2020. HDR below the monitor's 4K size runs on its 4K mode of the same refresh, scaled up.
+- **Audio over DisplayPort**: each DisplayPort display is a sound output, set up from its own EDID, through Apple's own
+  GPU-audio driver.
 - **Display sleep and system sleep**: the displays sleep and wake; the system sleeps and wakes with the desktop back on
   every display a couple of seconds after a key press (the card is brought up again from nothing after its power
   loss).
@@ -150,18 +156,13 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
 - Modes larger than the OpenCore console on a DisplayPort boot display (from a separate surface) only when it is the
   only display connected; with a second display the desktop stays at the console's size or smaller. Not for an HDMI
   boot display.
-- Variable refresh (FreeSync) by default: with `rdna4-vrr=1` it works on DisplayPort monitors, the boot display included
-  (48-144 Hz on the rig's two), at the timings at the monitor's top rate, with HDR on too (the boot display's HDR at 1440p
-  then runs on its 4K144 mode over DSC).
 - DisplayPort MST.
-- HDR by default: with `rdna4-hdr=1` (and `rdna4-vrr=1`) macOS offers HDR on a DisplayPort boot display whose EDID takes
-  HDR10, and the monitor gets the HDR metadata (PQ) and BT.2020; the link stays 8 bits a component, and the mastering
-  data is left to the monitor. Not on a second display or over HDMI.
-- Audio over HDMI and DisplayPort by default: with `rdna4-audio=1` macOS lists each DisplayPort display as a sound output
-  (through Apple's AppleGFXHDA), and sound plays through it (heard on the rig's Samsung); not over HDMI.
+- HDR on a second display or over HDMI (it runs on a DisplayPort boot display whose EDID takes HDR10, with the HDR
+  metadata (PQ) and BT.2020); 10 bits a component on the link only over DSC (4K144), else 8; the mastering data is left to
+  the monitor.
+- Audio over HDMI (DisplayPort audio runs on each DisplayPort display, heard on the rig's Samsung).
 - Hardware video decode and encode (VCN).
-- GFXOFF (the graphics block powered down when idle) on by default: it works with `rdna4-gfxoff=1` (about 3 W less while
-  the screen is still or the displays sleep), but has not yet run long or through a system sleep. Memory clock scaling with
+- Memory clock scaling with
   two 4K displays lit, or a boot display mode above 600 MHz (2560x1440@144, 4K144): the memory clock is held at its top
   level then (the planes underflowed when it dropped); with one display at 4K60 or less, or a 4K one beside a smaller one,
   memory scales and its deep sleep works (`rdna4-uclk=<MHz>` holds a minimum always).
@@ -321,6 +322,10 @@ default).
 | `rdna4-head2dp=0` | No displays on DisplayPort beside the boot display (one plugged in after boot gets no accelerated display). |
 | `rdna4-hotplug=0` | No hot-plug of the second display (`1`: only log its pin). |
 | `rdna4-syssleep=0` | macOS refuses system sleep (as for any unsupported card). |
+| `rdna4-vrr=0` | No variable refresh (FreeSync), and with it no HDR (macOS needs the timing range it brings). |
+| `rdna4-hdr=0` | No HDR modes. |
+| `rdna4-audio=0` | No audio over DisplayPort (the card's audio function left to macOS). |
+| `rdna4-gfxoff=0` | The graphics block is not powered down when idle (GFXOFF, about 3 W less while the screen is still). |
 | `rdna4-nosleep=1` | Display sleep does nothing (the screen stays on). |
 | `rdna4-noedid=1` | No EDID read (for a monitor that misbehaves on DDC). |
 | `rdna4-boot4k=0` | An HDMI boot display behind a passive DP++ adapter stays at what the firmware lit. |

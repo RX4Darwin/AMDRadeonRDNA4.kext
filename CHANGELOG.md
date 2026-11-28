@@ -5,6 +5,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- On by default now: variable refresh (`rdna4-vrr`), HDR (`rdna4-hdr`), audio over DisplayPort (`rdna4-audio`) and GFXOFF
+  (`rdna4-gfxoff`); each turns off with `=0`. On the rig: a boot without any of them in the boot-args had all four.
+
 - Variable refresh with HDR (`rdna4-vrr=1`, `rdna4-hdr=1`): macOS installs no variable timings on a display it counts as
   HDR-capable, so the Samsung had lost Variable altogether; the driver now lists variable copies of the top-refresh modes and
   their HDR twins itself. HDR switched on from a variable mode stays variable, and an HDR twin below 4K runs on the 4K mode
