@@ -12,7 +12,7 @@ classes' metaclasses get the real one as their superclass at the same time.
 writes src/ioaccel.hpp (the declarations), src/ioaccel_thunks.S (the thunks and their table), src/ioaccel_symbols.inc (the
 names, in table order) and src/ioaccel_slots.inc (the vtable slot each virtual thunk's function must be in). The KDK's slots must match the running macOS's: rdna4accel.cpp checks the known ones before using them.
 """
-import argparse, glob, os, re, struct, subprocess, sys
+import argparse, os, re, struct, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 IOSERVICE_SLOTS = 266   # IOService's vtable slots (OSObject's first): the first a direct subclass of IOService adds (checked with the SDK)
