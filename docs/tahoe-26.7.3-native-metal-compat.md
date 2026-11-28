@@ -2,53 +2,47 @@
 
 Target machine reported by the maintainer: macOS Tahoe 26.7.3, build 25G342, x86_64, Ryzen 5 5600X, RX 9070 XT (Navi 48).
 
-This is an audit record, not a claim that 26.7.3 is supported. The upstream v0.4.0 README lists Tahoe 26.6.2 as tested and 26.7 / later as needing testing.
+This is an audit record, not a claim that 26.7.3 is supported. Upstream v0.4.0 documents Tahoe 26.6.2 as hardware-tested and 26.7 / later as needing testing.
 
 ## Confirmed source facts
 
-1. The v0.4.0 path uses the driver's own native Metal accelerator by default. The paravirtual path is an explicit alternative. See `README.md`, `CHANGELOG.md`, `src/trial.cpp` and `src/rdna4accel.cpp`.
-2. The native accelerator derives from private `IOAcceleratorFamily2` classes. The project cannot link that System Kernel Collection framework directly, so it declares class layouts from a KDK and resolves base methods at runtime through generated thunks.
-3. `src/ioaccel_thunks.S` currently identifies its generator source as `KDK_26.5.2_25F84.kdk`.
-4. `tools/gen/accelgen.py` generates `src/ioaccel.hpp`, `src/ioaccel_thunks.S`, `src/ioaccel_symbols.inc` and `src/ioaccel_slots.inc` from a supplied KDK. Its comments say the generated slots must match the running macOS.
-5. `src/rdna4accel.cpp::familyLoaded` checks symbol resolution, expected vtable slots and metaclass layout before marking the accelerator ready. `accelTo` then checks the runtime base-class sizes before constructing the derived accelerator. A mismatch should make the native accelerator unavailable rather than silently using an unverified layout.
-6. The plugin also hooks `IONDRVFramebuffer::doDriverIO` in `src/plugin.cpp`. This is a separate compatibility surface from the native accelerator's private vtables.
-7. The existing project documentation describes 26.6.2 as the hardware-tested Tahoe version. No 26.7.3 hardware validation is established by this audit.
+1. The v0.4.0 path uses the driver's own native Metal accelerator by default. The paravirtual path is an explicit alternative.
+2. The native accelerator derives from private `IOAcceleratorFamily2` classes. The project declares class layouts from a KDK and resolves base methods at runtime through generated thunks.
+3. Before this audit, the generated declarations identified `KDK_26.5.2_25F84.kdk` as their source.
+4. `tools/gen/accelgen.py` generates six files: `ioaccel.hpp`, `ioaccel_thunks.S`, `ioaccel_symbols.inc`, `ioaccel_slots.inc`, `ioaccel_kexts.inc` and `ioaccel_classes.inc`.
+5. `src/rdna4accel.cpp::familyLoaded` checks symbol resolution, expected vtable slots and metaclass layout before marking the accelerator ready. `accelTo` checks runtime base-class sizes before constructing the derived accelerator.
+6. The plugin also hooks `IONDRVFramebuffer::doDriverIO`. This is a separate compatibility surface from the native accelerator's private vtables.
+7. The audit does not establish 26.7.3 hardware compatibility or explain the reported early boot stall.
 
-## Working hypothesis
+## 26.7.3 KDK ABI audit: completed
 
-The highest-value compatibility check for the native Metal path is whether the private `IOAcceleratorFamily2` symbols, vtable slots and class sizes in build 25G342 still match the 26.5.2 KDK-generated declarations. The existing runtime checks are useful evidence: collect their complete log output before changing any layouts.
+GitHub Actions run [46148522866](https://github.com/lucasmcgroarty29-tech/AMDRadeonRDNA4.kext/actions/runs/46148522866) completed successfully on a macOS 26 runner.
 
-This does **not** yet explain the reported early boot stall. If the machine stops before `IOAcceleratorFamily2` is loaded, the native accelerator's `familyLoaded` checks have not run and cannot be assumed to be the cause. The `rdna4-off=1` option disables the driver's hooks, so a boot comparison with that option is useful, but it does not by itself isolate the private accelerator ABI.
+- Downloaded `Kernel_Debug_Kit_26.7.3_build_25G342.dmg`.
+- Verified SHA-256: `219f27c7e039b6ab3426496e0d5852d55a31d00b3d3984d855cba04377c5dba0`.
+- Installed `KDK_26.7.3_25G342.kdk`.
+- Ran the generator successfully: 16 classes and 531 thunks.
+- Compared all six generated files against the committed v0.4.0 declarations.
+- The only differences were the generated KDK-version comments. Class layouts, symbols, vtable slots, thunk declarations, KDK associations and class declarations were otherwise identical.
+- Uploaded artifact: `tahoe-26.7.3-25G342-generated-abi` (artifact ID `15264732989`).
+
+**Conclusion:** no ABI declaration changes are justified by this comparison. Regenerating and committing the six files would only create comment churn. The existing runtime checks remain important because the target machine's loaded runtime still needs to confirm the expected layout.
+
+## Boot-stall investigation
+
+The ABI audit does not explain the reported early boot stall. If the machine stops before `IOAcceleratorFamily2` loads, `familyLoaded` has not run and its checks cannot be the cause. The plugin's `rdna4-off=1` option disables the plugin's hooks as well as its accelerator path, so it is a broad isolation switch, not a targeted accelerator-only test.
+
+The separate `IONDRVFramebuffer::doDriverIO` hook and the PCI/ACPI startup path remain independent areas to investigate. Do not infer that an unchanged accelerator ABI proves the whole driver is compatible.
 
 ## Next engineering steps
 
-1. Obtain the exact matching Kernel Debug Kit: `Kernel_Debug_Kit_26.7.3_build_25G342.dmg` (build `25G342`). The archived KDK manifest lists SHA-256 `219f27c7e039b6ab3426496e0d5852d55a31d00b3d3984d855cba04377c5dba0`; verify the checksum after downloading. Apple Developer Downloads is the preferred source; the Dortania KdkSupportPkg archive also indexes this exact build. Do not substitute a different KDK merely because its marketing version also says 26.7.3.
-2. Run the generator on a clean checkout of this branch, staging its six generated files outside the source tree:
+1. Run the full branch build and host tests on GitHub's macOS runner. A successful build is necessary but is not hardware validation.
+2. If CI passes, investigate the PCI/ACPI boot stall separately from the accelerator ABI. Review the exact startup ordering and the existing boot log evidence before changing patches.
+3. Keep experimental builds and any EFI changes separate from the only recovery EFI. Do not install an unvalidated build as the sole boot option.
+4. Hardware acceptance still requires a successful boot to the desktop on build 25G342, runtime symbol/slot/class-size checks, native Metal device enumeration and the project's Metal probes.
 
-   ```sh
-   mkdir -p /tmp/rdna4-abi-26.7.3
-   python3 tools/gen/accelgen.py \\
-     --kdk /Library/Developer/KDKs/KDK_26.7.3_25G342.kdk \\
-     --output-dir /tmp/rdna4-abi-26.7.3
-   ```
-
-   The generator now requires an explicit KDK path and creates the staging `src/` directory. Compare the staged files with the checked-in files before copying anything.
-3. Compare the generated vtable slot tables, class sizes and symbol names with the 26.5.2-generated files. Preserve a clear record of every changed slot and class size.
-4. Build the regenerated branch and run the existing host tests/CI. A successful compile is not hardware validation.
-5. On the target machine, first use the separate test EFI. Capture the full `AMDRadeonRDNA4: accel:` sequence and verify that all symbols resolve, all slots match, all class sizes match, and the accelerator reaches its ready state before enabling the native desktop.
-6. Keep the `rdna4-off=1` recovery path available. Do not install an unvalidated build into the only working EFI.
-
-## Acceptance criteria
-
-- The generated ABI files identify the exact target KDK.
-- No missing symbols, wrong vtable slots or class-size mismatches are reported.
-- Existing host tests and CI pass.
-- The RX 9070 XT boots to the desktop on build 25G342 using a test EFI.
-- Native Metal device enumeration and the project's Metal probe pass on that hardware.
-
-Until the last two criteria pass, this branch is experimental and should not be described as Tahoe 26.7.3-compatible.
-
+Until those hardware criteria pass, this branch is experimental and must not be described as Tahoe 26.7.3-compatible.
 
 ## Generator safety improvement
 
-The compatibility branch now requires an explicit `--kdk` path and supports `--output-dir`. It no longer silently selects the newest installed KDK. The generator creates the output `src/` directory automatically. Generate into a temporary directory, review all ABI diffs, and only then copy reviewed files into the repository.
+The compatibility branch requires an explicit `--kdk` path and supports `--output-dir`. It no longer silently selects the newest installed KDK. Generated files are staged outside the source tree for review before any source replacement.
