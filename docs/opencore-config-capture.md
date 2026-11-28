@@ -23,3 +23,15 @@ The script replaces `SystemSerialNumber`, `MLB`, and `SystemUUID` with placehold
 - Do not share the unredacted config, EFI folder, or any file containing your real SMBIOS identity.
 - Redaction is deliberately narrow. Check the output for any other personal information before sharing.
 - A redacted config is for static review, not for booting. Keep using your original config on the machine.
+
+## Boot-path audit report
+
+After making a redacted copy, generate a compact report of the settings most relevant to an early boot stall:
+
+```powershell
+py -3 tools/rig/inspect-opencore.py "E:\EFI\OC\config.redacted.plist" > opencore-audit.txt
+```
+
+The report includes boot arguments, ACPI entries, kernel patch metadata and byte patterns, enabled kext entries, kernel quirks, selected UEFI settings, and device-property names. It deliberately omits SMBIOS serial, MLB, UUID and ROM values.
+
+This is a review aid, not a substitute for `ocvalidate` from the matching OpenCore release. Check the report before sharing it because boot arguments and patch byte patterns are included.
