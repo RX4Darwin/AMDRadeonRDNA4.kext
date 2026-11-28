@@ -87,8 +87,12 @@ cause, though how it came to 1280x1024 rather than the Lenovo's 1920x1080 is not
   packet is sent again and the Samsung's tone mapping came back active. Not run: system sleep and a resolution change
   while in HDR.
 - Fill the mastering data from macOS's IOFBHDRMetaData (kIOFBHDRMetaDataAttribute) or the EDID.
-- 10 bits a component on the link (FMT bit depth, DIG pixel depth, MSA) for the twins; check the DP bandwidth at
-  2560x1440@144 and 4K (DSC).
+- (Done 2026-11-28) 10 bits a component on the link with HDR, as Linux drives the Samsung (test/ref/linux-vrrhdr): what
+  pipegen's DP sequence at PIPEGEN_BPC=10 changes is FMT's dynamic expansion, DP_PIXEL_FORMAT's component depth and the
+  MSA's MISC0 depth, applied with the video stream re-armed (steer FIFO reset) as Linux's unblank does, where 30 bits a
+  pixel fit the link; a DSC stream (4K144) is lit at 10 already. The VSC SDP's DB17 must say 10 too: with MISC1 bit 6 the
+  sink takes its format from there, and a 10-bit stream announced as 8 came out as stripes of wrong colours. Card: 4K60 HDR
+  at 10 bits looks right, HDR off back to 8 as well.
 - What WindowServer renders in HDR mode at 32 bpp (PQ-encoded 8 bit? a 10-bit or FP16 surface would need another depth
   mode, kDepthMode2 with 30-bit pixels) and whether the plane's gamma (cscSetGamma) has to be linear in HDR.
 - HDMI and the second pipe: the same InfoFrame through the HDMI generic packets, and setHdr on head 2's backend

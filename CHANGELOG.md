@@ -5,6 +5,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- HDR at 10 bits a component on the link (as Linux drives it), also without DSC (3840x2160@60): banding in PQ's gradients
+  was the cost of 8. On the rig: 4K60 HDR at 10 bits and back to 8 with HDR off, both seen right.
+
 - On by default now: variable refresh (`rdna4-vrr`), HDR (`rdna4-hdr`), audio over DisplayPort (`rdna4-audio`) and GFXOFF
   (`rdna4-gfxoff`); each turns off with `=0`. On the rig: a boot without any of them in the boot-args had all four.
 

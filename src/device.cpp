@@ -5409,13 +5409,19 @@ IOReturn RDNA4Device::setBootHdr(bool on) {
 	};
 	uint8_t features = 0;
 	const bool vsc = on && dpcdRead(sinkAuxInst, kDpcdFeatureList, &features, 1) && (features & kVscColorimetrySupported);
+	// HDR at 10 bits a component where the link carries 30 bits a pixel at the mode's clock, as Linux drives the Samsung (8 bits
+	// banded PQ's gradients); SDR, or a mode that does not fit, at 8. A DSC stream is lit at 10 already and left alone.
+	const bool compressed = regReadDmu(2, Hdr::kDpPixelFormat + o) & kCompressed;
+	const uint64_t carried = static_cast<uint64_t>(bootDpLink.lanes) * DpTrain::symbolClockKHz(bootDpLink.rate) * 8;
+	const bool ten = on && !compressed && liveTimingValid && static_cast<uint64_t>(liveTiming.pixelClockKHz) * 30 <= carried;
+	const uint32_t depth = ten ? 2 : 1;
 	if (on) {
 		uint32_t sdp[9];
 		update(kVpgMemPwr, kMemLightSleepDis | kMemLightSleepForce, kMemLightSleepDis);   // vpg31_poweron
 		staticMetadataSdp(sdp);
 		writePacket(kPacket, sdp);
 		if (vsc) {
-			vscBt2020Sdp(sdp);
+			vscBt2020Sdp(sdp, depth);   // (the sink's format: it must say what the stream carries)
 			writePacket(kVscPacket, sdp);
 		}
 	}
@@ -5423,8 +5429,23 @@ IOReturn RDNA4Device::setBootHdr(bool on) {
 	if (regReadDmu(2, kDpSecCntl + o))
 		update(kDpSecCntl, kSecStreamEnable, kSecStreamEnable);
 	update(kMsaMisc, kMisc1VscColorimetry, vsc ? kMisc1VscColorimetry : 0);
-	FBLOG("hdr: boot display metadata %s, BT.2020 %s (DPCD 0x2210 = 0x%02x): DP%u_DP_SEC_CNTL=0x%08x DP_MSA_MISC=0x%08x "
+	if (!compressed && ((regReadDmu(2, Hdr::kDpPixelFormat + o) & kPixelDepthMask) >> kPixelDepthShift) != depth) {
+		const uint32_t fmt = kFmtDynExp + Pipe::Reg::kOppStride * pipe.opp;
+		update(kDpVidStreamCntl, kVidStreamEnable, 0);
+		for (int i = 0; i < 500 && (regReadDmu(2, kDpVidStreamCntl + o) & kVidStreamStatus); i++)
+			IODelay(100);
+		regWriteDmu(2, fmt, (regReadDmu(2, fmt) & ~kFmtDynExpMode) | (ten ? 0 : kFmtDynExpMode));
+		update(Hdr::kDpPixelFormat, kPixelDepthMask, depth << kPixelDepthShift);
+		update(kMsaColorimetry, kMisc0DepthMask, depth << kMisc0DepthShift);
+		update(kDpSteerFifo, kSteerFifoReset, kSteerFifoReset);
+		IODelay(10);
+		update(kDpSteerFifo, kSteerFifoReset, 0);
+		update(kDpSteerFifo, kSteerFifoEnable, kSteerFifoEnable);
+		update(kDpVidStreamCntl, kVidStreamMask, kVidStreamOn);
+	}
+	FBLOG("hdr: boot display metadata %s, BT.2020 %s (DPCD 0x2210 = 0x%02x), %s: DP%u_DP_SEC_CNTL=0x%08x DP_MSA_MISC=0x%08x "
 	      "VPG_GENERIC_STATUS=0x%08x", on ? "on (PQ)" : "off", vsc ? "in a VSC SDP" : "not signalled", features,
+	      compressed ? "10 bits a component (DSC)" : ten ? "10 bits a component" : "8 bits a component",
 	      static_cast<unsigned>(o / Pipe::Reg::kDigStride), regReadDmu(2, kDpSecCntl + o), regReadDmu(2, kMsaMisc + o),
 	      regReadDmu(2, kVpgStatus + o));
 	return kIOReturnSuccess;

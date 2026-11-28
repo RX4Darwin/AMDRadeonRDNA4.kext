@@ -72,7 +72,8 @@ Lilu **1.7.1 or newer** is needed on macOS 26 (older Lilu turns itself off there
 - **Variable refresh (FreeSync)** on DisplayPort monitors that take it (48-144 Hz on the rig's two), at the monitor's top
   refresh rates, also with HDR on.
 - **HDR** on a DisplayPort boot display whose EDID takes HDR10: macOS offers it in Displays, and the monitor gets the HDR
-  metadata (PQ) and BT.2020. HDR below the monitor's 4K size runs on its 4K mode of the same refresh, scaled up.
+  metadata (PQ) and BT.2020 at 10 bits a component. HDR below the monitor's 4K size runs on its 4K mode of the same refresh,
+  scaled up.
 - **Audio over DisplayPort**: each DisplayPort display is a sound output, set up from its own EDID, through Apple's own
   GPU-audio driver.
 - **Display sleep and system sleep**: the displays sleep and wake; the system sleeps and wakes with the desktop back on
@@ -158,8 +159,7 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
   boot display.
 - DisplayPort MST.
 - HDR on a second display or over HDMI (it runs on a DisplayPort boot display whose EDID takes HDR10, with the HDR
-  metadata (PQ) and BT.2020); 10 bits a component on the link only over DSC (4K144), else 8; the mastering data is left to
-  the monitor.
+  metadata (PQ) and BT.2020, at 10 bits a component); the mastering data is left to the monitor.
 - Audio over HDMI (DisplayPort audio runs on each DisplayPort display, heard on the rig's Samsung).
 - Hardware video decode and encode (VCN).
 - Memory clock scaling with
