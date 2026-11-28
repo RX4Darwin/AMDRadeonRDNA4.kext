@@ -74,3 +74,21 @@ Until those hardware criteria pass, this branch is experimental and must not be 
 ## Generator safety improvement
 
 The compatibility branch requires an explicit `--kdk` path and supports `--output-dir`. It no longer silently selects the newest installed KDK. Generated files are staged outside the source tree for review before any source replacement.
+
+## Full branch CI: completed
+
+After the static boot-order notes were added, push run [46149252505](https://github.com/lucasmcgroarty29-tech/AMDRadeonRDNA4.kext/actions/runs/46149252505) (CI run #203, commit `2ab54257881843f52831620d44fc747b7a72d959`) completed with all three jobs successful on 2026-11-28:
+
+- **build:** plain kext, PVGPU kext, DEBUG PVGPU kext, host tests, native Metal bundle build and `mtlprobe` compile all passed.
+- **firmware:** firmware fetch, firmware-enabled host tests and firmware-embedded kext build all passed.
+- **abi:** exact 25G342 KDK download and checksum, KDK install, ABI generation, comparison against committed declarations and artifact upload all passed.
+
+This is stronger than the earlier ABI-only run: the complete configured build matrix and host checks passed on the branch. It remains a macOS CI result without an RX 9070 XT attached. It does not validate PCI enumeration, framebuffer takeover, runtime accelerator activation, Metal device enumeration or display stability on the target machine.
+
+## Current blocker and required evidence
+
+The next high-value input is the **active** `EFI/OC/config.plist` from the USB EFI that is actually being booted. Without it, the AMD kernel-patch order, enabled states, exact IOPCIFamily patches, ACPI tables, device properties and current boot arguments cannot be audited. Historical boot arguments are not a substitute for the active file.
+
+The config can contain serial numbers, MLB/ROM values, UUIDs and other machine identifiers. Before sharing, redact values for `SystemSerialNumber`, `MLB`, `SystemUUID`, `ROM`, and any personal identifiers, but preserve the surrounding keys, patch entries, booleans, masks, find/replace byte arrays and ordering. Do not change the actual EFI while collecting it; copy the file from the USB to Windows and attach that copy.
+
+Until that configuration is reviewed, avoid speculative changes to AMD kernel patches or ACPI. Keep the known-good/recovery EFI untouched and make any experiments on a separate copy.
