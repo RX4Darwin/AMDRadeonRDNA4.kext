@@ -379,7 +379,7 @@ private:
 
 	size_t total() const { return count + __atomic_load_n(&scaledCount, __ATOMIC_ACQUIRE); }
 	// what macOS lists (the order in entryId)
-	size_t entries() const { return total() + (hdr ? count : 0) + vrrCount() * (hdr ? 2 : 1); }
+	size_t entries() const { return total() + (hdr ? total() : 0) + vrrCount() * (hdr ? 2 : 1); }   // HDR: the scaled frames' twins too
 	int32_t entryId(size_t i) const;
 	const Modes::Mode &entry(size_t i) const;
 	bool hasVrrCopy(const Modes::Mode &m) const;   // a mode within 1 Hz of the EDID's top refresh (vrrModes)

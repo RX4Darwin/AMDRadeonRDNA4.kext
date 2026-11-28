@@ -72,8 +72,9 @@ Lilu **1.7.1 or newer** is needed on macOS 26 (older Lilu turns itself off there
 - **Variable refresh (FreeSync)** on DisplayPort monitors that take it (48-144 Hz on the rig's two), at the monitor's top
   refresh rates, also with HDR on.
 - **HDR** on a DisplayPort boot display whose EDID takes HDR10: macOS offers it in Displays, and the monitor gets the HDR
-  metadata (PQ) and BT.2020 at 10 bits a component. HDR below the monitor's 4K size runs on its 4K mode of the same refresh,
-  scaled up.
+  metadata (PQ) and BT.2020 at 10 bits a component, also in the HiDPI "looks like" sizes (at 60 Hz and the monitor's top
+  refresh: drawn at twice the size and scaled down, sharp). HDR in a size below the monitor's 4K runs on its 4K mode of the
+  same refresh, scaled up (softer).
 - **Audio over DisplayPort**: each DisplayPort display is a sound output, set up from its own EDID, through Apple's own
   GPU-audio driver.
 - **Display sleep and system sleep**: the displays sleep and wake; the system sleeps and wakes with the desktop back on

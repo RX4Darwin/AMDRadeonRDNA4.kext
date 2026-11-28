@@ -160,21 +160,23 @@ bool Translator::hasVrrCopy(const Modes::Mode &m) const {
 	return m.refreshMilliHz + 1000 >= base.range.maxVHz * 1000u && m.refreshMilliHz <= base.range.maxVHz * 1000u + 1000;
 }
 
-size_t Translator::vrrCount() const {
+size_t Translator::vrrCount() const {   // (the scaled frames' too: "looks like" sizes at the top refresh)
 	size_t n = 0;
-	for (size_t i = 0; i < count; i++)
-		n += hasVrrCopy(modes[i]);
+	for (size_t i = 0; i < total(); i++)
+		n += hasVrrCopy(at(i));
 	return n;
 }
 
 const Modes::Mode *Translator::vrrCopy(size_t k) const {
-	for (size_t i = 0; i < count; i++)
-		if (hasVrrCopy(modes[i]) && !k--)
-			return &modes[i];
+	for (size_t i = 0; i < total(); i++)
+		if (hasVrrCopy(at(i)) && !k--)
+			return &at(i);
 	return nullptr;
 }
 
-// The variable copies, the modes (and scaled frames), the copies' HDR twins, then the fixed modes' HDR twins. CoreDisplay
+// The variable copies, the modes (and scaled frames), the copies' HDR twins, then the fixed modes' and the scaled frames' HDR
+// twins (a HiDPI "looks like" size with HDR: drawn at twice the size and scaled down to the 4K head, sharp, where an HDR twin
+// of a smaller mode is scaled up and soft, 2026-11-28). CoreDisplay
 // restores a saved mode by what it looks like, and a copy looks like its fixed mode: it took the fixed one (and with HDR on its
 // fixed twin) while that came first, so the copies lead, as Variable is macOS's default where it installs variable timings.
 int32_t Translator::entryId(size_t i) const {
@@ -187,7 +189,7 @@ int32_t Translator::entryId(size_t i) const {
 	i -= total();
 	if (hdr && i < vrr)
 		return idFor(*vrrCopy(i)) | kVrrIdBit | kHdrIdBit;
-	return idFor(modes[i - (hdr ? vrr : 0)]) | kHdrIdBit;
+	return idFor(at(i - (hdr ? vrr : 0))) | kHdrIdBit;
 }
 
 const Modes::Mode &Translator::entry(size_t i) const {
@@ -200,7 +202,7 @@ const Modes::Mode &Translator::entry(size_t i) const {
 	i -= total();
 	if (hdr && i < vrr)
 		return *vrrCopy(i);
-	return modes[i - (hdr ? vrr : 0)];
+	return at(i - (hdr ? vrr : 0));
 }
 
 uint32_t Translator::extFor(const Edid::DetailedTiming &t, uint32_t minHz) const {
@@ -214,15 +216,15 @@ const Modes::Mode *Translator::modeFor(int32_t id) const {
 		const int32_t plain = id & ~(kVrrIdBit | kHdrIdBit);
 		if (isHdrId(id) && !hdr)
 			return nullptr;
-		for (size_t i = 0; i < count; i++)
-			if (idFor(modes[i]) == plain && hasVrrCopy(modes[i]))
-				return &modes[i];
+		for (size_t i = 0; i < total(); i++)
+			if (idFor(at(i)) == plain && hasVrrCopy(at(i)))
+				return &at(i);
 		return nullptr;
 	}
 	if (hdr && isHdrId(id)) {
-		for (size_t i = 0; i < count; i++)
-			if ((idFor(modes[i]) | kHdrIdBit) == id)
-				return &modes[i];
+		for (size_t i = 0; i < total(); i++)
+			if ((idFor(at(i)) | kHdrIdBit) == id)
+				return &at(i);
 		return nullptr;
 	}
 	const size_t n = total();
@@ -251,20 +253,16 @@ const Modes::Mode *Translator::baseFor(uint32_t refreshMilliHz) const {
 const Modes::Mode *Translator::timingOf(const Modes::Mode &m) const {
 	if (m.source != Modes::SourceScaled)
 		return &m;
-	for (size_t i = 0; i < count; i++)   // the base it was made from: its clock and refresh (runFor keeps them)
-		if (modes[i].t.pixelClockKHz == m.t.pixelClockKHz && modes[i].refreshMilliHz == m.refreshMilliHz &&
-		    modes[i].t.hActive >= m.t.hActive && modes[i].t.vActive >= m.t.vActive)
-			return &modes[i];
-	return nullptr;
+	return Modes::scaleBaseAt(modes, count, m.refreshMilliHz);   // (runFor and buildScaled keep the base's refresh)
 }
 
 const Modes::Mode *Translator::runFor(int32_t id) const {
 	const Modes::Mode *m = modeFor(id);
 	// on the base mode of the twin's refresh (2560x1440@144 HDR on 3840x2160@144, over DSC on the rig's Samsung)
 	const Modes::Mode *base = m && hdr && isHdrId(id) ? baseFor(m->refreshMilliHz) : nullptr;
-	if (!base || (m->t.hActive >= base->t.hActive && m->t.vActive >= base->t.vActive))
-		return m;
-	Modes::Mode &f = hdrFrames[m - modes];   // (a twin is of a table mode: modes[0..count))
+	if (!base || (m->t.hActive >= base->t.hActive && m->t.vActive >= base->t.vActive) || m < modes || m >= modes + count)
+		return m;   // (a scaled frame's twin runs as the frame does)
+	Modes::Mode &f = hdrFrames[m - modes];
 	f = *base;
 	f.id = m->id;
 	f.t.hActive = m->t.hActive;

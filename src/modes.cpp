@@ -345,12 +345,29 @@ const Mode *scaleBase(const Mode *modes, size_t n) {
 	return best && best->t.hActive >= 3840 && best->t.hActive <= 4096 ? best : nullptr;
 }
 
-size_t buildScaled(const Mode *modes, size_t n, Mode *out, size_t cap) {
+const Mode *scaleBaseAt(const Mode *modes, size_t n, uint32_t refreshMilliHz) {
 	const Mode *base = scaleBase(modes, n);
+	for (size_t i = 0; base && i < n; i++)
+		if (modes[i].t.hActive == base->t.hActive && modes[i].t.vActive == base->t.vActive && modes[i].refreshMilliHz == refreshMilliHz)
+			return &modes[i];
+	return nullptr;
+}
+
+// The sizes on the base (nearest 60 Hz), and with `fast` again on the base size's top-refresh mode (3840x2160@144 over DSC on the
+// rig's Samsung: "looks like 2560x1440" at 144 Hz), each frame at its base's refresh.
+size_t buildScaled(const Mode *modes, size_t n, Mode *out, size_t cap, bool fast) {
+	const Mode *base = scaleBase(modes, n), *top = base;
+	for (size_t i = 0; fast && base && i < n; i++)
+		if (modes[i].t.hActive == base->t.hActive && modes[i].t.vActive == base->t.vActive && modes[i].refreshMilliHz > top->refreshMilliHz)
+			top = &modes[i];
+	const Mode *const first = base;
+	const size_t frames = top != first ? 2 * MaxScaled : MaxScaled;
 	size_t count = 0;
-	for (size_t i = 0; base && i < MaxScaled && count < cap; i++) {
+	for (size_t k = 0; first && k < frames && count < cap; k++) {
+		const size_t i = k % MaxScaled;
+		base = k < MaxScaled ? first : top;
 		Mode m = *base;
-		m.id = ScaledIdBase + static_cast<uint32_t>(i);
+		m.id = ScaledIdBase + static_cast<uint32_t>(k);
 		m.t.hActive = static_cast<uint16_t>((2u * base->t.hActive * ScaledSteps[i][0] / ScaledSteps[i][1]) & ~1u);
 		m.t.vActive = static_cast<uint16_t>(2u * base->t.vActive * ScaledSteps[i][0] / ScaledSteps[i][1]);
 		m.t.pixelClockKHz = static_cast<uint32_t>(static_cast<uint64_t>(m.t.hTotal()) * m.t.vTotal() * base->refreshMilliHz / 1000000);

@@ -5,6 +5,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- HDR in the HiDPI "looks like" sizes, and those sizes at the monitor's top refresh too (on the 4K144 mode over DSC), with
+  variable refresh: "looks like 2560x1440" on the 4K Samsung at 144 Hz with HDR, drawn at 5120x2880 and scaled down, is as
+  sharp as SDR, where 2560x1440 HDR (scaled up 1.5x) looked soft. Scaling up uses a bicubic filter now. On the rig: seen sharp,
+  48-144 Hz (49 frames/s idle).
+
 - HDR at 10 bits a component on the link (as Linux drives it), also without DSC (3840x2160@60): banding in PQ's gradients
   was the cost of 8. On the rig: 4K60 HDR at 10 bits and back to 8 with HDR off, both seen right.
 

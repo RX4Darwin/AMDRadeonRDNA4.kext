@@ -100,14 +100,16 @@ bool usable(const Edid::DetailedTiming &t);
 // macOS's HiDPI "looks like 2048x1152" to "3360x1890" on a 3840x2160 head: frames of these fractions of twice its width and height.
 constexpr uint32_t ScaledSteps[][2] = { {8, 15}, {3, 5}, {2, 3}, {47, 60}, {5, 6}, {7, 8} };
 constexpr size_t MaxScaled = sizeof(ScaledSteps) / sizeof(ScaledSteps[0]);
+constexpr size_t MaxScaledAll = 2 * MaxScaled;   // with `fast`, the sizes on the base size's top-refresh mode too
 constexpr uint32_t ScaledIdBase = 1000;   // above any table's IDs
 
 // The largest mode of a table, of its size the one nearest 60 Hz: what a scaled frame is scaled down to. nullptr unless it is 3840 to
 // 4096 wide (a larger head's frames would wire too much host memory).
 const Mode *scaleBase(const Mode *modes, size_t n);
+const Mode *scaleBaseAt(const Mode *modes, size_t n, uint32_t refreshMilliHz);   // the base size's mode of that refresh, or nullptr
 
 // One entry per step for scaleBase's mode: its blanking and refresh, the frame's size. Returns how many (0 without a base).
-size_t buildScaled(const Mode *modes, size_t n, Mode *out, size_t cap);
+size_t buildScaled(const Mode *modes, size_t n, Mode *out, size_t cap, bool fast = false);
 
 } // namespace Modes
 

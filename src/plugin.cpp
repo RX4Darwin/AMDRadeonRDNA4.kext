@@ -317,7 +317,7 @@ bool scaledMemoryFor(ScaledMemory &s, const Modes::Mode *frames, size_t n) {
 	return true;
 }
 
-Modes::Mode gBootScaled[Modes::MaxScaled] {};   // the boot display's scaled modes (PvScanout::offerScaled)
+Modes::Mode gBootScaled[Modes::MaxScaledAll] {};   // the boot display's scaled modes (PvScanout::offerScaled)
 size_t gBootScaledCount { 0 };
 ScaledMemory gBootScaledMemory;
 bool gScaledOffered { false };                  // our accelerator serves WindowServer: it can present their frames
@@ -362,11 +362,7 @@ int32_t deviceSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 	}
 	// the head stays on (or goes to) the base mode the frame was made on (its clock and refresh: the largest mode, or for an HDR
 	// twin the one nearest its refresh, Ndrv::Translator::baseFor); the present path scales the frames to it
-	const Modes::Mode *base = nullptr;
-	for (size_t i = 0; i < dev->modeCount && !base; i++)
-		if (dev->modeTable[i].t.pixelClockKHz == m.t.pixelClockKHz && dev->modeTable[i].refreshMilliHz == m.refreshMilliHz &&
-		    dev->modeTable[i].t.hActive >= 3840)
-			base = &dev->modeTable[i];
+	const Modes::Mode *base = Modes::scaleBaseAt(dev->modeTable, dev->modeCount, m.refreshMilliHz);
 	if (!base)
 		base = Modes::scaleBase(dev->modeTable, dev->modeCount);
 	if (!base || !scaledMemoryFor(gBootScaledMemory, gBootScaled, gBootScaledCount))
@@ -2943,7 +2939,7 @@ void PvScanout::offerScaled()
 		const Modes::Mode *base = Modes::scaleBase(dev.modeTable, dev.modeCount);
 
 		gBootScaledCount = base && base->t.hActive <= dev.fbWidth && base->t.vActive <= dev.fbHeight
-		                   ? Modes::buildScaled(dev.modeTable, dev.modeCount, gBootScaled, Modes::MaxScaled) : 0;
+		                   ? Modes::buildScaled(dev.modeTable, dev.modeCount, gBootScaled, Modes::MaxScaledAll, true) : 0;
 		bootState->ndrv.setScaled(gBootScaled, gBootScaledCount);
 		if (gBootScaledCount)
 			FBLOG("modes: boot display: %zu scaled modes offered, up to %ux%u", gBootScaledCount,

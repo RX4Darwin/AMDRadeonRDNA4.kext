@@ -3022,6 +3022,17 @@ static int testScaledModes() {
 		failures += check(hz >= 59 && hz <= 60, "scaled: frame %zu refreshes at %u Hz", i, hz);
 	}
 
+	{   // with `fast`: the sizes again on the base size's top-refresh mode, IDs going on
+		const Modes::Mode two[] = { mode(1, 3840, 2160, 60000), mode(2, 3840, 2160, 144000), mode(3, 1920, 1080, 60000) };
+		Modes::Mode f[Modes::MaxScaledAll];
+		const size_t fn = Modes::buildScaled(two, 3, f, Modes::MaxScaledAll, true);
+		const bool sets = fn == 2 * Modes::MaxScaled && f[0].refreshMilliHz == 60000 && f[Modes::MaxScaled].refreshMilliHz == 144000 &&
+		                  f[Modes::MaxScaled + 2].t.hActive == 5120 && f[fn - 1].id == Modes::ScaledIdBase + fn - 1 &&
+		                  (Modes::refresh1616(f[fn - 1].t) >> 16) >= 143;
+		failures += check(sets && Modes::buildScaled(two, 3, f, Modes::MaxScaledAll) == Modes::MaxScaled,
+		                  "scaled: with the 144 Hz base: %zu frames, the last %u Hz", fn, Modes::refresh1616(f[fn - 1].t) >> 16);
+	}
+
 	FakeBackend fb;
 	fb.w = 6720, fb.h = 3780, fb.pitch = 6720 * 4;
 	Ndrv::Translator tr;
@@ -3073,6 +3084,25 @@ static int testScaledModes() {
 		                    fb.lastSwitch.source != Modes::SourceScaled && fb.lastSwitch.t.hActive == 3840 && !ht.scaledFrame(w, h);
 		failures += check(real && twin && listed && native, "scaled: HDR twins: real %d, twin %d, listed %d, native %d", real, twin,
 		                  listed, native);
+		// a "looks like" frame's HDR twin: listed, described as HDR10, switched to as the frame
+		ht.setScaled(s, n);
+		const int32_t looks = ht.idFor(s[2]) | Ndrv::Translator::kHdrIdBit;
+		Ndrv::VDResolutionInfoRec lr {};
+		lr.csPreviousDisplayModeID = Ndrv::kDisplayModeIDFindFirst;
+		bool seen = false;
+		for (int k = 0; k < 40 && ht.status(Ndrv::cscGetNextResolution, &lr, ret) && ret == Ndrv::kSuccess && lr.csDisplayModeID > 0; k++) {
+			seen = seen || lr.csDisplayModeID == looks;
+			lr.csPreviousDisplayModeID = lr.csDisplayModeID;
+		}
+		Ndrv::VDDetailedTimingRec lt {};
+		lt.csDisplayModeID = looks;
+		const bool described = ht.status(Ndrv::cscGetDetailedTiming, &lt, ret) && ret == Ndrv::kSuccess && lt.csHorizontalActive == 5120 &&
+		                       lt.csDynamicRange == Ndrv::kRangeDynamicHDR10;
+		hs.csData = looks;
+		const bool ran = ht.control(Ndrv::cscSwitchMode, &hs, ret) && ret == Ndrv::kSuccess && ht.scaledFrame(w, h) && w == 5120 &&
+		                 h == 2880 && fb.hdrOn;
+		failures += check(seen && described && ran, "scaled: a looks-like frame's HDR twin: listed %d, described %d, runs %d", seen,
+		                  described, ran);
 	}
 	{   // HDR twins below the base run on the base of their refresh, and the refresh is set on the timing that runs (the base's)
 		const Modes::Mode vt[] = { mode(1, 3840, 2160, 60000), mode(2, 3840, 2160, 144000), mode(3, 2560, 1440, 144000),
