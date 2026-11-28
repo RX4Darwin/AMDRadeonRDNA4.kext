@@ -47,6 +47,13 @@ jobs:
       - name: "Host tests (no ROM dump, no firmware: those checks say they are left out)"
         run: make test
 
+      - name: Repository script syntax
+        run: |
+          for script in tools/rig/*.sh tools/build/*.sh tools/metal/native/*.sh; do
+            bash -n "$script"
+          done
+          python3 -m py_compile tools/gen/accelgen.py
+
       - name: Native Metal bundle and mtlprobe
         run: |
           sh tools/metal/native/build.sh
