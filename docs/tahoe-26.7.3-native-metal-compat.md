@@ -38,3 +38,8 @@ This does **not** yet explain the reported early boot stall. If the machine stop
 - Native Metal device enumeration and the project's Metal probe pass on that hardware.
 
 Until the last two criteria pass, this branch is experimental and should not be described as Tahoe 26.7.3-compatible.
+
+
+## Generator safety improvement
+
+The compatibility branch now requires an explicit `--kdk` path and supports `--output-dir`. It no longer silently selects the newest installed KDK. Generate into a temporary directory, review all ABI diffs, and only then copy reviewed files into `src/`.
