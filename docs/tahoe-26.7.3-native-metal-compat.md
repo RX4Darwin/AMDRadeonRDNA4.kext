@@ -23,7 +23,16 @@ This does **not** yet explain the reported early boot stall. If the machine stop
 ## Next engineering steps
 
 1. Obtain the exact matching Kernel Debug Kit: `Kernel_Debug_Kit_26.7.3_build_25G342.dmg` (build `25G342`). The archived KDK manifest lists SHA-256 `219f27c7e039b6ab3426496e0d5852d55a31d00b3d3984d855cba04377c5dba0`; verify the checksum after downloading. Apple Developer Downloads is the preferred source; the Dortania KdkSupportPkg archive also indexes this exact build. Do not substitute a different KDK merely because its marketing version also says 26.7.3.
-2. Run `tools/gen/accelgen.py --kdk <matching-KDK>` on a clean checkout of this branch and inspect the generated diff. Do not overwrite the existing generated files until the diff is reviewed.
+2. Run the generator on a clean checkout of this branch, staging its six generated files outside the source tree:
+
+   ```sh
+   mkdir -p /tmp/rdna4-abi-26.7.3
+   python3 tools/gen/accelgen.py \\
+     --kdk /Library/Developer/KDKs/KDK_26.7.3_25G342.kdk \\
+     --output-dir /tmp/rdna4-abi-26.7.3
+   ```
+
+   The generator now requires an explicit KDK path and creates the staging `src/` directory. Compare the staged files with the checked-in files before copying anything.
 3. Compare the generated vtable slot tables, class sizes and symbol names with the 26.5.2-generated files. Preserve a clear record of every changed slot and class size.
 4. Build the regenerated branch and run the existing host tests/CI. A successful compile is not hardware validation.
 5. On the target machine, first use the separate test EFI. Capture the full `AMDRadeonRDNA4: accel:` sequence and verify that all symbols resolve, all slots match, all class sizes match, and the accelerator reaches its ready state before enabling the native desktop.
@@ -42,4 +51,4 @@ Until the last two criteria pass, this branch is experimental and should not be 
 
 ## Generator safety improvement
 
-The compatibility branch now requires an explicit `--kdk` path and supports `--output-dir`. It no longer silently selects the newest installed KDK. Generate into a temporary directory, review all ABI diffs, and only then copy reviewed files into `src/`.
+The compatibility branch now requires an explicit `--kdk` path and supports `--output-dir`. It no longer silently selects the newest installed KDK. The generator creates the output `src/` directory automatically. Generate into a temporary directory, review all ABI diffs, and only then copy reviewed files into the repository.
