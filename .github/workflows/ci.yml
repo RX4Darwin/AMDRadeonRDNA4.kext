@@ -49,10 +49,20 @@ jobs:
 
       - name: Repository script syntax
         run: |
-          for script in tools/rig/*.sh tools/build/*.sh tools/metal/native/*.sh; do
+          # Parse every checked-in shell script, not just the EFI-facing subset.
+          while IFS= read -r -d '' script; do
             bash -n "$script"
-          done
-          python3 -m py_compile tools/gen/accelgen.py
+          done < <(find tools -type f -name '*.sh' -print0)
+
+          # Compile every Python source file without leaving __pycache__ in the checkout.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          files = sorted(Path("tools").rglob("*.py"))
+          for path in files:
+              compile(path.read_bytes(), str(path), "exec")
+          print(f"Python syntax: {len(files)} files passed")
+          PY
 
       - name: Native Metal bundle and mtlprobe
         run: |
