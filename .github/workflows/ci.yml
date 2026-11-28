@@ -5,7 +5,7 @@ name: CI
 
 on:
   push:
-    branches: [main, next, "devel/**", "premetal/**", "dev/**"]
+    branches: [main, next, "devel/**", "premetal/**", "dev/**", "tahoe-26.7.3-native-metal-compat"]
   pull_request:
   workflow_dispatch:
 
