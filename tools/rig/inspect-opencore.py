@@ -53,8 +53,9 @@ def main() -> int:
     for key in ("SystemProductName", "SpoofVendor", "AdviseWindows", "ProcessorType"):
         if key in generic:
             print(f"- PlatformInfo.Generic.{key}: {text(generic[key])}")
-    if "SecureBootModel" in nvram:
-        print(f"- NVRAM SecureBootModel: {text(nvram['SecureBootModel'])}")
+    security = cfg.get("Misc", {}).get("Security", {})
+    if "SecureBootModel" in security:
+        print(f"- Misc.Security.SecureBootModel: {text(security['SecureBootModel'])}")
 
     section("ACPI")
     acpi = cfg.get("ACPI", {})
@@ -68,6 +69,13 @@ def main() -> int:
                 name = entry.get("Path") or entry.get("Comment") or entry.get("TableSignature") or "(unnamed)"
                 enabled = entry.get("Enabled", "(missing)")
                 print(f"  - [{i}] {text(name)} | Enabled={text(enabled)}")
+                if group == "Patch":
+                    for key in ("TableSignature", "OemTableId", "Find", "Replace", "Mask", "ReplaceMask", "Count", "Skip", "Base", "Limit"):
+                        if key in entry:
+                            value = entry[key]
+                            detail = text(value)
+                            length = f" (length={len(value)})" if isinstance(value, (bytes, bytearray)) else ""
+                            print(f"    - {key}: {detail}{length}")
 
     section("Kernel patches")
     patches = cfg.get("Kernel", {}).get("Patch", [])
@@ -105,8 +113,7 @@ def main() -> int:
         for key in sorted(values):
             if any(term in key.lower() for term in ("pci", "bar", "memory", "connect", "driver", "protocol")) or group == "APFS":
                 print(f"- UEFI.{group}.{key}: {text(values[key])}")
-    for key in ("Above4GDecoding", "Resizable BAR", "ResizeAppleGpuBars", "RebuildAppleMemoryMap", "SyncRuntimePermissions"):
-        print(f"- Miscellaneous {key}: inspect manually if present in firmware setup; not all are config.plist keys")
+    print("- Above-4G Decoding and Resizable BAR firmware toggles are motherboard BIOS settings, not OpenCore plist keys.")
 
     section("Device properties")
     props = cfg.get("DeviceProperties", {}).get("Add", {})
