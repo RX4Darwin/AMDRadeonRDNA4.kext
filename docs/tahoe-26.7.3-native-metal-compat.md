@@ -28,6 +28,19 @@ GitHub Actions run [46148522866](https://github.com/lucasmcgroarty29-tech/AMDRad
 
 **Conclusion:** no ABI declaration changes are justified by this comparison. Regenerating and committing the six files would only create comment churn. The existing runtime checks remain important because the target machine's loaded runtime still needs to confirm the expected layout.
 
+## Static boot-order review
+
+A source-level review of `plugin.cpp` and `device.cpp` narrows the likely boundary:
+
+- `pluginStart()` first checks `rdna4-off`, then initializes logging and registers Lilu callbacks for `IONDRVSupport` and `IOGraphicsFamily`. It also starts the native accelerator's family-load observer. It does not itself enumerate PCI devices or configure PCI bridges.
+- The framebuffer takeover path reaches `wrapStart()`, then `createHeads()` / `attach()`, and only then calls `RDNA4Device::init()` with an `IOPCIDevice` provider.
+- `RDNA4Device::init()` reads the PCI vendor/device and command registers. Its normal PCI configuration write is narrowly conditional: it enables memory decoding only when the command register says memory decoding is off. It explicitly does not enable bus mastering.
+- Expansion-ROM probing is opt-in via `rdna4-vbiosrom=1`; normal startup prefers an injected `ATY,bin_image` and otherwise leaves the expansion-ROM BAR untouched.
+
+**Implication:** if the last reliable boot marker is genuinely inside `IOPCIConfigurator::configure()`, before the GPU's PCI service and its framebuffer provider have been published, the later `RDNA4Device::init()` path is not yet executing. That makes its BAR mapping, VBIOS handling, display discovery and Metal accelerator setup poor first suspects. The remaining plugin-level possibility is earlier Lilu/plugin activation or a separate OpenCore/ACPI/PCI patch interaction; current evidence does not prove either.
+
+This is a source-order inference, not a kernel trace. The exact last emitted line and whether the GPU's `IOPCIDevice` service was already registered remain decisive evidence.
+
 ## Boot-stall investigation
 
 The ABI audit does not explain the reported early boot stall. If the machine stops before `IOAcceleratorFamily2` loads, `familyLoaded` has not run and its checks cannot be the cause. The plugin's `rdna4-off=1` option disables the plugin's hooks as well as its accelerator path, so it is a broad isolation switch, not a targeted accelerator-only test.
