@@ -41,6 +41,21 @@ A source-level review of `plugin.cpp` and `device.cpp` narrows the likely bounda
 
 This is a source-order inference, not a kernel trace. The exact last emitted line and whether the GPU's `IOPCIDevice` service was already registered remain decisive evidence.
 
+## Lilu startup and callback timing review
+
+The plugin has two additional early-start mechanisms worth distinguishing from GPU attach:
+
+1. `pluginStart()` registers load callbacks for `IONDRVSupport` and `IOGraphicsFamily`, then calls `RDNA4Accel::start()`.
+2. `RDNA4Accel::start()` registers callbacks for the accelerator-family kexts, registers three sysctls, and starts `accelAtBoot`.
+3. `accelAtBoot` polls for the GPU service for up to 60 seconds, but then checks the `rdna4-accel` trial/boot option. If it is absent or outside 1–4, it marks boot work complete and exits. Only an explicit value 1–4 causes it to load accelerator-family kexts and attempt native accelerator activation.
+4. Separately, `pluginStart()` schedules `lateNdrvCheck` for one second later. This polls the kernel's kext list for `IONDRVSupport` if Lilu has not delivered its load callback. If found, it routes framebuffer methods. It does not enumerate PCI devices or write PCI configuration space.
+
+The NDRV/IOGraphics callbacks do patch method entry points once those graphics kexts load. That is a legitimate compatibility surface to isolate, but the source shows no direct PCI configurator hook. The driver's PCI command-register write remains inside `RDNA4Device::init()`, reached only after an `IONDRVFramebuffer` is opened and its provider is resolved to an `IOPCIDevice`.
+
+**Important limitation:** a callback or background poll can overlap in wall-clock time with PCI configuration without causing that configuration. The source review establishes call ordering and direct dependencies, not a proof that no timing interaction exists. The user's prior `rdna4-off=1` test still stalled later around AppleACPICPU ProcessorId 12/13; this is evidence against a simple deterministic failure inside the enabled plugin, but changing timing can move a boot stall and does not identify its cause.
+
+The exact OpenCore config remains unavailable in the retrieved project context. In particular, the prior conversation does not contain the actual enabled AMD kernel-patch array or the exact IOPCIFamily patch entries. The previously mentioned `npci=0x2000` boot argument is historical and should not be assumed to be the current value. No patch-level conclusion should be made until the active EFI configuration is available.
+
 ## Boot-stall investigation
 
 The ABI audit does not explain the reported early boot stall. If the machine stops before `IOAcceleratorFamily2` loads, `familyLoaded` has not run and its checks cannot be the cause. The plugin's `rdna4-off=1` option disables the plugin's hooks as well as its accelerator path, so it is a broad isolation switch, not a targeted accelerator-only test.
