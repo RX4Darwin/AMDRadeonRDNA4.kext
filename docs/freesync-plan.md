@@ -62,3 +62,25 @@ probably unrelated).
    sink has 0x007 bit 6; each flip (rtScanoutFlip) then writes OTG_TRIGA_MANUAL_TRIG, as Linux after a flip. Only flips end
    the blank (Linux's default): a cursor moving over a still desktop is shown at the slow rate.
 4. Card: a game or a moving window at a rate under the maximum, the monitor's own refresh read-out; display sleep/wake.
+
+## With HDR on the boot display (2026-11-28)
+
+CoreDisplay installs no variable timings of its own on a display it counts as HDR-capable: with `rdna4-hdr=1` the Samsung
+got no programmable timings at all in four boots (no cscSetDetailedTiming), whatever the timing range declared (all four HDR
+fields, or only the dynamic ranges), while a boot whose range made it not HDR-capable installed 17 and the Lenovo always gets
+its own; its range check (CheckTimingWithRange, probed) passes the timings either way. So the Samsung had no Variable even in
+SDR, and HDR switched on from a variable mode could only land on the fixed HDR twin (CoreDisplay pairs twins by timing).
+
+So for a display with HDR twins the translator lists variable modes of its own (Ndrv::Translator::kVrrIdBit): a copy of every
+mode within 1 Hz of the EDID's top refresh, its timing carrying the blanking extension down to the EDID's lowest refresh, and
+an HDR10 twin of each copy with the same extension. CoreGraphics lists the copies (0x10000066 is 2560x1440@144 variable). A
+switch to a copy runs variable; HDR switched on from it lands on its twin (0x30000066), which runs on the base mode of its
+refresh (3840x2160@144 over DSC on the Samsung) with the extension taken to that timing. Card, 2026-11-28: the copy at
+48-144 Hz measured 48 frames/s on an idle desktop; with HDR on, V total 2314..6941 lines on the 4K144 base, 50 frames/s idle.
+The copies are listed first: CoreDisplay restores a saved mode by what it looks like, and a copy looks like its fixed mode,
+so with the fixed one first a saved variable mode came back fixed (and with HDR on as the fixed twin); listed first, the saved
+variable HDR mode came back at login. Variable is then what a restore picks for the top refresh, as macOS does on a display
+where it installs variable timings itself.
+A Linux capture with HDR and GNOME's "+vrr" modes (test/ref/linux-vrrhdr, tools/linux/vrrhdr-snap.py) showed amdgpu not running
+variable on the desktop either (V_TOTAL_MIN = MAX); it sends a FreeSync infopacket (GSP2) and the VSC SDP (GSP0) even in SDR,
+and drives HDR at 10 bits a component.

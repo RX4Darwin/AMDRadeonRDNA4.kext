@@ -151,7 +151,8 @@ units (WMMA) at 53 TFLOPS in FP16. See *Compute runtime* below.
   only display connected; with a second display the desktop stays at the console's size or smaller. Not for an HDMI
   boot display.
 - Variable refresh (FreeSync) by default: with `rdna4-vrr=1` it works on DisplayPort monitors, the boot display included
-  (48-144 Hz on the rig's two), at the timings at the monitor's top rate. At 4K144 over DSC it has not been tried.
+  (48-144 Hz on the rig's two), at the timings at the monitor's top rate, with HDR on too (the boot display's HDR at 1440p
+  then runs on its 4K144 mode over DSC).
 - DisplayPort MST.
 - HDR by default: with `rdna4-hdr=1` (and `rdna4-vrr=1`) macOS offers HDR on a DisplayPort boot display whose EDID takes
   HDR10, and the monitor gets the HDR metadata (PQ) and BT.2020; the link stays 8 bits a component, and the mastering

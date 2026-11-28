@@ -148,7 +148,77 @@ int32_t Translator::idFor(const Modes::Mode &m) const {
 	return m.id == bootModeId ? kBootModeId : kBootModeId + static_cast<int32_t>(m.id);
 }
 
+uint32_t Translator::minVHz() const {
+	Edid::BaseInfo base {};
+	return Edid::parseBaseBlock(edid, edidLen, base) && base.range.present && base.range.maxVHz > base.range.minVHz ? base.range.minVHz : 0;
+}
+
+bool Translator::hasVrrCopy(const Modes::Mode &m) const {
+	Edid::BaseInfo base {};
+	if (!vrrModes || !adaptiveSync || !minVHz() || !Edid::parseBaseBlock(edid, edidLen, base))
+		return false;
+	return m.refreshMilliHz + 1000 >= base.range.maxVHz * 1000u && m.refreshMilliHz <= base.range.maxVHz * 1000u + 1000;
+}
+
+size_t Translator::vrrCount() const {
+	size_t n = 0;
+	for (size_t i = 0; i < count; i++)
+		n += hasVrrCopy(modes[i]);
+	return n;
+}
+
+const Modes::Mode *Translator::vrrCopy(size_t k) const {
+	for (size_t i = 0; i < count; i++)
+		if (hasVrrCopy(modes[i]) && !k--)
+			return &modes[i];
+	return nullptr;
+}
+
+// The variable copies, the modes (and scaled frames), the copies' HDR twins, then the fixed modes' HDR twins. CoreDisplay
+// restores a saved mode by what it looks like, and a copy looks like its fixed mode: it took the fixed one (and with HDR on its
+// fixed twin) while that came first, so the copies lead, as Variable is macOS's default where it installs variable timings.
+int32_t Translator::entryId(size_t i) const {
+	const size_t vrr = vrrCount();
+	if (i < vrr)
+		return idFor(*vrrCopy(i)) | kVrrIdBit;
+	i -= vrr;
+	if (i < total())
+		return idFor(at(i));
+	i -= total();
+	if (hdr && i < vrr)
+		return idFor(*vrrCopy(i)) | kVrrIdBit | kHdrIdBit;
+	return idFor(modes[i - (hdr ? vrr : 0)]) | kHdrIdBit;
+}
+
+const Modes::Mode &Translator::entry(size_t i) const {
+	const size_t vrr = vrrCount();
+	if (i < vrr)
+		return *vrrCopy(i);
+	i -= vrr;
+	if (i < total())
+		return at(i);
+	i -= total();
+	if (hdr && i < vrr)
+		return *vrrCopy(i);
+	return modes[i - (hdr ? vrr : 0)];
+}
+
+uint32_t Translator::extFor(const Edid::DetailedTiming &t, uint32_t minHz) const {
+	const uint64_t hTotal = static_cast<uint64_t>(t.hActive) + t.hBlank, vTotal = static_cast<uint64_t>(t.vActive) + t.vBlank;
+	const uint64_t lines = hTotal && minHz ? static_cast<uint64_t>(t.pixelClockKHz) * 1000 / (hTotal * minHz) : 0;
+	return lines > vTotal ? static_cast<uint32_t>(lines - vTotal) : 0;
+}
+
 const Modes::Mode *Translator::modeFor(int32_t id) const {
+	if (isVrrId(id)) {
+		const int32_t plain = id & ~(kVrrIdBit | kHdrIdBit);
+		if (isHdrId(id) && !hdr)
+			return nullptr;
+		for (size_t i = 0; i < count; i++)
+			if (idFor(modes[i]) == plain && hasVrrCopy(modes[i]))
+				return &modes[i];
+		return nullptr;
+	}
 	if (hdr && isHdrId(id)) {
 		for (size_t i = 0; i < count; i++)
 			if ((idFor(modes[i]) | kHdrIdBit) == id)
@@ -167,9 +237,31 @@ bool Translator::isSlotId(int32_t id) {
 	return id >= kSlotIdBase && id < kSlotIdBase + static_cast<int32_t>(kSlots);
 }
 
+const Modes::Mode *Translator::baseFor(uint32_t refreshMilliHz) const {
+	const Modes::Mode *base = Modes::scaleBase(modes, count);
+	auto off = [refreshMilliHz](const Modes::Mode &m) {
+		return m.refreshMilliHz > refreshMilliHz ? m.refreshMilliHz - refreshMilliHz : refreshMilliHz - m.refreshMilliHz;
+	};
+	for (size_t i = 0; base && i < count; i++)
+		if (modes[i].t.hActive == base->t.hActive && modes[i].t.vActive == base->t.vActive && off(modes[i]) < off(*base))
+			base = &modes[i];
+	return base;
+}
+
+const Modes::Mode *Translator::timingOf(const Modes::Mode &m) const {
+	if (m.source != Modes::SourceScaled)
+		return &m;
+	for (size_t i = 0; i < count; i++)   // the base it was made from: its clock and refresh (runFor keeps them)
+		if (modes[i].t.pixelClockKHz == m.t.pixelClockKHz && modes[i].refreshMilliHz == m.refreshMilliHz &&
+		    modes[i].t.hActive >= m.t.hActive && modes[i].t.vActive >= m.t.vActive)
+			return &modes[i];
+	return nullptr;
+}
+
 const Modes::Mode *Translator::runFor(int32_t id) const {
 	const Modes::Mode *m = modeFor(id);
-	const Modes::Mode *base = m && hdr && isHdrId(id) ? Modes::scaleBase(modes, count) : nullptr;
+	// on the base mode of the twin's refresh (2560x1440@144 HDR on 3840x2160@144, over DSC on the rig's Samsung)
+	const Modes::Mode *base = m && hdr && isHdrId(id) ? baseFor(m->refreshMilliHz) : nullptr;
 	if (!base || (m->t.hActive >= base->t.hActive && m->t.vActive >= base->t.vActive))
 		return m;
 	Modes::Mode &f = hdrFrames[m - modes];   // (a twin is of a table mode: modes[0..count))
@@ -371,8 +463,8 @@ int32_t Translator::getNextResolution(VDResolutionInfoRec &r) const {
 	const Modes::Mode *m = nullptr;
 	int32_t id = 0;
 	if (prev == kDisplayModeIDFindFirst) {
-		m = &modes[0];
-		id = idFor(*m);
+		m = &entry(0);
+		id = entryId(0);
 	} else if (prev == kDisplayModeIDCurrent) {
 		m = modeFor(current);
 		id = current;
@@ -543,6 +635,8 @@ int32_t Translator::getDetailedTiming(VDDetailedTimingRec &r) const {
 	r.csVerticalSyncPulseWidth   = t.vSyncWidth;
 	r.csHorizontalSyncConfig     = t.hSyncPositive ? kSyncPositivePolarityMask : 0;
 	r.csVerticalSyncConfig       = t.vSyncPositive ? kSyncPositivePolarityMask : 0;
+	if (isVrrId(id))
+		r.csReserved2 = extFor(t, minVHz());   // verticalBlankingExtension: a variable mode
 	if (hdr) {   // both twins say what they are
 		const bool pq = isHdrId(id);
 		r.csPixelEncoding         = kRangeEncodingRGB444;
@@ -610,14 +704,13 @@ int32_t Translator::switchMode(VDSwitchInfoRec &r) {
 		if (err != kSuccess)
 			return err;
 	}
+	const uint32_t ext = refreshExt(r.csData, *m);
 	current = r.csData;
 	// The backend may place the new mode's surface elsewhere.
 	if (!same && !surface(*m, s))
 		return kBadArgument;
-	// An installed timing with a blanking extension is the mode with variable refresh; anything else runs it fixed.
-	const Slot *sl = slotFor(r.csData);
-	const uint32_t ext = sl && sl->mode ? sl->timing.csReserved2 : 0;
-	if (be.setRefresh && (ext || variable) && be.setRefresh(be.ctx, *m, ext) == kSuccess)
+	const Modes::Mode *run = timingOf(*m);
+	if (run && be.setRefresh && (ext || variable) && be.setRefresh(be.ctx, *run, ext) == kSuccess)
 		variable = ext != 0;
 	if (hdr && be.setHdr)   // every switch: a relit pipe may have lost the packet
 		(void)be.setHdr(be.ctx, isHdrId(current));
@@ -625,13 +718,22 @@ int32_t Translator::switchMode(VDSwitchInfoRec &r) {
 	return kSuccess;
 }
 
+// The blanking extension mode `id` runs with (0: fixed): an installed timing's own; a variable copy's (kVrrIdBit) taken to the
+// timing it runs on, its base for an HDR twin below it, with the same lowest refresh.
+uint32_t Translator::refreshExt(int32_t id, const Modes::Mode &m) const {
+	if (const Slot *sl = slotFor(id))
+		return sl->mode ? sl->timing.csReserved2 : 0;
+	const Modes::Mode *run = isVrrId(id) ? timingOf(m) : nullptr;
+	return run ? extFor(run->t, minVHz()) : 0;
+}
+
 void Translator::relit() {
 	const Modes::Mode *m = runFor(current);
 	if (!m || !be.switchTo || be.switchTo(be.ctx, *m, m->id == bootModeId) != kSuccess)
 		return;
-	const Slot *sl = slotFor(current);
-	const uint32_t ext = sl && sl->mode ? sl->timing.csReserved2 : 0;
-	if (be.setRefresh && (ext || variable) && be.setRefresh(be.ctx, *m, ext) == kSuccess)
+	const uint32_t ext = refreshExt(current, *m);
+	const Modes::Mode *run = timingOf(*m);
+	if (run && be.setRefresh && (ext || variable) && be.setRefresh(be.ctx, *run, ext) == kSuccess)
 		variable = ext != 0;
 	if (hdr && be.setHdr)
 		(void)be.setHdr(be.ctx, isHdrId(current));

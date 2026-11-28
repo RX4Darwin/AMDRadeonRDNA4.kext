@@ -5,6 +5,12 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.4.0 (on `next`, no number yet)
 
+- Variable refresh with HDR (`rdna4-vrr=1`, `rdna4-hdr=1`): macOS installs no variable timings on a display it counts as
+  HDR-capable, so the Samsung had lost Variable altogether; the driver now lists variable copies of the top-refresh modes and
+  their HDR twins itself. HDR switched on from a variable mode stays variable, and an HDR twin below 4K runs on the 4K mode
+  nearest its refresh (2560x1440@144 HDR on 3840x2160@144 over DSC). On the rig: 48 frames/s idle at 2560x1440 variable,
+  50 frames/s with HDR on; not yet looked at by eye.
+
 - The hardware cursor is scaled with the frames in scaled modes: with HDR at 2560x1440 on a 4K monitor it was two thirds of
   its size (the "looks like" sizes had it too large). On the rig the Samsung's cursor came out at its size and on target.
 

@@ -316,6 +316,15 @@ public:
 	bool hdr { false };
 	static constexpr int32_t kHdrIdBit = 0x20000000;
 	static bool isHdrId(int32_t id) { return id > 0 && (id & kHdrIdBit) && !isSlotId(id); }
+	// Variable copies of the modes within 1 Hz of the EDID's top refresh, ID | kVrrIdBit, listed by the driver itself with the
+	// blanking extension down to the EDID's lowest refresh in their timing, and their HDR10 twins (both bits). For a display
+	// with HDR twins: CoreDisplay installs no variable timings of its own on one it counts as HDR-capable (none in four boots
+	// on the rig's Samsung, whatever the range declared; the Lenovo gets them), so it had no Variable at all, and HDR switched on
+	// from a variable mode needs a twin with the same extension (CoreDisplay pairs twins by timing). Card, 2026-11-28: the copy
+	// runs 48-144 Hz, HDR on lands on its twin and stays variable (on the 4K144 base, 48-50 frames/s idle).
+	static constexpr int32_t kVrrIdBit = 0x10000000;
+	static bool isVrrId(int32_t id) { return id > 0 && (id & kVrrIdBit) && !isSlotId(id); }
+	bool vrrModes { false };
 	// An HDR twin of a mode smaller than a 3840x2160-class monitor (Modes::scaleBase) is listed with the mode's timing (CoreDisplay
 	// pairs the twins by timing) but runs as a scaled frame: the head on the base mode, macOS's frame of the mode's size scaled up
 	// to it when presented, as AMD's Windows driver does. A monitor then only ever gets its native HDR signal (docs/hdr-plan.md).
@@ -369,12 +378,21 @@ private:
 	int32_t setDetailedTiming(const VDDetailedTimingRec &r);
 
 	size_t total() const { return count + __atomic_load_n(&scaledCount, __ATOMIC_ACQUIRE); }
-	size_t entries() const { return total() + (hdr ? count : 0); }   // what macOS lists: the modes, then their HDR10 twins
-	int32_t entryId(size_t i) const { return i < total() ? idFor(at(i)) : idFor(modes[i - total()]) | kHdrIdBit; }
-	const Modes::Mode &entry(size_t i) const { return i < total() ? at(i) : modes[i - total()]; }
+	// what macOS lists (the order in entryId)
+	size_t entries() const { return total() + (hdr ? count : 0) + vrrCount() * (hdr ? 2 : 1); }
+	int32_t entryId(size_t i) const;
+	const Modes::Mode &entry(size_t i) const;
+	bool hasVrrCopy(const Modes::Mode &m) const;   // a mode within 1 Hz of the EDID's top refresh (vrrModes)
+	size_t vrrCount() const;
+	const Modes::Mode *vrrCopy(size_t k) const;     // the k-th mode with a variable copy
+	uint32_t minVHz() const;                        // the EDID's lowest refresh (0: none)
+	uint32_t extFor(const Edid::DetailedTiming &t, uint32_t minHz) const;   // lines of extension down to minHz
 	const Modes::Mode &at(size_t i) const { return i < count ? modes[i] : scaledModes[i - count]; }
 	const Modes::Mode *modeFor(int32_t id) const;   // the mode as listed
 	const Modes::Mode *runFor(int32_t id) const;    // as it runs: an HDR twin below the base mode as a scaled frame
+	const Modes::Mode *baseFor(uint32_t refreshMilliHz) const;   // the 3840x2160-class mode a frame scaled up runs on: nearest that refresh
+	const Modes::Mode *timingOf(const Modes::Mode &m) const;   // the table mode whose timing a mode runs (a scaled frame's base)
+	uint32_t refreshExt(int32_t id, const Modes::Mode &m) const;   // the blanking extension `id` runs with (0: fixed)
 	mutable Modes::Mode hdrFrames[Modes::MaxModes] {};
 	bool surface(const Modes::Mode &m, Surface &out) const;
 

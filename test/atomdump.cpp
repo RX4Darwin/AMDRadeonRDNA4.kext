@@ -2947,6 +2947,7 @@ struct FakeBackend {
 	bool     powerOn = true;
 	int      refreshCalls = 0;
 	uint32_t refreshExt = 0;
+	Modes::Mode lastRefresh {};
 	int      hdrCalls = 0;
 	bool     hdrOn = false;
 	Modes::Mode lastSwitch {};
@@ -2969,10 +2970,11 @@ struct FakeBackend {
 		b->powerCalls++;
 		b->powerOn = on;
 	}
-	static int32_t setRefresh(void *ctx, const Modes::Mode &, uint32_t ext) {
+	static int32_t setRefresh(void *ctx, const Modes::Mode &m, uint32_t ext) {
 		auto *b = static_cast<FakeBackend *>(ctx);
 		b->refreshCalls++;
 		b->refreshExt = ext;
+		b->lastRefresh = m;
 		return Ndrv::kSuccess;
 	}
 	static int32_t setHdr(void *ctx, bool on) {
@@ -3071,6 +3073,85 @@ static int testScaledModes() {
 		                    fb.lastSwitch.source != Modes::SourceScaled && fb.lastSwitch.t.hActive == 3840 && !ht.scaledFrame(w, h);
 		failures += check(real && twin && listed && native, "scaled: HDR twins: real %d, twin %d, listed %d, native %d", real, twin,
 		                  listed, native);
+	}
+	{   // HDR twins below the base run on the base of their refresh, and the refresh is set on the timing that runs (the base's)
+		const Modes::Mode vt[] = { mode(1, 3840, 2160, 60000), mode(2, 3840, 2160, 144000), mode(3, 2560, 1440, 144000),
+		                           mode(4, 2560, 1440, 60000) };
+		FakeBackend vb;
+		vb.w = 3840, vb.h = 2160, vb.pitch = 3840 * 4;
+		Ndrv::Translator vr;
+		vr.init(vt, 4, 1, nullptr, 0, vb.backend());
+		vr.hdr = true;
+		vr.adaptiveSync = true;
+		Ndrv::VDDetailedTimingRec slot {};
+		slot.csTimingSize = sizeof(slot);
+		slot.csDisplayModeID = 0x40000000;   // the first slot (Translator::kSlotIdBase)
+		slot.csDisplayModeState = 0;         // kDMSModeReady
+		slot.csDisplayModeAlias = 0x80001000;
+		slot.csPixelClock = vt[2].t.pixelClockKHz * 1000ull;
+		slot.csHorizontalActive = 2560, slot.csHorizontalBlanking = 160;
+		slot.csVerticalActive = 1440, slot.csVerticalBlanking = 62;
+		slot.csReserved2 = (1440 + 62) * 2;   // down to 48 Hz
+		const bool installed = vr.control(Ndrv::cscSetDetailedTiming, &slot, ret) && ret == Ndrv::kSuccess;
+		Ndrv::VDSwitchInfoRec vs {};
+		vs.csMode = Ndrv::kDepthMode1;
+		vs.csData = static_cast<int32_t>(0x80001000);
+		const bool variable = vr.control(Ndrv::cscSwitchMode, &vs, ret) && ret == Ndrv::kSuccess && vb.refreshExt == slot.csReserved2 &&
+		                      vb.lastRefresh.t.vActive == 1440;
+		vs.csData = vr.idFor(vt[2]) | Ndrv::Translator::kHdrIdBit;
+		const uint32_t vRun = 2160 + 62;
+		const bool twin = vr.control(Ndrv::cscSwitchMode, &vs, ret) && ret == Ndrv::kSuccess && vb.lastSwitch.refreshMilliHz == 144000 &&
+		                  vb.lastRefresh.t.vActive == 2160 && vb.lastRefresh.refreshMilliHz == 144000 && vb.refreshExt == 0;
+		const uint32_t carried = vb.refreshExt;
+		vs.csData = vr.idFor(vt[2]);   // HDR off: the fixed mode, still fixed
+		const bool fixed = vr.control(Ndrv::cscSwitchMode, &vs, ret) && ret == Ndrv::kSuccess && vb.refreshExt == 0;
+		vs.csData = vr.idFor(vt[2]) | Ndrv::Translator::kHdrIdBit;   // and from the fixed mode the twin stays fixed
+		const int calls = vb.refreshCalls;
+		const bool twinFixed = vr.control(Ndrv::cscSwitchMode, &vs, ret) && ret == Ndrv::kSuccess && vb.refreshCalls == calls;
+		vs.csData = vr.idFor(vt[3]) | Ndrv::Translator::kHdrIdBit;   // the 60 Hz twin on the 60 Hz base
+		const bool sixty = vr.control(Ndrv::cscSwitchMode, &vs, ret) && ret == Ndrv::kSuccess && vb.lastSwitch.refreshMilliHz == 60000;
+		failures += check(installed && variable && twin && fixed && twinFixed && sixty,
+		                  "hdr base: installed %d, variable %d, twin on the 4K144 base and fixed %d (ext %u, %u lines), back to the mode %d, twin from fixed %d, 60 Hz base %d",
+		                  installed, variable, twin, carried, vRun, fixed, twinFixed, sixty);
+	}
+	{   // driver-made variable modes (rdna4-vrrmodes=1): a copy of the top-refresh mode with the extension to the EDID's lowest
+		// refresh (the Lenovo fixture: 48-144 Hz), with HDR its twin too; switching runs it variable, the plain mode fixed
+		uint8_t ed[128];
+		const bool edOk = hexToBytes(kLenovoEdidHex, ed, sizeof(ed));
+		const Modes::Mode lt[] = { mode(1, 1920, 1080, 144000), mode(2, 1920, 1080, 60000) };
+		FakeBackend lb;
+		Ndrv::Translator lr;
+		lr.init(lt, 2, 1, ed, sizeof(ed), lb.backend());
+		lr.adaptiveSync = true;
+		lr.vrrModes = true;
+		const int32_t vid = lr.idFor(lt[0]) | Ndrv::Translator::kVrrIdBit;
+		Ndrv::VDResolutionInfoRec rr {};
+		rr.csPreviousDisplayModeID = Ndrv::kDisplayModeIDFindFirst;
+		size_t listed = 0;
+		bool sawVrr = false;
+		while (lr.status(Ndrv::cscGetNextResolution, &rr, ret) && ret == Ndrv::kSuccess && rr.csDisplayModeID > 0 && listed < 10) {
+			sawVrr = sawVrr || rr.csDisplayModeID == vid;
+			listed++;
+			rr.csPreviousDisplayModeID = rr.csDisplayModeID;
+		}
+		Ndrv::VDDetailedTimingRec dt {};
+		dt.csDisplayModeID = vid;
+		const uint32_t vTot = 1080 + 62, want = vTot * 3 - vTot;   // 144 -> 48 Hz: three times the lines
+		const bool timing = lr.status(Ndrv::cscGetDetailedTiming, &dt, ret) && ret == Ndrv::kSuccess && dt.csReserved2 + 2 >= want &&
+		                    dt.csReserved2 <= want + 2;
+		Ndrv::VDSwitchInfoRec ls {};
+		ls.csMode = Ndrv::kDepthMode1;
+		ls.csData = vid;
+		const bool on = lr.control(Ndrv::cscSwitchMode, &ls, ret) && ret == Ndrv::kSuccess && lb.refreshExt == dt.csReserved2;
+		ls.csData = lr.idFor(lt[0]);
+		const bool off = lr.control(Ndrv::cscSwitchMode, &ls, ret) && ret == Ndrv::kSuccess && lb.refreshExt == 0;
+		lr.hdr = true;
+		ls.csData = vid | Ndrv::Translator::kHdrIdBit;
+		const bool hdrVrr = lr.control(Ndrv::cscSwitchMode, &ls, ret) && ret == Ndrv::kSuccess && lb.refreshExt == dt.csReserved2 &&
+		                    lb.hdrOn;
+		failures += check(edOk && listed == 3 && sawVrr && timing && on && off && hdrVrr,
+		                  "vrrmodes: listed %zu (copy %d), extension %u (want %u), on %d, off %d, HDR twin variable %d", listed, sawVrr,
+		                  dt.csReserved2, want, on, off, hdrVrr);
 	}
 	tr.init(table, 3, 2, nullptr, 0, fb.backend());
 	sw = {};

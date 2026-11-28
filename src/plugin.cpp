@@ -360,8 +360,15 @@ int32_t deviceSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 			(void)dev->enableBootAudio();   // a mode switch can take the stream's audio packets down with it
 		return ret;
 	}
-	// the head stays on (or goes to) its largest mode; the present path scales the frames down to it
-	const Modes::Mode *base = Modes::scaleBase(dev->modeTable, dev->modeCount);
+	// the head stays on (or goes to) the base mode the frame was made on (its clock and refresh: the largest mode, or for an HDR
+	// twin the one nearest its refresh, Ndrv::Translator::baseFor); the present path scales the frames to it
+	const Modes::Mode *base = nullptr;
+	for (size_t i = 0; i < dev->modeCount && !base; i++)
+		if (dev->modeTable[i].t.pixelClockKHz == m.t.pixelClockKHz && dev->modeTable[i].refreshMilliHz == m.refreshMilliHz &&
+		    dev->modeTable[i].t.hActive >= 3840)
+			base = &dev->modeTable[i];
+	if (!base)
+		base = Modes::scaleBase(dev->modeTable, dev->modeCount);
 	if (!base || !scaledMemoryFor(gBootScaledMemory, gBootScaled, gBootScaledCount))
 		return kIOReturnNoMemory;
 	const Edid::DetailedTiming *live = dev->liveMode();
@@ -1810,6 +1817,7 @@ void attach(FbEntry &e) {
 	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidAll, dev.edidAllLen, be);
 	st->ndrv.adaptiveSync = vrr;
 	st->ndrv.hdr = hdrWanted(dev.edidAll, dev.edidAllLen);
+	st->ndrv.vrrModes = st->ndrv.hdr;   // its own variable modes (Ndrv::Translator::kVrrIdBit)
 #ifdef AMDRadeonRDNA4_PVGPU
 	// A test boot's level (rdna4-trial) is only known once NVRAM is; the heads' framebuffers are told before macOS asks.
 	uint32_t pvTrial = 0, pvDisp = 0;
