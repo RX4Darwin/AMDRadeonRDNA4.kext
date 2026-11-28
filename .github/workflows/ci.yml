@@ -5,7 +5,7 @@ name: CI
 
 on:
   push:
-    branches: [main, next, "devel/**", "premetal/**"]
+    branches: [main, next, "devel/**", "premetal/**", "dev/**", "tahoe-26.7.3-native-metal-compat"]
   pull_request:
   workflow_dispatch:
 
@@ -47,6 +47,99 @@ jobs:
       - name: "Host tests (no ROM dump, no firmware: those checks say they are left out)"
         run: make test
 
+      - name: Repository script syntax
+        run: |
+          # Parse every checked-in shell script, not just the EFI-facing subset.
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(find tools -type f -name '*.sh' -print0)
+
+          # Compile every Python source file without leaving __pycache__ in the checkout.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          files = sorted(Path("tools").rglob("*.py"))
+          for path in files:
+              compile(path.read_bytes(), str(path), "exec")
+          print(f"Python syntax: {len(files)} files passed")
+          PY
+
+      - name: OpenCore redactor smoke test
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          script = Path("tools/rig/redact-opencore.py")
+          sample = {
+              "PlatformInfo": {"Generic": {
+                  "SystemSerialNumber": "REAL-SERIAL",
+                  "MLB": "REAL-MLB",
+                  "SystemUUID": "11111111-2222-3333-4444-555555555555",
+                  "ROM": bytes.fromhex("001122334455"),
+              }},
+              "Kernel": {"Patch": [{"Comment": "keep this patch", "Enabled": True}]},
+          }
+          with tempfile.TemporaryDirectory() as temp:
+              source = Path(temp) / "config.plist"
+              output = Path(temp) / "config.redacted.plist"
+              source.write_bytes(plistlib.dumps(sample, fmt=plistlib.FMT_BINARY))
+              subprocess.run(
+                  [sys.executable, str(script), str(source), "-o", str(output)],
+                  check=True,
+              )
+              result = plistlib.loads(output.read_bytes())
+              assert result["PlatformInfo"]["Generic"]["SystemSerialNumber"] == "REDACTED-SERIAL"
+              assert result["PlatformInfo"]["Generic"]["MLB"] == "REDACTED-MLB"
+              assert result["PlatformInfo"]["Generic"]["SystemUUID"] == "REDACTED-UUID"
+              assert result["PlatformInfo"]["Generic"]["ROM"] == bytes(6)
+              assert result["Kernel"] == sample["Kernel"]
+              assert plistlib.loads(source.read_bytes()) == sample
+          print("OpenCore redactor: identity fields removed; config structure and source preserved")
+          PY
+
+      - name: OpenCore audit report smoke test
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          sample = {
+              "NVRAM": {"Add": {"test-guid": {"boot-args": "-v keepsyms=1"}}},
+              "PlatformInfo": {"Generic": {"SystemSerialNumber": "DO-NOT-PRINT"}},
+              "ACPI": {"Add": [{"Path": "SSDT-EC.aml", "Enabled": True}]},
+              "Kernel": {
+                  "Patch": [{
+                      "Comment": "PCI test patch", "Enabled": True,
+                      "Identifier": "com.apple.iokit.IOPCIFamily",
+                      "Find": bytes.fromhex("aabb"), "Replace": bytes.fromhex("ccdd"),
+                  }],
+                  "Add": [{"BundlePath": "Lilu.kext", "Enabled": True}],
+                  "Quirks": {"DisableIoMapper": True},
+              },
+              "DeviceProperties": {"Add": {"PciRoot(0x0)/Pci(0x1,0x0)": {"AAPL,slot-name": "Slot-1"}}},
+          }
+          with tempfile.TemporaryDirectory() as temp:
+              config = Path(temp) / "config.plist"
+              config.write_bytes(plistlib.dumps(sample))
+              result = subprocess.run(
+                  [sys.executable, "tools/rig/inspect-opencore.py", str(config)],
+                  check=True, capture_output=True, text=True,
+              ).stdout
+          assert "-v keepsyms=1" in result
+          assert "PCI test patch" in result
+          assert "aabb" in result and "ccdd" in result
+          assert "SSDT-EC.aml" in result and "Lilu.kext" in result
+          assert "DO-NOT-PRINT" not in result
+          print("OpenCore audit: boot-path settings included; SMBIOS identity omitted")
+          PY
+
       - name: Native Metal bundle and mtlprobe
         run: |
           sh tools/metal/native/build.sh
@@ -67,3 +160,91 @@ jobs:
         run: make test
       - name: Kext with firmware embedded
         run: make all PVGPU=1
+
+  abi:
+    # Generate declarations from the exact Tahoe 26.7.3 (25G342) KDK and compare with the v0.4.0 baseline.
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache exact Tahoe 26.7.3 KDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/Kernel_Debug_Kit_26.7.3_build_25G342.dmg
+          key: kdk-25G342-219f27c7e039b6ab3426496e0d5852d55a31d00b3d3984d855cba04377c5dba0
+
+      - name: Download and verify KDK
+        env:
+          KDK_DMG: ${{ runner.temp }}/Kernel_Debug_Kit_26.7.3_build_25G342.dmg
+        run: |
+          if [ ! -f "$KDK_DMG" ]; then
+            curl --fail --location --retry 5 --retry-all-errors \
+              "https://github.com/dortania/KdkSupportPkg/releases/download/25G342/Kernel_Debug_Kit_26.7.3_build_25G342.dmg" \
+              --output "$KDK_DMG"
+          fi
+          echo "219f27c7e039b6ab3426496e0d5852d55a31d00b3d3984d855cba04377c5dba0  $KDK_DMG" | shasum -a 256 --check
+
+      - name: Install exact KDK
+        env:
+          KDK_DMG: ${{ runner.temp }}/Kernel_Debug_Kit_26.7.3_build_25G342.dmg
+        run: |
+          MOUNT="$RUNNER_TEMP/kdk-mount"
+          mkdir -p "$MOUNT"
+          hdiutil attach "$KDK_DMG" -readonly -nobrowse -mountpoint "$MOUNT"
+          cleanup() { hdiutil detach "$MOUNT" -quiet || true; }
+          trap cleanup EXIT
+
+          PKG="$(find "$MOUNT" -maxdepth 3 -name '*.pkg' -print -quit)"
+          if [ -n "$PKG" ]; then
+            sudo installer -pkg "$PKG" -target /
+          else
+            KDK_BUNDLE="$(find "$MOUNT" -maxdepth 3 -name '*.kdk' -print -quit)"
+            if [ -z "$KDK_BUNDLE" ]; then
+              echo "No installer package or .kdk bundle found in mounted image" >&2
+              find "$MOUNT" -maxdepth 3 -print
+              exit 1
+            fi
+            sudo mkdir -p /Library/Developer/KDKs
+            sudo ditto "$KDK_BUNDLE" /Library/Developer/KDKs/"$(basename "$KDK_BUNDLE")"
+          fi
+
+          KDK_PATH="$(find /Library/Developer/KDKs -maxdepth 1 -type d -name '*25G342*.kdk' -print -quit)"
+          if [ -z "$KDK_PATH" ]; then
+            echo "Installed KDK for build 25G342 was not found" >&2
+            find /Library/Developer/KDKs -maxdepth 2 -print || true
+            exit 1
+          fi
+          echo "KDK_PATH=$KDK_PATH" >> "$GITHUB_ENV"
+          echo "Using $KDK_PATH"
+
+      - name: Generate Tahoe ABI declarations
+        run: |
+          python3 tools/gen/accelgen.py --kdk "$KDK_PATH" --output-dir "$RUNNER_TEMP/rdna4-tahoe-abi"
+          test -s "$RUNNER_TEMP/rdna4-tahoe-abi/src/ioaccel.hpp"
+          test -s "$RUNNER_TEMP/rdna4-tahoe-abi/src/ioaccel_thunks.S"
+          test -s "$RUNNER_TEMP/rdna4-tahoe-abi/src/ioaccel_symbols.inc"
+          test -s "$RUNNER_TEMP/rdna4-tahoe-abi/src/ioaccel_slots.inc"
+          test -s "$RUNNER_TEMP/rdna4-tahoe-abi/src/ioaccel_kexts.inc"
+          test -s "$RUNNER_TEMP/rdna4-tahoe-abi/src/ioaccel_classes.inc"
+
+      - name: Compare generated ABI with committed v0.4.0 declarations
+        run: |
+          set +e
+          for file in ioaccel.hpp ioaccel_thunks.S ioaccel_symbols.inc ioaccel_slots.inc ioaccel_kexts.inc ioaccel_classes.inc; do
+            echo "::group::$file"
+            diff -u "src/$file" "$RUNNER_TEMP/rdna4-tahoe-abi/src/$file"
+            status=$?
+            if [ "$status" -gt 1 ]; then exit "$status"; fi
+            echo "::endgroup::"
+          done
+
+      - name: Upload generated ABI files
+        uses: actions/upload-artifact@v4
+        with:
+          name: tahoe-26.7.3-25G342-generated-abi
+          path: ${{ runner.temp }}/rdna4-tahoe-abi/src/
+          if-no-files-found: error
+          retention-days: 14

@@ -202,9 +202,22 @@ void RDNA4Device::publishVBIOSInfo() {
 }
 
 bool RDNA4Device::loadVBIOS() {
-	if (!copyVBIOSFromProperty() && !copyVBIOSFromExpansionROM()) {
-		FBLOG("VBIOS: no image available (inject ATY,bin_image via DeviceProperties)");
-		return false;
+	// Reading the VBIOS from the expansion ROM requires writes to the PCI
+	// Expansion ROM BAR (including a sizing probe). Some firmware/platform
+	// combinations do not tolerate that transaction after boot hand-off.
+	// Prefer an injected image and leave PCI configuration untouched by
+	// default. The ROM path remains available as an explicit diagnostic opt-in.
+	if (!copyVBIOSFromProperty()) {
+		uint32_t romRead = 0;
+		const bool allowRomRead = PE_parse_boot_argn("rdna4-vbiosrom", &romRead, sizeof(romRead)) && romRead != 0;
+		if (!allowRomRead) {
+			FBLOG("VBIOS: no injected image; expansion-ROM PCI probing skipped (use rdna4-vbiosrom=1 to opt in)");
+			return false;
+		}
+		if (!copyVBIOSFromExpansionROM()) {
+			FBLOG("VBIOS: expansion-ROM read failed");
+			return false;
+		}
 	}
 
 	if (!atomBios.init(vbiosData, vbiosSize)) {
@@ -332,8 +345,20 @@ bool RDNA4Device::mapRegisters() {
 		return false;
 	}
 
-	rmmio = reinterpret_cast<volatile uint32_t *>(rmmioMap->getVirtualAddress());
-	rmmioSize = rmmioMap->getLength();
+	// Do not publish a register aperture until the mapping is demonstrably
+	// usable. A failed/empty mapping must leave all register access disabled.
+	const mach_vm_address_t address = rmmioMap->getVirtualAddress();
+	const IOByteCount length = rmmioMap->getLength();
+	if (!address || length < sizeof(uint32_t) || (length & (sizeof(uint32_t) - 1))) {
+		FBLOG("mmio: rejecting invalid BAR5 mapping (address 0x%llx, length %llu)",
+		      static_cast<uint64_t>(address), static_cast<uint64_t>(length));
+		rmmioMap->release();
+		rmmioMap = nullptr;
+		return false;
+	}
+
+	rmmio = reinterpret_cast<volatile uint32_t *>(address);
+	rmmioSize = static_cast<size_t>(length);
 	FBLOG("mmio: BAR5 mapped, %zu KiB", rmmioSize / 1024);
 	return true;
 }
@@ -348,9 +373,13 @@ void RDNA4Device::unmapRegisters() {
 }
 
 uint32_t RDNA4Device::regRead32(uint32_t byteOffset) const {
-	if (!rmmio || byteOffset + 4 > rmmioSize)
+	// Subtract only after checking the aperture size: byteOffset + 4 can
+	// wrap at UINT32_MAX and accidentally pass an out-of-range access.
+	if (!rmmio || rmmioSize < sizeof(uint32_t) ||
+	    static_cast<size_t>(byteOffset) > rmmioSize - sizeof(uint32_t) ||
+	    (byteOffset & (sizeof(uint32_t) - 1)))
 		return 0xFFFFFFFF;
-	return rmmio[byteOffset / 4];
+	return rmmio[byteOffset / sizeof(uint32_t)];
 }
 
 uint32_t RDNA4Device::regReadDmu(uint8_t baseIdx, uint32_t dwordOffset) const {
@@ -2599,12 +2628,39 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	owner->setProperty("GPU,Variant", model);
 
 	if (isAmd) {
-		// Enable memory space so the aperture is reachable; never bus
-		// mastering — nothing here issues DMA.
-		pciDevice->setMemoryEnable(true);
+		// Optional read-only PCI snapshot around the one configuration-space
+		// change made during normal attach. This helps distinguish a bad
+		// firmware/bridge hand-off from a failure caused by enabling MMIO.
+		uint32_t pciDiag = 0;
+		const bool tracePci = PE_parse_boot_argn("rdna4-pcidiag", &pciDiag, sizeof(pciDiag)) && pciDiag != 0;
+		if (tracePci)
+			logPciState("before-memory-enable");
+
+		// Only change PCI command space when firmware left memory decoding
+		// disabled. Rewriting an already-enabled command register is needless
+		// during framebuffer takeover, and some firmware/bridge combinations
+		// are sensitive to redundant configuration transactions. Never enable
+		// bus mastering — nothing here issues DMA.
+		const uint16_t pciCommand = pciDevice->configRead16(kIOPCIConfigCommand);
+		if (pciCommand == 0xFFFF) {
+			FBLOG("init: PCI command register is unreadable; leaving the framebuffer to IOBootNDRV");
+			return false;
+		}
+		if ((pciCommand & 0x0002) == 0) {
+			pciDevice->setMemoryEnable(true);
+			FBLOG("init: enabled PCI memory decoding (command 0x%04x -> 0x%04x)",
+			      pciCommand, pciDevice->configRead16(kIOPCIConfigCommand));
+		} else {
+			FBLOG("init: PCI memory decoding already enabled (command 0x%04x); no config write",
+			      pciCommand);
+		}
+		if (tracePci)
+			logPciState("after-memory-enable");
 
 		// Registers first: the on-die discovery fallback needs MMIO.
 		bool haveMmio = mapRegisters();
+		if (tracePci)
+			logPciState(haveMmio ? "after-bar5-map" : "bar5-map-failed");
 
 		// Connector layout and firmware info for mode setting; the display
 		// itself does not depend on this.
