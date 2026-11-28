@@ -7,7 +7,7 @@ virtuals they do not override, explicit Base::f calls) is a thunk in our kext: a
 with the real addresses (Lilu's solveSymbol) when IOAcceleratorFamily2 loads. The base's gMetaClass is a placeholder there; our
 classes' metaclasses get the real one as their superclass at the same time.
 
-    python3 tools/gen/accelgen.py [--kdk /Library/Developer/KDKs/KDK_....kdk]
+    python3 tools/gen/accelgen.py --kdk /Library/Developer/KDKs/KDK_....kdk [--output-dir /tmp/rdna4-abi]
 
 writes src/ioaccel.hpp (the declarations), src/ioaccel_thunks.S (the thunks and their table), src/ioaccel_symbols.inc (the
 names, in table order) and src/ioaccel_slots.inc (the vtable slot each virtual thunk's function must be in). The KDK's slots must match the running macOS's: rdna4accel.cpp checks the known ones before using them.
@@ -204,7 +204,7 @@ def main():
     if not os.path.isdir(ext):
         sys.exit('accelgen: KDK has no System/Library/Extensions: %s' % ext)
     outdir = os.path.abspath(a.output_dir)
-    os.makedirs(outdir, exist_ok=True)
+    os.makedirs(os.path.join(outdir, 'src'), exist_ok=True)
     decls, thunks, forward, slotted = [], [], set(), []   # slotted: (thunk index, vtable symbol, slot) to check at run time
     bins, sdk_root, nslots = {}, {}, dict(SDK_SLOTS)
 
