@@ -22,7 +22,7 @@ This does **not** yet explain the reported early boot stall. If the machine stop
 
 ## Next engineering steps
 
-1. Obtain the matching Kernel Debug Kit for the exact target build (expected naming pattern: `KDK_26.7.3_25G342.kdk`; verify the actual Apple package/build before use).
+1. Obtain the exact matching Kernel Debug Kit: `Kernel_Debug_Kit_26.7.3_build_25G342.dmg` (build `25G342`). The archived KDK manifest lists SHA-256 `219f27c7e039b6ab3426496e0d5852d55a31d00b3d3984d855cba04377c5dba0`; verify the checksum after downloading. Apple Developer Downloads is the preferred source; the Dortania KdkSupportPkg archive also indexes this exact build. Do not substitute a different KDK merely because its marketing version also says 26.7.3.
 2. Run `tools/gen/accelgen.py --kdk <matching-KDK>` on a clean checkout of this branch and inspect the generated diff. Do not overwrite the existing generated files until the diff is reviewed.
 3. Compare the generated vtable slot tables, class sizes and symbol names with the 26.5.2-generated files. Preserve a clear record of every changed slot and class size.
 4. Build the regenerated branch and run the existing host tests/CI. A successful compile is not hardware validation.
